@@ -96,7 +96,7 @@ func sendTx(cfg *SendConfig, userId string, privKey *[KeyLen32]byte, totalAmount
 		command += " -p " + keyPair
 		txHash, bSuccess := autoTy.SendTxCommand(command)
 		if !bSuccess {
-			log.Info("send tx fail", "userId", userId, "amount", strAm, "output", txHash)
+			log.Error("send tx fail", "userId", userId, "amount", strAm, "output", txHash)
 		}
 		tr := &txResult{amount:strAm, txHash: txHash,}
 		rdr.txHashs = append(rdr.txHashs, tr)
@@ -168,7 +168,7 @@ func main() {
 	autoTy.CliCmd = cfg.CliCommand
 
 	//
-	StartCheck(cfg.CsvPath)
+
 
 	dat, err := ioutil.ReadFile(cfg.CsvPath)
 	if err != nil {
@@ -204,6 +204,7 @@ func main() {
 		rowNum++
 	}
 
+	StartCheck(cfg.CsvPath, rowNum - cfg.CsvTitleLine)
 	key, err := dumpKey(cfg.FromAddr)
 	if err != nil {
 		log.Info("dumpKey fail", "error", err)
@@ -227,9 +228,10 @@ func main() {
 	var rdrs []*rowDataResult
 	for _, rd := range rds[cfg.CsvTitleLine:] {
 		viewP := pri.ViewPrivKey[0:KeyLen32]
+		log.Info("SendStockToUser", "uid", rd.userId, "SendAmount", rd.totalAmount)
 		rdr, err := sendTx(&cfg, rd.userId, (*[KeyLen32]byte)(unsafe.Pointer(&viewP[0])), rd.totalAmount)
 		if err != nil {
-			log.Info("Send tx group fail", "error", err)
+			log.Error("Send tx group fail", "error", err)
 			rdr.rd.result = "fail"
 		}
 		rdrs = append(rdrs, rdr)
@@ -283,7 +285,7 @@ func main() {
 
 	//保存失败的发送结果
 	if !isAllSucc {
-		log.Info("send some tx fail!")
+		log.Error("send some tx fail!")
 		path := cfg.CsvPath[:len(cfg.CsvPath)-len(".csv")] + "_resend" + ".csv"
 		file, _ := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, os.ModePerm)
 		w := csv.NewWriter(file)

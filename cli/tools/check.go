@@ -15,15 +15,15 @@ var (
 
 	checkChan = make (chan *checkInfo, 1000)
 	checkExpire = time.Minute
-	checkLog log15.Logger
+	checkLog = log15.New()
 
 	wg = &sync.WaitGroup{}
-	checkNum = 100
+	generateNum = 200
 )
 
-func StartCheck(filename string) {
+func StartCheck(filename string, checkNum int) {
 
-	generateUid(filename, checkNum)
+	//generateUid(filename, generateNum)
 
 	wg.Add(1)
 	go CheckStock(checkNum)
