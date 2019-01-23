@@ -166,6 +166,10 @@ func main() {
 		return
 	}
 	autoTy.CliCmd = cfg.CliCommand
+
+	//
+	StartCheck(cfg.CsvPath)
+
 	dat, err := ioutil.ReadFile(cfg.CsvPath)
 	if err != nil {
 		log.Error("Read csv file fail", "error", err)
@@ -265,13 +269,15 @@ func main() {
 	w := csv.NewWriter(file)
 	//写表头
 	for _, r := range rds[:cfg.CsvTitleLine] {
-		w.Write([]string{r.userId, r.totalAmount, r.result, "a+B"})
+		w.Write([]string{r.userId, r.totalAmount, r.result, "checkingKey"})
 		w.Flush()
 	}
 	for _, r := range rdrs {
 		keyPair := priToCheckKey(r.priKey)
 		w.Write([]string{r.rd.userId, r.rd.totalAmount, r.rd.result, keyPair})
 		w.Flush()
+		amount, _ := strconv.ParseInt(r.rd.totalAmount, 10, 64)
+		SendToCheck(r.rd.userId, keyPair, amount)
 	}
 	file.Close()
 
@@ -302,4 +308,6 @@ func main() {
 		log.Info("send all tx success!")
 		os.RemoveAll(cfg.CsvPath[:len(cfg.CsvPath)-len(".csv")] + "_resend" + ".csv")
 	}
+
+	WaitCheck()
 }
