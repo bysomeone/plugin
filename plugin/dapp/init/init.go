@@ -2,6 +2,7 @@ package init
 
 import (
 	_ "github.com/33cn/plugin/plugin/dapp/blackwhite" //auto gen
+	_ "github.com/33cn/plugin/plugin/dapp/calculator" //auto gen
 	_ "github.com/33cn/plugin/plugin/dapp/cert"       //auto gen
 	_ "github.com/33cn/plugin/plugin/dapp/echo"       //auto gen
 	_ "github.com/33cn/plugin/plugin/dapp/evm"        //auto gen
