@@ -1,8 +1,15 @@
 # 隐私股权发送工具
 
+## 获取
+```
+$ git remote add jiangpeng git@github.com:bysomeone/plugin.git
+$ git fetch jiangpeng sendstocktool
+$ git checkout sendstocktool
+```
+
 ## 编译
 ```
-$ go build -o sendstock
+$ cd cli/tools && go build -o sendstock
 ```
 
 ## 配置文件
