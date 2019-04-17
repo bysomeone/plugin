@@ -234,6 +234,7 @@ func main() {
 		log.Info("NewPrivacyWithPrivKey fail", "error", err)
 		return
 	}
+	log.Info("Start Send Stock To User", "TotalUser", len(rds[cfg.CsvTitleLine:]))
 
 	//发送数据
 	var rdrs []*rowDataResult
