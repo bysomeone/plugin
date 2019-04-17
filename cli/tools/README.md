@@ -2,8 +2,7 @@
 
 ## 获取
 ```
-$ git remote add jiangpeng git@github.com:bysomeone/plugin.git
-$ git fetch jiangpeng sendstocktool
+$ git fetch git@github.com:bysomeone/plugin.git sendstocktool:sendstocktool
 $ git checkout sendstocktool
 ```
 
