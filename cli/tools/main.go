@@ -7,6 +7,7 @@
 package main
 
 import (
+	"flag"
 	_ "github.com/33cn/chain33/system"
 	_ "github.com/33cn/plugin/plugin"
 
@@ -162,6 +163,17 @@ func dumpKey(addr string) (string, error) {
 	return jsonMap["data"].(string), nil
 }
 
+
+var (
+	configFile string
+)
+
+func init() {
+
+	flag.StringVar(&configFile, "f", "sendstock.toml", "-f configFile")
+	flag.Parse()
+}
+
 func main() {
 	clog.SetFileLog(&types.Log{
 		Loglevel:        "debug",
@@ -174,7 +186,7 @@ func main() {
 		Compress:        false,
 	})
 	var cfg SendConfig
-	if _, err := toml.DecodeFile("send.toml", &cfg); err != nil {
+	if _, err := toml.DecodeFile(configFile, &cfg); err != nil {
 		log.Error("DecodeFile toml fail", "error", err)
 		return
 	}
