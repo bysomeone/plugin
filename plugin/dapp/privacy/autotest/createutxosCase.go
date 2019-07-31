@@ -11,7 +11,6 @@ import (
 )
 
 //CreateUtxosCase pub2priv case
-//Deprecated:已经删除CreateUtxo功能, 用pub2priv替代
 type CreateUtxosCase struct {
 	types.BaseCase
 	From   string `toml:"from"`
