@@ -113,7 +113,7 @@ func (validator *gmValidator) getCertificationChain(cert *sm2.Certificate) ([]*s
 	}
 
 	if cert.IsCA {
-		return nil, errors.New("A CA certificate cannot be used directly by this validator")
+		return nil, errors.New("A CA certificate 123 cannot be used directly by this validator")
 	}
 
 	return validator.getValidationChain(cert, false)
