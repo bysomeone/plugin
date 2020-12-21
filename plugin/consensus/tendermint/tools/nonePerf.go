@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/33cn/chain33/common/log/log15"
+	"github.com/33cn/chain33/util"
+	"github.com/33cn/chain33/util/testnode"
 	"google.golang.org/grpc"
 	"io/ioutil"
 	"math/rand"
@@ -31,6 +33,7 @@ import (
 	"github.com/33cn/chain33/types"
 	ty "github.com/33cn/plugin/plugin/dapp/valnode/types"
 	_ "google.golang.org/grpc/encoding/gzip"
+	_ "github.com/33cn/chain33/system/dapp/coins"
 )
 
 const fee = 1e6
@@ -106,7 +109,7 @@ func Perf(ip, txsize, num, sleepinterval, totalduration string) {
 	//	fmt.Fprintln(os.Stderr, err)
 	//	return
 	//}
-	sizeInt, _ := strconv.Atoi(txsize)
+	//sizeInt, _ := strconv.Atoi(txsize)
 	if numInt < 10 {
 		numThread = 1
 	} else if numInt > 100 {
@@ -141,20 +144,40 @@ func Perf(ip, txsize, num, sleepinterval, totalduration string) {
 		}
 	}()
 	<-ch
+	addrNum := 1000
+	addrs := make([]string, addrNum)
+	for i:=0; i<addrNum; i++{
+		addrs[i], _ =  util.Genaddress()
+	}
+	testnode.GetDefaultConfig()
+	exec := types.LoadExecutorType("coins")
+	if exec == nil {
+		panic("unknow driver coins")
+	}
+
+	priv :=  util.HexToPrivkey("CC38546E9E659D15E6B4893F0AB32A06D103931A8230B0BDE71459D2B27D6944")
+
 
 	for i := 0; i < numThread; i++ {
 		go func() {
-			_, priv := genaddress()
+			//_, priv := genaddress()
 			for {
 
 				height := atomic.LoadInt64(&blockHeight)
 				for txs := 0; txs < numInt/numThread; txs++ {
-					tx := txPool.Get().(*types.Transaction)
-					tx.To = execAddr
+					//tx := txPool.Get().(*types.Transaction)
+					to := addrs[rand.Intn(addrNum)]
+					tx, _ := exec.AssertCreate(&types.CreateTx{
+						To:     to,
+						Amount: 1,
+					})
+					//tx.To = execAddr
+					tx.Execer = []byte("coins")
+					tx.To = to
 					tx.Fee = rand.Int63()
 					tx.Nonce = time.Now().UnixNano()
 					tx.Expire = height + types.TxHeightFlag + types.LowAllowPackHeight
-					tx.Payload = RandStringBytes(sizeInt)
+					//tx.Payload = RandStringBytes(sizeInt)
 					tx.Sign(types.SECP256K1, priv)
 					txChan <- tx
 				}
@@ -177,7 +200,7 @@ func Perf(ip, txsize, num, sleepinterval, totalduration string) {
 			for tx := range txChan {
 				_, err := gcli.SendTransaction(context.Background(), tx, grpc.UseCompressor("gzip"))
 
-				txPool.Put(tx)
+				//txPool.Put(tx)
 				if err != nil {
 					if strings.Contains(err.Error(), "ErrTxExpire"){
 						continue
@@ -349,7 +372,7 @@ func genaddress() (string, crypto.PrivKey) {
 		panic(err)
 	}
 	addrto := address.PubKeyToAddress(privto.PubKey().Bytes())
-	fmt.Println("addr:", addrto.String())
+	//fmt.Println("addr:", addrto.String())
 	return addrto.String(), privto
 }
 
