@@ -144,7 +144,7 @@ func Perf(ip, txsize, num, sleepinterval, totalduration string) {
 		}
 	}()
 	<-ch
-	addrNum := 1000
+	addrNum := 5000
 	addrs := make([]string, addrNum)
 	for i:=0; i<addrNum; i++{
 		addrs[i], _ =  util.Genaddress()
