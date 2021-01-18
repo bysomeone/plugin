@@ -49,18 +49,25 @@ func main() {
 		LoadHelp()
 		return
 	}
-	fmt.Println("jrpc url:", os.Args[2]+":8801")
+	//fmt.Println("jrpc url:", os.Args[2]+":8801")
 	r = rand.New(rand.NewSource(time.Now().UnixNano()))
 	argsWithoutProg := os.Args[1:]
 	switch argsWithoutProg[0] {
 	case "-h": //使用帮助
 		LoadHelp()
-	case "perf":
-		if len(argsWithoutProg) != 6 {
+	case "coins":
+		if len(argsWithoutProg) != 5 {
 			fmt.Print(errors.New("参数错误").Error())
 			return
 		}
-		Perf(argsWithoutProg[1], argsWithoutProg[2], argsWithoutProg[3], argsWithoutProg[4], argsWithoutProg[5])
+		sendTx("coins", argsWithoutProg[1], argsWithoutProg[2], argsWithoutProg[3], argsWithoutProg[4])
+	case "none":
+		if len(argsWithoutProg) != 5 {
+			fmt.Print(errors.New("参数错误").Error())
+			return
+		}
+		sendTx("none", argsWithoutProg[1], argsWithoutProg[2], argsWithoutProg[3], argsWithoutProg[4])
+
 	case "put":
 		if len(argsWithoutProg) != 3 {
 			fmt.Print(errors.New("参数错误").Error())
@@ -79,20 +86,23 @@ func main() {
 			return
 		}
 		ValNode(argsWithoutProg[1], argsWithoutProg[2], argsWithoutProg[3])
+	default:
+		LoadHelp()
 	}
 }
 
 // LoadHelp ...
 func LoadHelp() {
 	fmt.Println("Available Commands:")
-	fmt.Println("perf [ip, size, num, interval, duration]                     : 写数据性能测试")
+	fmt.Println("coins[ip, addrNum, txNum, interval(ms)]                     : 发送转账交易")
+	fmt.Println("none[ip, txSize, txNum, interval(ms)]                     : 发送存证交易")
 	fmt.Println("put  [ip, size]                                              : 写数据")
 	fmt.Println("get  [ip, hash]                                              : 读数据")
 	fmt.Println("valnode [ip, pubkey, power]                                  : 增加/删除/修改tendermint节点")
 }
 
-// Perf ...
-func Perf(ip, txsize, num, sleepinterval, totalduration string) {
+// sendTx none localhost:8802 1024
+func sendTx(execName, ip, size, num, sleepinterval string) {
 	var numThread int
 	numInt, err := strconv.Atoi(num)
 	if err != nil {
@@ -104,12 +114,8 @@ func Perf(ip, txsize, num, sleepinterval, totalduration string) {
 		fmt.Fprintln(os.Stderr, err)
 		return
 	}
-	//durInt, err := strconv.Atoi(totalduration)
-	//if err != nil {
-	//	fmt.Fprintln(os.Stderr, err)
-	//	return
-	//}
-	//sizeInt, _ := strconv.Atoi(txsize)
+
+	sizeInt, _ := strconv.Atoi(size)
 	if numInt < 10 {
 		numThread = 1
 	} else if numInt > 100 {
@@ -144,7 +150,7 @@ func Perf(ip, txsize, num, sleepinterval, totalduration string) {
 		}
 	}()
 	<-ch
-	addrNum := 5000
+	addrNum := sizeInt
 	addrs := make([]string, addrNum)
 	for i:=0; i<addrNum; i++{
 		addrs[i], _ =  util.Genaddress()
@@ -155,34 +161,26 @@ func Perf(ip, txsize, num, sleepinterval, totalduration string) {
 		panic("unknow driver coins")
 	}
 
-	priv :=  util.HexToPrivkey("CC38546E9E659D15E6B4893F0AB32A06D103931A8230B0BDE71459D2B27D6944")
+	minerPriv :=  util.HexToPrivkey("CC38546E9E659D15E6B4893F0AB32A06D103931A8230B0BDE71459D2B27D6944")
 
 
 	for i := 0; i < numThread; i++ {
 		go func() {
-			//_, priv := genaddress()
+			_, priv := genaddress()
+			var tx *types.Transaction
 			for {
 
 				height := atomic.LoadInt64(&blockHeight)
 				for txs := 0; txs < numInt/numThread; txs++ {
-					//tx := txPool.Get().(*types.Transaction)
-					to := addrs[rand.Intn(addrNum)]
-					tx, _ := exec.AssertCreate(&types.CreateTx{
-						To:     to,
-						Amount: 1,
-					})
-					//tx.To = execAddr
-					tx.Execer = []byte("coins")
-					tx.To = to
-					tx.Fee = rand.Int63()
-					tx.Nonce = time.Now().UnixNano()
-					tx.Expire = height + types.TxHeightFlag + types.LowAllowPackHeight
-					//tx.Payload = RandStringBytes(sizeInt)
-					tx.Sign(types.SECP256K1, priv)
+					if execName == "coins" {
+						tx = newCoinsTx(minerPriv, addrs, exec, height)
+					}else {
+						tx = newNoneTx(priv, height, sizeInt)
+					}
 					txChan <- tx
 				}
 				if sleep > 0 {
-					time.Sleep(time.Second)
+					time.Sleep(time.Duration(sleep) * time.Millisecond)
 				}
 			}
 		}()
@@ -200,7 +198,9 @@ func Perf(ip, txsize, num, sleepinterval, totalduration string) {
 			for tx := range txChan {
 				_, err := gcli.SendTransaction(context.Background(), tx, grpc.UseCompressor("gzip"))
 
-				//txPool.Put(tx)
+				if execName == "none" {
+					txPool.Put(tx)
+				}
 				if err != nil {
 					if strings.Contains(err.Error(), "ErrTxExpire"){
 						continue
@@ -212,9 +212,6 @@ func Perf(ip, txsize, num, sleepinterval, totalduration string) {
 
 					log.Error("sendtx", "err", err)
 					time.Sleep(time.Second)
-					//conn.Close()
-					//conn = newGrpcConn(ip)
-					//gcli = types.NewChain33Client(conn)
 				}
 			}
 		}()
@@ -229,6 +226,33 @@ var (
 	log = log15.New()
 	execAddr = address.ExecAddress("user.write")
 )
+
+func newNoneTx(priv crypto.PrivKey, height int64, size int) *types.Transaction {
+	tx := txPool.Get().(*types.Transaction)
+	tx.To = execAddr
+	tx.Fee = rand.Int63()
+	tx.Nonce = time.Now().UnixNano()
+	tx.Expire = height + types.TxHeightFlag + types.LowAllowPackHeight
+	tx.Payload = RandStringBytes(size)
+	tx.Sign(types.SECP256K1, priv)
+	return tx
+}
+
+func newCoinsTx(priv crypto.PrivKey, addrs []string, exec types.ExecutorType, height int64) *types.Transaction {
+	to := addrs[rand.Intn(len(addrs))]
+	tx, _ := exec.AssertCreate(&types.CreateTx{
+		To:     to,
+		Amount: 1,
+	})
+
+	tx.Execer = []byte("coins")
+	tx.To = to
+	tx.Fee = rand.Int63()
+	tx.Nonce = time.Now().UnixNano()
+	tx.Expire = height + types.TxHeightFlag + types.LowAllowPackHeight
+	tx.Sign(types.SECP256K1, priv)
+	return tx
+}
 
 func getHeight(gcli types.Chain33Client) (int64, error) {
 	header, err := gcli.GetLastHeader(context.Background(), &types.ReqNil{})
