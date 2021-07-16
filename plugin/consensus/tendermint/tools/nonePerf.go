@@ -101,7 +101,7 @@ func LoadHelp() {
 	fmt.Println("valnode [ip, pubkey, power]                                  : 增加/删除/修改tendermint节点")
 }
 
-// sendTx none localhost:8802 1024
+// sendTx none localhost:8802 32 1000 0
 func sendTx(execName, ip, size, num, sleepinterval string) {
 	var numThread int
 	numInt, err := strconv.Atoi(num)
