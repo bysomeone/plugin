@@ -166,7 +166,7 @@ func sendTx(execName, ip, size, num, sleepinterval string) {
 
 	for i := 0; i < numThread; i++ {
 		go func() {
-			_, priv := genaddress()
+			//_, priv := genaddress()
 			var tx *types.Transaction
 			for {
 
@@ -175,7 +175,7 @@ func sendTx(execName, ip, size, num, sleepinterval string) {
 					if execName == "coins" {
 						tx = newCoinsTx(minerPriv, addrs, exec, height)
 					}else {
-						tx = newNoneTx(priv, height, sizeInt)
+						tx = newNoneTx(minerPriv, height, sizeInt)
 					}
 					txChan <- tx
 				}
