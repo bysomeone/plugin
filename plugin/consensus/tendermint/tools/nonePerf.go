@@ -230,7 +230,7 @@ var (
 func newNoneTx(priv crypto.PrivKey, height int64, size int) *types.Transaction {
 	tx := txPool.Get().(*types.Transaction)
 	tx.To = execAddr
-	tx.Fee = rand.Int63()
+	tx.Fee = 10
 	tx.Nonce = time.Now().UnixNano()
 	tx.Expire = height + types.TxHeightFlag + types.LowAllowPackHeight
 	tx.Payload = RandStringBytes(size)
@@ -247,7 +247,7 @@ func newCoinsTx(priv crypto.PrivKey, addrs []string, exec types.ExecutorType, he
 
 	tx.Execer = []byte("coins")
 	tx.To = to
-	tx.Fee = rand.Int63()
+	tx.Fee = 10
 	tx.Nonce = time.Now().UnixNano()
 	tx.Expire = height + types.TxHeightFlag + types.LowAllowPackHeight
 	tx.Sign(types.SECP256K1, priv)
