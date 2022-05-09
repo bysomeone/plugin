@@ -95,7 +95,7 @@ var (
 	//tlog = log.New("module", "exchange.types")
 
 	//ForkFix Forks
-	//ForkFix1 = "ForkFix1"
+	ForkFix1 = "ForkFix1"
 
 	ForkParamV1 = "ForkParamV1"
 	ForkParamV2 = "ForkParamV2"
@@ -119,7 +119,7 @@ func init() {
 // InitFork defines register fork
 func InitFork(cfg *types.Chain33Config) {
 	cfg.RegisterDappFork(ExchangeX, "Enable", 0)
-	//cfg.RegisterDappFork(ExchangeX, ForkFix1, 0)
+	cfg.RegisterDappFork(ExchangeX, ForkFix1, 0)
 	cfg.RegisterDappFork(ExchangeX, ForkParamV1, 0)
 	cfg.RegisterDappFork(ExchangeX, ForkParamV2, 0)
 	cfg.RegisterDappFork(ExchangeX, ForkParamV3, 0)
@@ -168,6 +168,7 @@ var MverPrefix = "mver.exec.sub." + ExchangeX // [mver.exec.sub.exchange]
 
 type Econfig struct {
 	Banks     []string
+	RobotMap  map[string]bool
 	Coins     []CoinCfg
 	Exchanges map[string]*Trade // 现货交易、杠杠交易
 }
@@ -189,41 +190,81 @@ type Trade struct {
 }
 
 func (f *Econfig) GetFeeAddr() string {
+	if f == nil {
+		return ""
+	}
+
 	return f.Banks[0]
 }
 
+func (f *Econfig) IsBankAddr(addr string) bool {
+	if f == nil {
+		return false
+	}
+
+	for _, b := range f.Banks {
+		if b == addr {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (f *Econfig) IsFeeFreeAddr(addr string) bool {
+	if f == nil {
+		return false
+	}
+
+	return f.RobotMap[addr]
+}
+
 func (f *Econfig) GetCoinName(asset *Asset) string {
+	if f == nil {
+		return ""
+	}
+
 	for _, v := range f.Coins {
 		if v.Coin == asset.GetSymbol() && v.Execer == asset.GetExecer() {
 			return v.Name
 		}
 	}
+
 	return asset.Symbol
 }
 
 func (f *Econfig) GetSymbol(left, right *Asset) string {
+	if f == nil {
+		return ""
+	}
+
 	return fmt.Sprintf("%v_%v", f.GetCoinName(left), f.GetCoinName(right))
 }
 
-func (f *Econfig) GetTrade(or *LimitOrder) *Trade {
-	symbol := f.GetSymbol(or.LeftAsset, or.RightAsset)
+func (f *Econfig) GetTrade(left, right *Asset) *Trade {
+	if f == nil {
+		return nil
+	}
+
+	symbol := f.GetSymbol(left, right)
 	c, ok := f.Exchanges[symbol]
 	if !ok {
 		return nil
 	}
+
 	return c
 }
 
 func (t *Trade) GetPriceDigits() int32 {
 	if t == nil {
-		return 0
+		return 8
 	}
 	return t.PriceDigits
 }
 
 func (t *Trade) GetAmountDigits() int32 {
 	if t == nil {
-		return 0
+		return 8
 	}
 	return t.AmountDigits
 }

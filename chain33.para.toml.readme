@@ -72,6 +72,15 @@ whitelist=["127.0.0.1"]
 jrpcFuncWhitelist=["*"]
 grpcFuncWhitelist=["*"]
 
+#兼容支持ETH 部分RPC接口
+[rpc.sub.eth]
+enable=false
+# json rpc 监听地址
+httpAddr="localhost:8545"
+httpApi=["eth","web3","personal","admin","net"]
+# websocket 绑定地址
+wsAddr="localhost:8546"
+wsApi=["eth","web3","personal","admin","net"]
 
 [mempool]
 name="para"
@@ -309,6 +318,8 @@ ForkParaFullMinerHeight=0
 ForkParaRootHash=0
 #nodegroup approve需要经过autonomy board成员审批
 ForkParaAutonomySuperGroup=0
+#平行链支持自由注册，平行链默认开启
+ForkParaFreeRegister=0
 
 [fork.sub.evm]
 Enable=0
@@ -429,6 +440,10 @@ namespace=""
 banks = [
     "1PTGVR7TUm1MJUH7M1UNcKBGMvfJ7nCrnN"
 ]
+#机器人帐户列表
+robots = [
+    "1Nq8MDDVqSsS2zQeEZZa7bH53b9vBuUmEW"
+]
 #币种配置，
 #coin   转入exchange合约的币种名称
 #execer 转入exchange合约的币种执行器名称
@@ -456,6 +471,7 @@ exchanges = [
 
 [fork.sub.exchange]
 Enable=0
+ForkFix1=0
 ForkParamV1 = 0
 ForkParamV2 = 0
 ForkParamV3 = 0

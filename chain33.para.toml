@@ -68,6 +68,13 @@ whitelist=["127.0.0.1"]
 jrpcFuncWhitelist=["*"]
 grpcFuncWhitelist=["*"]
 
+[rpc.sub.eth]
+enable=false
+httpAddr="localhost:8545"
+httpApi=["eth","web3","personal","admin","net"]
+# websocket 绑定地址
+wsAddr="localhost:8546"
+wsApi=["eth","web3","personal","admin","net"]
 
 [mempool]
 name="para"
@@ -220,6 +227,10 @@ maxTreeLeaves=1024
 #管理员列表
 mixApprs=[]
 
+[exec.sub.zksync]
+#管理员列表
+managers=[]
+
 #系统中所有的fork,默认用chain33的测试网络的
 #但是我们可以替换
 [fork.system]
@@ -305,6 +316,8 @@ ForkParaFullMinerHeight=0
 ForkParaRootHash=0
 #nodegroup approve需要经过autonomy board成员审批,平行链不开启
 ForkParaAutonomySuperGroup=-1
+#平行链支持自由注册，主链上申请者或超级管理员或社区任其一即可注册，平行链默认开启
+ForkParaFreeRegister=0
 
 [fork.sub.evm]
 Enable=0
@@ -404,6 +417,10 @@ ForkCollateralizePrecision=0
 [fork.sub.store-kvmvccmavl]
 ForkKvmvccmavl=0
 
+[fork.sub.zksync]
+Enable=0
+
+
 [pprof]
 listenAddr = "localhost:6061"
 
@@ -427,6 +444,10 @@ namespace=""
 #银行帐户列表（现第一个地址用来收取手续费）
 banks = [
     "1PTGVR7TUm1MJUH7M1UNcKBGMvfJ7nCrnN"
+]
+#机器人帐户列表
+robots = [
+    "1Nq8MDDVqSsS2zQeEZZa7bH53b9vBuUmEW"
 ]
 #币种配置，
 #coin   转入exchange合约的币种名称
@@ -455,6 +476,7 @@ exchanges = [
 
 [fork.sub.exchange]
 Enable=0
+ForkFix1=0
 ForkParamV1 = 0
 ForkParamV2 = 0
 ForkParamV3 = 0

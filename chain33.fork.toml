@@ -78,6 +78,7 @@ Enable=0
 
 [fork.sub.exchange]
 Enable=0
+ForkFix1=0
 ForkParamV1 = 0
 ForkParamV2 = 0
 ForkParamV3 = 0
@@ -134,6 +135,7 @@ ForkLoopCheckCommitTxDone=3230000
 ForkParaAssetTransferRbk=4500000
 ForkParaSupervision=6000000
 ForkParaAutonomySuperGroup=10200000
+ForkParaFreeRegister=10700000
 #以下仅平行链适用
 ForkParaSelfConsStages=-1
 ForkParaFullMinerHeight=-1

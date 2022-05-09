@@ -326,6 +326,7 @@ ForkParaFullMinerHeight=0
 ForkParaSupervision=0
 ForkParaRootHash=0
 ForkParaAutonomySuperGroup=-1
+ForkParaFreeRegister=0
 
 [fork.sub.evm]
 Enable=0
@@ -378,6 +379,7 @@ Enable=0
 
 [fork.sub.exchange]
 Enable=0
+ForkFix1=0
 ForkParamV1 = 0
 ForkParamV2 = 0
 ForkParamV3 = 0
@@ -437,5 +439,8 @@ Enable=0
 #对已有的平行链如果不是从0开始同步数据，需要设置这个kvmvccmavl的对应平行链高度的fork，如果从0开始同步，statehash会跟以前mavl的不同
 [fork.sub.store-kvmvccmavl]
 ForkKvmvccmavl=1
+
+[fork.sub.zksync]
+Enable=0
 
 `

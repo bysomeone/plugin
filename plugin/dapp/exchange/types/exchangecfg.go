@@ -254,6 +254,10 @@ namespace=""
 banks = [
     "1PTGVR7TUm1MJUH7M1UNcKBGMvfJ7nCrnN"
 ]
+#机器人帐户列表
+robots = [
+    "1Nq8MDDVqSsS2zQeEZZa7bH53b9vBuUmEW"
+]
 #币种配置，
 #coin   转入exchange合约的币种名称
 #execer 转入exchange合约的币种执行器名称
@@ -282,6 +286,7 @@ exchanges = [
 
 [fork.sub.exchange]
 Enable=0
+ForkFix1=0
 ForkParamV1 = 0
 ForkParamV2 = 0
 ForkParamV3 = 0
