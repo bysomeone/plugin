@@ -2,7 +2,9 @@ package ethtxs
 
 import (
 	"crypto/ecdsa"
+	"github.com/ethereum/go-ethereum/core"
 	"math/big"
+	"time"
 
 	chain33Common "github.com/33cn/chain33/common"
 	"github.com/33cn/chain33/common/log/log15"
@@ -64,7 +66,7 @@ func RelayOracleClaimToEthereum(burnOrLockParameter *BurnOrLockParameter) (txhas
 
 	auth.GasLimit = GasLimit4RelayTx
 
-	claimID := crypto.Keccak256Hash(claim.chain33TxHash, claim.Chain33Sender, claim.EthereumReceiver.Bytes(), []byte(claim.Symbol), claim.Amount.Bytes())
+	claimID := crypto.Keccak256Hash(claim.Chain33TxHash, claim.Chain33Sender, claim.EthereumReceiver.Bytes(), []byte(claim.Symbol), claim.Amount.Bytes())
 
 	// Sign the hash using the active validator's private key
 	signature, err := utils.SignClaim4Evm(claimID, privateKey)
@@ -72,15 +74,23 @@ func RelayOracleClaimToEthereum(burnOrLockParameter *BurnOrLockParameter) (txhas
 		return "", err
 	}
 
-	txslog.Info("RelayProphecyClaimToEthereum", "sender", sender.String(), "nonce", auth.Nonce, "claim.chain33TxHash", chain33Common.ToHex(claim.chain33TxHash))
+	txslog.Info("RelayProphecyClaimToEthereum", "sender", sender.String(), "nonce", auth.Nonce, "claim.chain33TxHash", chain33Common.ToHex(claim.Chain33TxHash), "claimID", claimID.String())
 
-	tx, err := oracleInstance.NewOracleClaim(auth, uint8(claim.ClaimType), claim.Chain33Sender, claim.EthereumReceiver, tokenOnEth, claim.Symbol, claim.Amount, claimID, signature)
-	if nil != err {
-		txslog.Error("RelayProphecyClaimToEthereum", "NewOracleClaim failed due to:", err.Error())
-		return "", ErrNodeNetwork
+	for true {
+		tx, err := oracleInstance.NewOracleClaim(auth, uint8(claim.ClaimType), claim.Chain33Sender, claim.EthereumReceiver, tokenOnEth, claim.Symbol, claim.Amount, claimID, signature)
+		if nil != err {
+			txslog.Error("RelayProphecyClaimToEthereum", "NewOracleClaim failed due to:", err.Error())
+			if err.Error() != core.ErrInsufficientFunds.Error() {
+				return "", ErrNodeNetwork
+			}
+		} else {
+			txhash = tx.Hash().Hex()
+			break
+		}
+
+		time.Sleep(time.Second * 10)
 	}
 
-	txhash = tx.Hash().Hex()
 	txslog.Info("RelayProphecyClaimToEthereum", "NewOracleClaim tx hash:", txhash)
 	return txhash, nil
 }

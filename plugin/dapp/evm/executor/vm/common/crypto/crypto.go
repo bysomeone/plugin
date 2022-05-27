@@ -23,14 +23,18 @@ func ValidateSignatureValues(r, s *big.Int) bool {
 	return true
 }
 
-// Ecrecover 根据压缩消息和签名，返回压缩的公钥信息
+// Ecrecover 根据压缩消息和签名，返回非压缩的公钥信息
 func Ecrecover(hash, sig []byte) ([]byte, error) {
-	unpressedPub, err := ethCrypto.SigToPub(hash, sig)
+	return ethCrypto.Ecrecover(hash, sig)
+}
+
+// CompressPubKey compress pub key
+func CompressPubKey(pubKey []byte) ([]byte, error) {
+	pub, err := ethCrypto.UnmarshalPubkey(pubKey)
 	if err != nil {
 		return nil, err
 	}
-	bytes := (*btcec.PublicKey)(unpressedPub).SerializeCompressed()
-	return bytes, err
+	return ethCrypto.CompressPubkey(pub), nil
 }
 
 // SigToPub 根据签名返回公钥信息
@@ -66,5 +70,5 @@ func Keccak256Hash(data ...[]byte) (h common.Hash) {
 // CreateAddress2 creates an ethereum address given the address bytes, initial
 // contract code hash and a salt.
 func CreateAddress2(b common.Address, salt [32]byte, inithash []byte) common.Address {
-	return common.BytesToAddress(Keccak256([]byte{0xff}, b.Bytes(), salt[:], inithash))
+	return common.BytesToAddress(Keccak256([]byte{0xff}, b.Bytes(), salt[:], inithash)[12:])
 }
