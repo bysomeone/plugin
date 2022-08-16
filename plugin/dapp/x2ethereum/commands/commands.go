@@ -6,9 +6,10 @@ import (
 	"os"
 	"strconv"
 
+	dappcomm "github.com/33cn/plugin/plugin/dapp/common"
+
 	"github.com/33cn/chain33/rpc/jsonclient"
 	types2 "github.com/33cn/chain33/rpc/types"
-	"github.com/33cn/chain33/system/dapp/commands"
 	"github.com/33cn/chain33/types"
 	"github.com/33cn/plugin/plugin/dapp/x2ethereum/ebcli/buildflags"
 	"github.com/33cn/plugin/plugin/dapp/x2ethereum/ebrelayer/utils"
@@ -161,7 +162,7 @@ func CreateTransferCmd() *cobra.Command {
 }
 
 func transfer(cmd *cobra.Command, args []string) {
-	commands.CreateAssetTransfer(cmd, args, types3.X2ethereumX)
+	dappcomm.CreateAssetTransfer(cmd, args, types3.X2ethereumX)
 }
 
 func addTransferFlags(cmd *cobra.Command) {
@@ -203,7 +204,7 @@ func addCreateTokenSendToExecFlags(cmd *cobra.Command) {
 }
 
 func createTokenSendToExec(cmd *cobra.Command, args []string) {
-	commands.CreateAssetSendToExec(cmd, args, types3.X2ethereumX)
+	dappcomm.CreateTransfer2Exec(cmd, args, types3.X2ethereumX)
 }
 
 // CreateTokenWithdrawCmd create raw withdraw tx
@@ -231,7 +232,7 @@ func addCreateTokenWithdrawFlags(cmd *cobra.Command) {
 }
 
 func createTokenWithdraw(cmd *cobra.Command, args []string) {
-	commands.CreateAssetWithdraw(cmd, args, types3.X2ethereumX)
+	dappcomm.CreateAssetWithdraw(cmd, args, types3.X2ethereumX)
 }
 
 //CreateRawAddValidatorTxCmd AddValidator

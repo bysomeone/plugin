@@ -6,13 +6,14 @@ package common
 
 import (
 	"fmt"
+	"os"
+	"strings"
+
 	"github.com/33cn/chain33/rpc/jsonclient"
 	rpcTypes "github.com/33cn/chain33/rpc/types"
 	commandtypes "github.com/33cn/chain33/system/dapp/commands/types"
 	"github.com/33cn/chain33/types"
 	"github.com/spf13/cobra"
-	"os"
-	"strings"
 )
 
 func getRealExecName(paraName string, name string) string {

@@ -11,9 +11,10 @@ import (
 	"os"
 	"strings"
 
+	dappcomm "github.com/33cn/plugin/plugin/dapp/common"
+
 	"github.com/33cn/chain33/rpc/jsonclient"
 	rpctypes "github.com/33cn/chain33/rpc/types"
-	"github.com/33cn/chain33/system/dapp/commands"
 	cmdtypes "github.com/33cn/chain33/system/dapp/commands/types"
 	"github.com/33cn/chain33/types"
 	pt "github.com/33cn/plugin/plugin/dapp/paracross/types"
@@ -187,7 +188,7 @@ func addCreateTransferFlags(cmd *cobra.Command) {
 }
 
 func createTransfer(cmd *cobra.Command, args []string) {
-	commands.CreateAssetTransfer(cmd, args, pt.ParaX)
+	dappcomm.CreateAssetTransfer(cmd, args, pt.ParaX)
 }
 
 //CreateRawTransferToExecCmd create raw transfer to exec tx
@@ -215,7 +216,7 @@ func addCreateTransferToExecFlags(cmd *cobra.Command) {
 }
 
 func createTransferToExec(cmd *cobra.Command, args []string) {
-	commands.CreateAssetSendToExec(cmd, args, pt.ParaX)
+	dappcomm.CreateTransfer2Exec(cmd, args, pt.ParaX)
 }
 
 //CreateRawWithdrawCmd create raw withdraw tx
@@ -243,7 +244,7 @@ func addCreateWithdrawFlags(cmd *cobra.Command) {
 }
 
 func createWithdraw(cmd *cobra.Command, args []string) {
-	commands.CreateAssetWithdraw(cmd, args, pt.ParaX)
+	dappcomm.CreateAssetWithdraw(cmd, args, pt.ParaX)
 }
 
 // CreateRawCrossAssetTransferCmd create raw cross asset transfer tx

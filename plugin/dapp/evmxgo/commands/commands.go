@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"os"
 
+	dappcomm "github.com/33cn/plugin/plugin/dapp/common"
+
 	"github.com/33cn/chain33/rpc/jsonclient"
 	rpctypes "github.com/33cn/chain33/rpc/types"
-	"github.com/33cn/chain33/system/dapp/commands"
 	cmdtypes "github.com/33cn/chain33/system/dapp/commands/types"
 	"github.com/33cn/chain33/types"
 	evmxgotypes "github.com/33cn/plugin/plugin/dapp/evmxgo/types"
@@ -69,7 +70,7 @@ func addCreateTokenTransferFlags(cmd *cobra.Command) {
 }
 
 func createTokenTransfer(cmd *cobra.Command, args []string) {
-	commands.CreateAssetTransfer(cmd, args, evmxgotypes.EvmxgoX)
+	dappcomm.CreateAssetTransfer(cmd, args, evmxgotypes.EvmxgoX)
 }
 
 // CreateTokenTransferExecCmd create raw transfer tx
@@ -97,7 +98,7 @@ func addCreateTokenSendToExecFlags(cmd *cobra.Command) {
 }
 
 func createTokenSendToExec(cmd *cobra.Command, args []string) {
-	commands.CreateAssetSendToExec(cmd, args, evmxgotypes.EvmxgoX)
+	dappcomm.CreateTransfer2Exec(cmd, args, evmxgotypes.EvmxgoX)
 }
 
 // CreateTokenWithdrawCmd create raw withdraw tx
@@ -125,7 +126,7 @@ func addCreateTokenWithdrawFlags(cmd *cobra.Command) {
 }
 
 func createTokenWithdraw(cmd *cobra.Command, args []string) {
-	commands.CreateAssetWithdraw(cmd, args, evmxgotypes.EvmxgoX)
+	dappcomm.CreateAssetWithdraw(cmd, args, evmxgotypes.EvmxgoX)
 }
 
 // GetTokensCreatedCmd get finish created tokens
