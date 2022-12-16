@@ -135,6 +135,7 @@ func (p *ParacrossType) GetLogMap() map[int64]*types.LogInfo {
 		TyLogParaSupervisionNodeConfig:           {Ty: reflect.TypeOf(ReceiptParaNodeGroupConfig{}), Name: "LogParaSupervisionNodeConfig"},
 		TyLogParaSupervisionNodeGroupAddrsUpdate: {Ty: reflect.TypeOf(types.ReceiptConfig{}), Name: "LogParaSupervisionNodeGroupAddrsUpdate"},
 		TyLogParaSupervisionNodeStatusUpdate:     {Ty: reflect.TypeOf(ReceiptParaNodeAddrStatUpdate{}), Name: "LogParaSupervisionNodeStatusUpdate"},
+		TyLogParaCommitRollup: {Ty: reflect.TypeOf(CommitRollupLog{}), Name: "LogParaCommitRollup"},
 	}
 }
 
@@ -154,6 +155,7 @@ func (p *ParacrossType) GetTypeMap() map[string]int32 {
 		"SelfStageConfig":       ParacrossActionSelfStageConfig,
 		"ParaBindMiner":         ParacrossActionParaBindMiner,
 		"SupervisionNodeConfig": ParacrossActionSupervisionNodeConfig,
+		NameCommitRollupAction:  TyCommitRollup,
 	}
 }
 

@@ -55,6 +55,13 @@ const (
 	TyLogParaSupervisionNodeConfig           = 680
 	TyLogParaSupervisionNodeGroupAddrsUpdate = 681
 	TyLogParaSupervisionNodeStatusUpdate     = 682
+	TyLogParaCommitRollup = 683
+)
+
+// action name
+const (
+	// NameCommitRollupAction action name
+	NameCommitRollupAction = "CommitRollup"
 )
 
 // action type
@@ -73,6 +80,8 @@ const (
 	ParacrossActionParaBindMiner
 	// ParacrossActionSupervisionNodeConfig
 	ParacrossActionSupervisionNodeConfig
+	TyCommitRollup
+
 )
 
 const (
