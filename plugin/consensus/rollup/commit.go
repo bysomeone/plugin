@@ -254,7 +254,7 @@ func (r *RollUp) handleCommit() {
 		if err := r.commit2MainChain(commit); err != nil {
 			rlog.Error("handleCommit", "round", commitRound,
 				"crossTx", len(commit.crossTx.TxIndices), "err", err)
-			time.Sleep(time.Second * 2)
+			time.Sleep(time.Second * 5)
 			continue
 		}
 
@@ -286,9 +286,9 @@ func (r *RollUp) commit2MainChain(info *commitInfo) error {
 		}
 		tx = gtx.Tx()
 	}
-	rlog.Debug("commit2MainChain", "round", info.cp.GetCommitRound(),
-		"crossLen", len(info.crossTx.GetTxIndices()), "txHash", hex.EncodeToString(tx.Hash()))
 	err = r.sendTx2MainChain(tx)
+	rlog.Debug("commit2MainChain", "round", info.cp.GetCommitRound(),
+		"crossLen", len(info.crossTx.GetTxIndices()), "txHash", hex.EncodeToString(tx.Hash()), "err", err)
 	if err != nil {
 		return errors.Wrap(err, "sendTx2MainChain")
 	}

@@ -205,8 +205,11 @@ func (h *crossTxHandler) send2Mempool(mainHeight int64, txs []*types.Transaction
 		// 平行链发送交易有转发主链逻辑, 指定转发到mempool需要调用特定接口
 		api := h.ru.base.GetAPI().(*client.QueueProtocol)
 		_, err := api.Send2Mempool(tx)
-		// 发送至mempool失败, 可能情况是该交易已经打包但未提交状态, 此时节点重启导致
-		if err != nil {
+		// 所有验证者节点都会同步跨链交易, 存在先后次序, 重复情况只做日志记录
+		if err == types.ErrTxDup || err == types.ErrTxExist {
+			rlog.Debug("send2Mempool error", "mainHeight", mainHeight,
+				"txHash", hex.EncodeToString(tx.Hash()), "err", err)
+		} else if err != nil {
 			rlog.Error("send2Mempool error", "mainHeight", mainHeight,
 				"txHash", hex.EncodeToString(tx.Hash()), "err", err)
 		}
