@@ -71,8 +71,7 @@ func (r *RollUp) Init(base *consensus.BaseClient, subCfg []byte) {
 	}
 
 	if r.cfg.AuthAccount == "" && r.cfg.AuthKey == "" {
-		rlog.Info("info", "addr", r.cfg.AuthAccount)
-		panic("rollup must config authAccount")
+		panic("rollup Init, must config authAccount")
 	}
 
 	r.chainCfg = chainCfg
@@ -88,7 +87,7 @@ func (r *RollUp) Init(base *consensus.BaseClient, subCfg []byte) {
 	var err error
 	r.mainChainGrpc, err = grpcclient.NewMainChainClient(chainCfg, "")
 	if err != nil {
-		panic("init main chain grpc client err:" + err.Error())
+		panic("rollup init, NewMainChainClient err:" + err.Error())
 	}
 
 	go r.initJob()
@@ -127,17 +126,24 @@ func (r *RollUp) getKeyFromWallet(addr string) string {
 
 func (r *RollUp) initJob() {
 
+	rlog.Info("initJob start...")
 	// 等待获取钱包私钥
 	authKey := r.cfg.AuthKey
-
 	if authKey == "" {
 		var err error
 		r.cfg.AddressID, err = address.GetAddressType(r.cfg.AuthAccount)
 		if err != nil {
-			panic("invalid address type for authAccount config, " + r.cfg.AuthAccount)
+			panic("rollup initJob auth account, GetAddressType err:" + err.Error())
 		}
 		authKey = r.getKeyFromWallet(r.cfg.AuthAccount)
 	}
+
+	// 等待同步
+	for !r.isChainSync() {
+		rlog.Info("Init rollup wait chain sync block...")
+		time.Sleep(5 * time.Second)
+	}
+
 	valPubs := r.getValidatorPubKeys()
 	status := r.getRollupStatus()
 	for len(valPubs.GetBlsPubs()) == 0 || status == nil {
@@ -146,15 +152,8 @@ func (r *RollUp) initJob() {
 		valPubs = r.getValidatorPubKeys()
 		status = r.getRollupStatus()
 	}
-	// 等待同步
-	for !r.isChainSync() {
-		rlog.Info("Init rollup wait chain sync block...")
-		time.Sleep(5 * time.Second)
-	}
 
-	rlog.Info("Init rollup validator start...")
 	r.val.init(authKey, valPubs, status)
-	rlog.Info("Init rollup validator stop...")
 	r.nextBuildRound = status.CommitRound + 1
 	r.initFragIndex = status.BlockFragIndex
 	// 初始提交从高度1开始
@@ -166,6 +165,7 @@ func (r *RollUp) initJob() {
 	r.cache = newCommitCache(status.CommitRound)
 	r.cross.init(r, status)
 	r.trySubTopic(psValidatorSignTopic)
+	rlog.Info("initJob done...", "enable", r.val.enable)
 	r.initDone <- struct{}{}
 
 }
