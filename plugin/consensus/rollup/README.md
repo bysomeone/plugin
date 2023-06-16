@@ -56,6 +56,7 @@ rollup 涉及功能介绍
 isParaChain = false
 
 
+# 启用内存池
 [mempool]
 # 配置para以外的mempool插件
 name="timeline"
@@ -64,7 +65,7 @@ poolCacheSize=10240
 minTxFeeRate=0
 
 
-# p2p功能需开启, 建议使用dht插件
+# p2p功能需开启, 使用dht插件
 [p2p]
 types=["dht"]
 enable=true
@@ -72,6 +73,8 @@ enable=true
 [p2p.sub.dht]
 port=13803
 DHTDataPath="paradatadir/p2pstore"
+# 设定网络通道, 用于网络隔离
+channel=1024
 
 
 # 平行链相关的rpc配置
@@ -108,6 +111,8 @@ startHeight=0
 # 同步主链区块头, 预留高度, 减少回滚概率 
 # 默认12, 最低设为1
 reservedMainHeight=12
+# authKey配置非空时, 需要指定地址类型, 默认btc格式, eth格式配2
+AddressID=0
 
 [fork.system]
 ForkBlockHash= 0
@@ -126,8 +131,8 @@ ForkRootHash=0
 # 命令行基于验证节点私钥生成对应的bls公钥信息
 ./cli para bls pub -p <nodeAuthKey>
  
-# 主链 apply node group构建交易
-./cli para nodegroup apply --paraName=<paraTitle> -a <nodeAuthAddr> -p <nodeBlsPub> -c <frozenAmount>
+# 主链 apply node group构建交易, 多个账户逗号分隔
+./cli para nodegroup apply --paraName=<paraTitle> -a "addr1,addr2" -p "blsPub1,blsPub2" -c <frozenAmount>
 
 # 主链 approve node group构建交易, applyID即apply交易的哈希
 ./cli para nodegroup approve --paraName=<paraTitle> -c <frozenAmount> -i <applyID> 
@@ -141,6 +146,9 @@ ForkRootHash=0
 
 
 ```
+# 基于secp256k1私钥计算bls公钥
+./cli para bls pub -p <hexPrivKey>
+
 # 查看平行链rollup状态
 ./cli rollup status -t <paraTitle>
 
