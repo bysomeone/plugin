@@ -120,17 +120,23 @@ disableExecCheck=true
 
 [consensus]
 name="solo"
-minerstart=false
+minerstart=true
 genesisBlockTime=1514533394
 genesis="14KEKbYtKKQm4wMthSK9J4La4nAiidGozt"
 minerExecs=["ticket", "autonomy"]
 finalizer="snowman"
 
+[consensus.sub.solo]
+genesis="14KEKbYtKKQm4wMthSK9J4La4nAiidGozt"
+genesisBlockTime=1514533394
+benchMode=false
+waitTxMs=10
+
 [consensus.sub.snowman]
-k=1
-alpha=1
-betaVirtuous=1
-betaRogue=1
+k=2
+alpha=2
+betaVirtuous=2
+betaRogue=2
 concurrentRepolls=1
 
 [mver.consensus]
@@ -162,11 +168,7 @@ targetTimePerBlock = 16
 targetTimespan = 288 #only for test
 targetTimePerBlock = 2
 
-[consensus.sub.solo]
-genesis="14KEKbYtKKQm4wMthSK9J4La4nAiidGozt"
-genesisBlockTime=1514533394
-benchMode=true
-waitTxMs=100
+
 
 [consensus.sub.para]
 #主链指定高度的区块开始同步
