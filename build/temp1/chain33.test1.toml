@@ -59,6 +59,7 @@ reservedBlockNum=100
 disableShard=true
 # 使能从P2pStore中获取数据
 enableFetchP2pstore=true
+blockFinalizeGapHeight=1
 
 
 
