@@ -1,20 +1,27 @@
 
-#tran to return addr in ticket
+
+#0x991fb09dc31a44b3177673f330c582ac2ea168e0
+[[SimpleCase]]
+id = "import1"
+command = "account import_key -k 0x4257d8692ef7fe13c68b65d6a52f03933db2fa5ce8faf210b5b8b80c721ced01 -l eth -t 2"
+
+#tran to Beneficiary addr
 [[TransferCase]]
 id = "trans"
-command = "send coins transfer -a 10 -t 14KEKbYtKKQm4wMthSK9J4La4nAiidGozt -k 12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv"
+command = "send coins transfer -a 10 -t 0x991fb09dc31a44b3177673f330c582ac2ea168e0 -k 12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv"
 from = "12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv"
-to = "14KEKbYtKKQm4wMthSK9J4La4nAiidGozt"
+to = "0x991fb09dc31a44b3177673f330c582ac2ea168e0"
 amount = "10"
 checkItem = ["balance"]
+dep = ["import1"]
 
 
 
 #send to unfreeze exec
 [[TransferCase]]
 id = "transUnfreeze"
-command = "send coins transfer -a 5 -t 15YsqAuXeEXVHgm6RVx4oJaAAnhtwqnu3H -k 14KEKbYtKKQm4wMthSK9J4La4nAiidGozt"
-from = "14KEKbYtKKQm4wMthSK9J4La4nAiidGozt"
+command = "send coins transfer -a 5 -t 15YsqAuXeEXVHgm6RVx4oJaAAnhtwqnu3H -k 12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv"
+from = "12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv"
 to = "15YsqAuXeEXVHgm6RVx4oJaAAnhtwqnu3H"
 amount = "5"
 checkItem = ["balance"]
@@ -24,9 +31,9 @@ dep = ["trans"]
 
 [[UnfreezeCreateFix]]
 id = "createFix"
-command = "send unfreeze create fix_amount -a 0.01 -e coins -s bty -b 12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv -p 1 -t 2 -k 14KEKbYtKKQm4wMthSK9J4La4nAiidGozt"
-from = "14KEKbYtKKQm4wMthSK9J4La4nAiidGozt"
-to = "12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv"
+command = "send unfreeze create fix_amount -a 0.01 -e coins -s bty -b 0x991FB09DC31a44b3177673f330c582ac2ea168e0 -p 1 -t 2 -k 12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv"
+from = "12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv"
+to = "0x991fb09dc31a44b3177673f330c582ac2ea168e0"
 totalAmount = "2"
 period = 1
 checkItem =["frozen", "unfreeze"]
@@ -37,16 +44,16 @@ repeat = 2
 
 [[UnfreezeWithdraw]]
 id = "withdraw"
-command = "send unfreeze withdraw -k 12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv"
-addr = "12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv"
+command = "send unfreeze withdraw -k 0x991fb09dc31a44b3177673f330c582ac2ea168e0"
+addr = "0x991fb09dc31a44b3177673f330c582ac2ea168e0"
 checkItem = ["unfreeze"]
 dep = ["createFix"]
 
 
 [[UnfreezeTerminate]]
 id = "terminate"
-command = "send unfreeze terminate -k 14KEKbYtKKQm4wMthSK9J4La4nAiidGozt"
-addr = "14KEKbYtKKQm4wMthSK9J4La4nAiidGozt"
+command = "send unfreeze terminate -k 12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv"
+addr = "12qyocayNF7Lv6C9qW4avxs2E7U41fKSfv"
 checkItem = ["unfreeze"]
 dep = ["createFix", "withdraw"]
 

@@ -9,6 +9,7 @@ import (
 	dbm "github.com/33cn/chain33/common/db"
 	"github.com/33cn/chain33/system/dapp"
 	"github.com/33cn/chain33/types"
+	"github.com/33cn/plugin/plugin/dapp/common"
 	pty "github.com/33cn/plugin/plugin/dapp/unfreeze/types"
 )
 
@@ -17,7 +18,7 @@ func (u *Unfreeze) Exec_Create(payload *pty.UnfreezeCreate, tx *types.Transactio
 	if payload.AssetExec == "" || payload.AssetSymbol == "" || payload.TotalCount <= 0 || payload.Means == "" {
 		return nil, types.ErrInvalidParam
 	}
-
+	payload.Beneficiary = common.FmtEthAddressWithFork(payload.GetBeneficiary(), u.GetAPI().GetConfig(), u.GetHeight())
 	unfreeze, err := u.newEntity(payload, tx)
 	if err != nil {
 		uflog.Error("unfreeze create entity", "addr", tx.From(), "payload", payload)
@@ -57,6 +58,8 @@ func (u *Unfreeze) Exec_Withdraw(payload *pty.UnfreezeWithdraw, tx *types.Transa
 	if err != nil {
 		return nil, err
 	}
+	// 统一eth地址格式
+	unfreeze.Beneficiary = common.FmtEthAddressWithFork(unfreeze.Beneficiary, u.GetAPI().GetConfig(), u.GetHeight())
 	if unfreeze.Beneficiary != tx.From() {
 		uflog.Error("unfreeze withdraw no privilege", "beneficiary", unfreeze.Beneficiary, "txFrom", tx.From())
 		return nil, pty.ErrNoPrivilege
