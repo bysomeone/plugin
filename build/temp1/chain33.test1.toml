@@ -119,6 +119,10 @@ minTxFeeRate=0
 maxTxNumPerAccount=1000000
 disableExecCheck=true
 
+[mver.mempool.ForkMaxTxFeeV1]
+# 单笔交易最大的手续费, 50 coins
+maxTxFee=10
+
 [consensus]
 name="solo"
 minerstart=true
