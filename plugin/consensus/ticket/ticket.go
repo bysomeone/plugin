@@ -10,13 +10,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/33cn/chain33/common/address"
-	"github.com/33cn/chain33/system/address/eth"
 	"math/big"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/33cn/chain33/common/address"
+	"github.com/33cn/chain33/system/address/eth"
 
 	"github.com/33cn/chain33/common"
 	"github.com/33cn/chain33/common/crypto"
@@ -29,7 +30,7 @@ import (
 	cty "github.com/33cn/chain33/system/dapp/coins/types"
 	"github.com/33cn/chain33/types"
 	ty "github.com/33cn/plugin/plugin/dapp/ticket/types"
-	secp256k1 "github.com/btcsuite/btcd/btcec/btcec"
+	secp256k1 "github.com/btcsuite/btcd/btcec"
 	"github.com/golang/protobuf/proto"
 )
 
