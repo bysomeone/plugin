@@ -13,7 +13,7 @@ testdir="/home/jiangpeng/go/src/test"
 cd $chain33dir && make && cd -
 
 cp $chain33dir/build/chain33 ./ || echo "faild"
-cp $chain33dir/build/chain33-cli /usr/local/bin/33cli
+#cp $chain33dir/build/chain33-cli /usr/local/bin/33cli
 cp $chain33dir/build/chain33 ../temp1
 cp $chain33dir/build/chain33 ../temp2
 
