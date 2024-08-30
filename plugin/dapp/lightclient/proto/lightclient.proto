@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package types;
+option go_package = "../types";
+
+message LightclientAction {
+    int32 ty = 1;
+    oneof value {
+        CommitHeaders headers = 2;
+    }
+}
+
+
+message CommitHeaders {
+}
+
+message CommitHeadersLog {
+}
+
+service Lightclient {
+
+}
+
