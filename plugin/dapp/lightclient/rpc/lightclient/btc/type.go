@@ -2,11 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package btcclient
+package btc
 
 import (
 	_ "github.com/33cn/chain33/system/address"
-	ty "github.com/33cn/plugin/plugin/dapp/relay/types"
+	ty "github.com/33cn/plugin/plugin/dapp/lightclient/types"
 )
 
 var (

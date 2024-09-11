@@ -96,6 +96,480 @@ type LightclientAction_Headers struct {
 
 func (*LightclientAction_Headers) isLightclientAction_Value() {}
 
+type BtcHeader struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Hash          string `protobuf:"bytes,1,opt,name=hash,proto3" json:"hash,omitempty"`
+	Confirmations uint64 `protobuf:"varint,2,opt,name=confirmations,proto3" json:"confirmations,omitempty"`
+	Height        uint64 `protobuf:"varint,3,opt,name=height,proto3" json:"height,omitempty"`
+	Version       uint32 `protobuf:"varint,4,opt,name=version,proto3" json:"version,omitempty"`
+	MerkleRoot    string `protobuf:"bytes,5,opt,name=merkleRoot,proto3" json:"merkleRoot,omitempty"`
+	Time          int64  `protobuf:"varint,6,opt,name=time,proto3" json:"time,omitempty"`
+	Nonce         uint64 `protobuf:"varint,7,opt,name=nonce,proto3" json:"nonce,omitempty"`
+	Bits          int64  `protobuf:"varint,8,opt,name=bits,proto3" json:"bits,omitempty"`
+	Difficulty    int64  `protobuf:"varint,9,opt,name=difficulty,proto3" json:"difficulty,omitempty"`
+	PreviousHash  string `protobuf:"bytes,10,opt,name=previousHash,proto3" json:"previousHash,omitempty"`
+	NextHash      string `protobuf:"bytes,11,opt,name=nextHash,proto3" json:"nextHash,omitempty"`
+	IsReset       bool   `protobuf:"varint,12,opt,name=isReset,proto3" json:"isReset,omitempty"` // 0: nomal btc headers sync (default), 1: set the base
+}
+
+func (x *BtcHeader) Reset() {
+	*x = BtcHeader{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_lightclient_proto_msgTypes[1]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *BtcHeader) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BtcHeader) ProtoMessage() {}
+
+func (x *BtcHeader) ProtoReflect() protoreflect.Message {
+	mi := &file_lightclient_proto_msgTypes[1]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BtcHeader.ProtoReflect.Descriptor instead.
+func (*BtcHeader) Descriptor() ([]byte, []int) {
+	return file_lightclient_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *BtcHeader) GetHash() string {
+	if x != nil {
+		return x.Hash
+	}
+	return ""
+}
+
+func (x *BtcHeader) GetConfirmations() uint64 {
+	if x != nil {
+		return x.Confirmations
+	}
+	return 0
+}
+
+func (x *BtcHeader) GetHeight() uint64 {
+	if x != nil {
+		return x.Height
+	}
+	return 0
+}
+
+func (x *BtcHeader) GetVersion() uint32 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *BtcHeader) GetMerkleRoot() string {
+	if x != nil {
+		return x.MerkleRoot
+	}
+	return ""
+}
+
+func (x *BtcHeader) GetTime() int64 {
+	if x != nil {
+		return x.Time
+	}
+	return 0
+}
+
+func (x *BtcHeader) GetNonce() uint64 {
+	if x != nil {
+		return x.Nonce
+	}
+	return 0
+}
+
+func (x *BtcHeader) GetBits() int64 {
+	if x != nil {
+		return x.Bits
+	}
+	return 0
+}
+
+func (x *BtcHeader) GetDifficulty() int64 {
+	if x != nil {
+		return x.Difficulty
+	}
+	return 0
+}
+
+func (x *BtcHeader) GetPreviousHash() string {
+	if x != nil {
+		return x.PreviousHash
+	}
+	return ""
+}
+
+func (x *BtcHeader) GetNextHash() string {
+	if x != nil {
+		return x.NextHash
+	}
+	return ""
+}
+
+func (x *BtcHeader) GetIsReset() bool {
+	if x != nil {
+		return x.IsReset
+	}
+	return false
+}
+
+type BtcHeaders struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	BtcHeader []*BtcHeader `protobuf:"bytes,1,rep,name=btcHeader,proto3" json:"btcHeader,omitempty"`
+}
+
+func (x *BtcHeaders) Reset() {
+	*x = BtcHeaders{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_lightclient_proto_msgTypes[2]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *BtcHeaders) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BtcHeaders) ProtoMessage() {}
+
+func (x *BtcHeaders) ProtoReflect() protoreflect.Message {
+	mi := &file_lightclient_proto_msgTypes[2]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BtcHeaders.ProtoReflect.Descriptor instead.
+func (*BtcHeaders) Descriptor() ([]byte, []int) {
+	return file_lightclient_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *BtcHeaders) GetBtcHeader() []*BtcHeader {
+	if x != nil {
+		return x.BtcHeader
+	}
+	return nil
+}
+
+type BtcTransaction struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Hash          string  `protobuf:"bytes,1,opt,name=hash,proto3" json:"hash,omitempty"` // txhash
+	BlockHeight   uint64  `protobuf:"varint,2,opt,name=blockHeight,proto3" json:"blockHeight,omitempty"`
+	Vin           []*Vin  `protobuf:"bytes,3,rep,name=vin,proto3" json:"vin,omitempty"`
+	Vout          []*Vout `protobuf:"bytes,4,rep,name=vout,proto3" json:"vout,omitempty"`
+	Time          int64   `protobuf:"varint,5,opt,name=time,proto3" json:"time,omitempty"`
+	Confirmations uint64  `protobuf:"varint,6,opt,name=confirmations,proto3" json:"confirmations,omitempty"`
+}
+
+func (x *BtcTransaction) Reset() {
+	*x = BtcTransaction{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_lightclient_proto_msgTypes[3]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *BtcTransaction) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BtcTransaction) ProtoMessage() {}
+
+func (x *BtcTransaction) ProtoReflect() protoreflect.Message {
+	mi := &file_lightclient_proto_msgTypes[3]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BtcTransaction.ProtoReflect.Descriptor instead.
+func (*BtcTransaction) Descriptor() ([]byte, []int) {
+	return file_lightclient_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *BtcTransaction) GetHash() string {
+	if x != nil {
+		return x.Hash
+	}
+	return ""
+}
+
+func (x *BtcTransaction) GetBlockHeight() uint64 {
+	if x != nil {
+		return x.BlockHeight
+	}
+	return 0
+}
+
+func (x *BtcTransaction) GetVin() []*Vin {
+	if x != nil {
+		return x.Vin
+	}
+	return nil
+}
+
+func (x *BtcTransaction) GetVout() []*Vout {
+	if x != nil {
+		return x.Vout
+	}
+	return nil
+}
+
+func (x *BtcTransaction) GetTime() int64 {
+	if x != nil {
+		return x.Time
+	}
+	return 0
+}
+
+func (x *BtcTransaction) GetConfirmations() uint64 {
+	if x != nil {
+		return x.Confirmations
+	}
+	return 0
+}
+
+type Vin struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Address string `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
+	Value   uint64 `protobuf:"varint,2,opt,name=Value,proto3" json:"Value,omitempty"`
+}
+
+func (x *Vin) Reset() {
+	*x = Vin{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_lightclient_proto_msgTypes[4]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *Vin) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Vin) ProtoMessage() {}
+
+func (x *Vin) ProtoReflect() protoreflect.Message {
+	mi := &file_lightclient_proto_msgTypes[4]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Vin.ProtoReflect.Descriptor instead.
+func (*Vin) Descriptor() ([]byte, []int) {
+	return file_lightclient_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *Vin) GetAddress() string {
+	if x != nil {
+		return x.Address
+	}
+	return ""
+}
+
+func (x *Vin) GetValue() uint64 {
+	if x != nil {
+		return x.Value
+	}
+	return 0
+}
+
+type Vout struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Coinbase bool   `protobuf:"varint,1,opt,name=coinbase,proto3" json:"coinbase,omitempty"`
+	Address  string `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
+	Value    uint64 `protobuf:"varint,3,opt,name=Value,proto3" json:"Value,omitempty"`
+}
+
+func (x *Vout) Reset() {
+	*x = Vout{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_lightclient_proto_msgTypes[5]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *Vout) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Vout) ProtoMessage() {}
+
+func (x *Vout) ProtoReflect() protoreflect.Message {
+	mi := &file_lightclient_proto_msgTypes[5]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Vout.ProtoReflect.Descriptor instead.
+func (*Vout) Descriptor() ([]byte, []int) {
+	return file_lightclient_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *Vout) GetCoinbase() bool {
+	if x != nil {
+		return x.Coinbase
+	}
+	return false
+}
+
+func (x *Vout) GetAddress() string {
+	if x != nil {
+		return x.Address
+	}
+	return ""
+}
+
+func (x *Vout) GetValue() uint64 {
+	if x != nil {
+		return x.Value
+	}
+	return 0
+}
+
+type BtcSpv struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Hash        string   `protobuf:"bytes,1,opt,name=hash,proto3" json:"hash,omitempty"` // txhash
+	Time        int64    `protobuf:"varint,2,opt,name=time,proto3" json:"time,omitempty"`
+	Height      uint64   `protobuf:"varint,3,opt,name=height,proto3" json:"height,omitempty"`
+	BlockHash   string   `protobuf:"bytes,4,opt,name=blockHash,proto3" json:"blockHash,omitempty"`
+	TxIndex     uint32   `protobuf:"varint,5,opt,name=txIndex,proto3" json:"txIndex,omitempty"`
+	BranchProof [][]byte `protobuf:"bytes,6,rep,name=branchProof,proto3" json:"branchProof,omitempty"`
+}
+
+func (x *BtcSpv) Reset() {
+	*x = BtcSpv{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_lightclient_proto_msgTypes[6]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *BtcSpv) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BtcSpv) ProtoMessage() {}
+
+func (x *BtcSpv) ProtoReflect() protoreflect.Message {
+	mi := &file_lightclient_proto_msgTypes[6]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BtcSpv.ProtoReflect.Descriptor instead.
+func (*BtcSpv) Descriptor() ([]byte, []int) {
+	return file_lightclient_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *BtcSpv) GetHash() string {
+	if x != nil {
+		return x.Hash
+	}
+	return ""
+}
+
+func (x *BtcSpv) GetTime() int64 {
+	if x != nil {
+		return x.Time
+	}
+	return 0
+}
+
+func (x *BtcSpv) GetHeight() uint64 {
+	if x != nil {
+		return x.Height
+	}
+	return 0
+}
+
+func (x *BtcSpv) GetBlockHash() string {
+	if x != nil {
+		return x.BlockHash
+	}
+	return ""
+}
+
+func (x *BtcSpv) GetTxIndex() uint32 {
+	if x != nil {
+		return x.TxIndex
+	}
+	return 0
+}
+
+func (x *BtcSpv) GetBranchProof() [][]byte {
+	if x != nil {
+		return x.BranchProof
+	}
+	return nil
+}
+
 type CommitHeaders struct {
 	state         protoimpl.MessageState
 	sizeCache     protoimpl.SizeCache
@@ -105,7 +579,7 @@ type CommitHeaders struct {
 func (x *CommitHeaders) Reset() {
 	*x = CommitHeaders{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_lightclient_proto_msgTypes[1]
+		mi := &file_lightclient_proto_msgTypes[7]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -118,7 +592,7 @@ func (x *CommitHeaders) String() string {
 func (*CommitHeaders) ProtoMessage() {}
 
 func (x *CommitHeaders) ProtoReflect() protoreflect.Message {
-	mi := &file_lightclient_proto_msgTypes[1]
+	mi := &file_lightclient_proto_msgTypes[7]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -131,7 +605,7 @@ func (x *CommitHeaders) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommitHeaders.ProtoReflect.Descriptor instead.
 func (*CommitHeaders) Descriptor() ([]byte, []int) {
-	return file_lightclient_proto_rawDescGZIP(), []int{1}
+	return file_lightclient_proto_rawDescGZIP(), []int{7}
 }
 
 type CommitHeadersLog struct {
@@ -143,7 +617,7 @@ type CommitHeadersLog struct {
 func (x *CommitHeadersLog) Reset() {
 	*x = CommitHeadersLog{}
 	if protoimpl.UnsafeEnabled {
-		mi := &file_lightclient_proto_msgTypes[2]
+		mi := &file_lightclient_proto_msgTypes[8]
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		ms.StoreMessageInfo(mi)
 	}
@@ -156,7 +630,7 @@ func (x *CommitHeadersLog) String() string {
 func (*CommitHeadersLog) ProtoMessage() {}
 
 func (x *CommitHeadersLog) ProtoReflect() protoreflect.Message {
-	mi := &file_lightclient_proto_msgTypes[2]
+	mi := &file_lightclient_proto_msgTypes[8]
 	if protoimpl.UnsafeEnabled && x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -169,7 +643,7 @@ func (x *CommitHeadersLog) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommitHeadersLog.ProtoReflect.Descriptor instead.
 func (*CommitHeadersLog) Descriptor() ([]byte, []int) {
-	return file_lightclient_proto_rawDescGZIP(), []int{2}
+	return file_lightclient_proto_rawDescGZIP(), []int{8}
 }
 
 var File_lightclient_proto protoreflect.FileDescriptor
@@ -182,12 +656,68 @@ var file_lightclient_proto_rawDesc = []byte{
 	0x30, 0x0a, 0x07, 0x68, 0x65, 0x61, 0x64, 0x65, 0x72, 0x73, 0x18, 0x02, 0x20, 0x01, 0x28, 0x0b,
 	0x32, 0x14, 0x2e, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x43, 0x6f, 0x6d, 0x6d, 0x69, 0x74, 0x48,
 	0x65, 0x61, 0x64, 0x65, 0x72, 0x73, 0x48, 0x00, 0x52, 0x07, 0x68, 0x65, 0x61, 0x64, 0x65, 0x72,
-	0x73, 0x42, 0x07, 0x0a, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x22, 0x0f, 0x0a, 0x0d, 0x43, 0x6f,
-	0x6d, 0x6d, 0x69, 0x74, 0x48, 0x65, 0x61, 0x64, 0x65, 0x72, 0x73, 0x22, 0x12, 0x0a, 0x10, 0x43,
-	0x6f, 0x6d, 0x6d, 0x69, 0x74, 0x48, 0x65, 0x61, 0x64, 0x65, 0x72, 0x73, 0x4c, 0x6f, 0x67, 0x32,
-	0x0d, 0x0a, 0x0b, 0x6c, 0x69, 0x67, 0x68, 0x74, 0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74, 0x42, 0x0a,
-	0x5a, 0x08, 0x2e, 0x2e, 0x2f, 0x74, 0x79, 0x70, 0x65, 0x73, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74,
-	0x6f, 0x33,
+	0x73, 0x42, 0x07, 0x0a, 0x05, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x22, 0xcf, 0x02, 0x0a, 0x09, 0x42,
+	0x74, 0x63, 0x48, 0x65, 0x61, 0x64, 0x65, 0x72, 0x12, 0x12, 0x0a, 0x04, 0x68, 0x61, 0x73, 0x68,
+	0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x68, 0x61, 0x73, 0x68, 0x12, 0x24, 0x0a, 0x0d,
+	0x63, 0x6f, 0x6e, 0x66, 0x69, 0x72, 0x6d, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x18, 0x02, 0x20,
+	0x01, 0x28, 0x04, 0x52, 0x0d, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x72, 0x6d, 0x61, 0x74, 0x69, 0x6f,
+	0x6e, 0x73, 0x12, 0x16, 0x0a, 0x06, 0x68, 0x65, 0x69, 0x67, 0x68, 0x74, 0x18, 0x03, 0x20, 0x01,
+	0x28, 0x04, 0x52, 0x06, 0x68, 0x65, 0x69, 0x67, 0x68, 0x74, 0x12, 0x18, 0x0a, 0x07, 0x76, 0x65,
+	0x72, 0x73, 0x69, 0x6f, 0x6e, 0x18, 0x04, 0x20, 0x01, 0x28, 0x0d, 0x52, 0x07, 0x76, 0x65, 0x72,
+	0x73, 0x69, 0x6f, 0x6e, 0x12, 0x1e, 0x0a, 0x0a, 0x6d, 0x65, 0x72, 0x6b, 0x6c, 0x65, 0x52, 0x6f,
+	0x6f, 0x74, 0x18, 0x05, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0a, 0x6d, 0x65, 0x72, 0x6b, 0x6c, 0x65,
+	0x52, 0x6f, 0x6f, 0x74, 0x12, 0x12, 0x0a, 0x04, 0x74, 0x69, 0x6d, 0x65, 0x18, 0x06, 0x20, 0x01,
+	0x28, 0x03, 0x52, 0x04, 0x74, 0x69, 0x6d, 0x65, 0x12, 0x14, 0x0a, 0x05, 0x6e, 0x6f, 0x6e, 0x63,
+	0x65, 0x18, 0x07, 0x20, 0x01, 0x28, 0x04, 0x52, 0x05, 0x6e, 0x6f, 0x6e, 0x63, 0x65, 0x12, 0x12,
+	0x0a, 0x04, 0x62, 0x69, 0x74, 0x73, 0x18, 0x08, 0x20, 0x01, 0x28, 0x03, 0x52, 0x04, 0x62, 0x69,
+	0x74, 0x73, 0x12, 0x1e, 0x0a, 0x0a, 0x64, 0x69, 0x66, 0x66, 0x69, 0x63, 0x75, 0x6c, 0x74, 0x79,
+	0x18, 0x09, 0x20, 0x01, 0x28, 0x03, 0x52, 0x0a, 0x64, 0x69, 0x66, 0x66, 0x69, 0x63, 0x75, 0x6c,
+	0x74, 0x79, 0x12, 0x22, 0x0a, 0x0c, 0x70, 0x72, 0x65, 0x76, 0x69, 0x6f, 0x75, 0x73, 0x48, 0x61,
+	0x73, 0x68, 0x18, 0x0a, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0c, 0x70, 0x72, 0x65, 0x76, 0x69, 0x6f,
+	0x75, 0x73, 0x48, 0x61, 0x73, 0x68, 0x12, 0x1a, 0x0a, 0x08, 0x6e, 0x65, 0x78, 0x74, 0x48, 0x61,
+	0x73, 0x68, 0x18, 0x0b, 0x20, 0x01, 0x28, 0x09, 0x52, 0x08, 0x6e, 0x65, 0x78, 0x74, 0x48, 0x61,
+	0x73, 0x68, 0x12, 0x18, 0x0a, 0x07, 0x69, 0x73, 0x52, 0x65, 0x73, 0x65, 0x74, 0x18, 0x0c, 0x20,
+	0x01, 0x28, 0x08, 0x52, 0x07, 0x69, 0x73, 0x52, 0x65, 0x73, 0x65, 0x74, 0x22, 0x3c, 0x0a, 0x0a,
+	0x42, 0x74, 0x63, 0x48, 0x65, 0x61, 0x64, 0x65, 0x72, 0x73, 0x12, 0x2e, 0x0a, 0x09, 0x62, 0x74,
+	0x63, 0x48, 0x65, 0x61, 0x64, 0x65, 0x72, 0x18, 0x01, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x10, 0x2e,
+	0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x42, 0x74, 0x63, 0x48, 0x65, 0x61, 0x64, 0x65, 0x72, 0x52,
+	0x09, 0x62, 0x74, 0x63, 0x48, 0x65, 0x61, 0x64, 0x65, 0x72, 0x22, 0xbf, 0x01, 0x0a, 0x0e, 0x42,
+	0x74, 0x63, 0x54, 0x72, 0x61, 0x6e, 0x73, 0x61, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x12, 0x12, 0x0a,
+	0x04, 0x68, 0x61, 0x73, 0x68, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52, 0x04, 0x68, 0x61, 0x73,
+	0x68, 0x12, 0x20, 0x0a, 0x0b, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x48, 0x65, 0x69, 0x67, 0x68, 0x74,
+	0x18, 0x02, 0x20, 0x01, 0x28, 0x04, 0x52, 0x0b, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x48, 0x65, 0x69,
+	0x67, 0x68, 0x74, 0x12, 0x1c, 0x0a, 0x03, 0x76, 0x69, 0x6e, 0x18, 0x03, 0x20, 0x03, 0x28, 0x0b,
+	0x32, 0x0a, 0x2e, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x56, 0x69, 0x6e, 0x52, 0x03, 0x76, 0x69,
+	0x6e, 0x12, 0x1f, 0x0a, 0x04, 0x76, 0x6f, 0x75, 0x74, 0x18, 0x04, 0x20, 0x03, 0x28, 0x0b, 0x32,
+	0x0b, 0x2e, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x56, 0x6f, 0x75, 0x74, 0x52, 0x04, 0x76, 0x6f,
+	0x75, 0x74, 0x12, 0x12, 0x0a, 0x04, 0x74, 0x69, 0x6d, 0x65, 0x18, 0x05, 0x20, 0x01, 0x28, 0x03,
+	0x52, 0x04, 0x74, 0x69, 0x6d, 0x65, 0x12, 0x24, 0x0a, 0x0d, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x72,
+	0x6d, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x18, 0x06, 0x20, 0x01, 0x28, 0x04, 0x52, 0x0d, 0x63,
+	0x6f, 0x6e, 0x66, 0x69, 0x72, 0x6d, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x22, 0x35, 0x0a, 0x03,
+	0x56, 0x69, 0x6e, 0x12, 0x18, 0x0a, 0x07, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x18, 0x01,
+	0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73, 0x73, 0x12, 0x14, 0x0a,
+	0x05, 0x56, 0x61, 0x6c, 0x75, 0x65, 0x18, 0x02, 0x20, 0x01, 0x28, 0x04, 0x52, 0x05, 0x56, 0x61,
+	0x6c, 0x75, 0x65, 0x22, 0x52, 0x0a, 0x04, 0x56, 0x6f, 0x75, 0x74, 0x12, 0x1a, 0x0a, 0x08, 0x63,
+	0x6f, 0x69, 0x6e, 0x62, 0x61, 0x73, 0x65, 0x18, 0x01, 0x20, 0x01, 0x28, 0x08, 0x52, 0x08, 0x63,
+	0x6f, 0x69, 0x6e, 0x62, 0x61, 0x73, 0x65, 0x12, 0x18, 0x0a, 0x07, 0x61, 0x64, 0x64, 0x72, 0x65,
+	0x73, 0x73, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x61, 0x64, 0x64, 0x72, 0x65, 0x73,
+	0x73, 0x12, 0x14, 0x0a, 0x05, 0x56, 0x61, 0x6c, 0x75, 0x65, 0x18, 0x03, 0x20, 0x01, 0x28, 0x04,
+	0x52, 0x05, 0x56, 0x61, 0x6c, 0x75, 0x65, 0x22, 0xa2, 0x01, 0x0a, 0x06, 0x42, 0x74, 0x63, 0x53,
+	0x70, 0x76, 0x12, 0x12, 0x0a, 0x04, 0x68, 0x61, 0x73, 0x68, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
+	0x52, 0x04, 0x68, 0x61, 0x73, 0x68, 0x12, 0x12, 0x0a, 0x04, 0x74, 0x69, 0x6d, 0x65, 0x18, 0x02,
+	0x20, 0x01, 0x28, 0x03, 0x52, 0x04, 0x74, 0x69, 0x6d, 0x65, 0x12, 0x16, 0x0a, 0x06, 0x68, 0x65,
+	0x69, 0x67, 0x68, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x04, 0x52, 0x06, 0x68, 0x65, 0x69, 0x67,
+	0x68, 0x74, 0x12, 0x1c, 0x0a, 0x09, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x48, 0x61, 0x73, 0x68, 0x18,
+	0x04, 0x20, 0x01, 0x28, 0x09, 0x52, 0x09, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x48, 0x61, 0x73, 0x68,
+	0x12, 0x18, 0x0a, 0x07, 0x74, 0x78, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x18, 0x05, 0x20, 0x01, 0x28,
+	0x0d, 0x52, 0x07, 0x74, 0x78, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x12, 0x20, 0x0a, 0x0b, 0x62, 0x72,
+	0x61, 0x6e, 0x63, 0x68, 0x50, 0x72, 0x6f, 0x6f, 0x66, 0x18, 0x06, 0x20, 0x03, 0x28, 0x0c, 0x52,
+	0x0b, 0x62, 0x72, 0x61, 0x6e, 0x63, 0x68, 0x50, 0x72, 0x6f, 0x6f, 0x66, 0x22, 0x0f, 0x0a, 0x0d,
+	0x43, 0x6f, 0x6d, 0x6d, 0x69, 0x74, 0x48, 0x65, 0x61, 0x64, 0x65, 0x72, 0x73, 0x22, 0x12, 0x0a,
+	0x10, 0x43, 0x6f, 0x6d, 0x6d, 0x69, 0x74, 0x48, 0x65, 0x61, 0x64, 0x65, 0x72, 0x73, 0x4c, 0x6f,
+	0x67, 0x32, 0x0d, 0x0a, 0x0b, 0x4c, 0x69, 0x67, 0x68, 0x74, 0x63, 0x6c, 0x69, 0x65, 0x6e, 0x74,
+	0x42, 0x0a, 0x5a, 0x08, 0x2e, 0x2e, 0x2f, 0x74, 0x79, 0x70, 0x65, 0x73, 0x62, 0x06, 0x70, 0x72,
+	0x6f, 0x74, 0x6f, 0x33,
 }
 
 var (
@@ -202,19 +732,28 @@ func file_lightclient_proto_rawDescGZIP() []byte {
 	return file_lightclient_proto_rawDescData
 }
 
-var file_lightclient_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_lightclient_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
 var file_lightclient_proto_goTypes = []interface{}{
 	(*LightclientAction)(nil), // 0: types.LightclientAction
-	(*CommitHeaders)(nil),     // 1: types.CommitHeaders
-	(*CommitHeadersLog)(nil),  // 2: types.CommitHeadersLog
+	(*BtcHeader)(nil),         // 1: types.BtcHeader
+	(*BtcHeaders)(nil),        // 2: types.BtcHeaders
+	(*BtcTransaction)(nil),    // 3: types.BtcTransaction
+	(*Vin)(nil),               // 4: types.Vin
+	(*Vout)(nil),              // 5: types.Vout
+	(*BtcSpv)(nil),            // 6: types.BtcSpv
+	(*CommitHeaders)(nil),     // 7: types.CommitHeaders
+	(*CommitHeadersLog)(nil),  // 8: types.CommitHeadersLog
 }
 var file_lightclient_proto_depIdxs = []int32{
-	1, // 0: types.LightclientAction.headers:type_name -> types.CommitHeaders
-	1, // [1:1] is the sub-list for method output_type
-	1, // [1:1] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	7, // 0: types.LightclientAction.headers:type_name -> types.CommitHeaders
+	1, // 1: types.BtcHeaders.btcHeader:type_name -> types.BtcHeader
+	4, // 2: types.BtcTransaction.vin:type_name -> types.Vin
+	5, // 3: types.BtcTransaction.vout:type_name -> types.Vout
+	4, // [4:4] is the sub-list for method output_type
+	4, // [4:4] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_lightclient_proto_init() }
@@ -236,7 +775,7 @@ func file_lightclient_proto_init() {
 			}
 		}
 		file_lightclient_proto_msgTypes[1].Exporter = func(v interface{}, i int) interface{} {
-			switch v := v.(*CommitHeaders); i {
+			switch v := v.(*BtcHeader); i {
 			case 0:
 				return &v.state
 			case 1:
@@ -248,6 +787,78 @@ func file_lightclient_proto_init() {
 			}
 		}
 		file_lightclient_proto_msgTypes[2].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*BtcHeaders); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_lightclient_proto_msgTypes[3].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*BtcTransaction); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_lightclient_proto_msgTypes[4].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*Vin); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_lightclient_proto_msgTypes[5].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*Vout); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_lightclient_proto_msgTypes[6].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*BtcSpv); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_lightclient_proto_msgTypes[7].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*CommitHeaders); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_lightclient_proto_msgTypes[8].Exporter = func(v interface{}, i int) interface{} {
 			switch v := v.(*CommitHeadersLog); i {
 			case 0:
 				return &v.state
@@ -269,7 +880,7 @@ func file_lightclient_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_lightclient_proto_rawDesc,
 			NumEnums:      0,
-			NumMessages:   3,
+			NumMessages:   9,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
@@ -318,7 +929,7 @@ func RegisterLightclientServer(s *grpc.Server, srv LightclientServer) {
 }
 
 var _Lightclient_serviceDesc = grpc.ServiceDesc{
-	ServiceName: "types.lightclient",
+	ServiceName: "types.Lightclient",
 	HandlerType: (*LightclientServer)(nil),
 	Methods:     []grpc.MethodDesc{},
 	Streams:     []grpc.StreamDesc{},

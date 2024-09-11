@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package btcclient
+package btc
 
 import (
 	"errors"
@@ -12,7 +12,7 @@ import (
 
 	log "github.com/33cn/chain33/common/log/log15"
 	"github.com/33cn/chain33/common/merkle"
-	ty "github.com/33cn/plugin/plugin/dapp/relay/types"
+	ty "github.com/33cn/plugin/plugin/dapp/lightclient/types"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/rpcclient"
@@ -84,12 +84,8 @@ func newBtcd(config *rpcclient.ConnConfig, reconnectAttempts int) (BtcClient, er
 		currentBlock:        make(chan *blockStamp),
 		quit:                make(chan struct{}),
 	}
-	ntfnCallbacks := &rpcclient.NotificationHandlers{
-		OnClientConnected:   client.onClientConnect,
-		OnBlockConnected:    client.onBlockConnected,
-		OnBlockDisconnected: client.onBlockDisconnected,
-	}
-	rpcClient, err := rpcclient.New(client.connConfig, ntfnCallbacks)
+
+	rpcClient, err := rpcclient.New(client.connConfig, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -118,8 +114,6 @@ func (b *btcdClient) Start() error {
 	b.started = true
 	b.quitMtx.Unlock()
 
-	b.wg.Add(1)
-	go b.handler()
 	return nil
 }
 
@@ -155,130 +149,6 @@ func (b *btcdClient) BlockStamp() (*blockStamp, error) {
 	case <-b.quit:
 		return nil, errors.New("disconnected")
 	}
-}
-
-func (b *btcdClient) onClientConnect() {
-	select {
-	case b.enqueueNotification <- clientConnected{}:
-	case <-b.quit:
-	}
-}
-
-func (b *btcdClient) onBlockConnected(hash *chainhash.Hash, height int32, time time.Time) {
-	select {
-	case b.enqueueNotification <- blockConnected{
-		blockStamp: blockStamp{
-			Hash:   *hash,
-			Height: height,
-		},
-		Time: time,
-	}:
-	case <-b.quit:
-	}
-}
-
-func (b *btcdClient) onBlockDisconnected(hash *chainhash.Hash, height int32, time time.Time) {
-	select {
-	case b.enqueueNotification <- blockDisconnected{
-		blockStamp: blockStamp{
-			Hash:   *hash,
-			Height: height,
-		},
-		Time: time,
-	}:
-	case <-b.quit:
-	}
-}
-
-func (b *btcdClient) handler() {
-	hash, height, err := b.rpcClient.GetBestBlock()
-	if err != nil {
-		b.Stop()
-		b.wg.Done()
-		return
-	}
-
-	bs := &blockStamp{Hash: *hash, Height: height}
-	var notifications []interface{}
-	enqueue := b.enqueueNotification
-	var dequeue chan interface{}
-	var next interface{}
-	pingChan := time.After(time.Minute)
-out:
-	for {
-		select {
-		case n, ok := <-enqueue:
-			if !ok {
-				// If no notifications are queued for handling,
-				// the queue is finished.
-				if len(notifications) == 0 {
-					break out
-				}
-				// nil channel so no more reads can occur.
-				enqueue = nil
-				continue
-			}
-			if len(notifications) == 0 {
-				next = n
-				dequeue = b.dequeueNotification
-			}
-			notifications = append(notifications, n)
-			pingChan = time.After(time.Minute)
-
-		case dequeue <- next:
-			if n, ok := next.(blockConnected); ok {
-				bs = &blockStamp{
-					Height: n.Height,
-					Hash:   n.Hash,
-				}
-			}
-
-			notifications[0] = nil
-			notifications = notifications[1:]
-			if len(notifications) != 0 {
-				next = notifications[0]
-			} else {
-				// If no more notifications can be enqueued, the
-				// queue is finished.
-				if enqueue == nil {
-					break out
-				}
-				dequeue = nil
-			}
-
-		case <-pingChan:
-			type sessionResult struct {
-				err error
-			}
-			sessionResponse := make(chan sessionResult, 1)
-			go func() {
-				_, err := b.rpcClient.Session()
-				sessionResponse <- sessionResult{err}
-			}()
-
-			select {
-			case resp := <-sessionResponse:
-				if resp.err != nil {
-					b.Stop()
-					break out
-				}
-				pingChan = time.After(time.Minute)
-
-			case <-time.After(time.Minute):
-				b.Stop()
-				break out
-			}
-
-		case b.currentBlock <- bs:
-
-		case <-b.quit:
-			break out
-		}
-	}
-
-	b.Stop()
-	close(b.dequeueNotification)
-	b.wg.Done()
 }
 
 // POSTClient creates the equivalent HTTP POST rpcclient.Client.

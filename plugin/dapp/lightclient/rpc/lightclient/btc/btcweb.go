@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package btcclient
+package btc
 
 import (
 	"crypto/tls"
@@ -12,7 +12,7 @@ import (
 
 	log "github.com/33cn/chain33/common/log/log15"
 	"github.com/33cn/chain33/common/merkle"
-	ty "github.com/33cn/plugin/plugin/dapp/relay/types"
+	ty "github.com/33cn/plugin/plugin/dapp/lightclient/types"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/valyala/fasthttp"
 )
