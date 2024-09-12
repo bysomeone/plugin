@@ -10,7 +10,7 @@ import (
  * 关键数据上链（statedb）并生成交易回执（log）
  */
 
-func (l *lightclient) Exec_CommitHeaders(payload *lightclienttypes.CommitHeaders, tx *types.Transaction, index int) (*types.Receipt, error) {
+func (l *lightclient) Exec_BtcHeaders(headers *lightclienttypes.BtcHeaders, tx *types.Transaction, index int) (*types.Receipt, error) {
 	receipt := &types.Receipt{Ty: types.ExecOk}
 	//implement code
 	return receipt, nil

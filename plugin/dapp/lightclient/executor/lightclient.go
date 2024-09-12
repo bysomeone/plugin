@@ -1,10 +1,12 @@
 package executor
 
 import (
+	"github.com/33cn/chain33/common/db"
 	log "github.com/33cn/chain33/common/log/log15"
 	drivers "github.com/33cn/chain33/system/dapp"
 	"github.com/33cn/chain33/types"
-	lightclienttypes "github.com/33cn/plugin/plugin/dapp/lightclient/types"
+	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/types"
+	"sync"
 )
 
 /*
@@ -12,17 +14,31 @@ import (
  * 重载基类相关接口
  */
 
+type config struct {
+	CommitAddress string `json:"commitAddress"`
+}
+
 var (
 	//日志
-	elog = log.New("module", "lightclient.executor")
+	elog        = log.New("module", "lightclient.executor")
+	lightCfg    config
+	cfgInitOnce sync.Once
 )
 
-var driverName = lightclienttypes.LightclientX
+var driverName = ltypes.LightclientX
 
 // Init register dapp
 func Init(name string, cfg *types.Chain33Config, sub []byte) {
+	initCfg(sub)
 	drivers.Register(cfg, GetName(), newLightclient, cfg.GetDappFork(driverName, "Enable"))
 	InitExecType()
+}
+
+func initCfg(sub []byte) {
+
+	cfgInitOnce.Do(func() {
+		types.MustDecode(sub, &lightCfg)
+	})
 }
 
 // InitExecType Init Exec Type
@@ -51,8 +67,30 @@ func (l *lightclient) GetDriverName() string {
 	return driverName
 }
 
-// CheckTx 实现自定义检验交易接口，供框架调用
-func (l *lightclient) CheckTx(tx *types.Transaction, index int) error {
-	// implement code
-	return nil
+// ExecutorOrder 设置localdb的EnableRead
+func (l *lightclient) ExecutorOrder() int64 {
+	return drivers.ExecLocalSameTime
+}
+
+func readDB(kdb db.KV, key []byte, result types.Message) error {
+
+	val, err := kdb.Get(key)
+	if err != nil {
+		return err
+	}
+	return types.Decode(val, result)
+}
+
+func getBtcLastHeader(sdb db.KV) (*ltypes.BtcHeader, error) {
+
+	header := &ltypes.BtcHeader{}
+	err := readDB(sdb, btcLastHeaderKey(), header)
+	return header, err
+}
+
+func getBtcHeader(ldb db.KV, height uint64) (*ltypes.BtcHeader, error) {
+
+	header := &ltypes.BtcHeader{}
+	err := readDB(ldb, btcHeaderKey(height), header)
+	return header, err
 }

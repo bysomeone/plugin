@@ -3,10 +3,10 @@ syntax = "proto3";
 package types;
 option go_package = "../types";
 
-message LightclientAction {
+message LightClientAction {
     int32 ty = 1;
     oneof value {
-        CommitHeaders headers = 2;
+        BtcHeaders  btcHeaders = 2;
     }
 }
 
@@ -23,16 +23,23 @@ message BtcHeader {
     int64  difficulty    = 9;
     string previousHash  = 10;
     string nextHash      = 11;
-    bool   isReset       = 12; // 0: nomal btc headers sync (default), 1: set the base
-    // head (may not from 1)
+}
+
+
+message BtcHeadersLog {
+    uint64 confirmations = 1;
+    uint64 lastHeight = 2;
+    uint64 currHeight = 3;
+    string lastHash = 4;
+    string currHash = 5;
 }
 
 message BtcHeaders {
-    repeated BtcHeader btcHeader = 1;
+    repeated BtcHeader headers = 1;
 }
 
 message BtcTransaction {
-    string   hash               = 1; // txhash
+    string   hash               = 1;
     uint64   blockHeight        = 2;
     repeated Vin vin            = 3;
     repeated Vout vout          = 4;
@@ -52,7 +59,7 @@ message Vout {
 }
 
 message BtcSpv {
-    string   hash              = 1; // txhash
+    string   txHash              = 1;
     int64    time              = 2;
     uint64   height            = 3;
     string   blockHash         = 4;
@@ -61,13 +68,6 @@ message BtcSpv {
 }
 
 
-
-
-message CommitHeaders {
-}
-
-message CommitHeadersLog {
-}
 
 service Lightclient {
 

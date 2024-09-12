@@ -2,6 +2,11 @@ module github.com/33cn/plugin
 
 go 1.19
 
+
+replace (
+	github.com/33cn/chain33 => ../chain33
+)
+
 replace (
 	github.com/ava-labs/avalanchego => github.com/33cn/avalanchego v1.10.10-0.20240529041529-ada691598153
 	github.com/btcsuite/btcd => github.com/btcsuite/btcd v0.22.3
