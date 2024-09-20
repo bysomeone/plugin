@@ -1,12 +1,13 @@
 package executor
 
 import (
+	"sync"
+
 	"github.com/33cn/chain33/common/db"
 	log "github.com/33cn/chain33/common/log/log15"
 	drivers "github.com/33cn/chain33/system/dapp"
 	"github.com/33cn/chain33/types"
 	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/types"
-	"sync"
 )
 
 /*
@@ -93,4 +94,11 @@ func getBtcHeader(ldb db.KV, height uint64) (*ltypes.BtcHeader, error) {
 	header := &ltypes.BtcHeader{}
 	err := readDB(ldb, btcHeaderKey(height), header)
 	return header, err
+}
+
+func getBtcHeight(ldb db.KV, hash string) (*types.Int64, error) {
+
+	height := &types.Int64{}
+	err := readDB(ldb, btcHeaderHashHeightKey(hash), height)
+	return height, err
 }

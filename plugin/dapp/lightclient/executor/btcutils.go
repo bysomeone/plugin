@@ -1,13 +1,14 @@
 package executor
 
 import (
+	"math/big"
+	"time"
+
 	dbm "github.com/33cn/chain33/common/db"
 	"github.com/33cn/chain33/common/difficulty"
 	ty "github.com/33cn/plugin/plugin/dapp/lightclient/types"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
-	"math/big"
-	"time"
 )
 
 const (

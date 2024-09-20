@@ -2,6 +2,7 @@ package executor
 
 import (
 	"encoding/hex"
+
 	"github.com/33cn/chain33/common/difficulty"
 	"github.com/33cn/chain33/types"
 	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/types"
@@ -42,6 +43,11 @@ func (l *lightclient) checkBtcHeaders(tx *types.Transaction, headers *ltypes.Btc
 	if err != nil && err != types.ErrNotFound {
 		elog.Error("checkBtcHeaders", "getBtcLastHeader err", err)
 		return ErrBtcGetLastHeader
+	}
+
+	if len(headers.GetHeaders()) < 1 {
+		elog.Error("checkBtcHeaders", "err", "commit empty headers")
+		return types.ErrInvalidParam
 	}
 
 	for _, h := range headers.GetHeaders() {

@@ -29,9 +29,9 @@ message BtcHeader {
 message BtcHeadersLog {
     uint64 confirmations = 1;
     uint64 lastHeight = 2;
-    uint64 currHeight = 3;
+    uint64 commitHeight = 3;
     string lastHash = 4;
-    string currHash = 5;
+    string commitHash = 5;
 }
 
 message BtcHeaders {
