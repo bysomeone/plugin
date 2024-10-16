@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package types;
+option go_package = "../types";
+
+message RgbxAction {
+  int32 ty = 1;
+  oneof value {
+    issueAsset issue = 2;
+    transferAsset transfer = 3;
+  }
+}
+
+
+message issueAsset {
+}
+
+message transferAsset {
+}
+
+
+service rgbx {
+
+}
+
