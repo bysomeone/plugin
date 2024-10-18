@@ -10,7 +10,7 @@ import (
  * 关键数据上链（statedb）并生成交易回执（log）
  */
 
-func (r *rgbx) Exec_Issue(payload *rgbxtypes.IssueAsset, tx *types.Transaction, index int) (*types.Receipt, error) {
+func (r *rgbx) Exec_Mint(payload *rgbxtypes.MintAsset, tx *types.Transaction, index int) (*types.Receipt, error) {
 	receipt := &types.Receipt{Ty: types.ExecOk}
 	//implement code
 	return receipt, nil

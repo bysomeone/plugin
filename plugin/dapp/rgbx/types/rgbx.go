@@ -15,17 +15,17 @@ import (
 // action类型id和name，这些常量可以自定义修改
 const (
 	TyUnknowAction = iota + 100
-	TyIssueAction
+	TyMintAction
 	TyTransferAction
 
-	NameIssueAction    = "Issue"
+	NameMintAction     = "Mint"
 	NameTransferAction = "Transfer"
 )
 
 // log类型id值
 const (
 	TyUnknownLog = iota + 100
-	TyIssueLog
+	TyMintLog
 	TyTransferLog
 )
 
@@ -34,7 +34,7 @@ var (
 	RgbxX = "rgbx"
 	//定义actionMap
 	actionMap = map[string]int32{
-		NameIssueAction:    TyIssueAction,
+		NameMintAction:     TyMintAction,
 		NameTransferAction: TyTransferAction,
 	}
 	//定义log的id和具体log类型及名称，填入具体自定义log类型
