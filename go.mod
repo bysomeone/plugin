@@ -2,10 +2,7 @@ module github.com/33cn/plugin
 
 go 1.19
 
-
-replace (
-	github.com/33cn/chain33 => ../chain33
-)
+replace github.com/33cn/chain33 => ../chain33
 
 replace (
 	github.com/ava-labs/avalanchego => github.com/33cn/avalanchego v1.10.10-0.20240529041529-ada691598153
@@ -14,12 +11,13 @@ replace (
 )
 
 require (
-	github.com/33cn/chain33 v1.69.0
+	github.com/33cn/chain33 v0.0.0-00010101000000-000000000000
 	github.com/BurntSushi/toml v1.2.1
 	github.com/NebulousLabs/Sia v1.3.7
 	github.com/bitly/go-simplejson v0.5.0
-	github.com/btcsuite/btcd v0.23.4
+	github.com/btcsuite/btcd v0.23.5-0.20230711222809-7faa9b266231
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.0.1
+	github.com/btcsuite/btcwallet/walletdb v1.3.5
 	github.com/consensys/gnark v0.5.2
 	github.com/consensys/gnark-crypto v0.10.0
 	github.com/coreos/etcd v3.3.15+incompatible
@@ -34,6 +32,7 @@ require (
 	github.com/huin/goupnp v1.1.0
 	github.com/jackpal/go-nat-pmp v1.0.2
 	github.com/jinzhu/copier v0.3.6-0.20220210061904-7948fe2be217
+	github.com/lightninglabs/neutrino v0.16.0
 	github.com/mr-tron/base58 v1.2.0
 	github.com/pborman/uuid v1.2.0
 	github.com/perlin-network/life v0.0.0-20191203030451-05c0e0f7eaea
@@ -64,6 +63,7 @@ require (
 	github.com/OneOfOne/xxhash v1.2.5 // indirect
 	github.com/VictoriaMetrics/fastcache v1.10.0 // indirect
 	github.com/XiaoMi/pegasus-go-client v0.0.0-20210825081735-b8a75c1eac2b // indirect
+	github.com/aead/siphash v1.0.1 // indirect
 	github.com/andreyvit/diff v0.0.0-20170406064948-c7f18ee00883 // indirect
 	github.com/andybalholm/brotli v1.0.4 // indirect
 	github.com/apache/arrow/go/arrow v0.0.0-20200923215132-ac86123a3f01 // indirect
@@ -77,6 +77,7 @@ require (
 	github.com/btcsuite/btcd/btcutil v1.1.3 // indirect
 	github.com/btcsuite/btclog v0.0.0-20170628155309-84c8d2346e9f // indirect
 	github.com/btcsuite/btcutil v1.0.3-0.20201208143702-a53e38424cce // indirect
+	github.com/btcsuite/btcwallet/wtxmgr v1.5.0 // indirect
 	github.com/btcsuite/go-socks v0.0.0-20170105172521-4720035b7bfd // indirect
 	github.com/btcsuite/websocket v0.0.0-20150119174127-31079b680792 // indirect
 	github.com/cenkalti/backoff/v4 v4.2.0 // indirect
@@ -97,6 +98,7 @@ require (
 	github.com/decred/base58 v1.0.3 // indirect
 	github.com/decred/dcrd/crypto/blake256 v1.0.0 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.1.0 // indirect
+	github.com/decred/dcrd/lru v1.0.0 // indirect
 	github.com/dgraph-io/badger v1.6.2 // indirect
 	github.com/dgraph-io/ristretto v0.0.2 // indirect
 	github.com/dgryski/go-farm v0.0.0-20190423205320-6a90982ecee2 // indirect
@@ -151,6 +153,7 @@ require (
 	github.com/jbenet/go-temp-err-catcher v0.1.0 // indirect
 	github.com/jbenet/goprocess v0.1.4 // indirect
 	github.com/kevinms/leakybucket-go v0.0.0-20200115003610-082473db97ca // indirect
+	github.com/kkdai/bstream v0.0.0-20161212061736-f391b8402d23 // indirect
 	github.com/klauspost/compress v1.16.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.4 // indirect
 	github.com/koron/go-ssdp v0.0.4 // indirect
@@ -171,6 +174,10 @@ require (
 	github.com/libp2p/go-reuseport v0.2.0 // indirect
 	github.com/libp2p/go-yamux/v4 v4.0.0 // indirect
 	github.com/libp2p/zeroconf/v2 v2.2.0 // indirect
+	github.com/lightninglabs/neutrino/cache v1.1.0 // indirect
+	github.com/lightningnetwork/lnd/clock v1.0.1 // indirect
+	github.com/lightningnetwork/lnd/queue v1.0.1 // indirect
+	github.com/lightningnetwork/lnd/ticker v1.0.0 // indirect
 	github.com/marten-seemann/tcp v0.0.0-20210406111302-dfbc87cc63fd // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.19 // indirect
