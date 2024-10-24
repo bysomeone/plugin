@@ -125,7 +125,7 @@ func (b *btcWeb) GetSPV(height uint64, txHash string) (*ty.BtcSpv, error) {
 	}
 	proof := merkle.GetMerkleBranch(txs, txIndex)
 	spv := &ty.BtcSpv{
-		Hash:        txHash,
+		TxHash:      txHash,
 		Time:        block.Time,
 		Height:      block.Height,
 		BlockHash:   block.Hash,
