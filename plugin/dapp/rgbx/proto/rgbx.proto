@@ -8,7 +8,16 @@ message RgbxAction {
   oneof value {
     mintAsset mint = 2;
     transferAsset transfer = 3;
+    confirmTx confirm = 4;
   }
+}
+
+message asset {
+
+  uint32 type = 1;
+  uint64 totalAmount = 2;
+  string symbol = 3;
+  bytes metaHash =4;
 }
 
 
@@ -27,26 +36,49 @@ message outPoint {
   uint32 index = 2;
 }
 
+message txOut {
+  int64 value = 1;
+  bytes pkScript =2;
+}
+
+message btcWitness {
+  bytes txHash = 1;
+  outPoint in = 2;
+  txOut out = 3;
+}
 
 message AssetAccount {
 
   oneof value {
-
     outPoint utxo =1;
     string address = 2;
-
   }
 }
 
 message transferAsset {
 
-  string assetID = 1;
-  uint64 amount = 2;
+  string symbol = 1;
+  int64 amount = 2;
   AssetAccount from = 3;
   AssetAccount to = 4;
   AssetAccount change = 5;
 }
 
+message confirmTx {
+
+  int32 actionType = 1;
+  bool timeout = 2;
+  bytes txHash = 3;
+  btcWitness witness =4;
+}
+
+
+message pendingTx {
+  int32 actionType = 1;
+  int64 timestamp = 2;
+  bytes txHash = 3;
+  outPoint utxo = 4;
+}
 
 service rgbx {
 

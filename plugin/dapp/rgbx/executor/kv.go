@@ -12,3 +12,7 @@ var (
 	//KeyPrefixLocalDB local db的key必须前缀
 	KeyPrefixLocalDB = "LODB-rgbx-"
 )
+
+func formatPayloadKey(hash []byte) []byte {
+	return append([]byte(KeyPrefixStateDB+"payload-"), hash...)
+}

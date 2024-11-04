@@ -17,9 +17,11 @@ const (
 	TyUnknowAction = iota + 100
 	TyMintAction
 	TyTransferAction
+	TyConfirmAction
 
 	NameMintAction     = "Mint"
 	NameTransferAction = "Transfer"
+	NameConfirmAction  = "Confirm"
 )
 
 // log类型id值
@@ -27,6 +29,8 @@ const (
 	TyUnknownLog = iota + 100
 	TyMintLog
 	TyTransferLog
+	TyConfirmLog
+	TyPendingTxLog
 )
 
 var (
@@ -36,6 +40,7 @@ var (
 	actionMap = map[string]int32{
 		NameMintAction:     TyMintAction,
 		NameTransferAction: TyTransferAction,
+		NameConfirmAction:  TyConfirmAction,
 	}
 	//定义log的id和具体log类型及名称，填入具体自定义log类型
 	logMap = map[int64]*types.LogInfo{

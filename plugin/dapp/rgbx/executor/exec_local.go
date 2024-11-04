@@ -26,6 +26,14 @@ func (r *rgbx) ExecLocal_Transfer(payload *rgbxtypes.TransferAsset, tx *types.Tr
 	return r.addAutoRollBack(tx, dbSet.KV), nil
 }
 
+func (r *rgbx) ExecLocal_Confirm(payload *rgbxtypes.ConfirmTx, tx *types.Transaction, receiptData *types.ReceiptData, index int) (*types.LocalDBSet, error) {
+	dbSet := &types.LocalDBSet{}
+	//implement code, add customize kv to dbSet...
+
+	//auto gen for localdb auto rollback
+	return r.addAutoRollBack(tx, dbSet.KV), nil
+}
+
 // 当区块回滚时，框架支持自动回滚localdb kv，需要对exec-local返回的kv进行封装
 func (r *rgbx) addAutoRollBack(tx *types.Transaction, kv []*types.KeyValue) *types.LocalDBSet {
 
