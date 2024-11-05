@@ -1,5 +1,10 @@
 package executor
 
+import (
+	"github.com/33cn/chain33/common/db"
+	"github.com/33cn/chain33/types"
+)
+
 /*
  * 用户合约存取kv数据时，key值前缀需要满足一定规范
  * 即key = keyPrefix + userKey
@@ -15,4 +20,17 @@ var (
 
 func formatPayloadKey(hash []byte) []byte {
 	return append([]byte(KeyPrefixStateDB+"payload-"), hash...)
+}
+
+func formatAssetKey(symbol string) []byte {
+	return append([]byte(KeyPrefixLocalDB+"asset-"), symbol...)
+}
+
+func readDB(kdb db.KV, key []byte, result types.Message) error {
+
+	val, err := kdb.Get(key)
+	if err != nil {
+		return err
+	}
+	return types.Decode(val, result)
 }

@@ -15,15 +15,16 @@ message RgbxAction {
 message asset {
 
   uint32 type = 1;
-  uint64 totalAmount = 2;
+  int64 totalAmount = 2;
   string symbol = 3;
   bytes metaHash =4;
+  bytes genesisTx = 5;
 }
 
 
 message mintAsset {
   uint32 type = 1;
-  uint64 totalAmount = 2;
+  int64 totalAmount = 2;
   string symbol = 3;
   bytes metaHash =4;
   // FirstPrevOut represents the outpoint of the transaction's first
@@ -44,7 +45,7 @@ message txOut {
 message btcWitness {
   bytes txHash = 1;
   outPoint in = 2;
-  txOut out = 3;
+  txOut opRetOut = 3;
 }
 
 message AssetAccount {

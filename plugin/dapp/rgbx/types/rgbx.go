@@ -92,3 +92,16 @@ func (r *rgbxType) GetTypeMap() map[string]int32 {
 func (r *rgbxType) GetLogMap() map[int64]*types.LogInfo {
 	return logMap
 }
+
+// GetActionName get action name by action type
+func GetActionName(ty int32) string {
+	if ty == TyMintAction {
+		return NameMintAction
+	} else if ty == TyTransferAction {
+		return NameTransferAction
+	} else if ty == TyConfirmAction {
+		return NameConfirmAction
+	} else {
+		return "unknownAction"
+	}
+}
