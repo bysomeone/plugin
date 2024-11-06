@@ -50,9 +50,3 @@ func GetName() string {
 func (r *rgbx) GetDriverName() string {
 	return driverName
 }
-
-// CheckTx 实现自定义检验交易接口，供框架调用
-func (r *rgbx) CheckTx(tx *types.Transaction, index int) error {
-	// implement code
-	return nil
-}

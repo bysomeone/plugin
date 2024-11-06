@@ -21,7 +21,7 @@ type config struct {
 
 var (
 	//日志
-	elog        = log.New("module", "lightclient.executor")
+	elog        = log.New("module", "lightclient.exec")
 	lightCfg    config
 	cfgInitOnce sync.Once
 )

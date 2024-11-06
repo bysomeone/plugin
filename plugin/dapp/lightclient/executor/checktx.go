@@ -15,7 +15,7 @@ func (l *lightclient) CheckTx(tx *types.Transaction, index int) error {
 
 	err := types.Decode(tx.GetPayload(), action)
 	if err != nil {
-		elog.Error("lightclient CheckTx", "txHash", hex.EncodeToString(tx.Hash()), "Decode payload error", err)
+		elog.Error("CheckTx", "txHash", hex.EncodeToString(tx.Hash()), "Decode payload error", err)
 		return ErrDecodeAction
 	}
 
@@ -26,7 +26,7 @@ func (l *lightclient) CheckTx(tx *types.Transaction, index int) error {
 		err = types.ErrActionNotSupport
 	}
 	if err != nil {
-		elog.Error("rollup CheckTx", "txHash", hex.EncodeToString(tx.Hash()), "actionName", tx.ActionName(), "err", err)
+		elog.Error("CheckTx", "txHash", hex.EncodeToString(tx.Hash()), "actionName", tx.ActionName(), "err", err)
 	}
 	return err
 }

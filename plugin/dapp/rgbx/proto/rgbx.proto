@@ -27,9 +27,9 @@ message mintAsset {
   int64 totalAmount = 2;
   string symbol = 3;
   bytes metaHash =4;
-  // FirstPrevOut represents the outpoint of the transaction's first
+  // represents the outpoint of the transaction's
   // input that resulted in the creation of the asset.
-  outPoint firstPrevOut = 5;
+  outPoint genesisOut = 5;
 }
 
 message outPoint {

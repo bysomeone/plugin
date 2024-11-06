@@ -1,15 +1,33 @@
 package executor
 
-import "strings"
+import (
+	"errors"
+	"strings"
+)
+
+var (
+	ErrInvalidSymbolLength    = errors.New("invalid asset symbol length")
+	ErrInvalidAssetAmount     = errors.New("invalid asset amount")
+	ErrInvalidMetaHashLength  = errors.New("invalid meta hash length")
+	ErrNilGenesisOut          = errors.New("nil genesis output")
+	ErrDuplicateAssetSymbol   = errors.New("duplicate asset symbol")
+	ErrAssetNotExist          = errors.New("asset not exist")
+	ErrConfirmedTxNotExist    = errors.New("confirmed tx not exist")
+	ErrUnknownConfirmedAction = errors.New("unknown confirmed action")
+	ErrInvalidOpRetCommitment = errors.New("invalid op return commitment")
+	ErrGenesisOutNotEqual     = errors.New("genesis out not equal")
+)
 
 const (
 	// MaxAssetSymbolLength is the maximum byte length of an asset's symbol.
 	// This byte length is equivalent to character count for single-byte
 	// UTF-8 characters.
-	MaxAssetSymbolLength = 32
+	MaxAssetSymbolLength = 16
 
 	// MetaHashLen is the length of the metadata hash.
 	MetaHashLen = 32
+	// MaxAssetAmount max amount
+	MaxAssetAmount = 1e8 * 10000
 )
 
 // Type denotes the asset types supported by the Taproot Asset protocol.
