@@ -1,23 +1,45 @@
-# RGB USDT 跨链集成技术方案
+# RGB20 USDT 跨链集成技术方案
 
-**版本**: v1.0  
+**版本**: v2.0  
 **适用对象**: 开发者、架构师  
 **最后更新**: 2026-07-23  
 **前置依赖**: [BTC 跨链桥技术架构文档](./TECHNICAL.md)
 
 ---
 
+## 重要前提：rgbx ≠ RGB 标准协议
+
+**rgbx 是 Chain33 生态自定义的资产协议**，借用了 RGB 的核心思想（UTXO 封印、客户端验证、OP_RETURN 承诺），但使用了完全独立的数据格式和验证规则。rgbx **不是** RGB 标准协议的实现，两者的 commitment 格式、状态编码、Schema 定义均**互不兼容**。
+
+本方案的策略是：在 rgbx 合约层保持不动的情况下，于 neutrino 链下节点新增一套 **RGB20 适配层**，专门解析和验证标准 RGB 协议的数据，将 RGB20 USDT 的充提翻译为 rgbx 合约能理解的 Deposit/Withdraw 操作。
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  rgbx: 自定义协议       RGB 标准协议: LNP/BP 协会维护              │
+│                                                                  │
+│  mintAsset               RGB20 Schema (同质化代币)               │
+│  transferAsset           Contractum 语言定义                      │
+│  confirmTx               strict_types 编码                       │
+│  OP_RETURN: rgbx:xxx     Opret/Tapret commitment                 │
+│                                                                  │
+│         ≠ 不兼容 → 需要适配层桥接                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## 目录
 
 1. [背景与动机](#1-背景与动机)
-2. [RGB 协议概要](#2-rgb-协议概要)
+2. [rgbx 与 RGB 标准协议的关系](#2-rgbx-与-rgb-标准协议的关系)
 3. [架构设计](#3-架构设计)
-4. [核心流程设计](#4-核心流程设计)
-5. [数据结构变更](#5-数据结构变更)
-6. [Neutrino 官方节点改造](#6-neutrino-官方节点改造)
-7. [安全模型](#7-安全模型)
-8. [配置与部署](#8-配置与部署)
-9. [代码变更清单](#9-代码变更清单)
+4. [RGB20 适配层设计](#4-rgb20-适配层设计)
+5. [核心流程设计](#5-核心流程设计)
+6. [数据流与格式转换](#6-数据流与格式转换)
+7. [Neutrino 节点改造](#7-neutrino-节点改造)
+8. [安全模型](#8-安全模型)
+9. [配置与部署](#9-配置与部署)
+10. [代码变更清单](#10-代码变更清单)
 
 ---
 
@@ -25,82 +47,69 @@
 
 ### 1.1 现状
 
-当前跨链桥仅支持 BTC 原生币的充提。rgbx 合约已具备多资产管理框架（`CrossChainInfo` 按 `assetSymbol` 索引），为扩展新资产预留了接口。
+当前跨链桥通过 rgbx 合约支持 BTC 原生币的充提。rgbx 合约已具备多资产管理框架（`CrossChainInfo` 按 `assetSymbol` 索引，`DepositAsset`/`WithdrawAsset` 均带资产类型标识），为扩展新资产预留了接口。
 
 ### 1.2 目标
 
-支持 RGB 协议上发行的 USDT 在 Chain33 与 Bitcoin 网络之间双向流通：
+接入 **RGB 标准协议**上发行的 USDT（RGB20 同质化代币），实现与 Chain33 的双向跨链：
 
-- **充值**：用户将 RGB USDT 转入 TSS 控制的 UTXO → Chain33 铸造对应数量的 wrapped USDT
-- **提现**：用户在 Chain33 销毁 wrapped USDT → TSS 构造 BTC 交易将 RGB USDT 转出到用户地址
+- **充值**：用户用 RGB 钱包将 RGB20 USDT 转入桥的 TSS 封印 → Chain33 铸造 wrapped USDT
+- **提现**：用户在 Chain33 销毁 wrapped USDT → 桥构造 BTC 交易将 RGB20 USDT 转出
 
-### 1.3 核心差异：BTC vs RGB USDT
+### 1.3 为什么需要适配层
 
-| 维度 | BTC | RGB USDT |
-|------|-----|----------|
-| **资产载体** | BTC UTXO 的 value 字段 | RGB 状态机（client-side validated） |
-| **转账语义** | BTC 输出金额 = 转账金额 | BTC 输出金额仅覆盖手续费，RGB 状态转移携带实际金额 |
-| **所有权证明** | 控制 UTXO 私钥 | 控制密封 RGB 状态的 UTXO 私钥 + RGB 状态转移历史 |
-| **交易大小** | 标准 P2WPKH (~140 vBytes) | 额外 RGB 承诺数据（OP_RETURN ~50-200 bytes） |
-| **验证方式** | 仅需 BTC SPV 证明 | BTC SPV 证明 + RGB 客户端验证 |
-| **地址隔离** | 可共用 TSS 地址 | 建议独立 TSS 地址（UTXO 管理隔离） |
+rgbx 合约无法直接理解标准 RGB 协议的数据。需要一个链下适配层：
+
+| 层次 | 职责 |
+|------|------|
+| **rgbx 合约 (链上)** | BTC SPV 验证、OP_RETURN 承诺验证、资产发行/销毁（不变） |
+| **RGB20 适配器 (链下)** | 解析 RGB 标准协议数据、验证状态转移、提取金额 → 翻译为 rgbx 能理解的参数 |
+
+这和 Ethereum 跨链桥（cross2eth）的架构一致——链上合约不解析 EVM 交易，只验证 Merkle Proof；EVM 事件解析全在 relayer 里做。
 
 ---
 
-## 2. RGB 协议概要
+## 2. rgbx 与 RGB 标准协议的关系
 
-### 2.1 核心概念
+### 2.1 设计思想的共通点
 
-RGB 是 Bitcoin 上的客户端验证智能合约系统，关键概念：
+两者都基于以下核心概念：
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    RGB 资产状态转移模型                           │
-│                                                                  │
-│  ┌─────────────────┐          ┌─────────────────┐               │
-│  │   BTC Tx #N     │          │   BTC Tx #N+1   │               │
-│  │                 │          │                 │               │
-│  │ Inputs:         │          │ Inputs:         │               │
-│  │  [UTXO-A]  ◄─── Single-Use Seal ──── 关闭旧封印              │
-│  │                 │          │                 │               │
-│  │ Outputs:        │          │ Outputs:        │               │
-│  │  [UTXO-B]  ──── Single-Use Seal ────► 打开新封印              │
-│  │  OP_RETURN      │          │  OP_RETURN      │               │
-│  │  (RGB commitment)│          │  (RGB commitment)│              │
-│  └─────────────────┘          └─────────────────┘               │
-│                                                                  │
-│  RGB State:                                                     │
-│  Owner=UTXO-A             RGB State:                            │
-│  Amount=100 USDT    →     Owner=UTXO-B                          │
-│                           Amount=100 USDT (or split)             │
-└─────────────────────────────────────────────────────────────────┘
-```
+| 概念 | 说明 |
+|------|------|
+| **Single-Use Seal** | BTC UTXO 作为"封印"，锁定资产所有权 |
+| **Client-Side Validation** | 验证逻辑在客户端执行，BTC 链上只记录 commitment |
+| **State Transition** | 资产转移 = 关闭旧封印 + 打开新封印 |
+| **Commitment** | BTC 交易中嵌入状态转移的承诺数据 |
 
-### 2.2 与跨链桥的关系
+### 2.2 具体实现的不兼容
 
-| RGB 概念 | 跨链桥中的含义 |
-|----------|---------------|
-| **Single-Use Seal** | BTC UTXO 作为"封印"，锁定 RGB 状态 |
-| **State Transition** | RGB USDT 转账 = 打开旧封印 + 创建新封印 |
-| **Commitment** | OP_RETURN 中嵌入 RGB 状态转移的承诺哈希 |
-| **Client-Side Validation** | 官方节点需运行 RGB 客户端验证每次转移 |
+| | rgbx 协议 | RGB 标准协议 |
+|---|---|---|
+| **代币定义** | `MintAsset` (proto 自定义) | RGB20 Schema (Contractum 语言) |
+| **状态编码** | Protobuf 序列化 | strict_types 二进制编码 |
+| **承诺方式** | OP_RETURN `rgbx:deposit:xxx` | Opret (OP_RETURN) / Tapret (Taproot) 标准格式 |
+| **Schema 语言** | 无（代码硬编码验证规则） | Contractum + AluVM 虚拟机 |
+| **验证引擎** | Chain33 合约 Go 代码 | AluVM 字节码解释器 |
+| **资产转移** | `TransferAsset` + `ConfirmTx` | RGB State Transition (Schema 定义) |
+| **证明数据** | `UtxoSpendingProof` (BTC tx + 索引) | Consignment (完整状态转移链 + 附件) |
 
-### 2.3 RGB 客户端验证的必要性
+### 2.3 适配层的边界
 
-与 BTC 不同，RGB 资产转账的"有效性"不能仅通过 BTC 链上数据判断：
+**适配层需要做的**（接触标准 RGB 协议）：
 
-```
-BTC 交易已确认
-      │
-      ▼
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│ 检查 BTC 层面   │     │ 检查 RGB 层面   │     │ 验证结论         │
-│ • 交易在区块中  │     │ • 封印UTXO正确  │     │                 │
-│ • 矿工费合理    │     │ • 状态转移合法  │     │ ✅ 充值有效     │
-│ • 确认数足够    │     │ • 金额正确      │───▶│ ❌ 拒绝充值     │
-│                 │     │ • 无双重支付    │     │                 │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-```
+- 解析 RGB Consignment 数据（strict_types 解码）
+- 识别 RGB20 Schema 的状态转移（提取 USDT 金额和封印 UTXO）
+- 验证 Opret/Tapret commitment 格式
+- 调用 RGB Core 库验证状态转移合法性
+- 跟踪 TSS 地址下的 RGB 封印状态
+
+**适配层不需要做的**（由 rgbx 合约处理）：
+
+- BTC SPV 证明验证
+- OP_RETURN 广播承诺格式验证（rgbx 自己的 `rgbx:withdraw:xxx` 格式）
+- 封装资产的发行、锁定、销毁
+- 跨链状态机管理（Pending → Confirmed）
 
 ---
 
@@ -109,898 +118,742 @@ BTC 交易已确认
 ### 3.1 整体架构
 
 ```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                              Chain33 主链                                      │
-│                                                                               │
-│  ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐ │
-│  │ lightclient 合约      │  │ rgbx 合约             │  │ TSS 网络 (P2P)       │ │
-│  │                      │  │                      │  │                      │ │
-│  │ BTC区块头 (共用)      │  │ CrossChainInfo:      │  │ DKG-1: BTC 密钥组    │ │
-│  │ SPV 验证 (共用)       │  │  ├─ BTC → X.BTC     │  │ DKG-2: RGB_USDT 密钥 │ │
-│  │                      │  │  └─ RGB_USDT → X.RGB_USDT│                  │ │
-│  └──────────────────────┘  └──────────────────────┘  └──────────────────────┘ │
-└───────────────────────────────────────────────────────────────────────────────┘
-
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                              Bitcoin 主链                                      │
-│                                                                               │
-│  ┌──────────────────────────────────────────────────────────────────────┐    │
-│  │                    Neutrino 轻客户端 (官方节点)                         │    │
-│  │                                                                       │    │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                 │    │
-│  │  │ BTC 监听器   │  │ RGB 客户端   │  │ 交易构造器   │                 │    │
-│  │  │ • BTC 充值    │  │ • 状态验证   │  │ • BTC 提现   │                 │    │
-│  │  │ • 区块同步    │  │ • 封印追踪   │  │ • RGB USDT   │                 │    │
-│  │  │              │  │ • Schema 验证│  │   提现构造   │                 │    │
-│  │  └──────────────┘  └──────────────┘  └──────────────┘                 │    │
-│  └──────────────────────────────────────────────────────────────────────┘    │
-│                                                                               │
-│  ┌─────────────────────┐     ┌──────────────────────────┐                     │
-│  │ BTC TSS 地址 (BTC)  │     │ BTC TSS 地址 (RGB_USDT)  │                     │
-│  │ • 存储 BTC 价值     │     │ • 仅存储 BTC 粉尘/手续费 │                     │
-│  │ • 无 RGB 状态       │     │ • 密封 RGB USDT 状态     │                     │
-│  └─────────────────────┘     └──────────────────────────┘                     │
-└───────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                              Chain33 主链                                     │
+│                                                                              │
+│  ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐│
+│  │ lightclient 合约      │  │ rgbx 合约 (不变)      │  │ TSS 网络 (P2P)       ││
+│  │ BTC区块头 (复用)      │  │ BTC SPV验证 (复用)    │  │ DKG-1: BTC 密钥组    ││
+│  │                      │  │ OP_RETURN 承诺 (复用) │  │ DKG-2: RGB20 USDT    ││
+│  └──────────────────────┘  └──────────────────────┘  └──────────────────────┘│
+└──────────────────────────────────────────────────────────────────────────────┘
+                                    ▲
+                                    │ Deposit/Withdraw (与 BTC 桥相同的格式)
+                                    │
+┌───────────────────────────────────┴──────────────────────────────────────────┐
+│                         Neutrino 官方节点 (链下)                               │
+│                                                                              │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                    RGB20 USDT 适配层 (新增)                             │   │
+│  │                                                                       │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                 │   │
+│  │  │ commitment   │  │ state        │  │ seal         │                 │   │
+│  │  │ 解析器       │  │ 验证器       │  │ 追踪器       │                 │   │
+│  │  │ • Opret 解析 │  │ • RGB Core   │  │ • 封印UTXO   │                 │   │
+│  │  │ • Tapret 解析│  │ • RGB20      │  │   索引管理   │                 │   │
+│  │  │ • strict_    │  │   Schema     │  │ • 余额同步   │                 │   │
+│  │  │   types 解码 │  │ • 双重支付   │  │ • 过期检测   │                 │   │
+│  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘                 │   │
+│  │         └─────────────────┼─────────────────┘                         │   │
+│  │                           ▼                                           │   │
+│  │                ┌───────────────────┐                                  │   │
+│  │                │ 翻译为 rgbx 格式   │                                  │   │
+│  │                │ • 金额 (BTC→USDT) │                                  │   │
+│  │                │ • 地址映射        │                                  │   │
+│  │                │ • SPV证明构造     │                                  │   │
+│  │                └───────────────────┘                                  │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─────────────────────┐     ┌──────────────────────────┐                    │
+│  │ 已有: BTC 监听/构造  │     │ 已有: TSS 签名服务        │                    │
+│  │ (btcwallet.go,      │     │ (tss.go, 支持多密钥组)   │                    │
+│  │  bitcoin.go)        │     │                          │                    │
+│  └─────────────────────┘     └──────────────────────────┘                    │
+└──────────────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                           Bitcoin 主链                                        │
+│                                                                              │
+│  ┌─────────────────────────┐     ┌───────────────────────────┐              │
+│  │ BTC TSS 地址            │     │ BTC TSS 地址 (RGB20 USDT)  │              │
+│  │ • 存储 BTC 价值         │     │ • 仅 BTC 粉尘 (封印载体)    │              │
+│  │ • 无 RGB 状态           │     │ • 密封 RGB20 USDT 状态     │              │
+│  └─────────────────────────┘     └───────────────────────────┘              │
+│                                                                              │
+│  RGB20 USDT 的 commitment 格式 (标准 RGB 协议):                               │
+│  ┌─────────────────────────────────────────────────────────────┐            │
+│  │ Opret:  OP_RETURN <rgb_commitment_hash>                     │            │
+│  │ Tapret: Taproot script-path spend with tweaked commitment   │            │
+│  └─────────────────────────────────────────────────────────────┘            │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 模块职责扩展
+### 3.2 模块职责
 
-| 模块 | 原有职责 | 新增职责 |
-|------|---------|---------|
-| **rgbx 合约** | BTC Deposits/Withdraw | 通用化资产类型，支持 RGB_USDT 充提 |
-| **lightclient 合约** | BTC 区块头存储 | 无需变更 |
-| **neutrino 官方节点** | BTC 监听、交易构造、SPV 提交 | RGB 客户端验证、RGB USDT 沉积检测、RGB 提现构造 |
-| **TSS 网络** | BTC 提现签名 | 新增 RGB_USDT 密钥组 DKG，RGB 提现签名 |
+| 模块 | 类型 | 变更 | 职责 |
+|------|------|------|------|
+| **rgbx 合约** | 链上 | 极小改动 | 复用 BTC SPV 验证 + OP_RETURN 广播承诺 + 资产铸造/销毁 |
+| **lightclient 合约** | 链上 | 无变更 | BTC 区块头存储与查询 |
+| **TSS 网络** | P2P | 扩展 | 新增 RGB20 USDT 密钥组 DKG |
+| **RGB20 适配层** | 链下 (新增) | 全新 | 标准 RGB 协议解析、验证、格式翻译 |
+| **neutrino BTC 模块** | 链下 | 微调 | 区分 BTC 和 RGB20 充值的处理分支 |
 
-### 3.3 资产符号体系
+### 3.3 数据流全景
 
 ```
-跨链资产命名规则: <CrossChainAssetPrefix>.<Symbol>
+充值方向 (RGB20 USDT → Chain33):
 
-配置: CrossChainAssetPrefix = "X" (默认)
+BTC 交易 (含 RGB20 commitment)
+    │
+    ▼
+[RGB20 适配层]
+  • 解析 Opret/Tapret commitment
+  • strict_types 解码 Consignment
+  • 比对 RGB20 Schema → 提取 USDT 金额 + 封印 UTXO
+  • 调用 RGB Core 验证库
+    │
+    ▼ (翻译为)
+    │
+[rgbx.Deposit]
+  assetSymbol = "RGB20_USDT"
+  amount      = (从 RGB 状态提取的 USDT 金额)
+  depositAddr = (用户在 OP_RETURN 广播中指定的 Chain33 地址)
+  txProof     = (BTC SPV 证明，与 BTC 桥相同)
 
-┌──────────────────┬──────────────────┬──────────────────────────────┐
-│ 原始资产          │ Chain33 封装资产  │ 说明                          │
-├──────────────────┼──────────────────┼──────────────────────────────┤
-│ BTC              │ X.BTC            │ 已有，BTC 原生币               │
-│ RGB_USDT         │ X.RGB_USDT       │ 新增，RGB 协议上的 USDT        │
-│ (未来扩展)        │ X.XXX            │ 按相同模式扩展                │
-└──────────────────┴──────────────────┴──────────────────────────────┘
+提现方向 (Chain33 → RGB20 USDT):
+
+rgbx.Withdraw → PendingTx
+    │
+    ▼
+[RGB20 适配层]
+  • 查询 TSS 封印 UTXO 列表
+  • 选择封印余额 ≥ 提现金额 的 UTXO
+  • 构造 BTC 交易模板
+  • 生成 RGB20 State Transition (调用 RGB Core)
+  • 嵌入 Opret/Tapret commitment
+  • 嵌入 rgbx 广播承诺 (rgbx:withdraw:xxx，用于链上结算)
+    │
+    ▼
+TSS 签名 → 广播 → 确认 → rgbx.Confirm 结算
 ```
 
 ---
 
-## 4. 核心流程设计
+## 4. RGB20 适配层设计
 
-### 4.1 充值流程 (RGB USDT → Chain33)
+### 4.1 适配层的定位
+
+适配层是一个**纯链下模块**，运行在 neutrion 官方节点进程中。它的职责是架起标准 RGB 协议和 rgbx 合约之间的桥梁：
+
+```
+标准 RGB 协议世界                     rgbx 合约世界
+══════════════════     适配层      ══════════════════
+Consignment (strict)  ──解析──▶   DepositAsset (proto)
+RGB20 Schema          ──匹配──▶   assetSymbol = "RGB20_USDT"
+State Transition      ──提取──▶   amount = 提取的 USDT 数量
+Opret/Tapret commit   ──识别──▶   触发充值处理
+Seal UTXO             ──追踪──▶   对应 TSS PkScript
+```
+
+### 4.2 核心数据结构（适配层内部）
+
+```
+RGB20 Consignment (标准 RGB 协议):
+┌──────────────────────────────────────────────┐
+│ Transition Bundle                             │
+│  ├─ Transition #0                            │
+│  │   ├─ ContractID: rgb:xxx-USDT             │
+│  │   ├─ SchemaID:   rgb:xxx-USDT-Schema      │
+│  │   ├─ Inputs:                              │
+│  │   │   └─ Seal UTXO: txid:vout (旧封印)    │
+│  │   ├─ Assignments:                         │
+│  │   │   ├─ OwnedState (转入的金额)           │
+│  │   │   └─ FungibleToken (USDT 数量)        │
+│  │   └─ Valencies: (新封印 UTXO 列表)         │
+│  │       ├─ {output:0, amount: 500 USDT}     │
+│  │       ├─ {output:1, amount: 300 USDT}     │
+│  │       └─ {output:2, amount: 200 USDT}     │
+│  └─ ...更多 Transitions                       │
+│                                               │
+│  Attachment: (RGB 附件/证明)                   │
+│  └─ 前置 State Transitions 的证明             │
+└──────────────────────────────────────────────┘
+
+适配层提取结果:
+┌──────────────────────────────────────────────┐
+│  • 找到新封印在 output[0] (TSS PkScript)      │
+│  • 该封印对应的 USDT 金额: 500 USDT          │
+│  • 旧封印 UTXO: txid_A:vout_0               │
+│  • 新封印 UTXO: txid_B:vout_0               │
+│  • 广播承诺数据: (用户指定的 chain33 地址)     │
+└──────────────────────────────────────────────┘
+```
+
+### 4.3 RGB Core 集成方式
+
+```
+方案选择:
+
+选项 A: 调用 RGB Proxy (独立进程，gRPC)
+  ✅ 隔离性好，升级 RGB 协议不触及 neutrino
+  ✅ 复用社区 RGB Core 库
+  ❌ 额外运维成本 (多一个进程)
+
+选项 B: 内嵌 RGB Core (通过 CGO/FFI)
+  ✅ 部署简单
+  ❌ 编译复杂 (Rust + Go)
+  ❌ RGB 版本升级需重新编译 neutrino
+
+建议: 选项 A — RGB Proxy 方式
+
+neutrino (Go)                    RGB Proxy (Rust/gRPC)
+─────────────                    ─────────────────────
+rgb20/adapter.go                 rgb-core 库
+  │                                 │
+  ├─ ValidateDeposit() ──gRPC──▶   │
+  │  (传入 BTC tx bytes)          ├─ strict_types 解码
+  │                               ├─ RGB20 Schema 验证
+  │  ◀──gRPC── {valid, amount,   ├─ Seal 一致性检查
+  │             sealUTXO}         └─ 返回验证结果
+```
+
+### 4.4 适配层接口定义
+
+```go
+// rgb20/adapter.go — RGB20 适配层核心接口
+
+// RGB20Adapter 标准 RGB20 协议适配器
+type RGB20Adapter interface {
+    // ParseDepositFromBtcTx 从 BTC 交易中解析 RGB20 USDT 充值
+    // 输入: 已确认的 BTC 交易 + TSS PkScript
+    // 输出: 充值金额 + 新封印 UTXO + 充值目标地址
+    // 返回 error 如果:
+    //   - 交易中无 RGB20 commitment
+    //   - RGB20 Schema 不匹配
+    //   - 状态转移非法
+    //   - 封印不是到 TSS 地址的
+    ParseDepositFromBtcTx(btcTx *wire.MsgTx, tssPkScript []byte) (*RGB20Deposit, error)
+
+    // BuildWithdrawalTx 构造 RGB20 USDT 提现的 BTC 交易
+    // 输入: 提现参数
+    // 输出: 未签名的 BTC 交易 + RGB Consignment + 封印映射
+    BuildWithdrawalTx(params *RGB20WithdrawParams) (*RGB20WithdrawResult, error)
+
+    // GetSealBalance 查询指定 UTXO 封印的 RGB20 USDT 余额
+    GetSealBalance(outPoint wire.OutPoint) (int64, error)
+
+    // ListAvailableSeals 列出所有可用的 TSS 封印及其余额
+    ListAvailableSeals() ([]RGB20Seal, error)
+}
+
+// RGB20Deposit 充值解析结果
+type RGB20Deposit struct {
+    Amount       int64          // USDT 金额 (带精度)
+    NewSealUtxo  wire.OutPoint  // 新封印 UTXO 位置
+    OldSealUtxo  wire.OutPoint  // 被关闭的旧封印
+    DepositAddr  string         // Chain33 目标地址 (从广播承诺提取)
+    ContractID   string         // RGB 合约 ID
+}
+
+// RGB20Seal 封印 UTXO
+type RGB20Seal struct {
+    OutPoint    wire.OutPoint
+    UsdtAmount  int64  // USDT 余额
+    BtcValue    int64  // BTC 粉尘金额
+    Age         int64  // 封印年龄 (区块高度)
+}
+
+// RGB20WithdrawParams 提现参数
+type RGB20WithdrawParams struct {
+    Amount         int64          // 提现 USDT 金额
+    RecipientAddr  string         // 用户 BTC 地址
+    SealUtxo       wire.OutPoint  // 选择的封印 UTXO
+    FeeUtxo        wire.OutPoint  // 手续费 UTXO
+    FeeRate        int64          // sat/vByte
+    Chain33TxHash  []byte         // rgbx 广播承诺数据
+}
+
+// RGB20WithdrawResult 提现构造结果
+type RGB20WithdrawResult struct {
+    UnsignedTx     *wire.MsgTx    // BTC 交易
+    Consignment    []byte         // RGB Consignment 数据
+    BroadcastOpRet []byte         // rgbx 广播承诺 OP_RETURN
+    NewSeal        wire.OutPoint  // 用户侧新封印
+    ChangeSeal     wire.OutPoint  // 找零封印
+}
+```
+
+---
+
+## 5. 核心流程设计
+
+### 5.1 充值流程 (RGB20 USDT → Chain33)
 
 ```
 用户在 RGB 钱包操作
       │
       ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ 1. 构造 BTC 交易 (RGB USDT 转账)                                     │
-│    • Input: 用户当前封印 RGB USDT 的 UTXO                            │
-│    • Output[0]: TSS-RGB_USDT 地址 (新封印，金额=粉尘 546 sat)        │
-│    • Output[1]: OP_RETURN "rgbx:deposit:<assetSymbol>:<chain33Addr>"│
-│    • Output[N]: 找零 (如有，剩余 USDT 的新封印)                       │
-│    • RGB 承诺: 嵌入 RGB 状态转移数据                                  │
-│    • BTC 手续费: 从独立的 BTC UTXO 提供                               │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ BTC 交易 (标准 RGB20 USDT 转账)                               │
+│                                                              │
+│   Inputs:                                                    │
+│     [用户封印 UTXO] + [BTC 手续费 UTXO]                       │
+│                                                              │
+│   Outputs:                                                   │
+│     [TSS-P2WPKH 封印 UTXO]  ← 桥的新封印 (BtcValue=546 sat)  │
+│     [OP_RETURN 广播承诺]     ← 用户补充的 chain33 地址         │
+│     [找零封印 UTXO]          ← 如有                           │
+│                                                              │
+│   Commitment: Opret/Tapret (RGB 标准格式)                     │
+│     → 嵌入 RGB20 State Transition + Consignment              │
+└──────────────────────────────────────────────────────────────┘
       │
-      ▼
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ BTC 网络广播  │───▶│ Neutrino     │───▶│ RGB 客户端   │
-│              │    │ 监听 BTC 交易 │    │ 验证状态转移 │
-└──────────────┘    └──────────────┘    └──────┬───────┘
-                                              │
-                                    ┌─────────▼─────────┐
-                                    │ RGB 验证通过?      │
-                                    │ • Schema 合规     │
-                                    │ • 封印UTXO 正确    │
-                                    │ • 金额正确         │
-                                    │ • 无双重支付       │
-                                    └────────┬──────────┘
-                                             │
-                                    ┌────────▼────────┐
-                                    │ 等待 6 个区块确认│
-                                    └────────┬────────┘
-                                             │
-                                    ┌────────▼──────────────┐
-                                    │ 构造 BTC SPV 证明      │
-                                    │ + 提取 OP_RETURN 数据  │
-                                    │ + 对 TSS 输出金额求和  │
-                                    └────────┬──────────────┘
-                                             │
-                                    ┌────────▼──────────────┐
-                                    │ rgbx.Deposit           │
-                                    │ • assetSymbol=RGB_USDT│
-                                    │ • amount=USDT 金额    │
-                                    │ • depositAddress=     │
-                                    │   chain33地址          │
-                                    │ • BtcTxProof           │
-                                    └────────┬──────────────┘
-                                             │
-                                    ┌────────▼──────────────┐
-                                    │ 铸币 X.RGB_USDT       │
-                                    │ 到指定 Chain33 地址    │
-                                    └──────────────────────┘
+      ▼ BTC 交易广播到网络
+      │
+┌─────▼──────────────────────────────────────────────────────┐
+│ neutrino 节点处理                                            │
+│                                                              │
+│ 1. BTC 监听器检测到 TSS 地址收到新的 UTXO                     │
+│                                                              │
+│ 2. RGB20 适配器解析 BTC 交易:                                 │
+│    ├─ ParseDepositFromBtcTx()                               │
+│    ├─ 检测 commitment 类型 (Opret/Tapret)                     │
+│    ├─ strict_types 解码 Consignment                         │
+│    ├─ 比对 RGB20 Schema: 确认为 USDT 合约                     │
+│    ├─ 提取 Assignment: 转入的 USDT 金额                       │
+│    ├─ 提取 Valency: 新封印 UTXO 对应哪个 output               │
+│    └─ 验证: Schema 合规 + 无双重封印 + 金额一致               │
+│                                                              │
+│ 3. 等待 6 个区块确认                                          │
+│                                                              │
+│ 4. 构造 BTC SPV 证明 (复用现有逻辑)                            │
+│                                                              │
+│ 5. 提交 rgbx.Deposit:                                        │
+│    {                                                         │
+│      assetSymbol:    "RGB20_USDT"                            │
+│      amount:         (RGB 适配器提取的 USDT 金额)             │
+│      depositAddress: (广播承诺中用户指定的 chain33 地址)       │
+│      txProof:        (BTC SPV 证明)                          │
+│    }                                                         │
+│                                                              │
+│ 6. 链上铸币 X.RGB20_USDT 到用户地址                           │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-#### 4.1.1 OP_RETURN 数据格式
+#### 5.1.1 充值 commitment 的双层设计
+
+RGB20 充值交易实际包含两层 commitment：
 
 ```
-充值的 OP_RETURN (兼容原有格式):
-┌──────────┬──────────┬─────────────────────────┐
-│ prefix   │ action   │ payload                 │
-│ "rgbx:"  │"deposit:"│ "<chain33Address>"      │
-└──────────┴──────────┴─────────────────────────┘
-
-带资产类型的 OP_RETURN (新格式):
-┌──────────┬──────────┬──────────────────────────────────────────────┐
-│ prefix   │ action   │ payload                                      │
-│ "rgbx:"  │"deposit:"│ "<assetSymbol>:<chain33Address>"             │
-└──────────┴──────────┴──────────────────────────────────────────────┘
-
-示例:
-  BTC 充值:      "rgbx:deposit:1ABC..."   (兼容旧格式，assetSymbol 默认 BTC)
-  RGB_USDT 充值: "rgbx:deposit:RGB_USDT:1ABC..."
+BTC 交易
+├── RGB 层 commitment (Opret/Tapret)
+│   └── RGB20 Consignment 的 commitment hash
+│       → RGB 适配器解析，获取 USDT 金额和封印信息
+│
+└── 广播层 commitment (OP_RETURN，rgbx 已有格式)
+    └── "rgbx:deposit:RGB20_USDT:<chain33Addr>"
+        → rgbx 合约验证，确定资产类型和收款地址
+        → 格式与 BTC 充值兼容，仅 assetSymbol 不同
 ```
 
-#### 4.1.2 充值金额提取
-
-与 BTC 充值不同，RGB USDT 的金额**不在 BTC 交易输出中**，而在 RGB 状态转移数据中。
-
-```
-BTC 充值 (现有):
-  遍历 btcTx.TxOut → 匹配 PkScript == TSS PkScript → 累加 Value
-
-RGB USDT 充值 (新增):
-  BTC Tx 确认 + SPV 验证通过后
-    → RGB 客户端解析状态转移数据
-    → 提取转入 TSS 封印的 USDT 金额
-    → amount = RGB 状态转移金额 (非 BTC 金额)
-```
-
-**链上验证策略**：由于 Chain33 合约无法运行 RGB 客户端进行完整验证，采用以下分层验证：
-
-| 层级 | 验证内容 | 执行方 |
-|------|---------|--------|
-| **BTC 层 (链上)** | BTC tx 在区块中、Merkle 证明、确认数 | rgbx 合约 |
-| **承诺层 (链上)** | OP_RETURN 格式正确、目标地址有效 | rgbx 合约 |
-| **RGB 层 (链下)** | RGB 状态转移合法、金额正确、无双重支付 | 官方节点 RGB 客户端 |
-| **共识层 (链下)** | 多 guardian 对 RGB 状态转移结果达成共识 | Guardian 网络 |
-
-### 4.2 提现流程 (Chain33 → RGB USDT)
+### 5.2 提现流程 (Chain33 → RGB20 USDT)
 
 ```
 用户调用 rgbx.Withdraw
       │
       ▼
-┌──────────────┐    ┌──────────────────────────────────────────────────┐
-│ rgbx 合约     │───▶│ 创建 PendingTx                                     │
-│ 检查余额      │    │ • assetSymbol = "RGB_USDT" (或缩写)               │
-│ 锁定资产      │    │ • amount = 提现 USDT 数量                          │
-│              │    │ • destinationAddr = 目标 BTC 地址 (接收 RGB 封印)   │
-│              │    │ • feeRate = BTC 手续费率 (sat/vByte)                │
-└──────────────┘    └──────────────────────────────────────────────────┘
+┌──────────────┐    ┌────────────────────────────────────────┐
+│ rgbx 合约     │───▶│ 创建 PendingTx (与 BTC 提现相同结构)     │
+│ 锁定 X.RGB20_ │    │ assetSymbol = "RGB20_USDT"            │
+│ USDT          │    │ amount = 提现 USDT 数量               │
+│              │    │ destinationAddr = 用户 BTC 地址          │
+└──────────────┘    └────────────────────────────────────────┘
       │
       ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│ 官方节点监听到 PendingTx                                               │
-│                                                                      │
-│ 1. 读取 CrossChainInfo 获取 RGB_USDT 的 TSS 地址和 PkScript           │
-│ 2. RGB 客户端查询 TSS 地址下可用的 RGB USDT 封印 UTXO                  │
-│ 3. 选择封印 UTXO 作为 BTC 交易输入                                     │
-│ 4. 构造 BTC 交易:                                                     │
-│                                                                      │
-│    Inputs:                                                           │
-│      [封印 UTXO-A]  -- 当前持有 RGB USDT 的 UTXO (sticky 保护)        │
-│      [手续费 UTXO]  -- 独立的 BTC UTXO，用于支付矿工费                 │
-│                                                                      │
-│    Outputs:                                                          │
-│      [用户 BTC 地址]  -- 新封印，RGB USDT 金额 = 提现金额              │
-│      [找零 TSS 地址]  -- 新封印，剩余 USDT (如有)                      │
-│      [OP_RETURN]      -- "rgbx:withdraw:<chain33TxHash>"             │
-│                                                                      │
-│    RGB 承诺:                                                         │
-│      嵌入 RGB 状态转移数据 (schema + state transition + proof)        │
-│                                                                      │
-│    Sticky 末输入:                                                     │
-│      末输入 = 封印 UTXO (必须保持，防止更换 RGB 封印)                   │
-└──────────────────────────────────────────────────────────────────────┘
-      │
-      ▼
-┌──────────────┐    ┌──────────────────────────────────┐
-│ TSS 阈值签名 │───▶│ 非官方节点验证                     │
-│ (RGB_USDT    │    │ • Sticky 末输入一致               │
-│  密钥组)     │    │ • 输出金额正确                    │
-│              │    │ • OP_RETURN 承诺正确              │
-└──────────────┘    └──────────────────────────────────┘
-      │
-      ▼
-┌──────────────┐    ┌──────────────┐    ┌──────────────────┐
-│ BTC 网络广播  │───▶│ Neutrino     │───▶│ rgbx.Confirm     │
-│              │    │ 监听确认     │    │ • 销毁 X.RGB_USDT │
-│              │    │ (6 个区块)   │    │ • 清理 sticky    │
-└──────────────┘    └──────────────┘    └──────────────────┘
-```
-
-#### 4.2.1 BTC 交易费用处理
-
-RGB USDT 提现交易需要 BTC 手续费，但 RGB USDT 封印 UTXO 的 BTC 价值通常仅含粉尘：
-
-```
 ┌──────────────────────────────────────────────────────────────┐
-│                 RGB USDT 提现 — BTC 手续费来源                  │
-│                                                              │
-│  方案: 独立手续费 UTXO                                        │
-│                                                              │
-│  BTC Inputs:                                                 │
-│  ┌─────────────────────┐  ┌─────────────────────┐            │
-│  │ 封印 UTXO (sticky)  │  │ 手续费 UTXO          │            │
-│  │ value: 546 sat      │  │ value: ≥ 手续费+粉尘 │            │
-│  │ 密封: 1000 USDT     │  │ 无 RGB 状态          │            │
-│  └─────────────────────┘  └─────────────────────┘            │
-│                                                              │
-│  BTC Outputs:                                                │
-│  ┌─────────────────────┐  ┌─────────────────────┐            │
-│  │ 用户 BTC 地址        │  │ TSS 找零             │            │
-│  │ value: 546 sat      │  │ value: 剩余 - fee   │            │
-│  │ 新封印: 500 USDT    │  │ 新封印: 500 USDT    │            │
-│  └─────────────────────┘  └─────────────────────┘            │
-│                                                              │
-│  需要维护一个独立的 "手续费 UTXO 池"                           │
-│  定期从 TSS-BTC 地址向 TSS-RGB_USDT 地址转入小额 BTC           │
+│ neutrino 节点处理                                              │
+│                                                               │
+│ 1. 拉取 PendingTx，识别为 RGB20_USDT 提现                     │
+│                                                               │
+│ 2. RGB20 适配器: ListAvailableSeals()                         │
+│    → 列出所有封印余额 ≥ 提现金额的 UTXO                        │
+│                                                               │
+│ 3. 选择封印 UTXO + 手续费 UTXO                                 │
+│                                                               │
+│ 4. RGB20 适配器: BuildWithdrawalTx()                          │
+│    ├─ 调用 RGB Core 构造 State Transition                    │
+│    │   (Contractum → AluVM → strict_types 编码)              │
+│    ├─ 生成 Opret/Tapret commitment                            │
+│    ├─ 构造 BTC 交易模板:                                      │
+│    │   Inputs:  [封印 UTXO] + [手续费 UTXO]                   │
+│    │   Outputs: [用户封印] + [找零封印] + [OP_RETURN 广播]    │
+│    └─ 生成 rgbx 广播承诺: rgbx:withdraw:chain33Hash           │
+│                                                               │
+│ 5. Sticky 封印保护 (类比 Sticky 末输入):                       │
+│    封印 UTXO 必须固定，重试不可更换                             │
+│                                                               │
+│ 6. TSS 签名 → 广播 BTC 交易 → 等待确认                         │
+│                                                               │
+│ 7. 确认后: 构造 SPV 证明 → 提交 rgbx.Confirm 结算              │
+│    → 合约销毁锁定的 X.RGB20_USDT                               │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-### 4.3 DKG 初始化流程
+### 5.3 rgbx 合约侧的变更
 
-RGB USDT 需要独立的 TSS 密钥组：
+合约层需要的改动非常小：
+
+| 变更点 | 说明 |
+|--------|------|
+| `checkDeposit` 增加资产分支 | `RGB20_USDT` 时，金额验证不检查 BTC 输出金额（USDT 金额来自适配层），仅校验 SPV 证明 + 广播承诺格式 |
+| `validateDepositTxContent` 扩展 | 对 `RGB20_USDT` 跳过 "对 TSS 地址输出累加求和" 的验证（金额已在适配层确认） |
+| 新增 `RGBUSDTSymbol` 常量 | `types/asset.go` 中定义 |
+| **其他均复用** | SPV 验证、OP_RETURN 广播承诺解析、Pending 状态机、Confirm 结算逻辑全部不变 |
+
+---
+
+## 6. 数据流与格式转换
+
+### 6.1 核心转换矩阵
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                 RGB_USDT DKG 初始化流程                           │
-│                                                                  │
-│  1. Guardian 节点协商新的 DKG 会话                                 │
-│     • assetSymbol = "RGB_USDT"                                  │
-│     • 独立的随机种子 (不与 BTC 密钥组关联)                          │
-│                                                                  │
-│  2. DKG 协议执行 (GG18/GG20)                                      │
-│     • 生成 t-of-n 共享公钥                                       │
-│     • 派生 P2WPKH 地址 (TSS-RGB_USDT 收款地址)                    │
-│                                                                  │
-│  3. 各 Guardian 提交 CommitDKG 到 rgbx 合约                       │
-│     rgbx.CommitDKG {                                            │
-│       assetSymbol: "RGB_USDT"                                   │
-│       dkgAddress:  "bc1q..."  // TSS-RGB_USDT 地址               │
-│       pkScript:    0x0014... // P2WPKH 锁定脚本                  │
-│     }                                                            │
-│                                                                  │
-│  4. 全部 Guardian 提交后，合约自动创建 CrossChainInfo              │
-│     CrossChainInfo {                                            │
-│       assetSymbol:   "RGB_USDT"                                 │
-│       wrappedSymbol: "X.RGB_USDT"                               │
-│       tssAddress:    "bc1q..."                                  │
-│       pkScript:      0x0014...                                  │
-│     }                                                            │
-│                                                                  │
-│  5. 跨链桥就绪，可以处理 RGB_USDT 充提                             │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│              适配层：RGB 标准协议 → rgbx 格式的转换                 │
+│                                                                   │
+│  ┌─────────────────────┐          ┌─────────────────────┐         │
+│  │ RGB 标准协议        │          │ rgbx 合约格式        │         │
+│  ├─────────────────────┤          ├─────────────────────┤         │
+│  │ 充值金额来源:        │  转换    │ amount:              │         │
+│  │ Consignment →       │ ──────▶ │  RGB 状态转移提取的   │         │
+│  │ OwnedState →        │         │  USDT 数量            │         │
+│  │ FungibleToken       │         │                      │         │
+│  ├─────────────────────┤          ├─────────────────────┤         │
+│  │ 目标地址:            │  转换    │ depositAddress:      │         │
+│  │ 广播 OP_RETURN 中的  │ ──────▶ │  提取的 chain33 地址   │         │
+│  │ chain33 地址         │         │                      │         │
+│  ├─────────────────────┤          ├─────────────────────┤         │
+│  │ 资产类型识别:         │  转换    │ assetSymbol:         │         │
+│  │ RGB ContractID       │ ──────▶ │  "RGB20_USDT"        │         │
+│  │ == USDT 合约ID       │         │                      │         │
+│  ├─────────────────────┤          ├─────────────────────┤         │
+│  │ 封印 UTXO:           │  转换    │ 链下 Sticky 记录      │         │
+│  │ Valency[0] → vout   │ ──────▶ │ (链上不存储封印信息)   │         │
+│  └─────────────────────┘          └─────────────────────┘         │
+│                                                                   │
+│  rgbx 合约不关心字节是怎么转换的 —— 它只验证 BTC SPV 无误即可       │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 Opret vs Tapret commitment
+
+RGB 标准协议支持两种 commitment 方式：
+
+| | Opret | Tapret |
+|---|---|---|
+| **实现方式** | `OP_RETURN <hash>` | Taproot script-path 调整 |
+| **链上可见性** | 显式 OP_RETURN 输出 | 只在见证数据中出现 |
+| **BTC 交易大小** | ~50 bytes 额外 | ~16 bytes 额外 (更省) |
+| **适配器解析** | 遍历 TxOut 查找 OP_RETURN | 遍历 witness 查找 tapscript |
+| **当前主流** | 兼容性最好 | 隐私性和费用更优 |
+
+适配器需同时支持两种方式，优先检测 Opret，再检测 Tapret。
+
+### 6.3 广播承诺（用户自定 OP_RETURN）
+
+RGB20 充值交易的 BTC 部分还有一个额外的 OP_RETURN（用户自己加的广播承诺），用于指定资产类型和 Chain33 收款地址：
+
+```
+格式:
+  OP_RETURN "rgbx:deposit:<assetSymbol>:<chain33Address>"
+
+示例:
+  OP_RETURN "rgbx:deposit:RGB20_USDT:1ABC..."
+
+  ┌──────────┬────────────┬───────────────────────────────┐
+  │ "rgbx:"  │ "deposit:" │ "RGB20_USDT" : "1ABC..."     │
+  │ 协议前缀 │ 操作类型    │ 资产符号      目标 chain33 地址 │
+  └──────────┴────────────┴───────────────────────────────┘
+
+与 BTC 充值兼容:
+  BTC 充值:      "rgbx:deposit:1ABC..."   (assetSymbol 默认 "BTC")
+  RGB20 充值:    "rgbx:deposit:RGB20_USDT:1ABC..."
+
+解析规则:
+  1. 找到所有 OP_RETURN 输出
+  2. 一个是以 rgbx:deposit: 开头的 → 广播承诺 (rgbx 合约验证用)
+  3. 另一个是 Opret 格式的 → RGB 协议 commitment (适配器解析用)
 ```
 
 ---
 
-## 5. 数据结构变更
+## 7. Neutrino 节点改造
 
-### 5.1 Proto 定义 (rgbx.proto)
-
-#### 5.1.1 新增 RGB 证明结构
-
-```protobuf
-// 新增: RGB 状态转移证明 (链下验证使用，不上链完整数据)
-message rgbStateProof {
-    string contractId    = 1;  // RGB 合约 ID (如 USDT 合约)
-    string schemaId      = 2;  // RGB Schema ID
-    uint32 transitionIdx = 3;  // 状态转移索引
-    bytes  stateData     = 4;  // RGB 状态转移序列化数据
-    bytes  attachment    = 5;  // RGB 附件/证明数据
-    string sealUtxo      = 6;  // 旧封印 UTXO (被关闭的封印)
-    string newSealUtxo   = 7;  // 新封印 UTXO (目标地址的封印)
-}
-```
-
-#### 5.1.2 Deposit 结构扩展 (可选，向后兼容)
-
-```protobuf
-// depositAsset 已有 assetSymbol 字段，无需变更结构
-// 但建议在 OP_RETURN 解析中兼容新旧格式
-message depositAsset {
-    int64      amount         = 1;
-    string     depositAddress = 2;
-    string     assetSymbol    = 3;  // 已有字段: "BTC" | "RGB_USDT"
-    btcTxProof txProof        = 4;
-}
-```
-
-#### 5.1.3 新增 RGB 充值验证辅助消息
-
-```protobuf
-// 新增: Guardian 对 RGB 充值的验证确认
-message rgbDepositConfirmation {
-    string btcTxHash       = 1;  // 对应 BTC 交易哈希
-    string assetSymbol     = 2;  // 资产符号
-    int64  confirmedAmount = 3;  // 确认的 RGB USDT 金额
-    string sealUtxo        = 4;  // 新封印 UTXO 位置
-    int64  timestamp       = 5;  // 确认时间戳
-}
-```
-
-### 5.2 类型常量 (types/asset.go)
-
-```go
-// 新增跨链资产符号常量
-const (
-    BTCSymbol     = "BTC"       // 已有
-    RGBUSDTSymbol = "RGB_USDT"  // 新增: RGB 协议上的 USDT
-)
-```
-
-### 5.3 状态存储扩展 (executor/kv.go)
-
-```
-新增数据库桶:
-├── rgb-deposit-confirmations-    # RGB 充值 guardian 确认
-│   └── key: btcTxHash, value: []rgbDepositConfirmation
-├── rgb-seal-utxo-                # RGB 封印 UTXO 索引
-│   └── key: outPoint, value: {assetSymbol, amount}
-└── rgb-withdraw-sticky-seal      # RGB 提现 sticky 封印
-    └── key: chain33TxHash, value: sealOutPoint
-```
-
-### 5.4 Key 格式化函数
-
-```go
-// 新增 key 格式化
-func formatRgbDepositConfirmationKey(btcTxHash string) []byte {
-    return []byte(rgbDepositConfirmationsPrefix + btcTxHash)
-}
-
-func formatRgbSealUtxoKey(outPoint string) []byte {
-    return []byte(rgbSealUtxoPrefix + outPoint)
-}
-
-func formatRgbStickySealKey(chain33TxHash []byte) []byte {
-    return append([]byte(rgbStickySealPrefix), chain33TxHash...)
-}
-```
-
----
-
-## 6. Neutrino 官方节点改造
-
-### 6.1 新增 RGB 客户端模块
+### 7.1 新增文件结构
 
 ```
 plugin/dapp/lightclient/rpc/lightclient/neutrino/
-├── btcwallet.go        # 已有: BTC 钱包管理
-├── bitcoin.go          # 已有: BTC 官方节点逻辑
-├── tss.go              # 已有: TSS 服务
-├── rgbx.go             # 已有: Pending 交易管理
-├── rpc.go              # 已有: Chain33 RPC
-├── cache.go            # 已有: 内存缓存
-├── client.go           # 已有: 客户端初始化
-├── config.go           # 修改: 添加 RGB 配置
-├── wallet.go           # 已有: 钱包 DB 工具
+├── btcwallet.go        # 已有: BTC 交易监听、OP_RETURN 分类
+├── bitcoin.go          # 修改: 充值处理增加 RGB20 分支
+├── tss.go              # 修改: 签名支持多密钥组
+├── rgbx.go             # 已有: Pending 交易拉取
+├── config.go           # 修改: 添加 RGB20 配置
+├── client.go           # 修改: 初始化 RGB20 适配器
 │
-├── rgb/                # 新增: RGB 客户端模块
-│   ├── client.go       # RGB 客户端封装 (连接 RGB proxy/库)
-│   ├── validate.go     # RGB 状态转移验证
-│   ├── seal.go         # 封印 UTXO 管理与追踪
-│   └── schema.go       # RGB Schema 定义 (USDT)
+├── rgb20/              # 新增: RGB20 适配层
+│   ├── adapter.go      # RGB20Adapter 接口 + 实现
+│   ├── commitment.go   # Opret/Tapret commitment 解析
+│   ├── consignment.go  # strict_types 解码 + Consignment 解析
+│   ├── seal.go         # TSS 封印 UTXO 索引管理
+│   └── proxy.go        # RGB Proxy gRPC 客户端
 │
-├── rgbdeposit.go       # 新增: RGB USDT 充值处理
-└── rgbwithdraw.go      # 新增: RGB USDT 提现处理
+├── rgb20deposit.go     # 新增: RGB20 充值处理器
+├── rgb20withdraw.go    # 新增: RGB20 提现处理器
+└── rgbx/rpc/types.go   # 修改: 新增 RGB20 相关 RPC 类型
+
+### 7.2 充值处理分支
+
+```
+btcwallet.monitorTransactions()
+      │
+      ▼
+analyzeTransaction()
+      │
+      ├── 有输出到 TSS-BTC 地址? → BTC 充值 (已有逻辑)
+      │
+      ├── 有输出到 TSS-RGB20 地址? → 进入 RGB20 分支
+      │       │
+      │       ▼
+      │   rgb20deposit.processRgb20Deposit()
+      │       │
+      │       ├─ rgb20.ParseDepositFromBtcTx()  ← RGB Proxy 调用
+      │       │    • 解析 Opret/Tapret commitment
+      │       │    • 解码 Consignment
+      │       │    • 验证 RGB20 Schema
+      │       │    • 提取 USDT 金额 + 封印 UTXO
+      │       │
+      │       ├─ parseBroadcastOpReturn()       ← 已有的 OP_RETURN 解析
+      │       │    • 提取 assetSymbol 和 chain33 目标地址
+      │       │
+      │       ├─ 等待 6 确认 → buildBtcTxProof() ← 已有逻辑
+      │       │
+      │       └─ submitRgbxDeposit()            ← 已有逻辑(复用)
+      │            deposit.AssetSymbol = "RGB20_USDT"
+      │            deposit.Amount      = 适配器提取的金额
+      │
+      └── 其他 → 忽略或内部操作
 ```
 
-### 6.2 RGB 客户端接口设计
+### 7.3 提现处理分支
 
-```go
-// rgb/client.go — RGB 客户端核心接口
-package rgb
-
-import (
-    "github.com/btcsuite/btcd/wire"
-    "github.com/btcsuite/btcd/chaincfg/chainhash"
-)
-
-// RgbClient RGB 客户端接口
-type RgbClient interface {
-    // ValidateDeposit 验证 RGB 充值交易
-    // 返回: 转入 TSS 封印的 USDT 金额、新封印位置、错误
-    ValidateDeposit(btcTx *wire.MsgTx, tssScript []byte) (*DepositResult, error)
-
-    // BuildWithdrawal 构造 RGB 提现交易 (返回 BTC tx 模板和 RGB 承诺数据)
-    BuildWithdrawal(params *WithdrawalParams) (*WithdrawalResult, error)
-
-    // GetSealBalance 获取指定 UTXO 封印的 RGB 资产余额
-    GetSealBalance(outPoint wire.OutPoint, contractID string) (int64, error)
-
-    // ListSealUtxos 列出 TSS 控制的可用封印 UTXO 及其余额
-    ListSealUtxos(contractID string) ([]SealUtxo, error)
-
-    // VerifyStateTransition 验证 RGB 状态转移的合法性
-    VerifyStateTransition(btcTx *wire.MsgTx, contractID string) error
-}
-
-type DepositResult struct {
-    Amount      int64           // 转入的 USDT 金额
-    NewSeal     wire.OutPoint   // 新封印 UTXO
-    ContractID  string          // RGB 合约 ID
-}
-
-type WithdrawalParams struct {
-    Amount         int64             // 提现 USDT 金额
-    RecipientAddr  string            // 用户 BTC 地址
-    SealUtxo       wire.OutPoint     // 当前封印 UTXO
-    FeeUtxo        wire.OutPoint     // 手续费 UTXO
-    FeeRate        int64             // 费率 (sat/vByte)
-    Chain33TxHash  []byte            // chain33 交易哈希 (用于 OP_RETURN)
-    AssetSymbol    string            // 资产符号
-}
-
-type WithdrawalResult struct {
-    UnsignedTx  *wire.MsgTx     // 未签名的 BTC 交易
-    RgbCommitment []byte        // RGB 承诺数据 (嵌入 OP_RETURN)
-    NewSeal     wire.OutPoint   // 用户侧新封印
-    ChangeSeal  wire.OutPoint   // TSS 找零封印
-}
-
-type SealUtxo struct {
-    OutPoint    wire.OutPoint
-    Amount      int64           // RGB 资产余额
-    BtcValue    int64           // BTC 粉尘金额
-}
+```
+rgbx.pullPendingTx()
+      │
+      ▼
+pendingTx.AssetSymbol == "RGB20_USDT"?
+      │
+      ├── 是 → rgb20withdraw.processRgb20Withdraw()
+      │       │
+      │       ├─ rgb20.ListAvailableSeals()     ← 查询可用封印
+      │       ├─ 选择封印 + 手续费UTXO
+      │       ├─ rgb20.BuildWithdrawalTx()      ← RGB Proxy 构造
+      │       │    • 生成 RGB20 State Transition
+      │       │    • 生成 Opret/Tapret commitment
+      │       │    • 生成广播 OP_RETURN
+      │       ├─ Sticky 封印记录
+      │       ├─ TSS 签名 → 广播
+      │       └─ 确认后: rgbx.Confirm 结算
+      │
+      └── 否 → 进入 BTC 提现逻辑 (已有)
 ```
 
-### 6.3 充值处理流程 (rgbdeposit.go)
-
-```go
-// rgbdeposit.go — RGB USDT 充值处理
-package neutrino
-
-// processRgbDeposit 处理 RGB USDT 充值
-func (n *Neutrino) processRgbDeposit(btcTx *wire.MsgTx, blockInfo *BlockInfo) error {
-    // 1. 解析 OP_RETURN，提取 assetSymbol 和 depositAddress
-    assetSymbol, depositAddr, err := parseRgbDepositOpReturn(btcTx)
-    if err != nil || assetSymbol == "" {
-        return nil // 不是 RGB 充值
-    }
-
-    // 2. 获取该资产的 crossChainInfo (TSS PkScript)
-    info, err := n.getCrossChainInfo(assetSymbol)
-    if err != nil {
-        return err
-    }
-
-    // 3. 检查是否有输出到 TSS 地址 (封印位置)
-    sealOutput := findOutputToScript(btcTx, info.PkScript)
-    if sealOutput < 0 {
-        return fmt.Errorf("no output to TSS address")
-    }
-
-    // 4. RGB 客户端验证状态转移
-    result, err := n.rgbClient.ValidateDeposit(btcTx, info.PkScript)
-    if err != nil {
-        n.log.Error("RGB validation failed", "btcTxHash", btcTx.TxHash(), "err", err)
-        return err
-    }
-
-    // 5. 等待确认数达标
-    if blockInfo.Confirmations < n.cfg.BlockConfirmations {
-        n.cachePendingRgbDeposit(btcTx, blockInfo, result)
-        return nil
-    }
-
-    // 6. 构造 SPV 证明
-    proof, err := n.buildBtcTxProof(btcTx, blockInfo)
-    if err != nil {
-        return err
-    }
-
-    // 7. 提交 deposit 交易到 Chain33
-    deposit := &rtypes.DepositAsset{
-        Amount:         result.Amount,
-        DepositAddress: depositAddr,
-        AssetSymbol:    assetSymbol,
-        TxProof:        proof,
-    }
-    return n.submitDepositTx(deposit)
-}
-```
-
-### 6.4 提现处理流程 (rgbwithdraw.go)
-
-```go
-// rgbwithdraw.go — RGB USDT 提现处理
-package neutrino
-
-// processRgbWithdraw 处理 RGB USDT 提现
-func (n *Neutrino) processRgbWithdraw(pending *rtypes.PendingTx) error {
-    // 1. 获取跨链信息
-    info, err := n.getCrossChainInfo(pending.AssetSymbol)
-    if err != nil {
-        return err
-    }
-
-    // 2. 读取 sticky 记录
-    stickySeal, err := n.loadRgbStickySeal(pending.TxHash)
-    isRetry := (err == nil && stickySeal != nil)
-
-    // 3. 选择封印 UTXO
-    var sealUtxo *SealUtxo
-    if isRetry {
-        // 重试: 使用 sticky 封印
-        sealUtxo = stickySeal
-    } else {
-        // 首次: 选择可用封印 UTXO
-        sealUtxos, err := n.rgbClient.ListSealUtxos(info.AssetSymbol)
-        // 选择封印余额 >= pending.Amount 的 UTXO
-        sealUtxo = selectBestSealUtxo(sealUtxos, pending.Amount)
-    }
-
-    // 4. 选择手续费 UTXO
-    feeUtxo, err := n.selectFeeUtxo(info, pending.FeeRate, estimatedTxSize)
-    if err != nil {
-        return err
-    }
-
-    // 5. 构造提现交易
-    result, err := n.rgbClient.BuildWithdrawal(&rgb.WithdrawalParams{
-        Amount:        pending.Amount,
-        RecipientAddr: pending.TargetAddress,
-        SealUtxo:      sealUtxo.OutPoint,
-        FeeUtxo:       feeUtxo.OutPoint,
-        FeeRate:       pending.FeeRate,
-        Chain33TxHash: pending.TxHash,
-        AssetSymbol:   pending.AssetSymbol,
-    })
-    if err != nil {
-        return err
-    }
-
-    // 6. 记录 sticky 封印 (首次)
-    if !isRetry {
-        n.saveRgbStickySeal(pending.TxHash, sealUtxo)
-    }
-
-    // 7. TSS 签名 (使用 RGB_USDT 密钥组)
-    signedTx, err := n.tssSign(result.UnsignedTx, info.AssetSymbol)
-    if err != nil {
-        n.releaseUtxosExcept(feeUtxo.OutPoint, sealUtxo.OutPoint)
-        return err
-    }
-
-    // 8. 广播到 BTC 网络
-    return n.broadcastTx(signedTx)
-}
-```
-
-### 6.5 配置扩展 (config.go)
+### 7.4 配置扩展
 
 ```toml
-# 新增 RGB 相关配置
-[rgb]
-# RGB 客户端类型: "rgbproxy" | "rgblib" | "mock" (开发用)
-ClientType = "rgbproxy"
-
-# RGB Proxy 地址 (当使用 rgbproxy 时)
-ProxyAddr = "localhost:8080"
-
-# RGB 合约注册
-[rgb.contracts]
-# USDT 合约
-[rgb.contracts.usdt]
-ContractID = "rgb:2dwGxY...-USDT"  # RGB USDT 合约 ID
-SchemaID = "rgb:2dwGxY...-Schema"  # RGB Schema ID
-Precision = 6                      # 精度
-AssetSymbol = "RGB_USDT"           # 对应 Chain33 上的符号
-
-# 手续费 UTXO 池
-[rgb.feePool]
-# 最小手续费 UTXO 数量
-MinFeeUtxos = 10
-# 单个手续费 UTXO 推荐金额 (sat)
-TargetUtxoAmount = 100000
-# 从 BTC TSS 转入的阈值 (低于此数量自动补充)
-RefillThreshold = 5
-```
-
----
-
-## 7. 安全模型
-
-### 7.1 扩展的威胁矩阵
-
-在原 BTC 跨链桥威胁矩阵基础上新增:
-
-| 威胁 | 攻击者 | 影响 | 防护措施 | 残余风险 |
-|------|--------|------|---------|---------|
-| **RGB 状态伪造** | 充值用户 | 无成本获得 wrapped USDT | 官方节点 RGB 客户端验证 | RGB 客户端实现漏洞 |
-| **封印UTXO 替换** | 官方节点 | 提现双花 | Sticky 封印机制+TSS 多节点验证 | 官方+TSS 多数共谋 |
-| **RGB Schema 不兼容** | 合约升级 | 状态无法解析 | Schema 版本锁定+版本协商 | Schema 迁移期不一致 |
-| **BTC 手续费不足** | 运营失误 | 提现交易无法确认 | 手续费 UTXO 池监控+自动补充 | 极端费率波动 |
-| **封印 UTXO 粉尘被花费** | 第三方矿工 | RGB 封印破裂 | 封印 UTXO 金额≥546 sat，标记不要花费 | BTC 全节点策略变更 |
-
-### 7.2 充值安全分层
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   RGB USDT 充值验证分层                           │
-│                                                                  │
-│  Layer 1: BTC 链上验证 (rgbx 合约)                                │
-│  ├─ BTC 交易在区块中 (SPV Merkle 证明)                            │
-│  ├─ 区块头已提交到 lightclient                                    │
-│  ├─ 确认数 ≥ 6 个区块                                             │
-│  └─ OP_RETURN 格式正确, 目标地址有效                               │
-│                                                                  │
-│  Layer 2: RGB 链下验证 (官方节点)                                  │
-│  ├─ RGB 状态转移的封印UTXO正确                                      │
-│  ├─ RGB Schema 合规                                              │
-│  ├─ 转移金额符合 RGB 合约逻辑                                      │
-│  └─ 封印 UTXO 未被前置花费 (无双重封印)                             │
-│                                                                  │
-│  Layer 3: Guardian 共识 (多节点)                                   │
-│  ├─ 多个 guardian 独立运行 RGB 客户端验证                          │
-│  ├─ 充值需要 ≥ t 个 guardian 确认 (与 TSS 阈值一致)                │
-│  └─ 任一 guardian 拒绝 → 充值被阻止                               │
-│                                                                  │
-│  全部通过 → 提交 deposit 交易 → 铸币                              │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 7.3 Sticky 封印机制 (类比 Sticky 末输入)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                 RGB Sticky 封印机制                               │
-│                                                                  │
-│  关键原则: 同一提现请求的所有重试必须复用同一个封印 UTXO            │
-│                                                                  │
-│  首次构造:                                                        │
-│  ┌────────────────────────────────────────────┐                 │
-│  │ 1. 从可用封印 UTXO 中选择封印余额 ≥ 提现金额  │                 │
-│  │ 2. 记录 sticky 封印:                        │                 │
-│  │    chain33TxHash → {sealOutPoint, amount}   │                 │
-│  │ 3. 锁定该封印 UTXO (其他提现不可用)          │                 │
-│  └────────────────────────────────────────────┘                 │
-│                                                                  │
-│  重试/失败:                                                       │
-│  ┌────────────────────────────────────────────┐                 │
-│  │ 1. 读取 sticky 封印记录                      │                 │
-│  │ 2. 必须使用相同的封印 UTXO 作为输入           │                 │
-│  │ 3. 其他输入 (手续费 UTXO) 可更换              │                 │
-│  │ 4. OR_RETURN 输出必须包含相同的 chain33Hash  │                 │
-│  └────────────────────────────────────────────┘                 │
-│                                                                  │
-│  TSS 签名验证 (非官方节点):                                        │
-│  ┌────────────────────────────────────────────┐                 │
-│  │ 1. 检查待签名交易的 input[last] == sticky封印│                 │
-│  │ 2. 检查封印 UTXO 未被其他交易花费             │                 │
-│  │ 3. 检查 OP_RETURN 承诺数据正确               │                 │
-│  │ 4. 不一致 → 拒绝签名                         │                 │
-│  └────────────────────────────────────────────┘                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 7.4 BTC 费用管理安全
-
-RGB USDT 封印 UTXO 的 BTC 价值通常仅含 546 sat (粉尘限制)。提现交易的手续费需要独立的 BTC 来源：
-
-```
-手续费 UTXO 池管理:
-┌─────────────────────────────────────────────────────────────────┐
-│  1. 资金来源:                                                     │
-│     • 初始: 从 TSS-BTC 地址转入一批小额 BTC UTXO 到 TSS-RGB_USDT  │
-│     • 持续: 定期监控 UTXO 池余额，低于阈值自动补充                 │
-│                                                                  │
-│  2. 安全约束:                                                     │
-│     • 手续费 UTXO 与封印 UTXO 严格区分 (标记 + 独立密钥可选)       │
-│     • 单次提现最多使用 1 个手续费 UTXO + 1 个封印 UTXO             │
-│     • 手续费 UTXO 不可作为封印 UTXO (无 RGB 状态)                  │
-│                                                                  │
-│  3. 监控告警:                                                     │
-│     • 手续费 UTXO 数量 < MinFeeUtxos → 告警                       │
-│     • 所有手续费 UTXO 总额 < 预期月消耗 → 严重告警                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 8. 配置与部署
-
-### 8.1 官方节点配置
-
-```toml
-[rgbx]
-# 通用配置
-CommitAddress = "1CcmeX..."
-
-# 跨链资产前缀
-CrossChainAssetPrefix = "X"
-
-# Guardian 平行链
-GuardianParachainTitle = "user.p.rgbxguardians."
-
 [neutrino]
-# 已有配置
 IsOfficialNode = true
-BtcHeaderStartHeight = 840000
 BlockConfirmations = 6
 
-# RGB 配置
-[neutrino.Rgb]
-# RGB 客户端类型
-ClientType = "rgbproxy"    # rgbproxy | rgblib | mock
-# RGB Proxy 地址
-ProxyAddr = "127.0.0.1:8080"
-# RGB 数据目录 (当使用内置 RGB 库时)
-DataDir = "./rgb_data"
-
-# RGB 合约配置
-[neutrino.Rgb.Contracts.USDT]
-ContractID = "rgb:2dwGxY...-USDT"
-SchemaID = "rgb:2dwGxY...-USDT-Schema"
-Precision = 6
-AssetSymbol = "RGB_USDT"
-MinConfirmations = 6
-
-# 手续费 UTXO 池
-[neutrino.Rgb.FeePool]
-MinFeeUtxos = 10
-TargetUtxoAmount = 100000
-RefillThreshold = 5
-
-# RGB_USDT TSS 配置 (可以复用 BTC TSS 的对等节点)
-[neutrino.Tss.RGB_USDT]
+# BTC 桥 (已有)
+[neutrino.Tss.BTC]
 Peers = ["node1", "node2", "node3", "node4", "node5"]
 Threshold = 3
-Rank = 0
-```
 
-### 8.2 部署前提
+# RGB20 USDT 桥 (新增)
+[neutrino.Tss.RGB20_USDT]
+Peers = ["node1", "node2", "node3", "node4", "node5"]
+Threshold = 3
 
-1. **RGB Proxy 部署**: 每个官方节点需运行 RGB Proxy (或内置 RGB 库)
-2. **RGB 合约注册**: 确认 RGB USDT 的 ContractID 和 SchemaID
-3. **手续费 UTXO 初始化**: 首次部署需从 TSS-BTC 转入至少 0.01 BTC 到 TSS-RGB_USDT 地址
-4. **DKG 完成**: 全部 guardian 完成 RGB_USDT 的 DKG 流程
+# RGB20 适配层配置 (新增)
+[neutrino.RGB20]
+# RGB Proxy 地址 (每个官方节点运行一个 RGB Proxy)
+ProxyAddr = "127.0.0.1:8080"
+# 或使用内嵌库 (需 CGO/Rust 交叉编译)
+# LibraryPath = "/usr/local/lib/librgb.so"
 
-### 8.3 部署拓扑
+# 注册要支持的 RGB 合约
+[[neutrino.RGB20.Contracts]]
+ContractID = "rgb:2dwGxY...-USDT"       # RGB 合约 ID
+SchemaType = "RGB20"                     # Schema 类型
+AssetSymbol = "RGB20_USDT"               # Chain33 上的符号
+Precision   = 6                          # USDT 精度
+# 该合约对应的链上 TSS 信息 (需和 CommitDKG 一致)
+TssCrossChainKey = "RGB20_USDT"
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                   RGB USDT 桥部署拓扑                             │
-│                                                                  │
-│  每个官方节点运行:                                                 │
-│  ┌──────────────────────────────────────────┐                   │
-│  │  Chain33 节点                             │                   │
-│  │  ├─ rgbx 合约                             │                   │
-│  │  ├─ lightclient 合约                      │                   │
-│  │  └─ TSS 服务 (BTC + RGB_USDT 两组密钥)     │                   │
-│  │                                          │                   │
-│  │  Neutrino 服务                            │                   │
-│  │  ├─ BTC 监听器                            │                   │
-│  │  ├─ RBG 客户端 (连接 RGB Proxy)            │                   │
-│  │  ├─ 充值处理器 (BTC + RGB_USDT)           │                   │
-│  │  └─ 提现处理器 (BTC + RGB_USDT)           │                   │
-│  │                                          │                   │
-│  │  RGB Proxy (独立进程)                      │                   │
-│  │  ├─ RGB 合约引擎                           │                   │
-│  │  ├─ 状态存储 (本地文件)                     │                   │
-│  │  └─ gRPC API                             │                   │
-│  └──────────────────────────────────────────┘                   │
-│                                                                  │
-│  推荐: 3 官方节点 + 4 非官方节点, 阈值 = 5                         │
-│  RGB 客户端容量: 每个官方节点独立运行 RGB Proxy                    │
-└─────────────────────────────────────────────────────────────────┘
+# 手续费 UTXO 池
+[neutrino.RGB20.FeePool]
+MinUtxos = 10
+TargetAmount = 100000
+RefillThreshold = 5
 ```
 
 ---
 
-## 9. 代码变更清单
+## 8. 安全模型
 
-### 9.1 Phase 1: 基础框架 (合约层通用化)
+### 8.1 威胁矩阵
 
-| 文件 | 变更类型 | 内容 |
-|------|---------|------|
-| `types/asset.go` | 修改 | 添加 `RGBUSDTSymbol` 常量 |
-| `executor/checktx.go` | 修改 | `checkDeposit` 支持 `RGB_USDT` 资产符号的 OP_RETURN 解析 |
-| `executor/validate_proof.go` | 修改 | `validateDepositTxContent` 支持非 BTC 资产的金额验证逻辑分支 |
-| `executor/kv.go` | 新增 | RGB 相关 key 格式化函数 |
-| `proto/rgbx.proto` | 新增 | `rgbStateProof`、`rgbDepositConfirmation` 消息 |
+| 威胁 | 攻击者 | 影响 | 防护 | 残余风险 |
+|------|--------|------|------|---------|
+| **伪造 RGB20 充值** | 用户 | 骗取 wrapped USDT | RGB Core 验证 + Guardian 多节点确认 | RGB Core 0day |
+| **篡改 USDT 金额** | 用户 | 少转多报 | 适配器严格从 Consignment 提取 | 适配器解析 bug |
+| **双花同一封印** | 用户 | 同一 RGB 状态充值两次 | Seal 追踪器查重 + BTC SPV | 链重组 |
+| **封印 UTXO 替换** | 官方节点 | 提现双花 | Sticky 封印 + TSS 多节点验证 | 官方+TSS 多数共谋 |
+| **RGB Schema 升级** | 协议演进 | 旧版适配器无法解析 | Schema 版本白名单 | 过渡期不一致 |
+| **Commitment 伪造** | 用户 | 非 RGB20 交易被识别为充值 | contractID 精确匹配 | 适配器配置错误 |
+| **手续费不足** | 运营 | 提现无法确认 | 手续费 UTXO 池自动补充 | 极端费率 |
 
-### 9.2 Phase 2: Neutrino 节点改造
+### 8.2 分层验证模型
 
-| 文件 | 变更类型 | 内容 |
-|------|---------|------|
-| `neutrino/config.go` | 修改 | 添加 `RgbConfig` 结构体 |
-| `neutrino/client.go` | 修改 | 初始化 RGB 客户端 |
-| `neutrino/rgb/client.go` | 新增 | RGB 客户端接口与实现 |
-| `neutrino/rgb/validate.go` | 新增 | RGB 状态转移验证逻辑 |
-| `neutrino/rgb/seal.go` | 新增 | 封印 UTXO 管理与追踪 |
-| `neutrino/rgbdeposit.go` | 新增 | RGB USDT 充值监听与处理 |
-| `neutrino/rgbwithdraw.go` | 新增 | RGB USDT 提现构造与处理 |
-| `neutrino/bitcoin.go` | 修改 | 区分 BTC 和 RGB USDT 的充值/提现处理 |
+```
+Layer 1 (链上, rgbx 合约):
+  ✅ BTC SPV Merkle 证明
+  ✅ 广播 OP_RETURN 格式
+  ✅ 确认数 ≥ 6
+  ✅ 防重放 (depositUsedKey)
 
-### 9.3 Phase 3: TSS 集成
+Layer 2 (链下, RGB20 适配器):
+  ✅ Opret/Tapret commitment 解析成功
+  ✅ Consignment strict_types 解码成功
+  ✅ ContractID 匹配已注册的 USDT 合约
+  ✅ RGB20 Schema 验证通过 (AluVM)
+  ✅ 封印 UTXO 到 TSS 地址
+  ✅ 封印 UTXO 未被其他充值使用
 
-| 文件 | 变更类型 | 内容 |
-|------|---------|------|
-| `neutrino/tss.go` | 修改 | 支持多密钥组 (按 assetSymbol 索引) |
-| `neutrino/rpc.go` | 修改 | 新增 RGB 相关 RPC 接口 |
+Layer 3 (链下, Guardian 共识):
+  ✅ 多个 Guardian 独立运行适配器验证
+  ✅ ≥ t 个确认才提交 Deposit
+```
 
-### 9.4 Phase 4: 测试与部署
+### 8.3 与 BTC 桥的安全差异
 
-| 文件 | 变更类型 | 内容 |
-|------|---------|------|
-| `executor/crosschain_test.go` | 修改 | 添加 RGB_USDT 充提测试用例 |
-| `executor/validate_proof_test.go` | 修改 | 添加 RGB 充值验证测试 |
-| `cmd/ci/docker-compose.yml` | 修改 | 添加 RGB Proxy 容器 |
-| `cmd/ci/Dockerfile` | 修改 | 添加 RGB 客户端依赖 |
+| | BTC 桥 | RGB20 桥 |
+|---|---|---|
+| **链上金额验证** | ✅ 验证 TSS 输出金额 | ⚠️ 链上无法验证（金额在 RGB 状态） |
+| **链下金额验证** | 不需要 | ✅ RGB Core 验证（适配层） |
+| **多签确认充值** | 不需要（链上已验证） | ✅ 需要 ≥ t 个 guardian 确认 |
+| **总信任模型** | 信任 BTC PoW | 信任 BTC PoW + RGB Core + Guardian 多数 |
 
-### 9.5 兼容性
-
-- **向后兼容**：现有 BTC 桥功能完全不受影响
-- **Proto 兼容**：新增字段使用 protobuf 标准扩展，不影响已有消息解析
-- **API 兼容**：现有 RPC 接口不变，新增 RGB 专用接口
-- **数据库兼容**：新增存储桶，不修改已有桶结构
+关键差异：BTC 桥的**金额是链上可验证的**，RGB20 桥的**金额只能在链下验证**。因此 RGB20 桥**必须额外依赖 Guardian 多签确认充值金额**。
 
 ---
 
-## 附录 A: OP_RETURN 数据格式规范
+## 9. 配置与部署
 
-### 充值 OP_RETURN
+### 9.1 部署前提
 
-```
-格式: 0x6a <len> "rgbx:deposit:[<assetSymbol>:]<chain33Address>"
+1. **RGB Proxy 部署**：每个官方节点服务器上运行 RGB Proxy（连接 Bitcoin Core + RGB Core 库）
+2. **RGB 合约注册**：配置要支持的 RGB20 USDT 的 ContractID、SchemaID、精度
+3. **RGB20 DKG 完成**：Guardian 完成 RGB20_USDT 的 TSS 密钥生成
+4. **手续费 UTXO 初始化**：从 TSS-BTC 地址转入一笔 BTC 到 TSS-RGB20 地址作为手续费池
+5. **广播承诺规范约定**：用户充值时需附带 `rgbx:deposit:RGB20_USDT:<addr>` 的 OP_RETURN
 
-BTC 充值 (兼容现有):
-  OP_RETURN = 0x6a 0x30 726762783a6465706f7369743a31416263...
-  解码: "rgbx:deposit:1Abc..."
-
-RGB_USDT 充值 (新格式):
-  OP_RETURN = 0x6a 0x3a 726762783a6465706f7369743a5247425f555344543a31416263...
-  解码: "rgbx:deposit:RGB_USDT:1Abc..."
-
-解析规则:
-  1. 检查前缀 "rgbx:deposit:"
-  2. 按 ":" 分割 payload
-  3. 如果 segments == 1: assetSymbol = "BTC", depositAddr = segments[0]
-  4. 如果 segments == 2: assetSymbol = segments[0], depositAddr = segments[1]
-```
-
-### 提现 OP_RETURN
+### 9.2 部署拓扑
 
 ```
-格式: 0x6a <len> "rgbx:withdraw:<chain33TxHash>"
+每个官方节点:
+┌──────────────────────────────────────────────┐
+│                                              │
+│  Chain33 节点                                 │
+│  ├─ rgbx 合约                                 │
+│  ├─ lightclient 合约                          │
+│  └─ TSS 服务 (BTC 密钥组 + RGB20 密钥组)       │
+│                                              │
+│  Neutrino 服务                                │
+│  ├─ BTC 监听器 (已有)                          │
+│  ├─ BTC 交易构造器 (已有)                       │
+│  ├─ RGB20 适配层 (新增) ───gRPC───▶           │
+│  │                                    RGB Proxy
+│  ├─ RGB20 充值处理器 (新增)             (独立进程)
+│  └─ RGB20 提现处理器 (新增)              Rust 实现
+│                                          ├─ RGB Core 库
+│  Bitcoin Core / Neutrino                 ├─ strict_types 编解码
+│  (BTC P2P 网络同步)                       ├─ AluVM 虚拟机
+│                                          └─ RGB20 Schema
+└──────────────────────────────────────────────┘
 
-统一格式 (所有资产):
-  chain33TxHash = 32 字节交易哈希的十六进制编码
-
-注意: 提现的 assetSymbol 由 chain33TxHash 对应的 PendingTx 记录确定，
-      不需要在 OP_RETURN 中重复编码。
+推荐: 3 官方节点 + 4 非官方节点, 阈值 = 5
+每个官方节点独立运行 RGB Proxy
 ```
 
 ---
 
-## 附录 B: 参考资源
+## 10. 代码变更清单
+
+### 10.1 Phase 1: rgbx 合约层微调
+
+| 文件 | 变更 | 内容 |
+|------|------|------|
+| `types/asset.go` | 修改 | 添加 `RGB20USDTSymbol = "RGB20_USDT"` |
+| `executor/checktx.go` | 修改 | `checkDeposit` 对 `RGB20_USDT` 跳过 BTC 输出金额校验（金额在适配层验证） |
+| `executor/validate_proof.go` | 修改 | `validateDepositTxContent` 增加资产类型分支 |
+| `proto/rgbx.proto` | 修改 | OP_RETURN 解析兼容 `assetSymbol:addr` 格式 |
+
+### 10.2 Phase 2: RGB20 适配层（全新）
+
+| 文件 | 内容 |
+|------|------|
+| `neutrino/rgb20/adapter.go` | RGB20Adapter 接口 + RGB Proxy 调用实现 |
+| `neutrino/rgb20/commitment.go` | Opret/Tapret commitment 检测与解析 |
+| `neutrino/rgb20/consignment.go` | strict_types 解码、Consignment 遍历、金额提取 |
+| `neutrino/rgb20/seal.go` | TSS 封印 UTXO 索引管理（DB 存储） |
+| `neutrino/rgb20/proxy.go` | RGB Proxy gRPC 客户端封装 |
+| `neutrino/rgb20deposit.go` | RGB20 充值监听、验证、Deposit 提交 |
+| `neutrino/rgb20withdraw.go` | RGB20 提现构造、Sticky 封印、Confirm 结算 |
+
+### 10.3 Phase 3: 已有模块扩展
+
+| 文件 | 变更 | 内容 |
+|------|------|------|
+| `neutrino/config.go` | 修改 | 添加 `RGB20Config` |
+| `neutrino/client.go` | 修改 | 初始化 RGB20 适配器 |
+| `neutrino/bitcoin.go` | 修改 | 充值处理增加 RGB20 分支调度 |
+| `neutrino/tss.go` | 修改 | 多密钥组索引（按 assetSymbol 区分签名会话） |
+| `neutrino/btcwallet.go` | 修改 | OP_RETURN 分类增加 `RGB20_USDT` 识别 |
+
+### 10.4 Phase 4: 测试与部署
+
+| 文件 | 内容 |
+|------|------|
+| `executor/crosschain_test.go` | RGB20 充提测试 |
+| `neutrino/rgb20/adapter_test.go` | 适配器单元测试 (mock RGB Proxy) |
+| `cmd/ci/docker-compose.yml` | 测试环境增加 RGB Proxy 容器 |
+
+---
+
+## 附录 A: RGB 协议参考资料
 
 - RGB 协议规范: [https://rgb.tech/](https://rgb.tech/)
-- RGB 开发者文档: [https://docs.rgb.tech/](https://docs.rgb.tech/)
-- RGB Proxy: [https://github.com/RGB-Tools/rgb-proxy](https://github.com/RGB-Tools/rgb-proxy)
-- 现有 BTC 桥技术文档: [TECHNICAL.md](./TECHNICAL.md)
-- GG18/GG20 阈值签名论文: "Fast Multiparty Threshold ECDSA"
+- LNP/BP 标准协会: [https://www.lnp-bp.org/](https://www.lnp-bp.org/)
+- RGB Core (Rust): [https://github.com/RGB-WG/rgb-core](https://github.com/RGB-WG/rgb-core)
+- RGB20 Schema 规范: RGB 同质化代币标准接口
+- RGB Proxy: 社区维护的 RGB Core gRPC 服务封装
+- AluVM: RGB 智能合约虚拟机 [https://www.aluvm.org/](https://www.aluvm.org/)
+
+## 附录 B: 与 rgbx 协议的差异总结
+
+```
+             rgbx (已有)              RGB 标准协议 (需适配)
+             ─────────                ───────────────────
+代币定义       proto MintAsset           Contractum RGB20 Schema
+状态编码       protobuf                  strict_types
+承诺格式       rgbx:deposit:xxx          Opret / Tapret
+验证引擎       Go 合约定制逻辑            AluVM 字节码
+资产溯源       genesisOut UTXO           Genesis State Transition
+转移证明       UtxoSpendingProof         Consignment + Attachment
+
+适配层的本质: 做 strict_types → protobuf 的语义翻译
+```
 
 ---
 
