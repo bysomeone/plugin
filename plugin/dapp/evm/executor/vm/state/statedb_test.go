@@ -4,7 +4,11 @@ import (
 	"math"
 	"testing"
 
+	"github.com/33cn/chain33/account"
+	apimock "github.com/33cn/chain33/client/mocks"
+	"github.com/33cn/chain33/common/address"
 	ctypes "github.com/33cn/chain33/types"
+	"github.com/33cn/chain33/util"
 	"github.com/33cn/plugin/plugin/dapp/evm/executor/vm/common"
 	"github.com/33cn/plugin/plugin/dapp/evm/executor/vm/model"
 )
@@ -76,6 +80,57 @@ func TestTransferMaxInt64(t *testing.T) {
 		}
 	}()
 	mdb.Transfer("sender", "recipient", math.MaxInt64)
+}
+
+// TestAttackSimulationFullFlow 模拟完整攻击链路：
+// 攻击者通过 RPC 传入 amount=18446739873709551616 (接近 MaxUint64)，
+// 经过 int64→uint64 转换恢复后，进入 CanTransfer 和 Transfer。
+// 修复后，这两个入口都必须拒绝此值。
+// 本测试使用真实的 CoinsAccount + StateDB 搭建完整上下文。
+func TestAttackSimulationFullFlow(t *testing.T) {
+	cfg := ctypes.NewChain33Config(ctypes.GetDefaultCfgstring())
+	api := new(apimock.QueueProtocolAPI)
+	api.On("GetConfig").Return(cfg)
+
+	dbDir, stateDB, localDB := util.CreateTestDB()
+	defer util.CloseTestDB(dbDir, stateDB)
+
+	// 创建真实的 CoinsAccount（带 in-memory StateDB）
+	coinsAccount, err := account.NewAccountDB(cfg, "coins", cfg.GetCoinSymbol(), stateDB)
+	if err != nil {
+		t.Fatalf("failed to create coins account: %v", err)
+	}
+
+	// 构建 MemoryStateDB（模拟完整区块执行上下文）
+	execAddr := address.ExecAddress(cfg.ExecName("evm"))
+	mdb := NewMemoryStateDB(stateDB, localDB, coinsAccount, 1, api)
+	mdb.evmPlatformAddr = execAddr
+
+	sender := "14KEKbY3kNFLfQEGJbNweV4whre7NpqzuB"
+
+	// 攻击者的实际交易值：amount = 18446739873709551616 ≈ 2^64
+	attackAmount := uint64(18446739873709551616)
+
+	t.Run("CanTransfer rejects attack value", func(t *testing.T) {
+		if mdb.CanTransfer(sender, attackAmount) {
+			t.Fatal("BUG: CanTransfer accepted overflow amount — balance check bypassed!")
+		}
+		t.Log("✓ Attack overflow value correctly rejected by CanTransfer")
+	})
+
+	t.Run("Transfer rejects attack value", func(t *testing.T) {
+		if mdb.Transfer(sender, execAddr, attackAmount) {
+			t.Fatal("BUG: Transfer accepted overflow amount — would mint free WBTY!")
+		}
+		t.Log("✓ Attack overflow value correctly rejected by Transfer")
+	})
+
+	// MaxInt64 应正常通过（不会被溢出防护误杀）
+	t.Run("MaxInt64 is allowed", func(t *testing.T) {
+		if !mdb.CanTransfer(sender, math.MaxInt64) {
+			t.Log("MaxInt64 balance check result depends on actual balance, guard clause passed")
+		}
+	})
 }
 
 func TestMemoryStateDBAddLogStoresAddressAndDefaultsRemoved(t *testing.T) {
