@@ -230,7 +230,11 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 	snapshot = evm.StateDB.Snapshot()
 	to := AccountRef(addr)
 	// 向合约地址转账
-	evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value)
+	if value > 0 && !evm.Transfer(evm.StateDB, caller.Address(), to.Address(), value) {
+		log.Error("evm call transfer failed", "caller", caller.Address().String(), "to", to.Address().String(), "value", value)
+		evm.StateDB.RevertToSnapshot(snapshot)
+		return nil, snapshot, gas, model.ErrInsufficientBalance
+	}
 	log.Info("evm call", "caller address", caller.Address().String(), "contract address", to.Address().String(), "value", value)
 	// 从ForkV20EVMState开始，状态数据存储发生变更，需要做数据迁移
 	cfg := evm.StateDB.GetConfig()
@@ -481,7 +485,11 @@ func (evm *EVM) Create(caller ContractRef, contractAddr common.Address, code []b
 		return nil, -1, gas, err
 	}
 
-	evm.Transfer(evm.StateDB, caller.Address(), contractAddr, value)
+	// 向合约地址转账
+	if value > 0 && !evm.Transfer(evm.StateDB, caller.Address(), contractAddr, value) {
+		log.Error("evm create transfer failed", "caller", caller.Address().String(), "contractAddr", contractAddr.String(), "value", value)
+		return nil, -1, gas, model.ErrInsufficientBalance
+	}
 
 	// 创建新的合约对象，包含双方地址以及合约代码，可用Gas信息
 	var bigValue = new(big.Int).SetUint64(value)

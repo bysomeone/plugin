@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	tokenty "github.com/33cn/plugin/plugin/dapp/token/types"
@@ -127,13 +128,17 @@ func (mdb *MemoryStateDB) addChange(entry DataChange) {
 // SubBalance 从外部账户地址扣钱（钱其实是打到合约账户中的）
 func (mdb *MemoryStateDB) SubBalance(addr, caddr string, value uint64) {
 	res := mdb.Transfer(addr, caddr, value)
-	log15.Debug("transfer result", "from", addr, "to", caddr, "amount", value, "result", res)
+	if !res {
+		log15.Error("SubBalance transfer failed", "from", addr, "to", caddr, "amount", value)
+	}
 }
 
 // AddBalance 向外部账户地址打钱（钱其实是外部账户之前打到合约账户中的）
 func (mdb *MemoryStateDB) AddBalance(addr, caddr string, value uint64) {
 	res := mdb.Transfer(caddr, addr, value)
-	log15.Debug("transfer result", "from", addr, "to", caddr, "amount", value, "result", res)
+	if !res {
+		log15.Error("AddBalance transfer failed", "from", caddr, "to", addr, "amount", value)
+	}
 }
 
 // GetBalance ...
@@ -439,6 +444,15 @@ func (mdb *MemoryStateDB) GetChangedData(version int) (kvSet []*types.KeyValue, 
 
 // CanTransfer 借助coins执行器进行转账相关操作
 func (mdb *MemoryStateDB) CanTransfer(sender string, amount uint64) bool {
+	// 防止 uint64 → int64 溢出绕过余额检查
+	if amount > math.MaxInt64 {
+		return false
+	}
+	value := int64(amount)
+	if value <= 0 {
+		return false
+	}
+
 	var senderAcc *types.Account
 	conf := types.ConfSub(mdb.api.GetConfig(), evmtypes.ExecutorName)
 	ethMapFromExecutor := conf.GStr("ethMapFromExecutor")
@@ -450,7 +464,7 @@ func (mdb *MemoryStateDB) CanTransfer(sender string, amount uint64) bool {
 	}
 	log15.Info("CanTransfer", "balance", senderAcc.Balance, "sender", sender, "evmPlatformAddr", mdb.evmPlatformAddr)
 
-	return senderAcc.Balance >= int64(amount)
+	return senderAcc.Balance >= value
 }
 
 // TransferType 定义转账类型
@@ -476,6 +490,11 @@ func (mdb *MemoryStateDB) Transfer(sender, recipient string, amount uint64) bool
 		err error
 	)
 
+	// 防止 uint64 → int64 溢出导致转账静默失败
+	if amount > math.MaxInt64 {
+		log15.Error("transfer amount overflow", "sender", sender, "recipient", recipient, "amount", amount)
+		return false
+	}
 	value := int64(amount)
 	if value < 0 {
 		return false
@@ -488,9 +507,9 @@ func (mdb *MemoryStateDB) Transfer(sender, recipient string, amount uint64) bool
 	conf := types.ConfSub(mdb.api.GetConfig(), evmtypes.ExecutorName)
 	ethMapFromExecutor := conf.GStr("ethMapFromExecutor")
 	if bytes.Equal(types.GetRealExecName([]byte(ethMapFromExecutor)), []byte("coins")) {
-		ret, err = mdb.CoinsAccount.Transfer(sender, recipient, int64(amount))
+		ret, err = mdb.CoinsAccount.Transfer(sender, recipient, value)
 	} else { //paracross
-		ret, err = mdb.CoinsAccount.ExecTransfer(sender, recipient, mdb.evmPlatformAddr, int64(amount))
+		ret, err = mdb.CoinsAccount.ExecTransfer(sender, recipient, mdb.evmPlatformAddr, value)
 	}
 
 	// 这种情况下转账失败并不进行处理，也不会从sender账户扣款，打印日志即可

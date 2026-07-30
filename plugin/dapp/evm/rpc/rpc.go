@@ -21,6 +21,9 @@ import (
 // CreateEvmCallTx 创建未签名的部署合约交易
 func (c *channelClient) CreateDeployTx(ctx context.Context, in evmtypes.EvmContractCreateReq) (*types.UnsignTx, error) {
 	amountInt64 := in.Amount
+	if amountInt64 < 0 {
+		return nil, types.ErrAmount
+	}
 	exec := in.ParaName + evmtypes.ExecutorName
 	toAddr := address.ExecAddress(exec)
 
@@ -67,6 +70,9 @@ func (c *channelClient) CreateDeployTx(ctx context.Context, in evmtypes.EvmContr
 
 func (c *channelClient) CreateCallTx(ctx context.Context, in evmtypes.EvmContractCallReq) (*types.UnsignTx, error) {
 	amountInt64 := in.Amount
+	if amountInt64 <= 0 {
+		return nil, types.ErrAmount
+	}
 	feeInt64 := in.Fee
 	exec := in.ParaName + evmtypes.ExecutorName
 	toAddr := address.ExecAddress(exec)
@@ -104,6 +110,9 @@ func (c *channelClient) CreateCallTx(ctx context.Context, in evmtypes.EvmContrac
 }
 
 func (c *channelClient) CreateTransferOnlyTx(ctx context.Context, in evmtypes.EvmTransferOnlyReq) (*types.UnsignTx, error) {
+	if in.Amount <= 0 {
+		return nil, types.ErrAmount
+	}
 	exec := in.ParaName + evmtypes.ExecutorName
 	toAddr := address.ExecAddress(exec)
 
