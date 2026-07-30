@@ -197,6 +197,8 @@ github.com/btcsuite/winsvc v1.0.0/go.mod h1:jsenWakMcC0zFBFurPLEAyrnc/teJEM1O46f
 github.com/buger/jsonparser v0.0.0-20181115193947-bf1c66bbce23/go.mod h1:bbYlZJ7hK1yFx9hf58LP0zeX7UjIGs20ufpu3evjr+s=
 github.com/bysomeone/chain33 v0.0.0-20260730125925-5428996f7089 h1:vs8HfxBJgJK6B/IiTShbgKYp0vvu9e3oyjbWSj0CyQM=
 github.com/bysomeone/chain33 v0.0.0-20260730125925-5428996f7089/go.mod h1:9nwINei+dK/pztPobQSwJpeawYbR2o6UR01QM+AwBC8=
+github.com/bysomeone/chain33 v0.0.0-20260730152513-f4252a735f2d h1:RWPT+rfhTYk6KAs/09JtNjnFEPmfGuNNJBKYaLvYcLo=
+github.com/bysomeone/chain33 v0.0.0-20260730152513-f4252a735f2d/go.mod h1:9nwINei+dK/pztPobQSwJpeawYbR2o6UR01QM+AwBC8=
 github.com/c-bata/go-prompt v0.2.2 h1:uyKRz6Z6DUyj49QVijyM339UJV9yhbr70gESwbNU3e0=
 github.com/c-bata/go-prompt v0.2.2/go.mod h1:VzqtzE2ksDBcdln8G7mk2RX9QyGjH+OVqOCSiVIqS34=
 github.com/cactus/go-statsd-client/statsd v0.0.0-20191106001114-12b4e2b38748/go.mod h1:l/bIBLeOl9eX+wxJAzxS4TveKRtAqlyDpHjhkfO0MEI=

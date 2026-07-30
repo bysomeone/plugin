@@ -2,10 +2,10 @@ module github.com/33cn/plugin
 
 go 1.19
 
-replace github.com/33cn/chain33 => github.com/bysomeone/chain33 v0.0.0-20260730125925-5428996f7089
+replace github.com/33cn/chain33 => github.com/bysomeone/chain33 v0.0.0-20260730152513-f4252a735f2d
 
 require (
-	github.com/33cn/chain33 v0.0.0-20260730125925-5428996f7089
+	github.com/33cn/chain33 v0.0.0-20260730152513-f4252a735f2d
 	github.com/BurntSushi/toml v1.1.0
 	github.com/NebulousLabs/Sia v1.3.7
 	github.com/bitly/go-simplejson v0.5.0
