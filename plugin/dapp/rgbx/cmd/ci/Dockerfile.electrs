@@ -1,17 +1,24 @@
-# electrs 0.11.1（Electrum 索引器，供 RGB 侧车用）。rocksdb 需要 clang。
+# electrs 0.11.1（Electrum 索引器，供 RGB 侧车用）。rocksdb bindgen 需要 libclang。
+# electrs 源码固定 tag（v0.11.1），整个 `cargo build` RUN 层由 Docker 层缓存复用，
+# 无需依赖/源码分层（源码不随开发变化）。侧车才需要分层缓存（见 Dockerfile.sidecar）。
+ARG DEBIAN_MIRROR=mirrors.aliyun.com
+
 FROM rust:1.98-bookworm AS builder
+ARG DEBIAN_MIRROR
 RUN set -eux; \
-    apt-get update; \
-    for i in 1 2 3 4 5; do \
-        if apt-get install -y --no-install-recommends clang libclang-dev; then break; fi; \
-        echo "apt retry $i"; sleep 10; \
+    sed -i "s|deb.debian.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
+    for i in 1 2 3 4 5 6 7 8; do \
+        if apt-get update && apt-get install -y --no-install-recommends clang libclang-dev llvm-14-dev; then break; fi; \
+        echo "apt retry $i"; sleep 15; \
     done; \
-    apt-get install -y --no-install-recommends clang libclang-dev; \
+    apt-get update && apt-get install -y --no-install-recommends clang libclang-dev llvm-14-dev; \
+    ls /usr/lib/llvm-*/lib/libclang.so*; \
     rm -rf /var/lib/apt/lists/*
+# rocksdb bindgen 需要定位 libclang（Debian bookworm: /usr/lib/llvm-14/lib/libclang.so）
+ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 WORKDIR /src
 ARG ELECTRS_VERSION=v0.11.1
-RUN git clone --depth 1 --branch ${ELECTRS_VERSION} https://github.com/romanz/electrs.git .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN git clone --depth 1 --branch ${ELECTRS_VERSION} https://github.com/romanz/electrs.git . && \
     cargo build --release
 
 FROM ubuntu:22.04
