@@ -39,6 +39,10 @@ func (r *rgbx) checkWithdrawConfirm(txHash, confirmHash string, confirm *rtypes.
 			"btcProof", btcProof2String(confirm.GetBtcTxProof()), "err", err)
 		return err
 	}
+	// RGB20 分支：跳过链上 OP_RETURN 承诺与链上金额校验（H4：提现 correlation 走 txid↔pending 映射）。
+	if rtypes.IsRgb20Symbol(pendingTx.GetAssetSymbol()) {
+		return nil
+	}
 	if !hasWithdrawCommitment(btcTx, confirm.GetTxHash()) {
 		elog.Error("checkWithdrawConfirm commitment mismatch", "txHash", txHash, "confirmHash", confirmHash,
 			"btcProof", btcProof2String(confirm.GetBtcTxProof()))
@@ -51,6 +55,10 @@ func (r *rgbx) checkWithdrawConfirm(txHash, confirmHash string, confirm *rtypes.
 }
 
 func (r *rgbx) validateDepositTxContent(txHash string, deposit *rtypes.DepositAsset, btcTx *wire.MsgTx) error {
+	// RGB20 分支：全跳过链上金额（RGB 金额在 consignment 内）。
+	if rtypes.IsRgb20Symbol(deposit.GetAssetSymbol()) {
+		return nil
+	}
 	info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
 	if err != nil {
 		elog.Error("validateDepositTxContent getCrossChainInfo", "txHash", txHash, "symbol", deposit.GetAssetSymbol(), "err", err)
@@ -73,6 +81,10 @@ func (r *rgbx) validateDepositTxContent(txHash string, deposit *rtypes.DepositAs
 func (r *rgbx) validateWithdrawTxContent(txHash string, pendingTx *rtypes.PendingTx, btcTx *wire.MsgTx) error {
 	if pendingTx == nil {
 		return ErrPendingTxNotExist
+	}
+	// RGB20 分支：全跳过链上金额。
+	if rtypes.IsRgb20Symbol(pendingTx.GetAssetSymbol()) {
+		return nil
 	}
 	info, err := r.getCrossChainInfo(pendingTx.GetAssetSymbol())
 	if err != nil {

@@ -27,8 +27,10 @@ const (
 	depositUsedKeyPrefix      = KeyPrefixStateDB + "deposited-"
 )
 
-func formatDkgConfirmationsKey(dkgResult string) []byte {
-	return []byte(dkgConfirmationsKeyPrefix + dkgResult)
+// formatDkgConfirmationsKey 按 (symbol, dkgAddress) 索引确认集合（BL-2）。
+// 旧实现仅按地址索引：BTC 与 RGB20 复用同一 TSS 地址时互相污染，导致 RGB20 CrossChainInfo 建不出或取错 pubkey。
+func formatDkgConfirmationsKey(symbol, dkgAddress string) []byte {
+	return []byte(dkgConfirmationsKeyPrefix + formatSymbol(symbol) + "-" + dkgAddress)
 }
 
 func formatCrossChainInfoKey(symbol string) []byte {

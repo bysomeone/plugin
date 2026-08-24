@@ -19,7 +19,7 @@ func (r *rgbx) Exec_CommitDKG(commit *rtypes.CommitDKG, tx *types.Transaction, i
 	txHash := hex.EncodeToString(tx.Hash())
 	commitAddr := tx.From()
 	addrs := &types.ReqAddrs{}
-	err := readDB(r.GetStateDB(), formatDkgConfirmationsKey(commit.DkgAddress), addrs)
+	err := readDB(r.GetStateDB(), formatDkgConfirmationsKey(symbol, commit.DkgAddress), addrs)
 	if err != nil && !errors.Is(err, types.ErrNotFound) {
 		elog.Error("Exec_CommitDKG", "txHash", txHash, "symbol", symbol, "dkgAddr", commit.DkgAddress, "readDB err", err)
 		return nil, ErrGetDkgConfirmations
@@ -38,7 +38,7 @@ func (r *rgbx) Exec_CommitDKG(commit *rtypes.CommitDKG, tx *types.Transaction, i
 
 	encodeAddrs := types.Encode(addrs)
 	receipt.KV = append(receipt.KV, &types.KeyValue{
-		Key:   formatDkgConfirmationsKey(commit.GetDkgAddress()),
+		Key:   formatDkgConfirmationsKey(symbol, commit.GetDkgAddress()),
 		Value: encodeAddrs,
 	})
 
@@ -54,6 +54,9 @@ func (r *rgbx) Exec_CommitDKG(commit *rtypes.CommitDKG, tx *types.Transaction, i
 			WrappedSymbol: formatCrossChainSymbol(symbol),
 			TssAddress:    commit.DkgAddress,
 			PkScript:      commit.PkScript,
+			// RGB20 分支（BL-1）：TSS 组公钥，供 checkDeposit/Exec_Deposit 验 threshold_sig。
+			// 同一 (symbol,address) 的所有 CommitDKG 必须提交相同 pubkey。
+			Pubkey: commit.GetPubkey(),
 		}
 		receipt.KV = append(receipt.KV, &types.KeyValue{
 			Key:   formatCrossChainInfoKey(symbol),
@@ -70,6 +73,18 @@ func (r *rgbx) Exec_Deposit(deposit *rtypes.DepositAsset, tx *types.Transaction,
 	receipt := &types.Receipt{Ty: types.ExecOk}
 	txHash := tx.Hash()
 	symbol := ensureCrossChainSymbol(deposit.GetAssetSymbol())
+	// RGB20 分支：防御性复验 threshold_sig（CheckTx 已验，这里防止绕过 CheckTx 直接 Exec）。
+	if rtypes.IsRgb20Symbol(deposit.GetAssetSymbol()) {
+		info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
+		if err != nil {
+			elog.Error("Exec_Deposit getCrossChainInfo", "txHash", hex.EncodeToString(txHash), "symbol", symbol, "err", err)
+			return nil, ErrGetCrossChainInfo
+		}
+		if err := verifyThresholdSig(info.GetPubkey(), deposit); err != nil {
+			elog.Error("Exec_Deposit verifyThresholdSig", "txHash", hex.EncodeToString(txHash), "symbol", symbol, "err", err)
+			return nil, err
+		}
+	}
 	accDB, err := r.newAccount(symbol)
 	if err != nil {
 		elog.Error("Exec_Deposit newCrossChainAccount", "txHash", hex.EncodeToString(txHash), "symbol", symbol,
