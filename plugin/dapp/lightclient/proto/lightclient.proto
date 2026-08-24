@@ -70,6 +70,10 @@ message tssSignNotify {
     string          txType       = 3;
     bytes           btcTxData    = 4;
     repeated string signers      = 5;
+    // RGB20 提现：侧车 BuildWithdrawal 产出的未签 PSBT（H5/G4）。
+    bytes           psbt         = 6;
+    // RGB20 提现：该笔转移的 consignment（签名节点 ValidateConsignment 用）。
+    bytes           consignment  = 7;
 }
 
 message reqGetBtcHeader {

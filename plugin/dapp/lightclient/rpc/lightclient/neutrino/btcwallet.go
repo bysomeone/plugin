@@ -28,9 +28,10 @@ import (
 )
 
 const (
-	transactionTypeDeposit  string = "deposit"
-	transactionTypeWithdraw string = "withdraw"
-	_                       string = "mergeBalance"
+	transactionTypeDeposit      string = "deposit"
+	transactionTypeWithdraw     string = "withdraw"
+	transactionTypeRgb20Deposit string = "rgb20-deposit"
+	_                           string = "mergeBalance"
 )
 
 const (
@@ -562,6 +563,15 @@ func (b *btcWallet) parseOpReturn(pkScript []byte) (*opReturnData, error) {
 func (b *btcWallet) analyzeTransaction(hash *chainhash.Hash, tx *wire.MsgTx) *btcPendingTx {
 	info := &btcPendingTx{}
 
+	// 分类排除（BL-5/HR-2 定案：侧车状态排除）：
+	// 先查"已知 RGB txid"集合（来自侧车 ListTransfers 轮询 + RGB20 提现 txid 映射）。
+	// - 是已知 RGB 充值 receive 交易 → 跳过 BTC 充值路径（RGB 铸币走侧车路径，避免双入账）；
+	// - 是已知 RGB20 提现交易 → 跳过 BTC 提现路径（否则 getPendingTxBlockIndex("") 死循环）。
+	if b.client.rgb20 != nil && hash != nil && b.client.rgb20.IsKnownRgbTxid(hash.String()) {
+		log.Debug("analyzeTransaction skip known rgb tx", "txHash", hash.String())
+		return nil
+	}
+
 	// 检查输出：查找TSS地址、非TSS地址的输出和OP_RETURN
 	var hasTssOutput bool
 	var depositAmount, withdrawAmount btcutil.Amount
@@ -811,6 +821,14 @@ func (b *btcWallet) listUnspent() ([]*UTXO, error) {
 		if !bytes.Equal(pkScript, b.tssPkScript) {
 			log.Debug("listUnspent skip non-tss utxo", "txid", output.TxID, "vout", output.Vout, "amount", amount)
 			continue
+		}
+		// RGB seal 排除（HR-5）：seal（含 pending-mint）不得进 BTC 提现费池，否则会花掉 RGB 资产背书。
+		if b.client.rgb20 != nil {
+			op := wire.OutPoint{Hash: *txHash, Index: output.Vout}
+			if b.client.rgb20.IsSealOutpoint(op.String()) {
+				log.Debug("listUnspent skip rgb seal", "outpoint", op.String(), "amount", amount)
+				continue
+			}
 		}
 
 		utxo := &UTXO{
