@@ -52,9 +52,11 @@ BTCD_RPC_PASS="${BTCD_RPC_PASS:-1314}"
 BTC_CTL="compose_cmd exec -T btcd /usr/local/bin/btcctl --configfile=/tmp/btcctl.conf --rpcserver=127.0.0.1:18443 --rpcuser=${BTCD_RPC_USER} --rpcpass=${BTCD_RPC_PASS}"
 
 BTC_NETWORK="${BTC_NETWORK:-regtest}"
-BTC_P2P_ADDR="${BTC_P2P_ADDR:-btcd:18444}"
-BTC_RPC_ADDR="${BTC_RPC_ADDR:-btcd:18443}"
-HOST_BTC_RPC_ADDR="${HOST_BTC_RPC_ADDR:-127.0.0.1:18443}"
+# RGB20（Phase 5）：para 的 neutrino 锚定 HOST RGB bitcoind（regtest），而非 docker btcd。
+# 旧 BTC 功能用例已屏蔽；btcd 服务仅保留用于环境初始化。
+BTC_P2P_ADDR="${BTC_P2P_ADDR:-host.docker.internal:18544}"
+BTC_RPC_ADDR="${BTC_RPC_ADDR:-host.docker.internal:18543}"
+HOST_BTC_RPC_ADDR="${HOST_BTC_RPC_ADDR:-127.0.0.1:18543}"
 PARA_TITLE="${PARA_TITLE:-user.p.rgbx.}"
 TSS_THRESHOLD="${TSS_THRESHOLD:-3}"
 AUTO_DISCOVER_TSS_PEERS="${AUTO_DISCOVER_TSS_PEERS:-true}"
@@ -78,6 +80,21 @@ WITHDRAW_DEST_ADDR="${WITHDRAW_DEST_ADDR:-bcrt1qnnwpfpljh5n8m3a8xtf3x5ayvhjjplxm
 BTC_FUNDING_PRIV_HEX="${BTC_FUNDING_PRIV_HEX:-0000000000000000000000000000000000000000000000000000000000000001}"
 BTC_DEPOSIT_AMOUNT_SATS="${BTC_DEPOSIT_AMOUNT_SATS:-20000000}"
 BTC_WITHDRAW_AMOUNT_SATS="${BTC_WITHDRAW_AMOUNT_SATS:-500000}"
+
+# ===== RGB20 (Phase 5) =====
+# RGB20 链使用 HOST bitcoind+electrs+侧车（侧车为独立 gRPC 服务，port 50061 + test-sim 50064）。
+# para 容器经 host.docker.internal 访问宿主 RGB 服务。可整体改走 docker 服务（见 docker-compose.yml 注释）。
+RGB20_SYMBOL="${RGB20_SYMBOL:-RGB20_USDT}"
+RGB20_SIDECAR_SYMBOL="${RGB20_SIDECAR_SYMBOL:-USDT}"
+RGB20_SIDECAR_ADDR="${RGB20_SIDECAR_ADDR:-host.docker.internal:50061}"
+RGB20_SIDECAR_TEST_ADDR="${RGB20_SIDECAR_TEST_ADDR:-127.0.0.1:50064}"
+RGB20_PRECISION="${RGB20_PRECISION:-6}"
+RGB20_BITCOIND_RPC="${RGB20_BITCOIND_RPC:-host.docker.internal:18543}"
+RGB20_BITCOIND_P2P="${RGB20_BITCOIND_P2P:-host.docker.internal:18544}"
+RGB20_BITCOIND_USER="${RGB20_BITCOIND_USER:-rgb}"
+RGB20_BITCOIND_PASS="${RGB20_BITCOIND_PASS:-rgbpass123}"
+RGB20_DEPOSIT_AMOUNT="${RGB20_DEPOSIT_AMOUNT:-1000000}"   # 1.0 USDT (min units)
+RGB20_WITHDRAW_AMOUNT="${RGB20_WITHDRAW_AMOUNT:-500000}"  # 0.5 USDT
 BTC_WITHDRAW_FEE_RATE="${BTC_WITHDRAW_FEE_RATE:-20}"
 XBTC_TRANSFER_AMOUNT="${XBTC_TRANSFER_AMOUNT:-500000}"
 
@@ -183,13 +200,23 @@ maxUtxoRescanTime=60
 host="${BTC_RPC_ADDR}"
 user="${BTCD_RPC_USER}"
 pass="${BTCD_RPC_PASS}"
-disableTLS=false
-certFile="${BTCD_RPC_CERT_IN_CONTAINER}"
+disableTLS=true
+certFile=""
 
 [rpc.sub.light.neutrino.tss]
 peers=${toml_peers}
 threshold=${TSS_THRESHOLD}
 rank=${rank}
+
+[rpc.sub.light.neutrino.rgb20]
+sidecarAddr="${RGB20_SIDECAR_ADDR}"
+consignmentListen="0.0.0.0:17000"
+precision=${RGB20_PRECISION}
+
+[[rpc.sub.light.neutrino.rgb20.contracts]]
+symbol="${RGB20_SYMBOL}"
+sidecarSymbol="${RGB20_SIDECAR_SYMBOL}"
+precision=${RGB20_PRECISION}
 EOF
 }
 
@@ -704,18 +731,162 @@ function ensure_btcd_network_consistency() {
     fi
 }
 
+# =====================================================================
+# RGB20 E2E helpers (Phase 5)
+# =====================================================================
+
+function query_rgb20_balance() {
+    local addr="$1"
+    ${MAIN_CLI} asset balance -a "${addr}" --asset_exec=rgbx --asset_symbol=X"${RGB20_SYMBOL}" | jq -r '.balance // "0"'
+}
+
+function wait_rgb20_balance_not_less_than() {
+    local addr="$1"
+    local expected="$2"
+    local retries="${3:-60}"
+    local i
+    for ((i = 0; i < retries; i++)); do
+        local balance
+        balance=$(query_rgb20_balance "${addr}")
+        if awk "BEGIN{exit !(${balance} >= ${expected})}"; then
+            log_step "rgb20 balance reached: addr=${addr}, balance=${balance} >= ${expected}"
+            return 0
+        fi
+        sleep 2
+    done
+    fail "rgb20 balance not reached, addr=${addr}, expected>=${expected}"
+}
+
+function wait_rgb20_dkg_commit() {
+    log_step "wait RGB20 DKG commit (RGB20 CrossChainInfo pubkey)"
+    local retries=90
+    local i
+    for ((i = 0; i < retries; i++)); do
+        set +e
+        local info
+        info=$(${MAIN_CLI} rgbx getCross -s "${RGB20_SYMBOL}" 2>/dev/null)
+        local rc=$?
+        set -e
+        if [ "${rc}" -eq 0 ]; then
+            local pub
+            pub=$(echo "${info}" | jq -r '.pubkey // empty')
+            if [ -n "${pub}" ]; then
+                log_step "RGB20 DKG done, pubkey=${pub}"
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    fail "RGB20 DKG commit timeout"
+}
+
+function scenario_rgb20_deposit() {
+    log_step "scenario: RGB20 deposit (user pay -> sidecar settle -> TSS deposit sign -> chain33 mint)"
+    local before
+    before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
+
+    # 1. Go 桥 CreateReceive（para1 rgb20 HTTP）→ 侧车 invoice
+    local rec_json
+    rec_json=$(curl -s -X POST http://127.0.0.1:17000/rgbx/v1/deposit \
+        -H 'Content-Type: application/json' \
+        -d "{\"requestId\":\"rgb20-dep-1\",\"assetSymbol\":\"${RGB20_SYMBOL}\",\"amount\":${RGB20_DEPOSIT_AMOUNT},\"chain33Addr\":\"${USER_MAIN_ADDR}\"}")
+    local receive_id invoice
+    receive_id=$(echo "${rec_json}" | jq -r '.data.receiveId // empty')
+    invoice=$(echo "${rec_json}" | jq -r '.data.invoice // empty')
+    assert_non_empty "${receive_id}" "rgb20 receive_id empty"
+    assert_non_empty "${invoice}" "rgb20 invoice empty"
+    log_step "  receive_id=${receive_id}"
+
+    # 2. 侧车 test-sim 构建用户付款（未签 PSBT + consignment）
+    local pay_json
+    pay_json=$(curl -s -X POST http://127.0.0.1:50064/sim/user_pay \
+        -H 'Content-Type: application/json' -d "{\"invoice\":\"${invoice}\"}")
+    local psbt_hex cons_hex
+    psbt_hex=$(echo "${pay_json}" | jq -r '.psbt // empty')
+    cons_hex=$(echo "${pay_json}" | jq -r '.consignment // empty')
+    assert_non_empty "${psbt_hex}" "rgb20 user_pay psbt empty"
+    assert_non_empty "${cons_hex}" "rgb20 user_pay consignment empty"
+
+    # 3. Go 桥 TSS 组签名 PSBT（test sign-psbt 端点）
+    local signed_psbt
+    signed_psbt=$(curl -s -X POST http://127.0.0.1:17000/rgbx/v1/sign-psbt \
+        -H 'Content-Type: application/json' -d "{\"psbt\":\"${psbt_hex}\"}" | jq -r '.data.psbt // empty')
+    assert_non_empty "${signed_psbt}" "rgb20 sign-psbt empty"
+
+    # 4. 侧车 test-sim 广播已签 PSBT + provide consignment → settle
+    local settle_status
+    settle_status=$(curl -s -X POST http://127.0.0.1:50064/sim/user_pay_submit \
+        -H 'Content-Type: application/json' \
+        -d "{\"psbt\":\"${signed_psbt}\",\"consignment\":\"${cons_hex}\",\"receive_id\":\"${receive_id}\"}" | jq -r '.status // empty')
+    assert_eq "${settle_status}" "settled" "rgb20 settle status"
+
+    # 5. Go 桥 pollTransfers → submitDeposit（TSS 签 deposit）→ chain33 铸造 X.RGB20_USDT
+    local delta
+    delta=$(awk "BEGIN{printf \"%.8f\", ${RGB20_DEPOSIT_AMOUNT}/100000000}")
+    local expected
+    expected=$(awk "BEGIN{printf \"%.8f\", ${before} + ${delta}}")
+    wait_rgb20_balance_not_less_than "${USER_MAIN_ADDR}" "${expected}"
+    log_step "RGB20 deposit OK: balance ${before} -> >= ${expected}"
+}
+
+function scenario_rgb20_withdraw() {
+    log_step "scenario: RGB20 withdraw (chain33 withdraw -> sidecar BuildWithdrawal -> TSS signPsbt -> broadcast -> confirm -> burn)"
+    local before
+    before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
+    assert_true "$(awk "BEGIN{print (${before} > 0)?\"true\":\"false\"}")" "rgb20 balance is zero before withdraw"
+
+    # 1. 侧车 test-sim 创建用户发票（提现收款方）
+    local user_invoice
+    user_invoice=$(curl -s -X POST http://127.0.0.1:50064/sim/user_invoice \
+        -H 'Content-Type: application/json' \
+        -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${RGB20_WITHDRAW_AMOUNT}}" | jq -r '.invoice // empty')
+    assert_non_empty "${user_invoice}" "rgb20 user invoice empty"
+
+    # 2. chain33 发起提现（destinationAddr=invoice；CLI 硬编码 *1e8，反算 -a 口径）
+    local amt
+    amt=$(awk "BEGIN{printf \"%.8f\", ${RGB20_WITHDRAW_AMOUNT}/100000000}")
+    local withdraw_hash
+    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
+    assert_length "${withdraw_hash}" 66 "rgb20 withdraw tx hash"
+
+    # 3. 等桥确认销毁（pending 清除 = rgbx Confirm 已提交）
+    wait_no_withdraw_pending_for_user "${USER_MAIN_ADDR}"
+
+    # 4. 断言余额减少（-a 口径 *1e8 = min units，显示口径 /1e8）
+    local expected
+    expected=$(awk "BEGIN{printf \"%.8f\", ${before} - ${amt}}")
+    local after
+    after=$(query_rgb20_balance "${USER_MAIN_ADDR}")
+    assert_balance "${after}" "${expected}" "rgb20 balance not decreased after withdraw"
+    log_step "RGB20 withdraw OK: balance ${before} -> ${after}"
+}
+
 function run_tests() {
+    # ===== 环境初始化（保留） =====
     ensure_btcd_network_consistency
     prepare_btcd_mining_identity
     wait_btcd_ready
     scenario_para_health
     setup_para_nodegroup_on_main
-    # ensure_btc_crosschain_prerequisite
     wait_auto_dkg_commit
-    scenario_user_deposit_via_btc_tx
-    scenario_user_transfer_crosschain_asset
-    scenario_user_withdraw_auto_confirm
-    scenario_restart_recovery
+    wait_rgb20_dkg_commit
+
+    # ===== 旧 BTC 跨链功能用例（Phase 5 屏蔽，保留环境初始化） =====
+    # 用户要求：屏蔽 rgbx CI 里已有的 BTC 跨链功能测试用例（不执行旧功能测试），
+    # 聚焦 RGB20 充值/提现两条链路；环境初始化（chain33 节点/btcd/para/TSS）仍然启动。
+    # 被屏蔽用例：
+    #   scenario_user_deposit_via_btc_tx         （BTC 充值）
+    #   scenario_user_transfer_crosschain_asset   （XBTC 转账）
+    #   scenario_user_withdraw_auto_confirm       （BTC 提现确认）
+    #   scenario_restart_recovery                 （BTC pending 重启恢复）
+    # scenario_user_deposit_via_btc_tx
+    # scenario_user_transfer_crosschain_asset
+    # scenario_user_withdraw_auto_confirm
+    # scenario_restart_recovery
+
+    # ===== RGB20 充值/提现（Phase 5 新增） =====
+    scenario_rgb20_deposit
+    scenario_rgb20_withdraw
 }
 
 function print_logs_hint() {

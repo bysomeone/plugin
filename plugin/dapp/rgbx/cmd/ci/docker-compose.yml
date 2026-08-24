@@ -22,6 +22,9 @@ services:
         condition: service_healthy
     volumes:
       - ./btcd-data:/btcd:ro
+    # RGB20（Phase 5）：官方节点 rgb20 适配器 HTTP（充值请求 + consignment 上传 + 测试 sign-psbt）。
+    ports:
+      - "17000:17000"
 
   para2:
     build:
