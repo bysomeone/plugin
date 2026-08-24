@@ -56,6 +56,32 @@ type config struct {
 	BtcRPC btcRPCConfig `json:"btcRPC"`
 	// Tss tss config
 	Tss tssConfig `json:"tss"`
+	// Rgb20 RGB20 侧车桥配置（Phase 2b）。
+	Rgb20 rgb20Config `json:"rgb20"`
+}
+
+// rgb20Config RGB20 跨链桥（RGB20 USDT）配置。
+type rgb20Config struct {
+	// SidecarAddr RGB 侧车地址：unix socket 路径优先，否则 tcp host:port。
+	SidecarAddr string `json:"sidecarAddr"`
+	// ConsignmentListen consignment 上传/充值请求 HTTP 监听地址。空则不开 HTTP。
+	ConsignmentListen string `json:"consignmentListen"`
+	// Contracts RGB20 资产合约列表。
+	Contracts []rgb20Contract `json:"contracts"`
+	// Precision 默认精度（RGB20 USDT 为 6）。
+	Precision uint32 `json:"precision"`
+	// ChangeAddress 提现找零地址（TSS P2WPKH 地址）；留空则由 TSS 地址自动填充。
+	ChangeAddress string `json:"changeAddress"`
+}
+
+// rgb20Contract RGB20 资产合约注册项。
+type rgb20Contract struct {
+	Symbol        string `json:"symbol"`        // chain33 侧资产符号，如 RGB20_USDT
+	SidecarSymbol string `json:"sidecarSymbol"` // 侧车发行资产符号，如 USDT（空则回退 Symbol）
+	AssetID       string `json:"assetId"`       // rgb:...
+	Precision     uint32 `json:"precision"`     // 小数位
+	MinDeposit    int64  `json:"minDeposit"`    // 最小充值（最小单位）
+	MinWithdraw   int64  `json:"minWithdraw"`   // 最小提现（最小单位）
 }
 
 type btcRPCConfig struct {

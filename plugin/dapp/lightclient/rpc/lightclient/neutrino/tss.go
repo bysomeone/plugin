@@ -2,7 +2,9 @@ package neutrino
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"runtime"
 	"sync/atomic"
@@ -12,12 +14,16 @@ import (
 	"github.com/33cn/chain33/system/crypto/tss/gg18"
 	"github.com/33cn/chain33/types"
 	"github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
+	"github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/walletdb"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -159,6 +165,20 @@ func (t *tssService) init() {
 		PkScript:    t.pkScript,
 	}
 	t.client.submitMainchainTxUntilSuccess(rtypes.RgbxX, rtypes.NameCommitDKGAction, commitDKG)
+	// RGB20 补 CommitDKG（H6）：对每个注册的 RGB20 合约提交带 pubkey 的 CommitDKG，
+	// 否则 checkDeposit/Exec_Deposit 的 RGB20 分支拿不到 CrossChainInfo.Pubkey，无法验 threshold_sig。
+	if t.client.rgb20 != nil {
+		for _, symbol := range t.client.rgb20.Registry().Symbols() {
+			rgbCommitDKG := &rtypes.CommitDKG{
+				AssetSymbol: symbol,
+				DkgAddress:  t.tssAddress.EncodeAddress(),
+				PkScript:    t.pkScript,
+				Pubkey:      t.tssPublicKey.SerializeCompressed(),
+			}
+			t.client.submitMainchainTxUntilSuccess(rtypes.RgbxX, rtypes.NameCommitDKGAction, rgbCommitDKG)
+			log.Info("init tssService rgb20 commitDKG", "symbol", symbol, "tssAddress", t.tssAddress.EncodeAddress())
+		}
+	}
 	t.dkgCompleted.Store(true)
 	for {
 		peers, err := tss.FetchConnectedPeers(t.client.qclient, time.Second*3)
@@ -365,6 +385,148 @@ func (t *tssService) signBtcTx(tx *wire.MsgTx, inputAmounts []int64, signers []s
 	return nil
 }
 
+// normalizeLowS 将高-S 签名归一化为低-S（BIP146 规范），保证广播前签名合法。
+func normalizeLowS(sig *ecdsa.Signature) *ecdsa.Signature {
+	if sig != nil {
+		r := sig.R()
+		s := sig.S()
+		if s.IsOverHalfOrder() {
+			sNeg := new(btcec.ModNScalar).NegateVal(&s)
+			return ecdsa.NewSignature(&r, sNeg)
+		}
+	}
+	return sig
+}
+
+// computeRgb20DepositMsg 计算 RGB20 充值 TSS 签名的消息：
+// C = sha256(types.Encode(DepositAsset{threshold_sig:nil}))，与 rgbx 合约 computeDepositSignMessage 一致。
+func computeRgb20DepositMsg(dep *rtypes.DepositAsset) []byte {
+	d := proto.Clone(dep).(*rtypes.DepositAsset)
+	d.ThresholdSig = nil
+	h := sha256.Sum256(types.Encode(d))
+	return h[:]
+}
+
+// signPsbt 解析 PSBT，逐输入签名（GG18），写 partial_sigs，广播前 low-S 归一化。
+// 侧车 BuildWithdrawal 产出的 PSBT 已固定输入/输出与 RGB 承诺锚点，TSS 只签 witness（Spike 2 §5 结论）。
+// psbtSignFunc 对单个输入的 sigHash 进行签名，返回 GG18 阈值签名（DER）。
+type psbtSignFunc func(sigHash []byte, sessionName string) *signResult
+
+func (t *tssService) signPsbt(psbtBytes []byte) ([]byte, error) {
+	p, err := psbt.NewFromRawBytes(bytes.NewReader(psbtBytes), false)
+	if err != nil {
+		return nil, fmt.Errorf("decode psbt: %w", err)
+	}
+	signers := t.waitForSufficientSigners()
+	return t.signPsbtWithSigners(p, signers, func(sigHash []byte, sessionName string) *signResult {
+		return t.signMsg(sigHash, sessionName, signers)
+	})
+}
+
+// signPsbtWithSigners 对 PSBT 逐输入签名并写 partial_sigs（signFn 可注入，便于单测）。
+// 侧车 BuildWithdrawal 产出的 PSBT 已固定输入/输出与 RGB 承诺锚点，TSS 只签 witness（Spike 2 §5 结论）。
+func (t *tssService) signPsbtWithSigners(p *psbt.Packet, signers []string, signFn psbtSignFunc) ([]byte, error) {
+	if p == nil || p.UnsignedTx == nil {
+		return nil, fmt.Errorf("psbt invalid: missing unsigned tx")
+	}
+	if len(p.UnsignedTx.TxIn) != len(p.Inputs) {
+		return nil, fmt.Errorf("psbt invalid: tx=%d inputs=%d", len(p.UnsignedTx.TxIn), len(p.Inputs))
+	}
+	prevOutFetcher := txscript.NewMultiPrevOutFetcher(make(map[wire.OutPoint]*wire.TxOut, len(p.Inputs)))
+	for i := range p.Inputs {
+		op := p.UnsignedTx.TxIn[i].PreviousOutPoint
+		if p.Inputs[i].WitnessUtxo != nil {
+			prevOutFetcher.AddPrevOut(op, p.Inputs[i].WitnessUtxo)
+		} else if p.Inputs[i].NonWitnessUtxo != nil {
+			if int(op.Index) >= len(p.Inputs[i].NonWitnessUtxo.TxOut) {
+				return nil, fmt.Errorf("input %d non-witness utxo out of range", i)
+			}
+			prevOutFetcher.AddPrevOut(op, p.Inputs[i].NonWitnessUtxo.TxOut[op.Index])
+		} else {
+			return nil, fmt.Errorf("input %d missing witness/non-witness utxo", i)
+		}
+	}
+	txSigHashes := txscript.NewTxSigHashes(p.UnsignedTx, prevOutFetcher)
+	pubKeyBytes := t.tssPublicKey.SerializeCompressed()
+	txHash := p.UnsignedTx.TxHash()
+	sessions := make([]string, len(p.Inputs))
+	sigHashes := make([][]byte, len(p.Inputs))
+	for i := range p.Inputs {
+		op := p.UnsignedTx.TxIn[i].PreviousOutPoint
+		prevOut := prevOutFetcher.FetchPrevOutput(op)
+		sigHashType := p.Inputs[i].SighashType
+		if sigHashType == 0 {
+			sigHashType = txscript.SigHashAll // 缺省 SIGHASH_ALL（PSBT_IN_SIGHASH_TYPE）
+		}
+		sigHash, err := txscript.CalcWitnessSigHash(prevOut.PkScript, txSigHashes, sigHashType, p.UnsignedTx, i, prevOut.Value)
+		if err != nil {
+			return nil, fmt.Errorf("calc sig hash for input %d: %w", i, err)
+		}
+		sigHashes[i] = sigHash
+		sessions[i] = fmt.Sprintf("psbt-%s-%d", txHash, i)
+	}
+	for i := range p.Inputs {
+		result := signFn(sigHashes[i], sessions[i])
+		if result == nil || result.err != nil {
+			if result == nil {
+				return nil, fmt.Errorf("sign psbt input %d: nil result", i)
+			}
+			return nil, fmt.Errorf("sign psbt input %d: %w", i, result.err)
+		}
+		// low-S 归一化（广播前检查）
+		sig, err := ecdsa.ParseDERSignature(result.sig)
+		if err != nil {
+			return nil, fmt.Errorf("parse sig input %d: %w", i, err)
+		}
+		sig = normalizeLowS(sig)
+		sigHashType := p.Inputs[i].SighashType
+		if sigHashType == 0 {
+			sigHashType = txscript.SigHashAll
+		}
+		sigWithHash := append(sig.Serialize(), byte(sigHashType))
+		p.Inputs[i].PartialSigs = append(p.Inputs[i].PartialSigs, &psbt.PartialSig{
+			PubKey:    pubKeyBytes,
+			Signature: sigWithHash,
+		})
+		log.Debug("signPsbt applied partial sig", "input", i)
+	}
+	var buf bytes.Buffer
+	if err := p.Serialize(&buf); err != nil {
+		return nil, fmt.Errorf("serialize psbt: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// processSignRgb20Deposit 发起 rgb20-deposit TSS 签名轮次（BL-3/HR-6）：
+// 下发 txType=rgb20-deposit 通知（payload=DepositSignPayload JSON），签名节点独立验证后签 C；
+// 主节点本地也参与签名并返回阈值签名。
+func (t *tssService) processSignRgb20Deposit(payload *rgb20.DepositSignPayload) ([]byte, error) {
+	if payload == nil || payload.Deposit == nil {
+		return nil, types.ErrInvalidParam
+	}
+	signers := t.waitForSufficientSigners()
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal deposit payload: %w", err)
+	}
+	notify := &lighttypes.TssSignNotify{
+		TxType:  transactionTypeRgb20Deposit,
+		Payload: payloadBytes,
+		Signers: signers,
+	}
+	t.pubMsg(tssSignNotifyTopic, types.Encode(notify))
+	log.Debug("processSignRgb20Deposit published", "receiveId", payload.ReceiveID,
+		"sessionId", payload.SessionID, "signers", signers)
+
+	// 主节点本地签名（GG18 组内产生同一阈值签名）
+	msg := computeRgb20DepositMsg(payload.Deposit)
+	res := t.signMsg(msg, payload.SessionID, signers)
+	if res.err != nil {
+		return nil, res.err
+	}
+	return res.sig, nil
+}
+
 func (t *tssService) parseTxFromNotify(notify *lighttypes.TssSignNotify) (*wire.MsgTx, []int64, error) {
 	if notify == nil {
 		return nil, nil, types.ErrInvalidParam
@@ -518,6 +680,22 @@ func (t *tssService) handleSignNotify(msg []byte) {
 		return
 	}
 
+	// RGB20 分支：rgb20-deposit 签名轮次 / RGB20 提现 PSBT 签名。
+	switch notify.TxType {
+	case transactionTypeRgb20Deposit:
+		if err := t.handleRgb20DepositSign(notify); err != nil {
+			log.Error("handleSignNotify handleRgb20DepositSign", "err", err)
+		}
+		return
+	case transactionTypeWithdraw:
+		if len(notify.Psbt) > 0 {
+			if err := t.handleRgb20WithdrawSign(notify); err != nil {
+				log.Error("handleSignNotify handleRgb20WithdrawSign", "err", err)
+			}
+			return
+		}
+	}
+
 	tx, inputAmounts, err := t.parseTxFromNotify(notify)
 	if err != nil {
 		log.Error("handleSignNotify parseTxFromNotify", "type", notify.TxType, "err", err)
@@ -561,6 +739,57 @@ func (t *tssService) handleSignNotify(msg []byte) {
 	}
 	log.Debug("handleSignNotify success", "txType", notify.TxType,
 		"payload", hex.EncodeToString(notify.Payload), "btcHash", tx.TxHash().String())
+}
+
+// handleRgb20DepositSign 签名节点处理 rgb20-deposit 轮次：
+// 独立验证（去重 + 地址绑定 + 金额 + 侧车 ValidateConsignment + 同步高度门槛），通过后签 C。
+func (t *tssService) handleRgb20DepositSign(notify *lighttypes.TssSignNotify) error {
+	if t.client.rgb20 == nil {
+		return fmt.Errorf("rgb20 adapter not configured")
+	}
+	payload := &rgb20.DepositSignPayload{}
+	if err := json.Unmarshal(notify.Payload, payload); err != nil {
+		return fmt.Errorf("decode rgb20-deposit payload: %w", err)
+	}
+	if payload.Deposit == nil {
+		return fmt.Errorf("invalid rgb20-deposit payload: nil deposit")
+	}
+	// 签名节点独立验证（BL-3）
+	if err := t.client.rgb20.ValidateDepositConsignment(payload); err != nil {
+		return fmt.Errorf("validate rgb20 deposit: %w", err)
+	}
+	msg := computeRgb20DepositMsg(payload.Deposit)
+	res := t.signMsg(msg, payload.SessionID, notify.Signers)
+	if res.err != nil {
+		return res.err
+	}
+	log.Debug("handleRgb20DepositSign signed", "receiveId", payload.ReceiveID, "sessionId", payload.SessionID)
+	return nil
+}
+
+// handleRgb20WithdrawSign 签名节点处理 RGB20 提现 PSBT：交叉核对（BL-4/HR-3）后 signPsbt。
+func (t *tssService) handleRgb20WithdrawSign(notify *lighttypes.TssSignNotify) error {
+	if t.client.rgb20 == nil {
+		return fmt.Errorf("rgb20 adapter not configured")
+	}
+	pendingTx, err := t.checkNonOfficialWithdrawSign(notify.Payload)
+	if err != nil {
+		return err
+	}
+	valReq := &rgb20.ValidateWithdrawRequest{
+		Psbt:            notify.Psbt,
+		Consignment:     notify.Consignment,
+		ExpectedAmount:  pendingTx.GetAmount(),
+		MinSyncedHeight: uint64(pendingTx.GetTxBlockHeight()),
+	}
+	if err := t.client.rgb20.ValidateWithdrawPsbt(valReq); err != nil {
+		return fmt.Errorf("validate rgb20 withdrawal: %w", err)
+	}
+	if _, err := t.signPsbt(notify.Psbt); err != nil {
+		return fmt.Errorf("sign rgb20 withdrawal psbt: %w", err)
+	}
+	log.Debug("handleRgb20WithdrawSign signed psbt", "chain33Hash", hex.EncodeToString(notify.Payload))
+	return nil
 }
 
 // subTopic subscribes to a P2P topic

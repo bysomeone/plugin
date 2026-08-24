@@ -14,6 +14,7 @@ import (
 
 	"github.com/33cn/chain33/types"
 	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
+	"github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
@@ -125,6 +126,11 @@ func (n *neutrinoClient) depositWatcher() {
 			}
 		case pendingTx := <-depositChan:
 
+			// 分类排除防御（BL-5）：已知 RGB 交易的充值走 RGB20 路径，绝不经 BTC 路径双铸。
+			if n.rgb20 != nil && n.rgb20.IsKnownRgbTxid(pendingTx.txHash.String()) {
+				log.Debug("depositWatcher skip known rgb tx", "txHash", pendingTx.txHash.String())
+				continue
+			}
 			// 如果chain33DepositAddress为空，则使用第一个输入的utxo地址
 			if pendingTx.chain33DepositAddress == "" {
 				firstInputUtxo := pendingTx.tx.TxIn[0].PreviousOutPoint
@@ -147,6 +153,11 @@ func (n *neutrinoClient) commitDepositTx(pendingTx *btcPendingTx) error {
 	if state := n.getDepositState(pendingTx.txHash[:]); bytes.Equal(state, depositStatusProcessed) {
 		log.Debug("commitDepositTx already processed", "txHash", pendingTx.txHash.String())
 		n.bw.removePendingTx(pendingTx.txHash)
+		return nil
+	}
+	// 分类排除防御（BL-5）：已知 RGB 交易由 RGB20 路径铸造，跳过 BTC 铸造。
+	if n.rgb20 != nil && n.rgb20.IsKnownRgbTxid(pendingTx.txHash.String()) {
+		log.Debug("commitDepositTx skip known rgb tx", "txHash", pendingTx.txHash.String())
 		return nil
 	}
 	spv, err := n.bw.buildTxExistenceProof(pendingTx)
@@ -438,6 +449,26 @@ func (n *neutrinoClient) getPendingTxBlockIndex(txHash []byte) *rtypes.TxBlockIn
 	return txBlockIndex
 }
 
+// isRgb20Asset 判断资产符号是否为已注册的 RGB20 资产。
+func (n *neutrinoClient) isRgb20Asset(symbol string) bool {
+	return n.rgb20 != nil && n.rgb20.Registry().IsRegistered(symbol)
+}
+
+// processRgb20Withdraw 将 RGB20 提现 pending 交易路由到 rgb20 适配器（Phase 4 接线）。
+// 提现全程由 Adapter.Withdraw 内部 mutex 串行；失败返回 error 由调用方加入重试列表。
+func (n *neutrinoClient) processRgb20Withdraw(pending *rtypes.PendingTx) error {
+	req := &rgb20.WithdrawRequest{
+		Chain33TxHash:    pending.GetTxHash(),
+		Amount:           pending.GetAmount(),
+		FeeRate:          pending.GetFeeRate(),
+		RecipientInvoice: pending.GetTargetAddress(),
+		AssetSymbol:      pending.GetAssetSymbol(),
+		TxBlockHeight:    pending.GetTxBlockHeight(),
+	}
+	_, err := n.rgb20.WithdrawFlow(n.ctx, req)
+	return err
+}
+
 // withdrawalProcessor 监听chain33主链上比特币提现请求, 构造提现交易到比特币网络，并向chain33主链提交rgbx confirm交易
 func (n *neutrinoClient) withdrawalProcessor() {
 	withdrawalChan := n.bw.GetWithdrawChannel()
@@ -446,6 +477,7 @@ func (n *neutrinoClient) withdrawalProcessor() {
 	defer retryTicker.Stop()
 	withdrawReqChan := n.withdrawReqChan
 	withdrawReqList := make([]*withdrawRequest, 0, 16)
+	rgb20WithdrawRetry := make([]*rtypes.PendingTx, 0, 16)
 	confirmRetryList := make([]*confirmWithdraw, 0, 16)
 
 	for {
@@ -458,6 +490,14 @@ func (n *neutrinoClient) withdrawalProcessor() {
 			for _, p := range tempWithdraws {
 				if err := n.processWithdrawRequest(p); err != nil {
 					withdrawReqList = append(withdrawReqList, p)
+				}
+			}
+			tempRgb20 := rgb20WithdrawRetry
+			rgb20WithdrawRetry = rgb20WithdrawRetry[:0]
+			for _, p := range tempRgb20 {
+				if err := n.processRgb20Withdraw(p); err != nil {
+					log.Error("withdrawalProcessor rgb20 retry", "txHash", hex.EncodeToString(p.GetTxHash()), "err", err)
+					rgb20WithdrawRetry = append(rgb20WithdrawRetry, p)
 				}
 			}
 			tempConfirms := confirmRetryList
@@ -479,6 +519,16 @@ func (n *neutrinoClient) withdrawalProcessor() {
 			state := n.getWithdrawState(pending.GetTxHash())
 			if len(state) > 0 && bytes.Equal(state, withdrawStatusConfirmed) {
 				log.Debug("withdrawalProcessor hasWithdrawState", "txHash", hex.EncodeToString(pending.GetTxHash()), "state", string(state))
+				continue
+			}
+			// RGB20 提现：路由到 rgb20 适配器（invoice→BuildWithdrawal→TSS signPsbt→Finalize→广播→txid↔pending）。
+			if n.isRgb20Asset(pending.GetAssetSymbol()) {
+				log.Debug("withdrawalProcessor rgb20 withdraw", "txHash", hex.EncodeToString(pending.GetTxHash()),
+					"assetSymbol", pending.GetAssetSymbol())
+				if err := n.processRgb20Withdraw(pending); err != nil {
+					log.Error("withdrawalProcessor rgb20 withdraw", "txHash", hex.EncodeToString(pending.GetTxHash()), "err", err)
+					rgb20WithdrawRetry = append(rgb20WithdrawRetry, pending)
+				}
 				continue
 			}
 			req := pending2WithdrawRequest(pending)
@@ -543,6 +593,17 @@ func (n *neutrinoClient) buildWithdrawConfirm(btcPending *btcPendingTx, pendingT
 }
 
 func (n *neutrinoClient) processWithdrawConfirm(confirm *confirmWithdraw) bool {
+
+	// 已知 RGB20 提现交易但缺 chain33 关联（txid↔pending 映射缺失）→ 直接丢弃，
+	// 避免 getPendingTxBlockIndex("") 对空 hash 反复查询造成死循环（HR-2）。
+	if confirm.btcPending != nil && n.rgb20 != nil &&
+		n.rgb20.IsKnownRgbTxid(confirm.btcPending.txHash.String()) &&
+		len(confirm.btcPending.chain33WithdrawTxHash) == 0 {
+		log.Error("processWithdrawConfirm rgb20 withdraw missing chain33 mapping",
+			"btcTxid", confirm.btcPending.txHash.String())
+		n.bw.removePendingTx(confirm.btcPending.txHash)
+		return true
+	}
 
 	if confirm.pendingTxBlockIndex == nil {
 		confirm.pendingTxBlockIndex = n.getPendingTxBlockIndex(confirm.btcPending.chain33WithdrawTxHash)

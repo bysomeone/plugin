@@ -22,6 +22,7 @@ import (
 
 	"github.com/33cn/chain33/common/log/log15"
 	"github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient"
+	"github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	_ "github.com/btcsuite/btcwallet/walletdb/bdb"
 	"github.com/lightninglabs/neutrino"
@@ -56,6 +57,7 @@ type neutrinoClient struct {
 	neutrinoCS        *neutrino.ChainService
 	bw                *btcWallet
 	rgbx              *rgbx
+	rgb20             *rgb20.Adapter
 	bestBlock         *headerfs.BlockStamp
 	lock              sync.RWMutex
 	chain33FeeRate    int64
@@ -112,8 +114,47 @@ func (n *neutrinoClient) Init(ctx context.Context, q queue.Queue, cfg *lightclie
 	}
 	n.bw = bw
 	n.rgbx = newRGBX()
+	if err := n.initRgb20Adapter(); err != nil {
+		log.Error("Init", "initRgb20Adapter error", err)
+		return err
+	}
 	return nil
 
+}
+
+// initRgb20Adapter 按配置构造 RGB20 侧车适配器（所有节点都需要：签名节点用只读校验）。
+func (n *neutrinoClient) initRgb20Adapter() error {
+	if n.cfg.Rgb20.SidecarAddr == "" {
+		// 未配置侧车，跳过（BTC-only 部署）。
+		log.Debug("initRgb20Adapter rgb20 not configured")
+		return nil
+	}
+	rgbCfg := rgb20.Config{
+		SidecarAddr:       n.cfg.Rgb20.SidecarAddr,
+		ConsignmentListen: n.cfg.Rgb20.ConsignmentListen,
+		Precision:         n.cfg.Rgb20.Precision,
+		ChangeAddress:     n.cfg.Rgb20.ChangeAddress,
+		MinConfirmations:  n.cfg.BlockConfirmations,
+	}
+	for _, c := range n.cfg.Rgb20.Contracts {
+		rgbCfg.Contracts = append(rgbCfg.Contracts, rgb20.Contract{
+			Symbol:        c.Symbol,
+			SidecarSymbol: c.SidecarSymbol,
+			AssetID:       c.AssetID,
+			Precision:     c.Precision,
+			MinDeposit:    c.MinDeposit,
+			MinWithdraw:   c.MinWithdraw,
+		})
+	}
+	adapter, err := rgb20.NewAdapter(rgbCfg, rgb20.NewWalletStore(n.neutrinoCfg.Database))
+	if err != nil {
+		return err
+	}
+	adapter.SetBridge(n) // n 实现 rgb20.Chain33Bridge
+	n.rgb20 = adapter
+	log.Info("initRgb20Adapter", "sidecarAddr", n.cfg.Rgb20.SidecarAddr,
+		"contracts", len(rgbCfg.Contracts))
+	return nil
 }
 
 // Start starting routine
@@ -123,6 +164,20 @@ func (n *neutrinoClient) Start() {
 	n.tss.start()
 	go n.subMsg()
 	go n.cleanUp()
+	// RGB20 侧车连接：所有节点都需要（签名节点只读校验 ValidateConsignment/交叉核对）。
+	// 侧车可能晚于本节点启动（需先拿到 GG18 公钥再起侧车），这里后台重试。
+	if n.rgb20 != nil {
+		go func() {
+			n.waitUntilDone("rgb20 connect", func() bool {
+				if err := n.rgb20.Connect(n.ctx); err != nil {
+					log.Debug("Start rgb20 connect retry", "err", err)
+					return false
+				}
+				return true
+			}, time.Second*3)
+			log.Info("Start rgb20 sidecar connected")
+		}()
+	}
 	if !n.cfg.IsOfficialNode {
 		return
 	}
@@ -146,6 +201,12 @@ func (n *neutrinoClient) Start() {
 	go n.depositWatcher()
 	go n.withdrawalProcessor()
 	n.rgbx.start(n)
+	// RGB20 官方节点：充值轮询 + HTTP（consignment 上传/充值请求）。Start 非阻塞，后台等待侧车连接。
+	if n.rgb20 != nil {
+		if err := n.rgb20.Start(n.ctx); err != nil {
+			log.Error("Start", "rgb20 start error", err)
+		}
+	}
 }
 
 // handle subscription messages
@@ -176,6 +237,9 @@ func (n *neutrinoClient) subMsg() {
 func (n *neutrinoClient) cleanUp() {
 
 	<-n.ctx.Done()
+	if n.rgb20 != nil {
+		n.rgb20.Stop()
+	}
 	if n.cfg.IsOfficialNode {
 		if err := n.neutrinoCS.Stop(); err != nil {
 			log.Error("cleanUp Unable to stop neutrino server", "err", err)
