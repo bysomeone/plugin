@@ -1,0 +1,46 @@
+[package]
+name = "rgb-sidecar"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bdk_wallet = { version = "=3.1.0", features = ["std"] }
+bdk_electrum = { version = "=0.24.0", features = ["use-rustls"] }
+bdk_esplora = { version = "=0.22.2", features = ["blocking-https-rustls"] }
+
+# RGB 0.11.1-rc protocol crates (lib names noted in comments)
+rgb-ops = { version = "=0.11.1-rc.11" }                        # lib: rgbstd
+rgb-consensus = { version = "=0.11.1-rc.11", features = ["stl"] }  # lib: rgbcore
+rgb-invoicing = { version = "=0.11.1-rc.11" }                  # lib: rgbinvoice
+rgb-schemas = { version = "=0.11.1-rc.11" }                    # lib: schemata
+rgb-psbt-utils = { version = "=0.11.1-rc.11" }                 # lib: psrgbt
+rgb-strict-encoding = { version = "=1.0.2", features = ["bitcoin"] }  # lib: strict_encoding
+rgb-strict-types = { version = "=1.0.2", features = ["armor"] }       # lib: strict_types
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bitcoin = "0.32"
+anyhow = "1"
+amplify = "=4.8.1"
+
+# gRPC server
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+tokio-stream = "0.1"
+tower = "0.5"
+
+# misc
+rand = "0.9"
+electrum-client = "0.25"
+bdk_chain = "=0.23.3"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+base64 = "0.22"
+
+[build-dependencies]
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
+
+[profile.release]
+overflow-checks = true

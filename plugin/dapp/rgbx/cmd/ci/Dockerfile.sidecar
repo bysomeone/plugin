@@ -1,0 +1,28 @@
+# RGB 侧车（watch-only、单脚本 wpkh(TSS 公钥)）+ issue_usdt 助手。
+# 在 Linux rust 镜像内构建（宿主 macOS 二进制无法进 Linux 容器）。
+FROM rust:1.98-bookworm AS builder
+RUN set -eux; \
+    apt-get update; \
+    for i in 1 2 3 4 5; do \
+        if apt-get install -y --no-install-recommends protobuf-compiler clang; then break; fi; \
+        echo "apt retry $i"; sleep 10; \
+    done; \
+    apt-get install -y --no-install-recommends protobuf-compiler clang; \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY rgb-sidecar-src/ ./rgb-sidecar/
+WORKDIR /src/rgb-sidecar
+# 缓存依赖层：先拷 Cargo 清单
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release --bin rgb-sidecar --bin issue_usdt
+
+FROM ubuntu:22.04
+WORKDIR /sidecar
+COPY --from=builder /src/rgb-sidecar/target/release/rgb-sidecar /sidecar/rgb-sidecar
+COPY --from=builder /src/rgb-sidecar/target/release/issue_usdt /sidecar/issue_usdt
+# 默认 regtest 侧车（实际 pubkey/electrum 由 compose 环境变量注入）
+ENV RGB_SIDECAR_NETWORK=regtest \
+    RGB_SIDECAR_LISTEN=0.0.0.0:50061 \
+    RGB_SIDECAR_TEST_LISTEN=0.0.0.0:50064
+EXPOSE 50061 50064
+CMD ["/sidecar/rgb-sidecar"]

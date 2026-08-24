@@ -1,0 +1,170 @@
+// RGB 侧车 gRPC 契约 —— Go 桥(neutrino) ↔ Rust 侧车
+// 共享契约：Rust 侧（tonic）与 Go 侧（protoc）都从本文件生成。
+// 修改本契约必须走评审，不得由单侧擅自改动。
+syntax = "proto3";
+
+package rgb_sidecar;
+
+option go_package = "github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20/pb";
+
+service RgbSidecar {
+  // ---- 充值 ----
+  rpc CreateReceive(CreateReceiveRequest) returns (ReceiveData);
+  rpc ProvideConsignment(ProvideConsignmentRequest) returns (TransferState);
+  rpc ListTransfers(ListTransfersRequest) returns (ListTransfersResponse);
+  // ---- 只读校验（签名节点用，确定性、与钱包状态无关性由实现保证并返回 synced_height）----
+  rpc ValidateConsignment(ValidateConsignmentRequest) returns (ConsignmentValidation);
+  // ---- 查询 ----
+  rpc Sync(SyncRequest) returns (SyncResponse);
+  rpc ListSeals(ListSealsRequest) returns (ListSealsResponse);
+  rpc GetBalance(GetBalanceRequest) returns (Balance);
+  rpc ListAssets(ListAssetsRequest) returns (ListAssetsResponse);
+  // ---- 提现 ----
+  rpc BuildWithdrawal(BuildWithdrawalRequest) returns (BuildWithdrawalResponse);
+  rpc FinalizeWithdrawal(FinalizeWithdrawalRequest) returns (FinalizeWithdrawalResponse);
+  // ---- 辅助 ----
+  rpc ParseBtcTx(ParseBtcTxRequest) returns (ParseBtcTxResponse);
+}
+
+// ================= 充值 =================
+
+message CreateReceiveRequest {
+  string asset_symbol = 1;
+  int64 amount = 2;                    // 请求金额（资产最小单位）
+  repeated string transport_endpoints = 3;
+  uint32 min_confirmations = 4;
+}
+message ReceiveData {
+  string invoice = 1;
+  string receive_id = 2;
+  bytes seal_script = 3;               // 该 receive 对应的 seal 脚本（单脚本钱包下= TSS 脚本）
+}
+
+message ProvideConsignmentRequest {
+  bytes consignment = 1;
+  string receive_id_hint = 2;          // 可选：缩小匹配范围
+}
+message TransferState {
+  string receive_id = 1;
+  string status = 2;                   // waiting-counterparty | settled | failed | timeout
+  int64 amount = 3;                    // 结算金额（资产最小单位）
+  string asset_id = 4;                 // rgb:...
+  string txid = 5;
+  uint32 vout = 6;
+}
+
+message ListTransfersRequest {
+  string asset_symbol = 1;
+  string status_filter = 2;            // 空=全部
+}
+message ListTransfersResponse {
+  repeated TransferState transfers = 1;
+}
+
+// ================= 只读校验 =================
+
+message ValidateConsignmentRequest {
+  bytes consignment = 1;
+  int64 expected_amount = 2;
+  bytes expected_recipient_seal = 3;   // 预期收款 seal（outpoint 字节）
+  repeated string expected_closed_seals = 4; // 预期关闭的 seal outpoint
+}
+message ConsignmentValidation {
+  bool valid = 1;
+  string error_message = 2;
+  int64 amount = 3;
+  string asset_id = 4;
+  repeated string closed_seals = 5;    // 该状态转移关闭的 seal outpoint
+  repeated OpenedSeal opened_seals = 6;
+  string recipient_seal = 7;           // 打开的收款 seal outpoint
+  uint64 synced_height = 8;            // 侧车索引器已同步高度（签名节点据此做高度门槛）
+}
+message OpenedSeal {
+  string outpoint = 1;
+  int64 amount = 2;
+  string asset_id = 3;
+}
+
+// ================= 查询 =================
+
+message SyncRequest {
+  string asset_symbol = 1;
+  uint64 btc_block_height = 2;         // 可选：Go 侧已知的 BTC 高度
+}
+message SyncResponse {
+  bool changed = 1;
+  repeated string new_seals = 2;
+}
+
+message ListSealsRequest {
+  string asset_symbol = 1;
+}
+message SealInfo {
+  string outpoint = 1;                 // "txid:vout"
+  string asset_id = 2;
+  string asset_symbol = 3;
+  int64 amount = 4;                    // 资产数量（最小单位）
+  int64 btc_value = 5;                 // 该 UTXO 的 BTC 值（sat）
+  uint32 maturity_height = 6;
+  string status = 7;                   // pending-mint | minted | consumed
+}
+message ListSealsResponse {
+  repeated SealInfo seals = 1;
+}
+
+message GetBalanceRequest {
+  string asset_symbol = 1;
+}
+message Balance {
+  int64 settled = 1;
+  int64 pending = 2;
+}
+
+message ListAssetsRequest {}
+message AssetInfo {
+  string asset_id = 1;                 // rgb:...
+  string asset_symbol = 2;
+  string schema = 3;                   // RGB20/IFA 等
+  uint32 precision = 4;
+}
+message ListAssetsResponse {
+  repeated AssetInfo assets = 1;
+}
+
+// ================= 提现 =================
+
+message BuildWithdrawalRequest {
+  string asset_symbol = 1;
+  string asset_id = 2;
+  int64 amount = 3;                    // 要发送的资产量（最小单位）
+  string recipient_invoice = 4;        // 用户 RGB 钱包生成的 invoice
+  string change_address = 5;           // TSS 地址（change seal）
+  uint32 fee_rate = 6;                 // sat/vB
+}
+message BuildWithdrawalResponse {
+  bytes psbt = 1;                      // 未签 PSBT（TSS 将签名）
+  repeated int64 input_amounts = 2;    // 各输入 prevout 值，顺序同 PSBT 输入
+  bytes consignment = 3;               // 该笔转移的 consignment（记录用）
+}
+
+message FinalizeWithdrawalRequest {
+  bytes psbt_signed = 1;               // TSS 签名后的 PSBT
+}
+message FinalizeWithdrawalResponse {
+  string txid = 1;                     // 广播用 txid；Go 侧据此做 txid↔pending 关联
+  string recipient_seal_outpoint = 2;  // 新打开的收款 seal
+  string change_seal_outpoint = 3;     // change seal（可能为空）
+}
+
+// ================= 辅助 =================
+
+message ParseBtcTxRequest {
+  bytes btc_tx = 1;                    // 序列化 BTC 交易（no-witness）
+  bytes tss_pk_script = 2;             // TSS 脚本，用于定位 seal 输出
+}
+message ParseBtcTxResponse {
+  bool has_rgb_commitment = 1;
+  string commitment_type = 2;          // "opret" | "tapret" | ""
+  string asset_id = 3;
+  uint32 seal_output_index = 4;
+}

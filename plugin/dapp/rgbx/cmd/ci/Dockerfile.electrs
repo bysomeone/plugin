@@ -1,0 +1,21 @@
+# electrs 0.11.1（Electrum 索引器，供 RGB 侧车用）。rocksdb 需要 clang。
+FROM rust:1.98-bookworm AS builder
+RUN set -eux; \
+    apt-get update; \
+    for i in 1 2 3 4 5; do \
+        if apt-get install -y --no-install-recommends clang libclang-dev; then break; fi; \
+        echo "apt retry $i"; sleep 10; \
+    done; \
+    apt-get install -y --no-install-recommends clang libclang-dev; \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+ARG ELECTRS_VERSION=v0.11.1
+RUN git clone --depth 1 --branch ${ELECTRS_VERSION} https://github.com/romanz/electrs.git .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release
+
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/target/release/electrs /usr/local/bin/electrs
+EXPOSE 60401
+CMD ["electrs"]
