@@ -27,11 +27,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = PathBuf::from(env_or("RGB_SIDECAR_DATA_DIR", "./sidecar-data"));
     let electrum_url = env_or("RGB_SIDECAR_ELECTRUM", "127.0.0.1:60401");
     let network = parse_network(&env_or("RGB_SIDECAR_NETWORK", "regtest"));
-    let tss_pubkey_hex = env_or(
-        "RGB_SIDECAR_TSS_PUBKEY",
+    let tss_pubkey_hex = std::env::var("RGB_SIDECAR_TSS_PUBKEY")
+        .ok()
+        .filter(|s| !s.is_empty())
         // Dev default = test key 0x11... (E2E key); production MUST set the real TSS pubkey.
-        "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa",
-    );
+        .unwrap_or_else(|| "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa".to_string());
     let grpc_listen = env_or("RGB_SIDECAR_LISTEN", "0.0.0.0:50061");
 
     let cfg = Config {

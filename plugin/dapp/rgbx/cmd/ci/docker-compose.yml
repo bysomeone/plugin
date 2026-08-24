@@ -101,6 +101,7 @@ services:
       - -rpcuser=${RGB20_BITCOIND_USER:-rgb}
       - -rpcpassword=${RGB20_BITCOIND_PASS:-rgbpass123}
       - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
     volumes:
       - rgb-bitcoind-data:/data
     ports:
@@ -117,13 +118,12 @@ services:
       context: .
       dockerfile: Dockerfile.electrs
     command:
-      - electrs
-      - --network=regtest
-      - --db-dir=/electrs-db
-      - --daemon-dir=/data
-      - --daemon-rpc-addr=rgb-bitcoind:18443
-      - --daemon-p2p-addr=rgb-bitcoind:18444
-      - --electrum-rpc-addr=0.0.0.0:60401
+      - /bin/sh
+      - -c
+      - |
+        mkdir -p /data/regtest
+        printf 'rgb:rgbpass123' > /data/regtest/.cookie
+        exec electrs --network=regtest --db-dir=/electrs-db --daemon-dir=/data           --daemon-rpc-addr=rgb-bitcoind:18443 --daemon-p2p-addr=rgb-bitcoind:18444           --electrum-rpc-addr=0.0.0.0:60401
     volumes:
       - rgb-bitcoind-data:/data
       - rgb-electrs-db:/electrs-db

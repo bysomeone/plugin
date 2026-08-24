@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 bdk_wallet = { version = "=3.1.0", features = ["std"] }
 bdk_electrum = { version = "=0.24.0", features = ["use-rustls"] }
-bdk_esplora = { version = "=0.22.2", features = ["blocking-https-rustls"] }
 
 # RGB 0.11.1-rc protocol crates (lib names noted in comments)
 rgb-ops = { version = "=0.11.1-rc.11" }                        # lib: rgbstd

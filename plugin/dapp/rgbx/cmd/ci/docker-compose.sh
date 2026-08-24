@@ -200,6 +200,7 @@ maxUtxoRescanTime=60
 host="${BTC_RPC_ADDR}"
 user="${BTCD_RPC_USER}"
 pass="${BTCD_RPC_PASS}"
+mode="http"
 disableTLS=true
 certFile=""
 
