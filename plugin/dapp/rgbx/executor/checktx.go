@@ -9,7 +9,10 @@ import (
 	"github.com/33cn/chain33/common/address"
 	"github.com/33cn/chain33/types"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
 )
 
@@ -64,6 +67,8 @@ var (
 const (
 	maxBtcFeeRate        = int64(1000)
 	minBtcWithdrawAmount = int64(546)
+	// minRgb20WithdrawAmount RGB20 提现最小金额（token 最小单位口径）。
+	minRgb20WithdrawAmount = int64(1)
 )
 
 // CheckTx 实现自定义检验交易接口，供框架调用
@@ -225,6 +230,25 @@ func (r *rgbx) checkCommitDKG(txHash, fromAddr string, commitDKG *rtypes.CommitD
 			"pkScript", hex.EncodeToString(commitDKG.GetPkScript()), "expectPkScript", hex.EncodeToString(pkScript), "err", err)
 		return ErrInvalidDkgAddress
 	}
+	// RGB20 分支（BL-1）：校验 hash160(pubkey) == pkScript[2:]，确保 TSS 组公钥与地址一致。
+	if rtypes.IsRgb20Symbol(symbol) {
+		if len(commitDKG.GetPubkey()) == 0 {
+			elog.Error("checkCommitDKG rgb20 empty pubkey", "txHash", txHash, "symbol", symbol)
+			return ErrInvalidDkgAddress
+		}
+		pub, err := btcec.ParsePubKey(commitDKG.GetPubkey())
+		if err != nil {
+			elog.Error("checkCommitDKG rgb20 parse pubkey", "txHash", txHash, "symbol", symbol, "err", err)
+			return ErrInvalidDkgAddress
+		}
+		pubHash := btcutil.Hash160(pub.SerializeCompressed())
+		if len(pkScript) != 22 || pkScript[0] != txscript.OP_0 || pkScript[1] != 0x14 ||
+			!bytes.Equal(pubHash, pkScript[2:]) {
+			elog.Error("checkCommitDKG rgb20 pubkey mismatch", "txHash", txHash, "symbol", symbol,
+				"pubHash", hex.EncodeToString(pubHash), "pkScript", hex.EncodeToString(pkScript))
+			return ErrInvalidDkgAddress
+		}
+	}
 	guardianAddrs, err := r.getGuardianNodeAddress(rgbxCfg.GuardianParachainTitle)
 	if err != nil {
 		elog.Error("checkCommitDKG getGuardianNodeAddress", "txHash", txHash, "symbol", symbol, "err", err)
@@ -246,6 +270,36 @@ func (r *rgbx) checkCommitDKG(txHash, fromAddr string, commitDKG *rtypes.CommitD
 func (r *rgbx) checkWithdraw(fromAddr, txHash string, withdraw *rtypes.WithdrawAsset) error {
 
 	symbol := ensureCrossChainSymbol(withdraw.GetAssetSymbol())
+
+	// RGB20 分支：destinationAddr 是用户 RGB 钱包 invoice（非 BTC 地址），跳过地址解码；
+	// 金额下限按 token 最小单位口径，不套用 BTC dust（546 sat）。
+	if rtypes.IsRgb20Symbol(withdraw.GetAssetSymbol()) {
+		if withdraw.GetAmount() < minRgb20WithdrawAmount {
+			elog.Error("checkWithdraw rgb20 amount", "txHash", txHash, "amount", withdraw.GetAmount())
+			return ErrInvalidWithdrawAmount
+		}
+		if withdraw.GetDestinationAddr() == "" {
+			elog.Error("checkWithdraw rgb20 empty invoice", "txHash", txHash)
+			return ErrInvalidWithdrawDestination
+		}
+		if withdraw.GetFeeRate() < 1 || withdraw.GetFeeRate() > maxBtcFeeRate {
+			elog.Error("checkWithdraw rgb20 feeRate", "txHash", txHash, "feeRate", withdraw.GetFeeRate())
+			return ErrInvalidWithdrawFeeRate
+		}
+		accDB, err := r.newAccount(symbol)
+		if err != nil {
+			elog.Error("checkWithdraw rgb20 newAccount", "txHash", txHash, "symbol", withdraw.GetAssetSymbol(), "err", err)
+			return err
+		}
+		balance := accDB.LoadAccount(fromAddr).GetBalance()
+		if balance < withdraw.GetAmount() {
+			elog.Error("checkWithdraw rgb20 insufficient balance", "txHash", txHash, "from", fromAddr,
+				"symbol", symbol, "need", withdraw.GetAmount(), "balance", balance)
+			return types.ErrInsufficientBalance
+		}
+		return nil
+	}
+
 	if withdraw.GetAmount() < minBtcWithdrawAmount {
 		elog.Error("checkWithdraw amount", "txHash", txHash, "amount", withdraw.GetAmount())
 		return ErrInvalidWithdrawAmount
@@ -292,6 +346,20 @@ func (r *rgbx) checkDeposit(txHash string, deposit *rtypes.DepositAsset) error {
 	if err != nil {
 		elog.Error("checkDeposit validate btc tx proof", "txHash", txHash, "btcProof", btcProof2String(deposit.GetTxProof()), "err", err)
 		return err
+	}
+	// RGB20 分支：跳过链上 OP_RETURN 承诺与链上金额校验（RGB 金额在 consignment 内，由侧车验证），
+	// 改验 TSS 阈值签名 threshold_sig（btcec 直验 C=sha256(Encode(DepositAsset{threshold_sig:nil}))）。
+	if rtypes.IsRgb20Symbol(deposit.GetAssetSymbol()) {
+		info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
+		if err != nil {
+			elog.Error("checkDeposit rgb20 getCrossChainInfo", "txHash", txHash, "symbol", deposit.GetAssetSymbol(), "err", err)
+			return ErrGetCrossChainInfo
+		}
+		if err := verifyThresholdSig(info.GetPubkey(), deposit); err != nil {
+			elog.Error("checkDeposit rgb20 verifyThresholdSig", "txHash", txHash, "symbol", deposit.GetAssetSymbol(), "err", err)
+			return err
+		}
+		return nil
 	}
 	if !hasDepositCommitment(btcTx, addr) {
 		elog.Error("checkDeposit commitment mismatch", "txHash", txHash, "depositAddress", addr)

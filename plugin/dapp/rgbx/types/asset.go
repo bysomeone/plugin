@@ -1,5 +1,7 @@
 package types
 
+import "strings"
+
 const (
 	// MaxAssetSymbolLength is the maximum byte length of an asset's symbol.
 	// This byte length is equivalent to character count for single-byte
@@ -31,7 +33,16 @@ const (
 const (
 	// BTCSymbol bitcoin
 	BTCSymbol = "BTC"
+
+	// RGB20USDTSymbol RGB20 资产符号（UTEXO 发行的 Bitcoin 原生 USDT）。
+	// 与标准 RGB（v0.11.1）RGB20/IFA 协议对接，链上只做 TSS 阈值签名门禁。
+	RGB20USDTSymbol = "RGB20_USDT"
 )
+
+// IsRgb20Symbol 判断是否为 RGB20 协议资产。
+func IsRgb20Symbol(symbol string) bool {
+	return strings.ToUpper(symbol) == RGB20USDTSymbol
+}
 
 // String returns a human-readable description of the type.
 func (t AssetType) String() string {
