@@ -215,6 +215,78 @@ fn http_error(code: u16, msg: &str) -> Vec<u8> {
     out
 }
 
+/// Locate `needle` inside `haystack`; return the byte offset or `None`.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|win| win == needle)
+}
+
+/// Read one HTTP request from the socket using Content-Length framing
+/// (header until `\r\n\r\n`, then exactly `Content-Length` body bytes).
+///
+/// Previously this used `read_to_end` which only returns once the *client*
+/// closes the connection (EOF) — curl never does, so every endpoint hung.
+/// Returns the full request bytes (header + separator + body) for `handle`.
+async fn read_http_request(sock: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    const MAX_HEADER: usize = 64 * 1024;
+    let mut buf = Vec::with_capacity(1 << 20);
+    let header_end;
+    loop {
+        let mut chunk = [0u8; 4096];
+        let n = sock.read(&mut chunk).await?;
+        if n == 0 {
+            // Peer closed the connection before a complete header arrived.
+            if buf.is_empty() {
+                return Ok(buf); // empty connection — caller should close
+            }
+            header_end = None;
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+            header_end = Some(pos);
+            break;
+        }
+        if buf.len() > MAX_HEADER {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request header too large",
+            ));
+        }
+    }
+
+    let Some(header_end) = header_end else {
+        // No body separator — pass through what we got (handle tolerates it).
+        return Ok(buf);
+    };
+
+    // Parse Content-Length (absent -> 0, e.g. a plain GET).
+    let header = String::from_utf8_lossy(&buf[..header_end]);
+    let content_length = header
+        .lines()
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                v.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    // Bytes already received past the separator are the start of the body.
+    let mut body = buf.split_off(header_end + 4);
+    if body.len() < content_length {
+        let mut remaining = vec![0u8; content_length - body.len()];
+        sock.read_exact(&mut remaining).await?;
+        body.extend_from_slice(&remaining);
+    }
+    // Rebuild the full request buffer: header (+separator) + body.
+    buf.extend_from_slice(&body);
+    Ok(buf)
+}
+
 /// Spawn the test-sim HTTP server (only when `RGB_SIDECAR_TEST_LISTEN` is set).
 pub fn spawn(engine: Arc<Mutex<RgbEngine>>, listen: &str) -> Result<()> {
     let addr: SocketAddr = listen.parse()?;
@@ -227,8 +299,10 @@ pub fn spawn(engine: Arc<Mutex<RgbEngine>>, listen: &str) -> Result<()> {
             };
             let engine = engine.clone();
             tokio::spawn(async move {
-                let mut buf = Vec::with_capacity(1 << 20);
-                let _ = sock.read_to_end(&mut buf).await;
+                let buf = match read_http_request(&mut sock).await {
+                    Ok(buf) if !buf.is_empty() => buf,
+                    _ => return, // read error / empty connection — just close
+                };
                 let resp = handle(&buf, engine).await;
                 let _ = sock.write_all(&resp).await;
                 let _ = sock.flush().await;
