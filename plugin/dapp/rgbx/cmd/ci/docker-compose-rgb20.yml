@@ -1,0 +1,123 @@
+# RGB20 (Phase 5) 独立 compose override 文件。
+# 与基础 docker-compose.yml 合并使用：docker compose -f docker-compose.yml -f docker-compose-rgb20.yml ...
+# 1) 给 main 加健康检查（chain33-cli 可查询即 RPC ready），para 等待 main healthy 再启动——
+#    para 启动即连主链 grpc(8802)，main 未就绪时 para 会 panic 退出（Phase 5 DKG 修复，环境时序）。
+# 2) para1-4 depends_on main 提升为 service_healthy。
+# 3) RGB20 链服务（rgb-bitcoind/electrs/侧车）独立放在本文件，避免污染基础 docker-compose.yml。
+
+services:
+  main:
+    healthcheck:
+      test: ["CMD", "/root/chain33-cli", "--conf=chain33.test.toml", "block", "last_header"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
+
+  para1:
+    depends_on:
+      main:
+        condition: service_healthy
+      btcd:
+        condition: service_healthy
+
+  para2:
+    depends_on:
+      main:
+        condition: service_healthy
+
+  para3:
+    depends_on:
+      main:
+        condition: service_healthy
+
+  para4:
+    depends_on:
+      main:
+        condition: service_healthy
+
+  # ===== RGB20 (Phase 5)：RGB 链 =====
+  # bitcoind regtest（RGB 链）+ electrs 索引 + RGB 侧车，全部走 compose 内部网络。
+  # 宿主 macOS 二进制无法进 Linux 容器，故 electrs/侧车在 Docker 内构建（Dockerfile.electrs/sidecar）。
+  rgb-bitcoind:
+    image: lncm/bitcoind:v27.2
+    command:
+      - -regtest
+      - -datadir=/data
+      - -server=1
+      - -txindex=1
+      - -fallbackfee=0.0001
+      - -rpcuser=${RGB20_BITCOIND_USER:-rgb}
+      - -rpcpassword=${RGB20_BITCOIND_PASS:-rgbpass123}
+      - -rpcallowip=0.0.0.0/0
+      - -rpcbind=0.0.0.0
+    volumes:
+      - rgb-bitcoind-data:/data
+    ports:
+      - "18543:18443"
+      - "18544:18444"
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=${RGB20_BITCOIND_USER:-rgb}", "-rpcpassword=${RGB20_BITCOIND_PASS:-rgbpass123}", "getblockcount"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # esplora-backend（Blockstream/electrs fork）：默认直接读 bitcoind 的 blk 文件（--daemon-dir 按 regtest
+  # 自动追加 /regtest 子目录），再连 RPC 同步 mempool/新块；Electrum 协议端口 60401 供侧车 bdk_electrum 使用，
+  # HTTP API 端口 3002 便于调试。--db-dir 用 /electrs-db/esplora（独立子目录，避开旧 romanz/electrs 不兼容的 schema）。
+  rgb-electrs:
+    build:
+      context: .
+      dockerfile: Dockerfile.electrs
+    environment:
+      # electrs(new-index) 用 stderrlog -v 控制日志级别（默认 info，-v=debug），RUST_LOG 不生效、仅保留占位
+      RUST_LOG: debug
+    command:
+      - /bin/sh
+      - -c
+      - |
+        exec electrs -v \
+          --network=regtest \
+          --db-dir=/electrs-db/esplora \
+          --daemon-dir=/data \
+          --daemon-rpc-addr=rgb-bitcoind:18443 \
+          --electrum-rpc-addr=0.0.0.0:60401 \
+          --cookie=${RGB20_BITCOIND_USER:-rgb}:${RGB20_BITCOIND_PASS:-rgbpass123} \
+          --http-addr=0.0.0.0:3002
+    volumes:
+      - rgb-bitcoind-data:/data
+      - rgb-electrs-db:/electrs-db
+    depends_on:
+      rgb-bitcoind:
+        condition: service_healthy
+    ports:
+      - "60401:60401"
+      - "3002:3002"
+
+  rgb-sidecar:
+    build:
+      context: .
+      dockerfile: Dockerfile.sidecar
+    environment:
+      RGB_SIDECAR_DATA_DIR: /data
+      RGB_SIDECAR_ELECTRUM: rgb-electrs:60401
+      RGB_SIDECAR_NETWORK: regtest
+      RGB_SIDECAR_TSS_PUBKEY: ${RGB20_TSS_PUBKEY:-}
+      RGB_SIDECAR_LISTEN: 0.0.0.0:50061
+      RGB_SIDECAR_TEST_LISTEN: 0.0.0.0:50064
+      RGB_BITCOIND_RPC: http://rgb-bitcoind:18443
+      RGB_BITCOIND_USER: ${RGB20_BITCOIND_USER:-rgb}
+      RGB_BITCOIND_PASS: ${RGB20_BITCOIND_PASS:-rgbpass123}
+    volumes:
+      - rgb-sidecar-data:/data
+    depends_on:
+      rgb-electrs:
+        condition: service_started
+    ports:
+      - "50061:50061"
+      - "50064:50064"
+
+volumes:
+  rgb-bitcoind-data:
+  rgb-electrs-db:
+  rgb-sidecar-data:

@@ -1,6 +1,9 @@
-# electrs 0.11.1（Electrum 索引器，供 RGB 侧车用）。rocksdb bindgen 需要 libclang。
-# electrs 源码固定 tag（v0.11.1），整个 `cargo build` RUN 层由 Docker 层缓存复用，
-# 无需依赖/源码分层（源码不随开发变化）。侧车才需要分层缓存（见 Dockerfile.sidecar）。
+# esplora-backend（Blockstream/electrs，分支 new-index）—— RGB 生态标准 Electrum 索引器。
+# 替换 romanz/electrs v0.11.1：旧版在 aarch64 上索引含 RGB 交易的区块会卡死（db 停在 384K、
+# electrum 端口监听但不响应）。Blockstream 独立维护的 electrs fork 生产验证过 RGB 交易。
+# 仍走 Electrum 协议（--electrum-rpc-addr），侧车 bdk_electrum 客户端无需改动。
+# 固定 commit（95bf0cfce），整个 cargo build RUN 层由 Docker 层缓存复用。
+# 构建依赖：rocksdb bindgen 需要 libclang；rocksdb/libzmq 的 C++ 需要 cmake/g++/autotools。
 ARG DEBIAN_MIRROR=mirrors.aliyun.com
 
 FROM rust:1.98-bookworm AS builder
@@ -8,21 +11,32 @@ ARG DEBIAN_MIRROR
 RUN set -eux; \
     sed -i "s|deb.debian.org|${DEBIAN_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
     for i in 1 2 3 4 5 6 7 8; do \
-        if apt-get update && apt-get install -y --no-install-recommends clang libclang-dev llvm-14-dev; then break; fi; \
+        if apt-get update && apt-get install -y --no-install-recommends \
+            clang libclang-dev llvm-14-dev cmake build-essential autoconf automake libtool pkg-config; then break; fi; \
         echo "apt retry $i"; sleep 15; \
     done; \
-    apt-get update && apt-get install -y --no-install-recommends clang libclang-dev llvm-14-dev; \
+    apt-get update && apt-get install -y --no-install-recommends \
+        clang libclang-dev llvm-14-dev cmake build-essential autoconf automake libtool pkg-config; \
     ls /usr/lib/llvm-*/lib/libclang.so*; \
     rm -rf /var/lib/apt/lists/*
 # rocksdb bindgen 需要定位 libclang（Debian bookworm: /usr/lib/llvm-14/lib/libclang.so）
 ENV LIBCLANG_PATH=/usr/lib/llvm-14/lib
 WORKDIR /src
-ARG ELECTRS_VERSION=v0.11.1
-RUN git clone --depth 1 --branch ${ELECTRS_VERSION} https://github.com/romanz/electrs.git . && \
-    cargo build --release
+ARG ESPLORA_COMMIT=95bf0cfce3a7868190941f4450ea5269cfa2b77e
+# 浅取单个 commit（GitHub 允许按 SHA fetch），源码+依赖一次性落到仓库；cargo fetch 单独一层做依赖缓存。
+RUN git init -q && \
+    git remote add origin https://github.com/Blockstream/electrs.git && \
+    git fetch -q --depth 1 origin ${ESPLORA_COMMIT} && \
+    git checkout -q FETCH_HEAD && \
+    git log -1 --oneline && \
+    cargo fetch
+# 上游 release profile 开 lto+codegen-units=1，构建极慢；CI 镜像覆盖为增量编译加速（索引功能不受影响）。
+RUN mkdir -p .cargo && \
+    printf '[profile.release]\nlto = false\ncodegen-units = 16\n' > .cargo/config.toml && \
+    cargo build --release --bin electrs --offline
 
-FROM ubuntu:22.04
+FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /src/target/release/electrs /usr/local/bin/electrs
-EXPOSE 60401
+EXPOSE 60401 3002
 CMD ["electrs"]
