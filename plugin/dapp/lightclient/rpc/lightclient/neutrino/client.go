@@ -96,6 +96,14 @@ func (n *neutrinoClient) Init(ctx context.Context, q queue.Queue, cfg *lightclie
 		log.Error("Init", "initNeutrinoConfig error", err)
 		return err
 	}
+	// RGB20 适配器：所有节点都需要（签名节点只读校验 ValidateConsignment/交叉核对）。
+	// 不能放在 IsOfficialNode 分支里，否则 para2-4（validator）不创建 adapter，
+	// handleRgb20DepositSign/handleRgb20WithdrawSign 报 "rgb20 adapter not configured"，
+	// 不参与 deposit/withdraw 的 GG18 组签名（组签名超时）。
+	if err := n.initRgb20Adapter(); err != nil {
+		log.Error("Init", "initRgb20Adapter error", err)
+		return err
+	}
 	if !n.cfg.IsOfficialNode {
 		return nil
 	}
@@ -114,10 +122,6 @@ func (n *neutrinoClient) Init(ctx context.Context, q queue.Queue, cfg *lightclie
 	}
 	n.bw = bw
 	n.rgbx = newRGBX()
-	if err := n.initRgb20Adapter(); err != nil {
-		log.Error("Init", "initRgb20Adapter error", err)
-		return err
-	}
 	return nil
 
 }
