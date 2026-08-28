@@ -29,7 +29,11 @@ fn env_or(key: &str, default: &str) -> String {
 
 fn basic_auth(user: &str, pass: &str) -> String {
     use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+    // 修复：必须带 "Basic " scheme，否则 bitcoind RPC 返回 401（issue_usdt.rs 同款实现带前缀）。
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
+    )
 }
 
 /// bitcoind JSON-RPC（test-sim 用，不依赖本机 bitcoin-cli）。
@@ -55,7 +59,9 @@ fn rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
 
 /// Mine regtest blocks via bitcoind JSON-RPC. Test-only.
 fn mine_blocks(n: u32) -> Result<()> {
-    let addr = rpc("getnewaddress", serde_json::json!([{}]))?
+    // 修复：getnewaddress 不接收参数对象，空参即可（[{}] 会被 bitcoind 判为 label 类型错误 -3，
+    // 导致挖块失败 → deposit settle 卡住）。
+    let addr = rpc("getnewaddress", serde_json::json!([]))?
         .as_str()
         .unwrap_or_default()
         .to_string();
@@ -108,6 +114,9 @@ pub struct SimPayResult {
 
 impl SimulateExt for RgbEngine {
     fn simulate_user_pay_begin(&mut self, invoice: &str) -> Result<SimPayOutcome> {
+        // 同步 TSS watch-only 钱包：否则 bdk list_unspent 看不到 TSS 地址的 BTC UTXO，
+        // build_transfer 报 "BTC inputs (0) cannot cover output+fee"。
+        self.wallet.sync()?;
         let parsed = parse_invoice(invoice)?;
         let amount = parsed
             .amount
