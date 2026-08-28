@@ -490,6 +490,12 @@ func (t *tssService) signPsbtWithSigners(p *psbt.Packet, signers []string, signF
 		})
 		log.Debug("signPsbt applied partial sig", "input", i)
 	}
+	// Phase 5 修复：签完所有输入后 finalize（partial sig → final witness）。
+	// 根因：sign-psbt 之前返回只含 partial_sigs 的未 finalize PSBT，侧车 extract_tx()
+	// 会丢弃 partial sig 得到无 witness 交易，广播报 "Witness program hash mismatch"。
+	if err := psbt.MaybeFinalizeAll(p); err != nil {
+		return nil, fmt.Errorf("finalize psbt: %w", err)
+	}
 	var buf bytes.Buffer
 	if err := p.Serialize(&buf); err != nil {
 		return nil, fmt.Errorf("serialize psbt: %w", err)
