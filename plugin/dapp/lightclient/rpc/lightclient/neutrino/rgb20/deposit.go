@@ -110,14 +110,18 @@ func (a *Adapter) pollTransfers() {
 
 func (a *Adapter) pollTransfersOnce() {
 	if a.sidecar.Load() == nil {
+		log.Error("pollTransfersOnce", "err", "sidecar not connected")
 		return
 	}
 	rsp, err := a.sidecar.Load().ListTransfers(a.ctx, &pb.ListTransfersRequest{StatusFilter: "settled"})
 	if err != nil {
+		log.Error("pollTransfersOnce ListTransfers", "err", err)
 		return
 	}
+	log.Info("pollTransfersOnce", "settledTransfers", len(rsp.Transfers))
 	for _, t := range rsp.Transfers {
 		if err := a.onSettledTransfer(t); err != nil {
+			log.Error("pollTransfersOnce onSettledTransfer", "receiveId", t.ReceiveId, "err", err)
 			continue
 		}
 	}
@@ -133,6 +137,7 @@ func (a *Adapter) onSettledTransfer(t *pb.TransferState) error {
 	rec, err := a.receives.Get(t.ReceiveId)
 	if err != nil {
 		// 非本桥发起的 receive（侧车自建），跳过
+		log.Debug("onSettledTransfer receive not found", "receiveId", t.ReceiveId, "err", err)
 		return nil
 	}
 	if rec.Status == ReceiveStatusMinted {
@@ -244,21 +249,36 @@ func (a *Adapter) ValidateDepositConsignment(payload *DepositSignPayload) error 
 	if len(payload.Consignment) == 0 {
 		return fmt.Errorf("empty consignment")
 	}
-	rec, err := a.receives.Get(payload.ReceiveID)
-	if err != nil {
-		return fmt.Errorf("receive not found: %s", payload.ReceiveID)
+	// 本地 receive 可能存在（官方节点）也可能不存在（validator 节点：receive 只在官方节点
+	// 通过 CreateReceive 创建，validator 的本地 store 没有）。validator 节点退化为用
+	// payload 携带的数据 + 侧车确定性校验，保证能独立验证 deposit（BL-3）。
+	var rec *ReceiveRecord
+	if r, err := a.receives.Get(payload.ReceiveID); err == nil {
+		rec = r
+	} else {
+		log.Debug("ValidateDepositConsignment receive not local, using payload data", "receiveId", payload.ReceiveID)
 	}
-	// 去重：本节点已 minted 则拒绝（杜绝重复铸造）
-	if rec.Status == ReceiveStatusMinted {
-		return fmt.Errorf("receive %s already minted", payload.ReceiveID)
+	if rec != nil {
+		// 去重：本节点已 minted 则拒绝（杜绝重复铸造）
+		if rec.Status == ReceiveStatusMinted {
+			return fmt.Errorf("receive %s already minted", payload.ReceiveID)
+		}
 	}
 	// 地址绑定：deposit 目标地址必须等于充值请求的 Chain33 地址
-	if rec.Chain33Addr != payload.Deposit.DepositAddress {
-		return fmt.Errorf("address binding mismatch: rec=%s dep=%s", rec.Chain33Addr, payload.Deposit.DepositAddress)
+	reqAddr := payload.Chain33Addr
+	if rec != nil {
+		reqAddr = rec.Chain33Addr
+	}
+	if reqAddr != payload.Deposit.DepositAddress {
+		return fmt.Errorf("address binding mismatch: req=%s dep=%s", reqAddr, payload.Deposit.DepositAddress)
 	}
 	// 金额匹配
-	if rec.Amount != payload.Deposit.Amount {
-		return fmt.Errorf("amount mismatch: rec=%d dep=%d", rec.Amount, payload.Deposit.Amount)
+	reqAmount := payload.Deposit.Amount
+	if rec != nil {
+		reqAmount = rec.Amount
+	}
+	if reqAmount != payload.Deposit.Amount {
+		return fmt.Errorf("amount mismatch: req=%d dep=%d", reqAmount, payload.Deposit.Amount)
 	}
 	// SPV 独立验证（对 lightclient 头）：签名节点必须能独立确认付款交易上链。
 	if a.bridge == nil {
@@ -270,16 +290,24 @@ func (a *Adapter) ValidateDepositConsignment(payload *DepositSignPayload) error 
 	if a.sidecar.Load() == nil {
 		return fmt.Errorf("sidecar unavailable")
 	}
+	var expectedSeal []byte
+	if rec != nil {
+		expectedSeal = []byte(rec.Seal)
+	}
 	v, err := a.sidecar.Load().ValidateConsignment(a.ctx, &pb.ValidateConsignmentRequest{
 		Consignment:           payload.Consignment,
-		ExpectedAmount:        rec.Amount,
-		ExpectedRecipientSeal: []byte(rec.Seal),
+		ExpectedAmount:        reqAmount,
+		ExpectedRecipientSeal: expectedSeal,
 	})
 	if err != nil {
 		return fmt.Errorf("validate consignment: %w", err)
 	}
 	if !v.Valid {
 		return fmt.Errorf("consignment invalid: %s", v.ErrorMessage)
+	}
+	// 金额匹配（侧车返回的 consignment 金额）
+	if v.Amount != payload.Deposit.Amount {
+		return fmt.Errorf("consignment amount mismatch: sidecar=%d dep=%d", v.Amount, payload.Deposit.Amount)
 	}
 	// 同步高度门槛（HR-3）：侧车索引器高度必须覆盖付款交易所在高度
 	if v.SyncedHeight < payload.BtcBlockHeight {
