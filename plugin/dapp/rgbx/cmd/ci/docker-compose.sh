@@ -17,7 +17,7 @@ if [ "$#" -gt 0 ]; then
     case "${1}" in
     run | up | down | init | config | test)
         ACTION="${1}"
-        PROJECT="${2:-build}"
+        PROJECT="${2:-rgbx-ci}"
         ;;
     *)
         PROJECT="${1}"
@@ -25,10 +25,15 @@ if [ "$#" -gt 0 ]; then
     esac
 fi
 if [ -z "${PROJECT}" ]; then
-    PROJECT="build"
+    PROJECT="rgbx-ci"
 fi
 
 export COMPOSE_PROJECT_NAME="${PROJECT}"
+
+# Phase 5：RGB20 服务/override 独立 compose 文件，与基础文件合并。
+# 基础 docker-compose.yml 保持纯净；main healthcheck + para 等待 main healthy + RGB 链服务
+# 都放在 docker-compose-rgb20.yml。这样基础文件改动最小，避免与其他分支冲突。
+export COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml:docker-compose-rgb20.yml}"
 
 if command -v docker-compose >/dev/null 2>&1; then
     COMPOSE_BIN="docker-compose"
@@ -52,11 +57,12 @@ BTCD_RPC_PASS="${BTCD_RPC_PASS:-1314}"
 BTC_CTL="compose_cmd exec -T btcd /usr/local/bin/btcctl --configfile=/tmp/btcctl.conf --rpcserver=127.0.0.1:18443 --rpcuser=${BTCD_RPC_USER} --rpcpass=${BTCD_RPC_PASS}"
 
 BTC_NETWORK="${BTC_NETWORK:-regtest}"
-# RGB20（Phase 5）：para 的 neutrino 锚定 compose 内 rgb-bitcoind（regtest）。
-# 旧 BTC 功能用例已屏蔽；btcd 服务仅保留用于环境初始化。
-BTC_P2P_ADDR="${BTC_P2P_ADDR:-rgb-bitcoind:18444}"
-BTC_RPC_ADDR="${BTC_RPC_ADDR:-rgb-bitcoind:18443}"
-HOST_BTC_RPC_ADDR="${HOST_BTC_RPC_ADDR:-127.0.0.1:18543}"
+# 单 btcd 收敛（Phase 5 收尾）：BTC 桥 + RGB 链共用同一个 btcd 全节点（BIP157 committed
+# filters，neutrino 能同步头/过滤器；bitcoind 不服务 BIP157 是原 SPV EOF 根因）。para 的
+# neutrino connectPeers 指 btcd:18444（P2P），btcRPC 指 btcd:18443（TLS + /btcd/rpc.cert）。
+BTC_P2P_ADDR="${BTC_P2P_ADDR:-btcd:18444}"
+BTC_RPC_ADDR="${BTC_RPC_ADDR:-btcd:18443}"
+HOST_BTC_RPC_ADDR="${HOST_BTC_RPC_ADDR:-127.0.0.1:18443}"
 PARA_TITLE="${PARA_TITLE:-user.p.rgbx.}"
 TSS_THRESHOLD="${TSS_THRESHOLD:-3}"
 AUTO_DISCOVER_TSS_PEERS="${AUTO_DISCOVER_TSS_PEERS:-true}"
@@ -89,10 +95,12 @@ RGB20_SIDECAR_SYMBOL="${RGB20_SIDECAR_SYMBOL:-USDT}"
 RGB20_SIDECAR_ADDR="${RGB20_SIDECAR_ADDR:-rgb-sidecar:50061}"
 RGB20_SIDECAR_TEST_ADDR="${RGB20_SIDECAR_TEST_ADDR:-127.0.0.1:50064}"
 RGB20_PRECISION="${RGB20_PRECISION:-6}"
-RGB20_BITCOIND_RPC="${RGB20_BITCOIND_RPC:-host.docker.internal:18543}"
-RGB20_BITCOIND_P2P="${RGB20_BITCOIND_P2P:-host.docker.internal:18544}"
-RGB20_BITCOIND_USER="${RGB20_BITCOIND_USER:-rgb}"
-RGB20_BITCOIND_PASS="${RGB20_BITCOIND_PASS:-rgbpass123}"
+# RGB 链收敛到单 btcd：sidecar/issue_usdt/test-sim 的 RPC 指向 btcd（TLS，凭据 root/1314，
+# cert=/btcd/rpc.cert）。RGB_BITCOIND_RPC 为 host:port（无 scheme），scheme 由 cert 是否设置决定。
+RGB20_BITCOIND_RPC="${RGB20_BITCOIND_RPC:-btcd:18443}"
+RGB20_BITCOIND_USER="${RGB20_BITCOIND_USER:-${BTCD_RPC_USER:-root}}"
+RGB20_BITCOIND_PASS="${RGB20_BITCOIND_PASS:-${BTCD_RPC_PASS:-1314}}"
+RGB20_BITCOIND_CERT="${RGB20_BITCOIND_CERT:-/btcd/rpc.cert}"
 RGB20_DEPOSIT_AMOUNT="${RGB20_DEPOSIT_AMOUNT:-1000000}"   # 1.0 USDT (min units)
 RGB20_WITHDRAW_AMOUNT="${RGB20_WITHDRAW_AMOUNT:-500000}"  # 0.5 USDT
 BTC_WITHDRAW_FEE_RATE="${BTC_WITHDRAW_FEE_RATE:-20}"
@@ -175,6 +183,16 @@ function config_para_file() {
     if ! grep -q '^enableTSS=' "${path}" 2>/dev/null; then
         perl -i -0pe 's/\[crypto\]\n/[crypto]\nenableTSS=true\n/' "${path}"
     fi
+    # Phase 5 DKG 修复：para 链 paracross fork 高度与主链(local)对齐。
+    # 主链 local 下 ForkCommitTx/ForkLoopCheckCommitTxDone 都被特殊处理为 1；
+    # para 链若用默认 2270000/4320000，nodegroup apply 无条件写带前缀 key 而 approve
+    # 在 fork 未激活时用 raw id 查询，key 不一致导致 para 链 nodegroup 建立失败（getNodegGroupId ErrNotFound）。
+    perl -i -pe 's/^mainForkParacrossCommitTx=.*/mainForkParacrossCommitTx=1/' "${path}"
+    perl -i -pe 's/^mainLoopCheckCommitTxDoneForkHeight=.*/mainLoopCheckCommitTxDoneForkHeight=1/' "${path}"
+    # Phase 5 DKG 修复：RGB20 CI 屏蔽旧 BTC 跨链用例后，主链没有持续的 para 交易，
+    # para 链若按默认空块间隔(0:50)推进，会长期停在 nodegroup approve 高度导致 blockSync 追不上主链
+    # （syncCaughtUp=false → para is not Sync）。这里收紧到每 1 个主链区块产出一个空 para 区块，让 para 快速追上主链。
+    perl -i -pe 's/^emptyBlockInterval=.*/emptyBlockInterval=["0:1"]/' "${path}"
     # Para nodes must enable DHT before peer discovery and TSS peer collection.
     perl -i -pe 's/^types=.*/types=["dht"]/' "${path}"
     perl -i -pe 's/^enable=.*/enable=true/' "${path}"
@@ -201,8 +219,8 @@ host="${BTC_RPC_ADDR}"
 user="${BTCD_RPC_USER}"
 pass="${BTCD_RPC_PASS}"
 mode="http"
-disableTLS=true
-certFile=""
+disableTLS=false
+certFile="${BTCD_RPC_CERT_IN_CONTAINER}"
 
 [rpc.sub.light.neutrino.tss]
 peers=${toml_peers}
@@ -440,6 +458,13 @@ function prepare_accounts() {
     ${MAIN_CLI} account import_key -k "${USER_B_KEY}" -l rgbxUserB >/dev/null || true
     ${MAIN_CLI} send coins transfer -t "${USER_B_ADDR}" -a 100 -k "${GENESIS_KEY}" >/dev/null
 
+    prepare_para_accounts
+}
+
+# Phase 5 DKG 修复（追加）：para 钱包 seed/解锁/AUTH 私钥导入。
+# para 重启后钱包需要重新解锁，且 import 的 AUTH 账户需要重新导入（否则 TSS 拿不到 commit 私钥，
+# submitMainchainTx 一直失败重试，BTC/RGB20 CrossChainInfo 建不出来）。
+function prepare_para_accounts() {
     save_seed_and_unlock "${PARA1_CLI}" || true
     save_seed_and_unlock "${PARA2_CLI}" || true
     save_seed_and_unlock "${PARA3_CLI}" || true
@@ -548,6 +573,68 @@ function apply_dynamic_tss_peers_and_restart() {
     wait_cli_ready "${PARA4_CLI}"
 }
 
+# Phase 5 DKG 修复：把"发现 TSS peers 写入 toml"与"重启 para"解耦。
+# nodegroup approve 前重启 para 会让 TSS init 因 guardian 未就绪而挂起；
+# 故先只把 DHT 发现的 peers 写进 para toml，等 nodegroup 就绪后再统一重启 para。
+function prepare_para_tss_peers() {
+    if [ "${AUTO_DISCOVER_TSS_PEERS}" != "true" ]; then
+        log_step "skip dynamic peer discovery; use static TSS_PEERS=${TSS_PEERS}"
+        return 0
+    fi
+
+    wait_para_dht_discovery
+
+    local discovered
+    discovered=$(discover_tss_peer_names) || fail "failed to discover 4 peer names from net peer"
+    TSS_PEERS="${discovered}"
+    log_step "discovered TSS_PEERS=${TSS_PEERS}"
+
+    log_step "rewrite TSS peers in para toml (no restart yet)"
+    rewrite_tss_peers_only
+}
+
+# Phase 5 DKG 修复（核心）：把环境初始化（含 DKG）独立成一个阶段，与测试用例分离。
+#   1. 主链 setup para nodegroup（apply+approve）——para 链 paracross fork 高度已与主链(local)对齐，
+#      nodegroup apply/approve 在 para 链重放成功（见 config_para_file 的 fork 修复）；
+#   2. 重启 para 节点——让 TSS init 重跑：para 初次启动时 nodegroup 尚未 approve，
+#      CommitDKG 提交被 para 链 rgbx 拒绝（ErrGetGuardianNodeAddress）后无限重试挂起；
+#      重启后 nodegroup 已就绪，DKG keygen 在 4 节点间重开并提交成功；
+#   3. 重启后 para 钱包重新上锁，须再次解锁（save_seed_and_unlock），否则 TSS 拿不到 commit 私钥，
+#      submitMainchainTx 一直失败重试（这是"init 完成但 BTC getCross 为空"的又一阻塞点）；
+#   4. 等主链 BTC CrossChainInfo.tssAddress 落地（4 个 guardian 均提交 CommitDKG 后创建）。
+# 这样 compose up 即"环境就绪"，测试阶段只跑用例、不碰初始化时序。
+function init_chain33_dkg() {
+    log_step "chain33 DKG init phase: nodegroup -> restart para(TSS re-init) -> unlock -> wait DKG commit"
+
+    wait_cli_ready "${MAIN_CLI}"
+    setup_para_nodegroup_on_main
+
+    # 等 para RPC ready 再准备账户（wallet seed/import key 依赖 para 已启动，过早执行会静默失败）。
+    wait_cli_ready "${PARA1_CLI}"
+    wait_cli_ready "${PARA2_CLI}"
+    wait_cli_ready "${PARA3_CLI}"
+    wait_cli_ready "${PARA4_CLI}"
+    # 钱包/账户就绪：TSS 提交 CommitDKG 需要钱包私钥（AUTH 地址），para 共识 fetchPriKey 也依赖解锁钱包。
+    prepare_accounts
+
+    # 重启 para（push 最新 toml + restart）：TSS init 重跑，nodegroup 已就绪可提交 DKG。
+    restart_para_nodes_with_new_toml
+    wait_cli_ready "${PARA1_CLI}"
+    wait_cli_ready "${PARA2_CLI}"
+    wait_cli_ready "${PARA3_CLI}"
+    wait_cli_ready "${PARA4_CLI}"
+
+    # 重启后 para 钱包重新上锁：再次解锁 para1-4（TSS 提交 CommitDKG / para 共识 fetchPriKey 都需要钱包私钥）。
+    save_seed_and_unlock "${PARA1_CLI}" || true
+    save_seed_and_unlock "${PARA2_CLI}" || true
+    save_seed_and_unlock "${PARA3_CLI}" || true
+    save_seed_and_unlock "${PARA4_CLI}" || true
+
+    # 等主链 DKG 落地（4 个 guardian 均提交 CommitDKG 后创建 CrossChainInfo）。
+    wait_auto_dkg_commit
+    log_step "chain33 DKG init done"
+}
+
 function setup_para_nodegroup_on_main() {
     log_step "setup para nodegroup on main chain"
     ${MAIN_CLI} send coins transfer -t "${AUTH_ADDR1}" -a 100 -k "${GENESIS_KEY}" >/dev/null
@@ -573,6 +660,27 @@ function setup_para_nodegroup_on_main() {
     ${MAIN_CLI} para nodegroup addrs --paraName="${PARA_TITLE}"
 }
 
+function wait_para_nodegroup_ready() {
+    # Phase 5 DKG 修复：para 侧 nodegroup 需同步主链后才可查。
+    # para 初次 TSS init 在 nodegroup approve 前已失败并挂起重试，此时 para 链可能停在旧高度，
+    # 重启 para 重新同步后此轮询才能通过（作为 DKG 提交前置校验）。
+    log_step "wait para nodegroup visible on para chain (para1)"
+    local retries=120
+    local i
+    for ((i = 0; i < retries; i++)); do
+        local addrs
+        addrs=$(${PARA1_CLI} para nodegroup addrs --paraName="${PARA_TITLE}" 2>/dev/null | jq -r '.value // empty')
+        local cnt
+        cnt=$(echo "${addrs}" | tr ',' '\n' | sed '/^$/d' | wc -l | xargs)
+        if [ "${cnt}" -ge 4 ]; then
+            log_step "para nodegroup ready on para chain: ${addrs}"
+            return 0
+        fi
+        sleep 2
+    done
+    fail "para nodegroup not visible on para chain within timeout"
+}
+
 function ensure_btc_crosschain_prerequisite() {
     log_step "check BTC cross-chain prerequisite only (no mint bootstrap)"
     set +e
@@ -592,7 +700,7 @@ function ensure_btc_crosschain_prerequisite() {
 
 function wait_auto_dkg_commit() {
     log_step "wait auto DKG commit by neutrino+tss"
-    local retries=60
+    local retries=180
     local i
     for ((i = 0; i < retries; i++)); do
         set +e
@@ -639,6 +747,18 @@ function run_tests() {
     wait_btcd_ready
     scenario_para_health
     setup_para_nodegroup_on_main
+
+    # Phase 5 DKG 修复（追加，不改原有流程）：nodegroup 建立后 para 需要重启一次，
+    # 让 TSS init 重跑（para 初次启动时 nodegroup 尚未 approve，CommitDKG 提交被拒后无限重试挂起）；
+    # 重启后 nodegroup 已就绪、fork 高度已对齐，DKG 可提交成功。重启后钱包重新上锁，须再解锁。
+    restart_para_nodes_with_new_toml
+    wait_cli_ready "${PARA1_CLI}"
+    wait_cli_ready "${PARA2_CLI}"
+    wait_cli_ready "${PARA3_CLI}"
+    wait_cli_ready "${PARA4_CLI}"
+    # 重启后 para 钱包重新上锁 + AUTH 账户需重新导入，否则 TSS 拿不到 commit 私钥。
+    prepare_para_accounts
+
     wait_auto_dkg_commit
 
     # ===== 测试入口（testcase.sh）：屏蔽旧 BTC + RGB20 全部（env/充值/提现/smoke）=====
