@@ -25,7 +25,15 @@ fn parse_network(s: &str) -> Network {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = PathBuf::from(env_or("RGB_SIDECAR_DATA_DIR", "./sidecar-data"));
-    let electrum_url = env_or("RGB_SIDECAR_ELECTRUM", "127.0.0.1:60401");
+    // btcd JSON-RPC endpoint (host:port). TLS is used when RGB_BITCOIND_CERT is set
+    // (btcd self-signed cert path), mirroring the chain33 CLI disableTLS=false+rpcCertFile shape.
+    let btc_rpc_host = env_or("RGB_BITCOIND_RPC", "btcd:18443");
+    let btc_rpc_user = env_or("RGB_BITCOIND_USER", "root");
+    let btc_rpc_pass = env_or("RGB_BITCOIND_PASS", "1314");
+    let btc_rpc_cert = std::env::var("RGB_BITCOIND_CERT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
     let network = parse_network(&env_or("RGB_SIDECAR_NETWORK", "regtest"));
     let tss_pubkey_hex = std::env::var("RGB_SIDECAR_TSS_PUBKEY")
         .ok()
@@ -36,7 +44,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = Config {
         data_dir,
-        electrum_url,
+        btc_rpc_host,
+        btc_rpc_user,
+        btc_rpc_pass,
+        btc_rpc_cert,
         network,
         tss_pubkey_hex,
         grpc_listen: grpc_listen.clone(),
