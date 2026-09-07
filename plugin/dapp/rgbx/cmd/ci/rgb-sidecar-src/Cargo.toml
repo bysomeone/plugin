@@ -35,6 +35,8 @@ rand = "0.9"
 electrum-client = "0.25"
 bdk_chain = "=0.23.3"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+# rustls for trusting btcd's self-signed RPC cert (btcd RPC is TLS; cert is CA:TRUE).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 base64 = "0.22"
 
 [build-dependencies]

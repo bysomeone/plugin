@@ -12,8 +12,16 @@ use bitcoin::Network;
 pub struct Config {
     /// Directory for persisted state (Stock bin files + `ledger.json`).
     pub data_dir: PathBuf,
-    /// Electrum server (electrs) URL, e.g. `127.0.0.1:60401`.
-    pub electrum_url: String,
+    /// btcd JSON-RPC endpoint, `host:port` (e.g. `btcd:18443`). TLS is used when
+    /// `btc_rpc_cert` is set (btcd serves a self-signed cert, CA:TRUE).
+    pub btc_rpc_host: String,
+    /// btcd RPC user.
+    pub btc_rpc_user: String,
+    /// btcd RPC password.
+    pub btc_rpc_pass: String,
+    /// Optional path to btcd's `rpc.cert` (PEM) to trust for TLS. `None` => plain HTTP
+    /// (test-only convenience; the production path always sets the cert).
+    pub btc_rpc_cert: Option<PathBuf>,
     /// Bitcoin network (regtest/testnet/mainnet).
     pub network: Network,
     /// Compressed pubkey hex of the TSS key. `wpkh(<this>)` is the descriptor.

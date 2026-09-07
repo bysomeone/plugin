@@ -14,7 +14,6 @@ use bitcoin::absolute::LockTime;
 use bitcoin::{
     Address, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
-use electrum_client::ElectrumApi;
 use psrgbt::{RgbOutExt, RgbPsbtExt};
 use rand::Rng;
 use bitcoin::Network;
@@ -37,20 +36,21 @@ use crate::invoice::{
     consignment_from_bytes, consignment_to_bytes, network_to_chainnet, parse_invoice,
 };
 use crate::ledger::{AssetRec, Ledger, ReceiveRec};
+use crate::rpc::BtcdRpc;
 use crate::types::{recv_status, SealStatus, SealTxOut};
 use crate::wallet::{BtcWallet, WalletUtxo};
 
-/// A `ResolveWitness` that resolves witness transactions from the Electrum indexer.
-struct ElectrumResolver {
-    electrum: Arc<electrum_client::Client>,
+/// A `ResolveWitness` that resolves witness transactions from the btcd node.
+struct BtcdResolver {
+    rpc: Arc<BtcdRpc>,
     chain_net: ChainNet,
 }
 
-impl ResolveWitness for ElectrumResolver {
+impl ResolveWitness for BtcdResolver {
     fn resolve_witness(&self, witness_id: Txid) -> Result<WitnessStatus, WitnessResolverError> {
-        match self.electrum.transaction_get(&witness_id) {
-            Ok(tx) => Ok(WitnessStatus::Resolved(tx, WitnessOrd::Tentative)),
-            Err(_) => Ok(WitnessStatus::Unresolved),
+        match self.rpc.get_transaction(&witness_id) {
+            Ok(Some(tx)) => Ok(WitnessStatus::Resolved(tx, WitnessOrd::Tentative)),
+            _ => Ok(WitnessStatus::Unresolved),
         }
     }
     fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
@@ -115,11 +115,11 @@ pub struct RgbEngine {
     pub stock: Stock,
     pub ledger: Ledger,
     wallet: BtcWallet,
-    electrum: Arc<electrum_client::Client>,
+    rpc: Arc<BtcdRpc>,
     chain_net: ChainNet,
     tss_script: ScriptBuf,
     tss_address: Address,
-    resolver: ElectrumResolver,
+    resolver: BtcdResolver,
     pending_withdrawals: HashMap<String, PendingWithdrawal>,
 }
 
@@ -140,16 +140,19 @@ impl RgbEngine {
         };
 
         let ledger = Ledger::load(&cfg.ledger_path())?;
-        let wallet = BtcWallet::new(&cfg.electrum_url, &cfg.tss_pubkey_hex, cfg.network)?;
+        let rpc = Arc::new(BtcdRpc::connect(
+            &cfg.btc_rpc_host,
+            &cfg.btc_rpc_user,
+            &cfg.btc_rpc_pass,
+            cfg.btc_rpc_cert.as_deref(),
+            cfg.network,
+        )?);
+        let wallet = BtcWallet::new(rpc.clone(), &cfg.tss_pubkey_hex, cfg.network)?;
         let tss_address = wallet.address().clone();
         let tss_script = wallet.script().clone();
         let chain_net = network_to_chainnet(cfg.network);
-        let electrum = Arc::new(
-            electrum_client::Client::new(&cfg.electrum_url)
-                .map_err(|e| anyhow!("electrum connect {}: {}", cfg.electrum_url, e))?,
-        );
-        let resolver = ElectrumResolver {
-            electrum: electrum.clone(),
+        let resolver = BtcdResolver {
+            rpc: rpc.clone(),
             chain_net,
         };
 
@@ -158,7 +161,7 @@ impl RgbEngine {
             stock,
             ledger,
             wallet,
-            electrum,
+            rpc,
             chain_net,
             tss_script,
             tss_address,
@@ -188,12 +191,14 @@ impl RgbEngine {
         self.cfg.network
     }
 
-    /// Height of the indexer tip.
+    /// Height of the chain tip (btcd `getblockcount`).
     pub fn synced_height(&self) -> u64 {
-        self.electrum
-            .block_headers_subscribe()
-            .map(|h| h.height as u64)
-            .unwrap_or(0)
+        self.rpc.get_block_count().unwrap_or(0)
+    }
+
+    /// Current BTC UTXO set of the single TSS script (watch-only), from btcd.
+    pub fn list_unspent_btc(&self) -> Result<Vec<WalletUtxo>> {
+        Ok(self.wallet.list_unspent())
     }
 
     // ===================================================================
@@ -251,8 +256,8 @@ impl RgbEngine {
         let contract: rgbstd::containers::Contract =
             valid_contract.clone().into_consignment().into_contract();
         let genesis_bytes = consignment_to_bytes(&contract)?;
-        let resolver = ElectrumResolver {
-            electrum: self.electrum.clone(),
+        let resolver = BtcdResolver {
+            rpc: self.rpc.clone(),
             chain_net,
         };
         self.stock
@@ -431,7 +436,7 @@ impl RgbEngine {
         // BTC value of the receive output, from the witness tx (when available).
         let btc_value = Txid::from_str(&txid)
             .ok()
-            .and_then(|tid| self.electrum.transaction_get(&tid).ok())
+            .and_then(|tid| self.rpc.get_transaction(&tid).ok().flatten())
             .and_then(|tx| tx.output.get(vout as usize).cloned())
             .map(|o| o.value.to_sat() as i64)
             .unwrap_or(0);
@@ -564,6 +569,9 @@ impl RgbEngine {
         fee_rate: u64,
         recipient_btc: u64,
     ) -> Result<BuildTransferOutcome> {
+        // 同步 TSS watch-only 钱包：否则 bdk list_unspent 看不到 TSS 地址的 BTC UTXO，
+        // 构造 PSBT 时 BTC 输入为 0，报 "BTC inputs (0) cannot cover output+fee"。
+        self.wallet.sync()?;
         let asset = self
             .ledger
             .asset(symbol)
@@ -706,8 +714,8 @@ impl RgbEngine {
     }
 
     pub fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
-        self.electrum
-            .transaction_broadcast(tx)
+        self.rpc
+            .send_raw_transaction(tx)
             .map_err(|e| anyhow!("broadcast: {e}"))
     }
 
@@ -715,12 +723,12 @@ impl RgbEngine {
     pub fn wait_tx(&self, txid: Txid, timeout: std::time::Duration) -> Result<()> {
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
-            if self.electrum.transaction_get(&txid).is_ok() {
+            if self.rpc.get_transaction(&txid).map(|o| o.is_some()).unwrap_or(false) {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
-        anyhow::bail!("tx {txid} not visible to indexer within {timeout:?}")
+        anyhow::bail!("tx {txid} not visible to btcd within {timeout:?}")
     }
 
     // ===================================================================
@@ -873,7 +881,7 @@ impl RgbEngine {
                                 asset_id: asset_id.clone(),
                             });
                             if recipient.is_none() {
-                                if let Ok(tx) = self.electrum.transaction_get(&wtxid) {
+                                if let Ok(Some(tx)) = self.rpc.get_transaction(&wtxid) {
                                     if let Some(o) = tx.output.get(vout.to_u32() as usize) {
                                         if o.script_pubkey == self.tss_script {
                                             recipient = Some(outpoint);
