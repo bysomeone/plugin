@@ -73,8 +73,12 @@ fn fund_tss_address(
         }
         for (vout, o) in &t.outputs {
             if o.value > FUND_AMOUNT_SAT + FUND_FEE_SAT {
-                chosen = Some((OutPoint { txid: t.txid, vout: *vout }, o.value));
-                break 'outer;
+                let outpoint = OutPoint { txid: t.txid, vout: *vout };
+                // Skip already-spent coinbases (a previous run may have used them).
+                if rpc.get_txout(&outpoint)?.is_some() {
+                    chosen = Some((outpoint, o.value));
+                    break 'outer;
+                }
             }
         }
     }
@@ -173,11 +177,16 @@ async fn main() -> Result<()> {
     if funding_wif.is_empty() {
         return Err(anyhow!("BTC_FUNDING_WIF env required to fund the TSS address on btcd"));
     }
-    let fund_txid = fund_tss_address(&rpc, &funding_wif, &tss_script)?;
-    println!("funded TSS address, txid={fund_txid}");
     engine.sync()?;
     let unspents = engine.list_unspent_btc()?;
-    println!("TSS BTC unspents: {}", unspents.len());
+    if unspents.is_empty() {
+        let fund_txid = fund_tss_address(&rpc, &funding_wif, &tss_script)?;
+        println!("funded TSS address, txid={fund_txid}");
+        engine.sync()?;
+        println!("TSS BTC unspents after fund: {}", engine.list_unspent_btc()?.len());
+    } else {
+        println!("TSS already funded: {} unspent UTXO(s)", unspents.len());
+    }
 
     if engine.ledger.asset("USDT").is_some() {
         println!("USDT already issued, skipping");
