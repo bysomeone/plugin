@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use bitcoin::absolute::LockTime;
@@ -41,13 +41,24 @@ use crate::types::{recv_status, SealStatus, SealTxOut};
 use crate::wallet::{BtcWallet, WalletUtxo};
 
 /// A `ResolveWitness` that resolves witness transactions from the btcd node.
+///
+/// Withdrawal consignments are validated *before* their anchor tx is broadcast (the signers need
+/// to agree before the tx is sent), so the anchor is not yet on btcd. Such anchors are resolved
+/// from `local_anchors` — a shared cache of the txs this engine just built — before falling back
+/// to the node. Deposit/user-pay anchors are broadcast & mined first, so they resolve from btcd.
 struct BtcdResolver {
     rpc: Arc<BtcdRpc>,
     chain_net: ChainNet,
+    local_anchors: Arc<Mutex<HashMap<Txid, Transaction>>>,
 }
 
 impl ResolveWitness for BtcdResolver {
     fn resolve_witness(&self, witness_id: Txid) -> Result<WitnessStatus, WitnessResolverError> {
+        if let Ok(guard) = self.local_anchors.lock() {
+            if let Some(tx) = guard.get(&witness_id) {
+                return Ok(WitnessStatus::Resolved(tx.clone(), WitnessOrd::Tentative));
+            }
+        }
         match self.rpc.get_transaction(&witness_id) {
             Ok(Some(tx)) => Ok(WitnessStatus::Resolved(tx, WitnessOrd::Tentative)),
             _ => Ok(WitnessStatus::Unresolved),
@@ -121,6 +132,9 @@ pub struct RgbEngine {
     tss_address: Address,
     resolver: BtcdResolver,
     pending_withdrawals: HashMap<String, PendingWithdrawal>,
+    /// Txs built by `build_transfer` that are not yet broadcast (withdrawal anchors awaiting TSS
+    /// signature). Shared with `resolver` so pre-broadcast consignment validation can resolve them.
+    local_anchors: Arc<Mutex<HashMap<Txid, Transaction>>>,
 }
 
 impl RgbEngine {
@@ -151,9 +165,11 @@ impl RgbEngine {
         let tss_address = wallet.address().clone();
         let tss_script = wallet.script().clone();
         let chain_net = network_to_chainnet(cfg.network);
+        let local_anchors = Arc::new(Mutex::new(HashMap::new()));
         let resolver = BtcdResolver {
             rpc: rpc.clone(),
             chain_net,
+            local_anchors: local_anchors.clone(),
         };
 
         Ok(Self {
@@ -167,6 +183,7 @@ impl RgbEngine {
             tss_address,
             resolver,
             pending_withdrawals: HashMap::new(),
+            local_anchors,
         })
     }
 
@@ -259,6 +276,7 @@ impl RgbEngine {
         let resolver = BtcdResolver {
             rpc: self.rpc.clone(),
             chain_net,
+            local_anchors: self.local_anchors.clone(),
         };
         self.stock
             .import_contract(valid_contract, resolver)
@@ -605,6 +623,7 @@ impl RgbEngine {
             .stock
             .transition_builder(contract_id, "transfer")
             .map_err(|e| anyhow!("transition_builder: {e:?}"))?;
+        let wallet_utxos = self.wallet.list_unspent();
         let mut input_amounts: Vec<i64> = Vec::new();
         let mut input_btc: Vec<u64> = Vec::new();
         for outpoint in input_outpoints {
@@ -625,10 +644,8 @@ impl RgbEngine {
                 _ => return Err(anyhow!("input {outpoint} not fungible")),
             };
             input_amounts.push(amount.value() as i64);
-            let btc = self
-                .wallet
-                .list_unspent()
-                .into_iter()
+            let btc = wallet_utxos
+                .iter()
                 .find(|u| u.outpoint == *outpoint)
                 .map(|u| u.value)
                 .unwrap_or(0);
@@ -656,19 +673,60 @@ impl RgbEngine {
         }
         let transition = builder.complete_transition()?;
 
-        // Build the unsigned PSBT with explicit inputs.
-        let total_btc = input_btc.iter().sum::<u64>();
-        let est_vbytes = 10 + 41 * input_outpoints.len() + 31 * 3 + 68 * input_outpoints.len();
-        let fee = est_vbytes as u64 * fee_rate;
-        if total_btc < recipient_btc + fee {
-            return Err(anyhow!("BTC inputs ({total_btc}) cannot cover output+fee"));
+        // ---- BTC funding ----
+        // RGB receive outputs are dust (546 sats) so a single seal usually cannot cover the
+        // recipient dust output + miner fee. When the seal BTC is insufficient, pull additional
+        // bridge-owned BTC UTXOs (TSS script, e.g. the deposit change output) as pure-BTC fee
+        // inputs. They carry no RGB state and are not part of the transition — they only fund
+        // the carrier transaction, and their excess returns to the TSS change output.
+        let seal_btc_total = input_btc.iter().sum::<u64>();
+        let mut extra_fee_inputs: Vec<(OutPoint, u64)> = Vec::new(); // (outpoint, btc value)
+        let mut total_btc = seal_btc_total;
+        let mut n_inputs = input_outpoints.len();
+        loop {
+            // 与既有字节模型保持一致（3 输出上界，P2WPKH 输入 41+68 计费）。
+            let est_vbytes = (10 + 41 * n_inputs + 31 * 3 + 68 * n_inputs) as u64;
+            let fee = est_vbytes * fee_rate;
+            if total_btc >= recipient_btc + fee {
+                break;
+            }
+            // 选一笔桥自有（TSS 脚本）、未作为 RGB seal / 已选费输入 的 BTC UTXO（取最大额优先）。
+            let next = wallet_utxos
+                .iter()
+                .filter(|u| u.script_pubkey == self.tss_script)
+                .filter(|u| !self.ledger.seals.contains_key(&u.outpoint.to_string()))
+                .filter(|u| !input_outpoints.contains(&u.outpoint))
+                .filter(|u| !extra_fee_inputs.iter().any(|(o, _)| o == &u.outpoint))
+                .max_by_key(|u| u.value)
+                .cloned();
+            match next {
+                Some(u) => {
+                    total_btc += u.value;
+                    extra_fee_inputs.push((u.outpoint, u.value));
+                    n_inputs += 1;
+                }
+                None => {
+                    return Err(anyhow!(
+                        "BTC inputs ({total_btc}) cannot cover output+fee; no bridge-owned BTC fee UTXO available"
+                    ));
+                }
+            }
         }
+        let est_vbytes = (10 + 41 * n_inputs + 31 * 3 + 68 * n_inputs) as u64;
+        let fee = est_vbytes * fee_rate;
         let change_btc = total_btc - recipient_btc - fee;
 
+        // 交易输入 = RGB seal 输入 + 桥自有费输入。
+        let mut all_inputs: Vec<OutPoint> = input_outpoints.to_vec();
+        let mut all_input_btc: Vec<u64> = input_btc.clone();
+        for (o, v) in &extra_fee_inputs {
+            all_inputs.push(*o);
+            all_input_btc.push(*v);
+        }
         let mut tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: LockTime::ZERO,
-            input: input_outpoints
+            input: all_inputs
                 .iter()
                 .map(|o| TxIn {
                     previous_output: *o,
@@ -683,13 +741,21 @@ impl RgbEngine {
                 TxOut { value: bitcoin::Amount::from_sat(change_btc), script_pubkey: change_script.clone() },
             ],
         };
-        if change_amount == 0 {
+        // 无 RGB change、也无 BTC 找零时才去掉 change 输出；只要有多余 BTC（来自费输入）
+        // 就必须保留找零输出回到 TSS，避免把费输入的币烧成手续费。
+        if change_amount == 0 && change_btc == 0 {
             tx.output.truncate(2);
         }
         let mut psbt = Psbt::from_unsigned_tx(tx)?;
         for (i, _outpoint) in input_outpoints.iter().enumerate() {
             psbt.inputs[i].witness_utxo = Some(TxOut {
                 value: bitcoin::Amount::from_sat(input_btc[i]),
+                script_pubkey: self.tss_script.clone(),
+            });
+        }
+        for (j, (_, v)) in extra_fee_inputs.iter().enumerate() {
+            psbt.inputs[input_outpoints.len() + j].witness_utxo = Some(TxOut {
+                value: bitcoin::Amount::from_sat(*v),
                 script_pubkey: self.tss_script.clone(),
             });
         }
@@ -700,6 +766,13 @@ impl RgbEngine {
         psbt.set_rgb_close_method(CloseMethod::OpretFirst);
         let fascia = psbt.rgb_commit()?;
         let txid = psbt.get_txid();
+        // Cache the un-broadcast anchor so the withdrawal consignment can be validated (locally by
+        // the official node AND by signing nodes via the shared sidecar) before the tx is signed &
+        // broadcast. rgb_commit wrote the commitment into unsigned_tx, so its txid == `txid`.
+        self.local_anchors
+            .lock()
+            .unwrap()
+            .insert(txid, psbt.unsigned_tx.clone());
 
         let recipient_out = OutputSeal::with(txid, 1);
         let mut outputs = vec![recipient_out];
@@ -715,7 +788,7 @@ impl RgbEngine {
         Ok(BuildTransferOutcome {
             psbt,
             input_amounts,
-            input_btc_values: input_btc,
+            input_btc_values: all_input_btc,
             consignment,
             txid,
             recipient_vout: 1,
@@ -798,6 +871,8 @@ impl RgbEngine {
     ) -> Result<(Txid, String, Option<String>)> {
         let tx = signed_psbt.clone().extract_tx()?;
         let txid = tx.compute_txid();
+        // Anchor is being broadcast; drop it from the local resolver cache (btcd will own it now).
+        self.local_anchors.lock().unwrap().remove(&txid);
 
         let pending = self
             .pending_withdrawals
