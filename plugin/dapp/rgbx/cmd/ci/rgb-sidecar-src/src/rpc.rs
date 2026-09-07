@@ -16,7 +16,72 @@ use base64::Engine;
 use bitcoin::consensus::encode;
 use bitcoin::hashes::hex::FromHex;
 use bitcoin::{Address, Network, OutPoint, ScriptBuf, Transaction, Txid};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+
+/// Pins the btcd RPC self-signed cert. btcd's `rpc.cert` has CA:TRUE, so webpki rejects it as an
+/// end-entity (`CaUsedAsEndEntity`) when added to a root store; pinning the exact DER is the
+/// standard way to trust a self-signed server cert.
+#[derive(Debug)]
+struct PinnedCertVerifier {
+    pinned: CertificateDer<'static>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.pinned.as_ref() {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "btcd RPC cert does not match pinned rpc.cert".into(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
 
 /// A btcd JSON-RPC connection. Cheap to clone (shares the underlying ureq agent).
 #[derive(Clone)]
@@ -59,17 +124,18 @@ impl BtcdRpc {
         let scheme = if cert.is_some() { "https" } else { "http" };
         let mut builder = ureq::AgentBuilder::new();
         if let Some(cert_path) = cert {
-            let cert_der = rustls::pki_types::CertificateDer::from_pem_file(cert_path)
+            let pinned = CertificateDer::from_pem_file(cert_path)
                 .with_context(|| format!("read btcd cert {}", cert_path.display()))?;
-            let mut roots = rustls::RootCertStore::empty();
-            roots
-                .add(cert_der)
-                .context("add btcd self-signed cert to trust roots")?;
             let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let verifier = PinnedCertVerifier {
+                pinned,
+                provider: provider.clone(),
+            };
             let tls = rustls::ClientConfig::builder_with_provider(provider)
                 .with_safe_default_protocol_versions()
                 .context("rustls protocol versions")?
-                .with_root_certificates(roots)
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth();
             builder = builder.tls_config(Arc::new(tls));
         }

@@ -70,7 +70,13 @@ function wait_rgb20_sidecar_grpc() {
 }
 
 function run_rgb20_env() {
-    log_step "RGB20 env: wait DKG -> issue USDT at GG18 script -> start sidecar"
+    log_step "RGB20 env: wait DKG -> fund TSS on btcd -> issue USDT at GG18 script -> start sidecar"
+
+    # RGB 链已收敛到 btcd：给 TSS 地址注资需要挖矿私钥（WIF，--miningaddr=mrCDr）。
+    # 未提前 prepare 时现场推导（docker-compose.sh prepare_btcd_mining_identity 会设置 BTC_FUNDING_WIF）。
+    if [ -z "${BTC_FUNDING_WIF:-}" ]; then
+        prepare_btcd_mining_identity
+    fi
 
     wait_rgb20_dkg_commit
     local pubkey
@@ -86,10 +92,11 @@ function run_rgb20_env() {
     local issue_out
     issue_out=$(compose_cmd run --rm --no-deps \
         -e RGB_SIDECAR_TSS_PUBKEY="${pubkey}" \
-        -e RGB_SIDECAR_ELECTRUM="rgb-electrs:60401" \
-        -e RGB_BITCOIND_RPC="http://rgb-bitcoind:18443" \
-        -e RGB_BITCOIND_USER="${RGB20_BITCOIND_USER:-rgb}" \
-        -e RGB_BITCOIND_PASS="${RGB20_BITCOIND_PASS:-rgbpass123}" \
+        -e RGB_BITCOIND_RPC="${RGB20_BITCOIND_RPC:-btcd:18443}" \
+        -e RGB_BITCOIND_USER="${RGB20_BITCOIND_USER:-root}" \
+        -e RGB_BITCOIND_PASS="${RGB20_BITCOIND_PASS:-1314}" \
+        -e RGB_BITCOIND_CERT="${RGB20_BITCOIND_CERT:-/btcd/rpc.cert}" \
+        -e BTC_FUNDING_WIF="${BTC_FUNDING_WIF}" \
         rgb-sidecar /sidecar/issue_usdt 2>&1)
     echo "${issue_out}" | tail -15
     echo "${issue_out}" | grep -q "ISSUE-DONE" || fail "issue_usdt did not complete"
@@ -142,6 +149,16 @@ function scenario_rgb20_deposit() {
         -H 'Content-Type: application/json' \
         -d "{\"psbt\":\"${signed_psbt}\",\"consignment\":\"${cons_hex}\",\"receive_id\":\"${receive_id}\"}" | jq -r '.status // empty')
     assert_eq "${settle_status}" "settled" "rgb20 settle status"
+
+    # 4.5 上传 consignment 给 Go 桥（submitDeposit 需要；否则 pollTransfers 报
+    # "consignment not provided"，铸造不触发）。端点为 base64。侧车对已 settle 的 receive
+    # 幂等返回，故此处 200。
+    local cons_b64 cons_up
+    cons_b64=$(echo "${cons_hex}" | xxd -r -p | base64)
+    cons_up=$(curl -s -X POST http://127.0.0.1:17000/rgbx/v1/consignment \
+        -H 'Content-Type: application/json' \
+        -d "{\"receiveId\":\"${receive_id}\",\"consignment\":\"${cons_b64}\"}")
+    echo "${cons_up}" | grep -q '"code":200' || fail "rgb20 consignment upload failed: ${cons_up}"
 
     # 5. Go 桥 pollTransfers → submitDeposit（TSS 签 deposit）→ chain33 铸造 X.RGB20_USDT
     local delta expected

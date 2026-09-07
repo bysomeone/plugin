@@ -390,6 +390,17 @@ impl RgbEngine {
             .validate(&self.resolver, &config)
             .map_err(|e| anyhow!("consignment invalid: {e}"))?;
 
+        // Idempotent re-settle: the Go bridge uploads the consignment AFTER the test-sim already
+        // settled the receive. Return the existing settled record instead of erroring so the bridge
+        // has a consistent view and can proceed to pollTransfers -> submitDeposit.
+        if let Some(h) = receive_id_hint {
+            if let Some(r) = self.ledger.receive(h) {
+                if r.status == recv_status::SETTLED {
+                    return Ok(r.clone());
+                }
+            }
+        }
+
         let mut candidate = receive_id_hint
             .and_then(|h| self.ledger.receive(h))
             .filter(|r| r.status == recv_status::WAITING_COUNTERPARTY)
