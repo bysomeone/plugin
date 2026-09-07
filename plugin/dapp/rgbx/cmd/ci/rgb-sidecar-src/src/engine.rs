@@ -827,6 +827,11 @@ impl RgbEngine {
         change_address: &str,
         fee_rate: u64,
     ) -> Result<BuildTransferOutcome> {
+        // 先从链上对账 seal 生命周期：上一笔提现的 change seal 只有在其锚定 tx 上链后
+        // （PendingMint -> Minted，sync 依据 TSS UTXO 集合推导）才可花。否则紧接的下一笔
+        // 提现在 select_seals 阶段会报 "0 minted seals"（充值 settle 路径在 test_sim 里
+        // 会显式 sync，提现路径漏了这步）。
+        self.sync()?;
         let (seals, _total) = self.ledger.select_seals(symbol, amount)?;
         let input_outpoints: Vec<OutPoint> = seals
             .iter()
