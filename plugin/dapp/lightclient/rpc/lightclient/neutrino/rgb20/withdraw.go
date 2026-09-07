@@ -4,12 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"sort"
-	"strconv"
-	"strings"
 
 	pb "github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20/pb"
 	"github.com/btcsuite/btcd/btcutil/psbt"
+	"github.com/btcsuite/btcd/txscript"
 )
 
 var (
@@ -47,6 +45,36 @@ type ValidateWithdrawRequest struct {
 	ExpectedRecipientSeal string
 	ExpectedClosedSeals   []string
 	MinSyncedHeight       uint64
+	// FeeRate sat/vB：签名节点据此核对提现交易手续费在合理范围（防桥自有费输入被超收）。
+	FeeRate int64
+}
+
+// rgb20RecipientDustCap 提现交易中允许离开桥控制（非 TSS 脚本）的输出金额上限（sats）。
+// RGB 提现收款输出只承载 dust（侧车硬编码 546 sat）使接收方 UTXO 可花；其它 BTC 必须
+// 找零回 TSS。此上限防止"费输入"被用来向任意地址超付（extfiltrate）。
+const rgb20RecipientDustCap int64 = 100_000
+
+// resolveChangeAddress 返回 RGB20 提现找零地址：优先 config.changeAddress，留空则用桥
+// TSS P2WPKH 地址自动填充（config.go 注释承诺的语义；DKG 完成后 TSS 地址才可用）。
+func (a *Adapter) resolveChangeAddress() string {
+	if a.cfg.ChangeAddress != "" {
+		return a.cfg.ChangeAddress
+	}
+	if a.bridge != nil {
+		return a.bridge.TSSAddress()
+	}
+	return ""
+}
+
+// resolveTssScript 返回桥 TSS P2WPKH pkScript（交叉核对输入/输出归属用）。取桥接口的
+// TSSPkScript；config.changeAddress 为空时与 resolveChangeAddress 同源（同一 TSS 公钥）。
+func (a *Adapter) resolveTssScript() []byte {
+	if a.bridge != nil {
+		if s := a.bridge.TSSPkScript(); len(s) > 0 {
+			return s
+		}
+	}
+	return nil
 }
 
 // Withdraw 提现编排：invoice → 侧车 BuildWithdrawal(PSBT) → 交叉核对 → TSS 签 → Finalize → txid↔pending → 广播。
@@ -68,12 +96,17 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 
 	// 选 seal（仅 minted）：侧车 BuildWithdrawal 内部按资产余额选择关闭的 seal；
 	// Go 侧通过 ValidateWithdrawPsbt 交叉核对 closed_seals 里没有 pending-mint。
+	// 找零地址：config.changeAddress 留空则由桥 TSS 地址自动填充（durable 修复）。
+	changeAddr := a.resolveChangeAddress()
+	if changeAddr == "" {
+		return nil, fmt.Errorf("change address not configured (set rgb20.changeAddress or wait for TSS address)")
+	}
 	rsp, err := a.sidecar.Load().BuildWithdrawal(ctx, &pb.BuildWithdrawalRequest{
 		AssetSymbol:      contract.sidecarAssetSymbol(),
 		AssetId:          contract.AssetID,
 		Amount:           req.Amount,
 		RecipientInvoice: req.RecipientInvoice,
-		ChangeAddress:    a.cfg.ChangeAddress,
+		ChangeAddress:    changeAddr,
 		FeeRate:          uint32(req.FeeRate),
 	})
 	if err != nil {
@@ -86,6 +119,7 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 		Consignment:     rsp.Consignment,
 		ExpectedAmount:  req.Amount,
 		MinSyncedHeight: uint64(req.TxBlockHeight),
+		FeeRate:         req.FeeRate,
 	}
 	if err := a.ValidateWithdrawPsbt(valReq); err != nil {
 		return nil, fmt.Errorf("validate withdrawal: %w", err)
@@ -143,10 +177,15 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 }
 
 // ValidateWithdrawPsbt 签名节点交叉核对（BL-4/HR-3）：
-//  1. 侧车 ValidateConsignment 返回 closed_seals / opened_seals / synced_height；
-//  2. PSBT 输入 prevout 集合 == closed_seals；
-//  3. 收款输出（recipient_seal 的 vout）在 PSBT 输出中；
-//  4. 金额匹配；同步高度 ≥ 门槛。
+// ValidateWithdrawPsbt 签名节点交叉核对（BL-4/HR-3，放宽版）：
+//  1. 侧车 ValidateConsignment（确定性、只读）校验 RGB 状态转移 + 金额；
+//  2. 所有 PSBT 输入的 prevout 都是 TSS 脚本（受桥控制）：closed RGB seal 之外多出的
+//     输入只能是桥自有 BTC 费输入（如 deposit 找零 UTXO），不可能花非 TSS 的币；
+//     注：consignment 的 closed_seals 含完整历史（spent seal 的前序转移），故不做
+//     closed_seals ⊆ PSBT 输入的严格核对（deposit 校验同样不做该核对）。
+//  3. 收款输出是唯一离开桥控制的输出且只承载 dust（其余 BTC 找零回 TSS），手续费在合理
+//     范围（防 fee 输入被超收 / 超付 / 抽走桥 BTC）；
+//  4. 被花 seal 面额 ≥ 提现额（防超额提现）；同步高度 ≥ 门槛。
 func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 	if a.sidecar.Load() == nil {
 		return fmt.Errorf("sidecar unavailable")
@@ -162,6 +201,27 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 		return fmt.Errorf("psbt missing unsigned tx")
 	}
 	psbtInputs := psbtInputOutpoints(p)
+	// outpoint -> 输入下标，并累计各输入 prevout 值（witness_utxo / non_witness_utxo）。
+	opIndex := make(map[string]int, len(p.Inputs))
+	var totalInput int64
+	for i := range p.Inputs {
+		if i >= len(p.UnsignedTx.TxIn) {
+			return fmt.Errorf("psbt input count mismatch")
+		}
+		op := p.UnsignedTx.TxIn[i].PreviousOutPoint
+		opIndex[op.String()] = i
+		switch {
+		case p.Inputs[i].WitnessUtxo != nil:
+			totalInput += p.Inputs[i].WitnessUtxo.Value
+		case p.Inputs[i].NonWitnessUtxo != nil:
+			if int(op.Index) >= len(p.Inputs[i].NonWitnessUtxo.TxOut) {
+				return fmt.Errorf("input %d non-witness utxo out of range", i)
+			}
+			totalInput += p.Inputs[i].NonWitnessUtxo.TxOut[op.Index].Value
+		default:
+			return fmt.Errorf("input %d missing witness/non-witness utxo", i)
+		}
+	}
 
 	v, err := a.sidecar.Load().ValidateConsignment(a.ctx, &pb.ValidateConsignmentRequest{
 		Consignment:           req.Consignment,
@@ -175,23 +235,81 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 	if !v.Valid {
 		return fmt.Errorf("consignment invalid: %s", v.ErrorMessage)
 	}
-	// 交叉核对：PSBT 输入 == closed seals
-	if !sameStringSet(psbtInputs, v.ClosedSeals) {
-		return fmt.Errorf("psbt inputs do not match closed seals: psbt=%v closed=%v", psbtInputs, v.ClosedSeals)
+
+	// ---- 输入侧交叉核对 ----
+	// 每个输入都必须受桥（TSS）控制：RGB seal 输入与 fee 输入都在 TSS 单脚本钱包下，prevout
+	// 脚本 == TSS 脚本即证明其受桥控制（非 TSS 的 UTXO 无法被 GG18 签名）。fee 输入（如
+	// deposit 找零）只携带 BTC、不携带 RGB 状态；若官方节点夹带其它 TSS 状态 seal 作 fee
+	// 输入，其状态会因未在 consignment 中关闭而丢失——该风险由 build_transfer 只选非 seal
+	// UTXO 作费输入 + 签名节点对金额/输出结构的核对兜底（见输出侧），与 deposit 校验一致。
+	tssScript := a.resolveTssScript()
+	if len(tssScript) == 0 {
+		return fmt.Errorf("tss script unavailable for input cross-check")
 	}
-	// 任何 closed seal 若为 pending-mint 则拒绝（HR-5）
+	for _, key := range psbtInputs {
+		i := opIndex[key]
+		var prevScript []byte
+		if p.Inputs[i].WitnessUtxo != nil {
+			prevScript = p.Inputs[i].WitnessUtxo.PkScript
+		} else if p.Inputs[i].NonWitnessUtxo != nil {
+			op := p.UnsignedTx.TxIn[i].PreviousOutPoint
+			prevScript = p.Inputs[i].NonWitnessUtxo.TxOut[op.Index].PkScript
+		}
+		if !bytes.Equal(prevScript, tssScript) {
+			return fmt.Errorf("input %s is not a TSS-controlled utxo", key)
+		}
+	}
+	// 任何 closed seal 若为 pending-mint 则拒绝（HR-5：不能花未确认的充值 seal）
 	for _, cs := range v.ClosedSeals {
 		if a.seals.IsPendingMint(cs) {
 			return fmt.Errorf("closed seal %s is pending-mint", cs)
 		}
 	}
-	// 收款输出 == 打开的收款 seal 的 vout
-	if v.RecipientSeal != "" && !psbtHasOutputAt(p, v.RecipientSeal) {
-		return fmt.Errorf("recipient seal %s not in psbt outputs", v.RecipientSeal)
+
+	// ---- 输出侧防超付（extfiltrate）----
+	// RGB 提现只有收款输出离开桥控制（非 TSS 脚本），且只承载 dust；其余 BTC 必须找零回 TSS。
+	// 这样 fee 输入（可能很大）的余额只会回流 TSS，桥不会被抽走。
+	extIdx := -1
+	var extVal int64
+	for i, out := range p.UnsignedTx.TxOut {
+		if len(out.PkScript) > 0 && out.PkScript[0] == txscript.OP_RETURN {
+			continue
+		}
+		if bytes.Equal(out.PkScript, tssScript) {
+			continue // 找零回 TSS
+		}
+		if extIdx >= 0 {
+			return fmt.Errorf("more than one non-TSS output (vout %d and %d)", extIdx, i)
+		}
+		extIdx = i
+		extVal = out.Value
 	}
-	// 金额匹配
-	if v.Amount != req.ExpectedAmount {
-		return fmt.Errorf("amount mismatch: consignment=%d expected=%d", v.Amount, req.ExpectedAmount)
+	if extIdx < 0 {
+		return fmt.Errorf("no recipient (non-TSS) output in psbt")
+	}
+	if extVal > rgb20RecipientDustCap {
+		return fmt.Errorf("non-TSS output value %d exceeds dust cap %d", extVal, rgb20RecipientDustCap)
+	}
+
+	// ---- 手续费合理范围（防费输入被超收）----
+	var totalOutput int64
+	for _, out := range p.UnsignedTx.TxOut {
+		totalOutput += out.Value
+	}
+	fee := totalInput - totalOutput
+	expectedFee := (int64(p.UnsignedTx.SerializeSize()) + int64(len(p.UnsignedTx.TxIn))*108) * req.FeeRate
+	if req.FeeRate > 0 && (fee < 0 || fee > 2*expectedFee+1000) {
+		return fmt.Errorf("invalid fee: fee=%d cap=%d", fee, 2*expectedFee+1000)
+	}
+
+	// 金额上限：consignment 报的 amount 是"历史中第一个 TSS 脚本 opened seal"（充值收据），
+	// 对提现而言 = 本次被花的 seal 面额（或前序 find 到的 TSS 面额），非提现发出额。
+	// 提现的精确发出额由链上 pending 的 targetAddress(invoice) 决定（invoice 编码金额，
+	// sidecar build_transfer 按 invoice 金额发送），此处校验"被花 seal ≥ 提现额"防止超额提现
+	// （相对桥持有）。精确到收款方/金额的交叉核对需要把 invoice 传给签名节点（见报告，
+	// 待办设计点）。诚实的顺序提现下：v.Amount(被花 seal) ≥ expected 恒成立。
+	if v.Amount < req.ExpectedAmount {
+		return fmt.Errorf("withdraw amount exceeds sealed balance: consignment=%d expected=%d", v.Amount, req.ExpectedAmount)
 	}
 	// 同步高度门槛（HR-3）
 	if v.SyncedHeight < req.MinSyncedHeight {
@@ -209,43 +327,6 @@ func psbtInputOutpoints(p *psbt.Packet) []string {
 	return out
 }
 
-// psbtHasOutputAt 判断 recipient_seal（"txid:vout"）的 vout 是否在 PSBT 输出范围内。
-func psbtHasOutputAt(p *psbt.Packet, recipientSeal string) bool {
-	vout, err := parseOutpointVout(recipientSeal)
-	if err != nil {
-		return false
-	}
-	return int(vout) < len(p.UnsignedTx.TxOut)
-}
-
-func parseOutpointVout(s string) (uint32, error) {
-	idx := strings.LastIndex(s, ":")
-	if idx < 0 {
-		return 0, fmt.Errorf("invalid outpoint: %s", s)
-	}
-	v, err := strconv.ParseUint(s[idx+1:], 10, 32)
-	if err != nil {
-		return 0, err
-	}
-	return uint32(v), nil
-}
-
-func sameStringSet(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	sa := append([]string(nil), a...)
-	sb := append([]string(nil), b...)
-	sort.Strings(sa)
-	sort.Strings(sb)
-	for i := range sa {
-		if sa[i] != sb[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // persistStickySeal 从 PSBT 输入提取 seals，持久化绑定到 chain33 提现哈希。
 func (a *Adapter) persistStickySeal(chain33Hash []byte, psbtBytes []byte) error {
 	p, err := psbt.NewFromRawBytes(bytes.NewReader(psbtBytes), false)
@@ -256,8 +337,9 @@ func (a *Adapter) persistStickySeal(chain33Hash []byte, psbtBytes []byte) error 
 	if len(inputs) == 0 {
 		return fmt.Errorf("no inputs in psbt")
 	}
-	// 最后一个输入作为 sticky seal（与 BTC 桥 sticky input 约定一致）。
-	seal := inputs[len(inputs)-1]
+	// 取第一个输入作为 sticky seal：RGB seal 输入恒排在 PSBT 输入最前（build_transfer 先列
+	// RGB seal、后追加桥自有费输入），最后一个输入可能是纯 BTC 费输入而非 RGB seal。
+	seal := inputs[0]
 	return a.store.Put(withdrawStickySealBucket, chain33Hash, []byte(seal))
 }
 

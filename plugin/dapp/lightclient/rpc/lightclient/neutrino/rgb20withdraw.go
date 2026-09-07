@@ -12,6 +12,23 @@ import (
 
 // 以下方法使 neutrinoClient 实现 rgb20.Chain33Bridge（提现侧）。
 
+// TSSAddress 返回桥 TSS P2WPKH 地址（DKG 完成后可用）。config.changeAddress 留空时由
+// rgb20 适配器据此自动填充，作为 RGB20 提现的找零地址。
+func (n *neutrinoClient) TSSAddress() string {
+	if n == nil || n.tss == nil || n.tss.tssAddress == nil {
+		return ""
+	}
+	return n.tss.tssAddress.String()
+}
+
+// TSSPkScript 返回桥 TSS P2WPKH 输出的 pkScript（签名节点交叉核对提现 PSBT 用）。
+func (n *neutrinoClient) TSSPkScript() []byte {
+	if n == nil || n.tss == nil {
+		return nil
+	}
+	return n.tss.pkScript
+}
+
 // SubmitConfirm 提交 rgbx Confirm 交易（RGB20 提现确认销毁；合约 RGB20 分支跳过 commitment）。
 func (n *neutrinoClient) SubmitConfirm(confirm *rtypes.ConfirmTx) error {
 	_, err := n.submitMainchainTx(rtypes.RgbxX, rtypes.NameConfirmAction, confirm)

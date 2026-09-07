@@ -127,6 +127,12 @@ type Chain33Bridge interface {
 	GetBtcTipHeight() int64
 	// BroadcastTx 广播已签提现交易（由 neutrino 主包实现，走 btcwallet）。
 	BroadcastTx(psbtSigned []byte, txid string) error
+	// TSSAddress 返回桥 TSS 的 P2WPKH 地址（regtest bcrt1…/testnet tb1…/mainnet bc1…）。
+	// RGB20 提现的找零地址；config.changeAddress 留空时据此自动填充。
+	TSSAddress() string
+	// TSSPkScript 返回桥 TSS P2WPKH 输出的 pkScript（16 进制? 不，raw bytes）。
+	// 签名节点交叉核对提现 PSBT 时，用它判断额外输入/找零输出是否受桥（TSS）控制。
+	TSSPkScript() []byte
 }
 
 // RGB20Adapter 是 neutrino 主包使用的适配器接口。
