@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 
@@ -261,6 +262,111 @@ func Test_DepositSignPayload_JSONRoundTrip(t *testing.T) {
 	require.Equal(t, payload.ReceiveID, got.ReceiveID)
 	require.Equal(t, payload.SessionID, got.SessionID)
 	require.Equal(t, payload.Consignment, got.Consignment)
+}
+
+// buildWithdrawValidationPSBT 构造一个能通过 ValidateWithdrawPsbt 其余检查的未签 PSBT：
+// 单输入（TSS 脚本 UTXO）+ 一个收款 dust 输出（非 TSS，离开桥控制）+ 找零回 TSS。
+func buildWithdrawValidationPSBT(t *testing.T, sealOutpoint string) []byte {
+	t.Helper()
+	tss := (&fakeBridge{}).TSSPkScript()
+	op, err := wire.NewOutPointFromString(sealOutpoint)
+	require.NoError(t, err)
+	tx := wire.NewMsgTx(wire.TxVersion)
+	tx.AddTxIn(wire.NewTxIn(op, nil, nil))
+	tx.AddTxOut(wire.NewTxOut(546, []byte{0x51})) // 收款输出（dust）
+	tx.AddTxOut(wire.NewTxOut(4000, tss))         // 找零回 TSS
+	p, err := psbt.NewFromUnsignedTx(tx)
+	require.NoError(t, err)
+	p.Inputs[0].WitnessUtxo = &wire.TxOut{Value: 5000, PkScript: tss}
+	var buf bytes.Buffer
+	require.NoError(t, p.Serialize(&buf))
+	return buf.Bytes()
+}
+
+// crossCheckWithdrawValidation 构造一份"关闭 change seal"的侧车校验结果（其余字段满足门槛）。
+func crossCheckWithdrawValidation(closedSeal string) *pb.ConsignmentValidation {
+	return &pb.ConsignmentValidation{
+		Valid:        true,
+		Amount:       1000,
+		SyncedHeight: 200,
+		ClosedSeals:  []string{closedSeal},
+	}
+}
+
+// Test_WithdrawValidate_RefreshSealStatusFromSidecar 锁住 afcb7b934 的修复：
+// seal 生命周期的权威在侧车——提现的 change seal 由侧车 sync() 在其上链后提升为 minted，
+// 而本地 SealIndex 只在 FinalizeWithdrawal 时把它登记为 pending-mint，此后没有路径提升。
+// 因此校验前必须用侧车 ListSeals 视图对齐本地状态，否则第二笔提现会被 HR-5
+// （closed seal ... is pending-mint）永久拒绝，"连续两笔提现"必失败。
+//
+// 反向同样要锁住：侧车仍报 pending-mint、或侧车读不到（fail-closed 降级）时，必须按本地
+// 视图拒绝，而不能放行未确认的 seal。
+func Test_WithdrawValidate_RefreshSealStatusFromSidecar(t *testing.T) {
+	const sealOutpoint = "1111111111111111111111111111111111111111111111111111111111111111:0"
+
+	cases := []struct {
+		name          string
+		sidecarStatus string
+		listSealsErr  error
+		wantErr       string
+		wantLocal     string
+	}{
+		{
+			name:          "sidecar minted promotes local pending-mint",
+			sidecarStatus: SealStatusMinted,
+			wantLocal:     SealStatusMinted,
+		},
+		{
+			name:          "sidecar still pending-mint keeps HR-5 rejection",
+			sidecarStatus: SealStatusPendingMint,
+			wantErr:       "pending-mint",
+			wantLocal:     SealStatusPendingMint,
+		},
+		{
+			name:         "sidecar unavailable degrades fail-closed",
+			listSealsErr: errors.New("sidecar down"),
+			wantErr:      "pending-mint",
+			wantLocal:    SealStatusPendingMint,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := NewMockSidecar()
+			mock.ValidateResp = []*pb.ConsignmentValidation{crossCheckWithdrawValidation(sealOutpoint)}
+			mock.ListSealsErr = tc.listSealsErr
+			if tc.sidecarStatus != "" {
+				mock.seals[sealOutpoint] = &pb.SealInfo{Outpoint: sealOutpoint, Status: tc.sidecarStatus}
+			}
+			adapter, cleanup := newTestAdapter(t, mock, &fakeBridge{})
+			defer cleanup()
+
+			// 本地视图：该 change seal 由上一笔提现的 FinalizeWithdrawal 登记为 pending-mint。
+			require.NoError(t, adapter.seals.Add(&Seal{
+				Outpoint:    sealOutpoint,
+				AssetSymbol: "RGB20_USDT",
+				Amount:      1000,
+				Status:      SealStatusPendingMint,
+			}))
+
+			err := adapter.ValidateWithdrawPsbt(&ValidateWithdrawRequest{
+				Psbt:            buildWithdrawValidationPSBT(t, sealOutpoint),
+				Consignment:     []byte("consignment"),
+				ExpectedAmount:  1000,
+				MinSyncedHeight: 100,
+			})
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tc.wantErr)
+			}
+
+			seal, ok := adapter.seals.Get(sealOutpoint)
+			require.True(t, ok)
+			require.Equal(t, tc.wantLocal, seal.Status)
+		})
+	}
 }
 
 func Test_WithdrawStickySealAndTxidMap(t *testing.T) {

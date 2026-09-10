@@ -27,6 +27,7 @@ type MockSidecar struct {
 	BuildResp       *pb.BuildWithdrawalResponse
 	FinalizeResp    *pb.FinalizeWithdrawalResponse
 	ParseResp       *pb.ParseBtcTxResponse
+	ListSealsErr    error // 非空则 ListSeals 返回该错误（驱动 fail-closed 降级路径）
 	CreateReceiveFn func(ctx context.Context, req *pb.CreateReceiveRequest) (*pb.ReceiveData, error)
 	OnProvide       func(ctx context.Context, req *pb.ProvideConsignmentRequest) (*pb.TransferState, error)
 	SidecarAddr     string // 提供给 BuildWithdrawal 的找零地址（TSS 地址）
@@ -130,6 +131,9 @@ func (m *MockSidecar) Sync(_ context.Context, _ *pb.SyncRequest) (*pb.SyncRespon
 }
 
 func (m *MockSidecar) ListSeals(_ context.Context, _ *pb.ListSealsRequest) (*pb.ListSealsResponse, error) {
+	if m.ListSealsErr != nil {
+		return nil, m.ListSealsErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := &pb.ListSealsResponse{}
