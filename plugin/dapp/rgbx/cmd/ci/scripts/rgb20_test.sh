@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RGB20 全部测试（Phase 5）：环境初始化 + 充值 + 提现 + sidecar smoke，一个文件按函数组织。
+# RGB20 全部测试（Phase 5）：环境初始化 + 充值 + 提现 + 两连提现 + sidecar smoke，一个文件按函数组织。
 # 依赖 docker-compose.sh 已定义的辅助（MAIN_CLI/PARA1_CLI/compose_cmd/assert_*/log_step 等）。
 # 由 testcase.sh 入口 source 本文件后调用 run_rgb20_* 系列函数。
 
@@ -207,34 +207,163 @@ function scenario_rgb20_deposit() {
 # RGB20 提现 E2E
 # =====================================================================
 
-function scenario_rgb20_withdraw() {
-    log_step "scenario: RGB20 withdraw (chain33 withdraw -> sidecar BuildWithdrawal -> TSS signPsbt -> broadcast -> confirm -> burn)"
-    local before
-    before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
-    assert_true "$(awk "BEGIN{print (${before} > 0)?\"true\":\"false\"}")" "rgb20 balance is zero before withdraw"
+# rgb20_withdraw_once <amount_min_units> <label>：跑一遍完整提现（chain33 withdraw → 侧车
+# BuildWithdrawal → TSS 组签 → 广播 → 确认 → 链上 burn），断言 pending 清空 + 余额正确递减。
+function rgb20_withdraw_once() {
+    local amount="$1"
+    local label="${2:-withdraw}"
+    local before after amt withdraw_hash expected
 
+    before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
     # 1. 侧车 test-sim 创建用户发票（提现收款方）
     local user_invoice
     user_invoice=$(curl -s -X POST http://127.0.0.1:50064/sim/user_invoice \
         -H 'Content-Type: application/json' \
-        -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${RGB20_WITHDRAW_AMOUNT}}" | jq -r '.invoice // empty')
-    assert_non_empty "${user_invoice}" "rgb20 user invoice empty"
+        -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${amount}}" | jq -r '.invoice // empty')
+    assert_non_empty "${user_invoice}" "rgb20 user invoice empty (${label})"
 
     # 2. chain33 发起提现（destinationAddr=invoice；CLI 硬编码 *1e8，反算 -a 口径）
-    local amt withdraw_hash
-    amt=$(awk "BEGIN{printf \"%.8f\", ${RGB20_WITHDRAW_AMOUNT}/100000000}")
+    amt=$(awk "BEGIN{printf \"%.8f\", ${amount}/100000000}")
     withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
-    assert_length "${withdraw_hash}" 66 "rgb20 withdraw tx hash"
+    assert_length "${withdraw_hash}" 66 "rgb20 withdraw tx hash (${label})"
 
     # 3. 等桥确认销毁（pending 清除 = rgbx Confirm 已提交）
     wait_no_withdraw_pending_for_user "${USER_MAIN_ADDR}"
 
     # 4. 断言余额减少（-a 口径 *1e8 = min units，显示口径 /1e8）
-    local expected after
     expected=$(awk "BEGIN{printf \"%.8f\", ${before} - ${amt}}")
     after=$(query_rgb20_balance "${USER_MAIN_ADDR}")
-    assert_balance "${after}" "${expected}" "rgb20 balance not decreased after withdraw"
-    log_step "RGB20 withdraw OK: balance ${before} -> ${after}"
+    assert_balance "${after}" "${expected}" "rgb20 balance not decreased after withdraw (${label})"
+    log_step "RGB20 withdraw OK (${label}): balance ${before} -> ${after} (amount=${amount} min units)"
+}
+
+function scenario_rgb20_withdraw() {
+    log_step "scenario: RGB20 withdraw (chain33 withdraw -> sidecar BuildWithdrawal -> TSS signPsbt -> broadcast -> confirm -> burn)"
+    local before
+    before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
+    assert_true "$(awk "BEGIN{print (${before} > 0)?\"true\":\"false\"}")" "rgb20 balance is zero before withdraw"
+    rgb20_withdraw_once "${RGB20_WITHDRAW_AMOUNT}" "single-withdraw"
+}
+
+# =====================================================================
+# RGB20 两连提现 E2E（回归 afcb7b934 / e538fc299 修复的性质）
+# =====================================================================
+#
+# 第一笔提现会闭合当前 seal 并产生一个 change seal（余额回到桥的 TSS 地址）；第二笔提现必须
+# 花掉这个 change seal。这条链路曾经必失败：
+#   - 侧车侧：提现转移没 merge 进 Stock → build_transfer 报 "outpoint <txid>:<vout> has no state"（e538fc299 修）；
+#   - Go 侧：change seal 只在 FinalizeWithdrawal 时被登记为 pending-mint，此后无路径提升 →
+#     下一笔提现被 HR-5（"closed seal ... is pending-mint"）永久拒绝（afcb7b934 修）。
+# 因此本场景同时校验"两笔都成功 burn + 余额递减 + listPendByFrom 清空"与"第二笔的输入确实是
+# 第一笔的 change seal"（缺任一修复时第二笔都会卡在 pending 直到超时）。
+
+# 侧车账本视图（seal 生命周期的权威）：engine 每次状态变更后把账本落盘到 /data/ledger.json。
+# change seal 的创建（finalize_withdrawal）与最终 Consumed（第二笔把它花掉）都能从这里读到，
+# 这也是 Go 侧 refreshSealStatuses 对齐本地 SealIndex 的数据来源。
+function rgb20_ledger_json() {
+    compose_cmd exec -T rgb-sidecar cat /data/ledger.json 2>/dev/null
+}
+
+# 已登记的 seal outpoint 列表（排序，供 comm 求差集）。
+function rgb20_ledger_seal_outpoints() {
+    rgb20_ledger_json | jq -r '.seals | keys[]' | sort
+}
+
+# 读某个 seal 的字段（status / amount / ...）。
+function rgb20_ledger_seal_field() {
+    local outpoint="$1"
+    local field="$2"
+    rgb20_ledger_json | jq -r --arg o "${outpoint}" --arg f "${field}" '.seals[$o][$f] // empty'
+}
+
+# 侧车账本里未被消费的 seal 面额之和 = 本桥当前持有、可被提现花掉的 RGB 数量。
+# 注意含 PendingMint：提现刚产生的 change seal 要等下一次 sync（下一笔提现的 build）才提升为
+# Minted，此刻它已经可以参与下一笔提现，因此不能只看 minted（/sim/status 的 total_balance 会漏掉它）。
+function query_rgb20_ledger_spendable() {
+    rgb20_ledger_json | jq -r '[.seals[]? | select((.status | ascii_downcase) != "consumed") | .amount] | add // 0'
+}
+
+# BTC 交易所在高度（未确认返回 0）。
+function btc_tx_block_height() {
+    local txid="$1"
+    local block_hash
+    block_hash=$(${BTC_CTL} --"${BTC_NETWORK}" getrawtransaction "${txid}" 1 | jq -r '.blockhash // empty')
+    if [ -z "${block_hash}" ]; then
+        echo 0
+        return 0
+    fi
+    ${BTC_CTL} --"${BTC_NETWORK}" getblockheader "${block_hash}" | jq -r '.height'
+}
+
+# 在 btcd 链上找首个花费 outpoint（"txid:vout"）的交易；找不到返回非 0。
+function find_btc_spender_tx() {
+    local outpoint="$1"
+    local txid="${outpoint%%:*}"
+    local vout="${outpoint##*:}"
+    local start tip h block_hash t raw
+    start=$(btc_tx_block_height "${txid}")
+    tip=$(${BTC_CTL} --"${BTC_NETWORK}" getblockcount)
+    for ((h = start; h <= tip; h++)); do
+        block_hash=$(${BTC_CTL} --"${BTC_NETWORK}" getblockhash "${h}")
+        for t in $(${BTC_CTL} --"${BTC_NETWORK}" getblock "${block_hash}" 1 | jq -r '.tx[]'); do
+            raw=$(${BTC_CTL} --"${BTC_NETWORK}" getrawtransaction "${t}" 1)
+            if echo "${raw}" | jq -e --arg t "${txid}" --argjson v "${vout}" \
+                'any(.vin[]?; .txid == $t and .vout == $v)' >/dev/null 2>&1; then
+                echo "${t}"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+function scenario_rgb20_two_withdrawals() {
+    log_step "scenario: RGB20 two consecutive withdrawals (second must spend the first's change seal)"
+
+    # 余额沿用前序场景（deposit 充值 → withdraw 提现剩下的那部分）：本场景要连提两笔，
+    # 合计不超过剩余额。判据用侧车账本的资产余额（= 可被提现花掉的 RGB 数量），而不是
+    # chain33 余额 —— 后者跨 run 累积，而每次 run 都会重建侧车账本。
+    local sidecar_before need_min_unit seals_before
+    sidecar_before=$(query_rgb20_ledger_spendable)
+    need_min_unit=$((RGB20_TWO_WITHDRAW_AMOUNT * 2))
+    assert_true "$(awk "BEGIN{print (${sidecar_before} >= ${need_min_unit})?\"true\":\"false\"}")" \
+        "rgb20 sidecar holdings too low for two withdrawals (deposit/withdraw scenarios must run first): have=${sidecar_before}, need=${need_min_unit}"
+    seals_before=$(rgb20_ledger_seal_outpoints)
+
+    # ---- 第一笔提现：产生 change seal ----
+    rgb20_withdraw_once "${RGB20_TWO_WITHDRAW_AMOUNT}" "two-withdrawals #1"
+
+    local seals_after1 change_seal
+    seals_after1=$(rgb20_ledger_seal_outpoints)
+    change_seal=$(comm -13 <(echo "${seals_before}") <(echo "${seals_after1}") | head -1)
+    assert_non_empty "${change_seal}" "first withdrawal produced no change seal in sidecar ledger"
+    assert_eq "$(comm -13 <(echo "${seals_before}") <(echo "${seals_after1}") | wc -l | tr -d ' ')" "1" \
+        "expected exactly one new seal after the first withdrawal"
+    # change seal 金额 = 提现前侧车持仓 - 提现额（RGB 状态守恒：被花 seal 的面额 = 提现额 + 找零）
+    local expect_change_min_unit=$((sidecar_before - RGB20_TWO_WITHDRAW_AMOUNT))
+    assert_eq "$(rgb20_ledger_seal_field "${change_seal}" amount)" "${expect_change_min_unit}" \
+        "change seal amount mismatch"
+    log_step "  change seal of withdrawal #1: ${change_seal} (amount=${expect_change_min_unit})"
+
+    # ---- 第二笔提现：必须花掉第一笔的 change seal ----
+    rgb20_withdraw_once "${RGB20_TWO_WITHDRAW_AMOUNT}" "two-withdrawals #2"
+
+    # 断言 1：侧车账本中该 change seal 最终为 Consumed（第二笔把它闭合了）
+    assert_eq "$(rgb20_ledger_seal_field "${change_seal}" status | tr 'A-Z' 'a-z')" "consumed" \
+        "change seal ${change_seal} is not consumed after the second withdrawal"
+
+    # 断言 2：第二笔提现的 BTC 交易输入包含该 change seal，且它在首个输入位
+    # （build_transfer 先列 RGB seal、后追加桥自有费输入；PSBT 输入即最终交易的输入）。
+    local spender first_in
+    if ! spender=$(find_btc_spender_tx "${change_seal}"); then
+        fail "no BTC tx spends change seal ${change_seal} (second withdrawal did not use it)"
+    fi
+    first_in=$(${BTC_CTL} --"${BTC_NETWORK}" getrawtransaction "${spender}" 1 |
+        jq -r '.vin[0].txid + ":" + (.vin[0].vout | tostring)')
+    assert_eq "${first_in}" "${change_seal}" \
+        "second withdrawal tx ${spender} does not spend the change seal as its first (RGB) input"
+
+    log_step "RGB20 two withdrawals OK: ${change_seal} created by #1, spent by #2 (tx ${spender}), ledger=consumed"
 }
 
 # =====================================================================
@@ -262,5 +391,6 @@ function run_rgb20_all() {
     run_rgb20_env
     scenario_rgb20_deposit
     scenario_rgb20_withdraw
+    scenario_rgb20_two_withdrawals
     run_rgb20_sidecar_smoke
 }
