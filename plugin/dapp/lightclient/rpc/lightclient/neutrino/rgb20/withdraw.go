@@ -259,6 +259,14 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 			return fmt.Errorf("input %s is not a TSS-controlled utxo", key)
 		}
 	}
+	// 用侧车的 seal 状态对齐本地 SealIndex，再判定 pending-mint。
+	// 提现产生的 change seal 在侧车侧由 sync() 在其上链后提升为 minted，但 Go 侧只在
+	// FinalizeWithdrawal 时把它登记为 pending-mint（见 Withdraw），此后再没有任何路径提升它；
+	// 不刷新的话，下一笔提现会因为这里（HR-5）被永久拒绝，即"连续两笔提现"必失败。
+	// 侧车的 ListSeals 读的是同一份账本，且本函数前一步的 BuildWithdrawal 已经 sync 过，
+	// 因此这里只读、不触发一次昂贵的钱包重扫。
+	a.refreshSealStatuses()
+
 	// 任何 closed seal 若为 pending-mint 则拒绝（HR-5：不能花未确认的充值 seal）
 	for _, cs := range v.ClosedSeals {
 		if a.seals.IsPendingMint(cs) {
@@ -365,4 +373,37 @@ func (a *Adapter) GetChain33HashByTxid(txid string) ([]byte, error) {
 // putKnownWithdrawTxid 将提现交易 txid 记为已知 RGB txid（排除 BTC 提现路径）。
 func (a *Adapter) putKnownWithdrawTxid(txid string) error {
 	return a.store.Put(txidBucket, []byte(txid), []byte("withdraw"))
+}
+
+// refreshSealStatuses 用侧车的 seal 视图对齐本地 SealIndex（pending-mint -> minted）。
+//
+// 侧车是 seal 生命周期的权威：提现的 change seal 由侧车 sync() 在其锚定交易上链后提升为
+// minted。Go 侧只在 FinalizeWithdrawal 之后把它登记为 pending-mint，此后没有任何路径提升，
+// 于是下一笔提现会被 HR-5 的 pending-mint 检查永久拒绝（连续的第二次提现必失败）。
+// 两侧状态一致时本调用无副作用（MarkMinted 只提升 pending-mint），因此可以安全地每次校验都跑。
+// 只读侧车、不触发 sync：调用方（BuildWithdrawal）刚刚 sync 过同一份账本。
+func (a *Adapter) refreshSealStatuses() {
+	sc := a.sidecar.Load()
+	if sc == nil {
+		return
+	}
+	for _, symbol := range a.reg.Symbols() {
+		contract, ok := a.reg.Get(symbol)
+		if !ok {
+			continue
+		}
+		rsp, err := sc.ListSeals(a.ctx, &pb.ListSealsRequest{AssetSymbol: contract.sidecarAssetSymbol()})
+		if err != nil {
+			continue // 侧车不可用时保持本地视图，由后续校验/重试兜底
+		}
+		for _, s := range rsp.GetSeals() {
+			outpoint := s.GetOutpoint()
+			if s.GetStatus() != SealStatusMinted || outpoint == "" {
+				continue
+			}
+			if a.seals.IsPendingMint(outpoint) {
+				_ = a.seals.MarkMinted(outpoint)
+			}
+		}
+	}
 }
