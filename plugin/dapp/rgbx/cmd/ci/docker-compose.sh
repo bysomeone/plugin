@@ -15,7 +15,7 @@ ACTION="run"
 PROJECT=""
 if [ "$#" -gt 0 ]; then
     case "${1}" in
-    run | up | down | init | config | test)
+    run | up | down | reset | init | config | test)
         ACTION="${1}"
         PROJECT="${2:-rgbx-ci}"
         ;;
@@ -796,6 +796,14 @@ function do_down() {
     compose_cmd down --remove-orphans
 }
 
+# 一次性全量清空：删容器 + 删卷（main/para/DKG、btcd 链），下次 up 从零重建。
+# 用于 btcd 清链等导致 chain33 头链与 BTC 链错位、无法原地恢复的场景。
+# 注意：容器重启不会走到这里——已通过 btcd --datadir 修复让 down/up 可原位恢复。
+function do_reset() {
+    log_step "reset: remove containers AND volumes (DKG/chain state will be rebuilt on next up)"
+    compose_cmd down -v --remove-orphans
+}
+
 case "${ACTION}" in
 run)
     do_run_all
@@ -814,6 +822,9 @@ test)
     ;;
 down)
     do_down
+    ;;
+reset)
+    do_reset
     ;;
 *)
     fail "unknown action: ${ACTION}"
