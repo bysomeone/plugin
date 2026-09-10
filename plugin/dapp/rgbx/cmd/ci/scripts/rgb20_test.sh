@@ -24,6 +24,11 @@ function wait_rgb20_balance_not_less_than() {
             log_step "rgb20 balance reached: addr=${addr}, balance=${balance} >= ${expected}"
             return 0
         fi
+        # 主链铸币依赖签名节点的 VerifyDepositSpv —— 它查主链 lightclient 的 BTC 头。
+        # 充值付款交易通常落在 btcd 的 tip 上，而 para1 提交 BTC 头受 blockConfirmations(=1)
+        # 限制只能提交到 tip-1；若此时链条不再前进，该高度的头永远提交不上去，spv verify 一直
+        # ErrNotFound、充值永不铸币（全新重建后必现）。这里等待期间持续挖块，让头链跟上。
+        mine_btcd_blocks 1
         sleep 2
     done
     fail "rgb20 balance not reached, addr=${addr}, expected>=${expected}"
@@ -69,6 +74,33 @@ function wait_rgb20_sidecar_grpc() {
     fail "rgb-sidecar gRPC 50061 not ready"
 }
 
+# btcd regtest 的 segwit 靠 BIP9 激活（MinerConfirmationWindow=144 / RuleChangeActivationThreshold=108）：
+# 全新重建后链上只有 warm-up 挖出的 ~105 块时，segwit 仍是 lockedin，任何 P2WPKH（TSS 单脚本
+# 地址）花费都会被 btcd 拒绝：
+#   TX rejected: ... has witness data, but segwit isn't active yet
+# 充值付款交易因此广播失败、E2E 卡在第一步。实测 h=290 仍 lockedin、h=490 active，故先把链挖到
+# 500 以上再进 E2E（regtest 挖块是秒级的，代价可忽略）。
+function ensure_btcd_segwit_active() {
+    local target_height="${1:-500}"
+    local height status
+    height=$(${BTC_CTL} --"${BTC_NETWORK}" getblockcount)
+    while [ "${height}" -lt "${target_height}" ]; do
+        mine_btcd_blocks 100
+        height=$(${BTC_CTL} --"${BTC_NETWORK}" getblockcount)
+    done
+    local i
+    for ((i = 0; i < 20; i++)); do
+        status=$(${BTC_CTL} --"${BTC_NETWORK}" getblockchaininfo | jq -r '.bip9_softforks.segwit.status // empty')
+        if [ "${status}" = "active" ]; then
+            log_step "btcd segwit active (height=${height}, status=${status})"
+            return 0
+        fi
+        mine_btcd_blocks 50
+        height=$(${BTC_CTL} --"${BTC_NETWORK}" getblockcount)
+    done
+    fail "btcd segwit not active (height=${height}, status=${status})"
+}
+
 function run_rgb20_env() {
     log_step "RGB20 env: wait DKG -> fund TSS on btcd -> issue USDT at GG18 script -> start sidecar"
 
@@ -77,6 +109,9 @@ function run_rgb20_env() {
     if [ -z "${BTC_FUNDING_WIF:-}" ]; then
         prepare_btcd_mining_identity
     fi
+
+    # 必须早于任何 P2WPKH 花费（充值付款 / 提现广播）：全新重建时链太短，segwit 未激活。
+    ensure_btcd_segwit_active
 
     wait_rgb20_dkg_commit
     local pubkey
