@@ -9,6 +9,7 @@ services:
       - "8802:8802"
     volumes:
       - ./btcd-data:/btcd:ro
+      - main-data:/root/datadir
 
   para1:
     build:
@@ -22,6 +23,7 @@ services:
         condition: service_healthy
     volumes:
       - ./btcd-data:/btcd:ro
+      - para1-data:/root/paradatadir
     # RGB20（Phase 5）：官方节点 rgb20 适配器 HTTP（充值请求 + consignment 上传 + 测试 sign-psbt）。
     ports:
       - "17000:17000"
@@ -35,6 +37,7 @@ services:
       - main
     volumes:
       - ./btcd-data:/btcd:ro
+      - para2-data:/root/paradatadir
 
   para3:
     build:
@@ -45,6 +48,7 @@ services:
       - main
     volumes:
       - ./btcd-data:/btcd:ro
+      - para3-data:/root/paradatadir
 
   para4:
     build:
@@ -55,6 +59,7 @@ services:
       - main
     volumes:
       - ./btcd-data:/btcd:ro
+      - para4-data:/root/paradatadir
 
   btcd:
     # RPC TLS cert auto-gen uses os.Hostname(); must match Docker DNS name "btcd"
@@ -68,6 +73,11 @@ services:
     command:
       - btcd
       - --regtest
+      # 显式指定非默认 datadir：btcd 的 removeRegressionDB() 在 --regtest 下、且 datadir
+      # 为默认值（~/.btcd/data）时，每次启动都会删掉 regtest 链。指定一个不同路径即可
+      # 跳过删除（仍落在 ./btcd-data 挂载内）。否则每次容器重启都会清链，导致 chain33
+      # lightclient 已存的 BTC 头链与 btcd 新链错位、充值 SPV 永久验不过。
+      - --datadir=/root/.btcd/chain
       - --txindex
       - --addrindex
       - --rpclisten=0.0.0.0:18443
@@ -87,76 +97,9 @@ services:
       timeout: 5s
       retries: 30
 
-  # ===== RGB20 (Phase 5)：RGB 链 =====
-  # bitcoind regtest（RGB 链）+ electrs 索引 + RGB 侧车，全部走 compose 内部网络。
-  # 宿主 macOS 二进制无法进 Linux 容器，故 electrs/侧车在 Docker 内构建（Dockerfile.electrs/sidecar）。
-  rgb-bitcoind:
-    image: lncm/bitcoind:v27.2
-    command:
-      - -regtest
-      - -datadir=/data
-      - -server=1
-      - -txindex=1
-      - -fallbackfee=0.0001
-      - -rpcuser=${RGB20_BITCOIND_USER:-rgb}
-      - -rpcpassword=${RGB20_BITCOIND_PASS:-rgbpass123}
-      - -rpcallowip=0.0.0.0/0
-      - -rpcbind=0.0.0.0
-    volumes:
-      - rgb-bitcoind-data:/data
-    ports:
-      - "18543:18443"
-      - "18544:18444"
-    healthcheck:
-      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=${RGB20_BITCOIND_USER:-rgb}", "-rpcpassword=${RGB20_BITCOIND_PASS:-rgbpass123}", "getblockcount"]
-      interval: 5s
-      timeout: 5s
-      retries: 30
-
-  rgb-electrs:
-    build:
-      context: .
-      dockerfile: Dockerfile.electrs
-    command:
-      - /bin/sh
-      - -c
-      - |
-        mkdir -p /data/regtest
-        printf 'rgb:rgbpass123' > /data/regtest/.cookie
-        exec electrs --network=regtest --db-dir=/electrs-db --daemon-dir=/data           --daemon-rpc-addr=rgb-bitcoind:18443 --daemon-p2p-addr=rgb-bitcoind:18444           --electrum-rpc-addr=0.0.0.0:60401
-    volumes:
-      - rgb-bitcoind-data:/data
-      - rgb-electrs-db:/electrs-db
-    depends_on:
-      rgb-bitcoind:
-        condition: service_healthy
-    ports:
-      - "60401:60401"
-
-  rgb-sidecar:
-    build:
-      context: .
-      dockerfile: Dockerfile.sidecar
-    environment:
-      RGB_SIDECAR_DATA_DIR: /data
-      RGB_SIDECAR_ELECTRUM: rgb-electrs:60401
-      RGB_SIDECAR_NETWORK: regtest
-      RGB_SIDECAR_TSS_PUBKEY: ${RGB20_TSS_PUBKEY:-}
-      RGB_SIDECAR_LISTEN: 0.0.0.0:50061
-      RGB_SIDECAR_TEST_LISTEN: 0.0.0.0:50064
-      RGB_BITCOIND_RPC: http://rgb-bitcoind:18443
-      RGB_BITCOIND_USER: ${RGB20_BITCOIND_USER:-rgb}
-      RGB_BITCOIND_PASS: ${RGB20_BITCOIND_PASS:-rgbpass123}
-    volumes:
-      - rgb-sidecar-data:/data
-    depends_on:
-      rgb-electrs:
-        condition: service_started
-    ports:
-      - "50061:50061"
-      - "50064:50064"
-
 volumes:
-  rgb-bitcoind-data:
-  rgb-electrs-db:
-  rgb-sidecar-data:
+  main-data:
+  para1-data:
+  para2-data:
+  para3-data:
+  para4-data:
