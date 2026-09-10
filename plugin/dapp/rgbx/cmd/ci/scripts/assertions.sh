@@ -33,7 +33,10 @@ function assert_balance {
     local actual="${1}"
     local expect="${2}"
     local message="${3:-assert_balance failed}"
-    if [ "${actual}" != "${expect}" ]; then
+    # 余额是定点小数字符串：CLI 查询返回 4 位小数（0.0050），而调用方用 awk 算出来的
+    # expected 是 8 位（0.00500000）——字符串比较会误判失败。awk 的 == 对两个数值字符串做
+    # 数值比较（非数值时退化为字符串比较），正好兼顾两种情况。
+    if ! awk -v a="${actual}" -v b="${expect}" 'BEGIN{exit !(a == b)}'; then
         fail "${message}, expect=${expect}, actual=${actual}"
     fi
 }
