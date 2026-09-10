@@ -18,10 +18,12 @@ use psrgbt::{RgbOutExt, RgbPsbtExt};
 use rand::Rng;
 use bitcoin::Network;
 use rgbinvoice::Precision;
-use rgbcore::validation::{ResolveWitness, ValidationConfig, WitnessResolverError, WitnessStatus};
+use rgbcore::validation::{
+    ResolveWitness, ValidationConfig, WitnessOrdProvider, WitnessResolverError, WitnessStatus,
+};
 use rgbcore::vm::WitnessOrd;
 use rgbcore::{ChainNet, ContractId, Opout, TxoSeal, Txid};
-use rgbstd::containers::{Consignment, ConsignmentExt};
+use rgbstd::containers::{Consignment, ConsignmentExt, Fascia};
 use rgbstd::contract::{AllocatedState, ContractBuilder, IssuerWrapper, TransitionBuilder};
 use rgbstd::invoice::Amount;
 use rgbstd::persistence::fs::FsBinStore;
@@ -73,6 +75,15 @@ impl ResolveWitness for BtcdResolver {
     }
 }
 
+impl WitnessOrdProvider for BtcdResolver {
+    /// Witness ordering view of the same resolver: used when merging a locally built fascia
+    /// (`Stock::consume_fascia`), where the anchor tx is typically not yet mined and resolves
+    /// from the `local_anchors` cache as [`WitnessOrd::Tentative`].
+    fn witness_ord(&self, witness_id: Txid) -> Result<WitnessOrd, WitnessResolverError> {
+        Ok(self.resolve_witness(witness_id)?.witness_ord())
+    }
+}
+
 /// Result of a consignment inspection.
 #[derive(Clone, Debug)]
 pub struct ConsignmentInspection {
@@ -102,6 +113,9 @@ pub struct BuildTransferOutcome {
     pub input_amounts: Vec<i64>,
     pub input_btc_values: Vec<u64>,
     pub consignment: Vec<u8>,
+    /// The RGB fascia exported from the PSBT: merging it into the Stock is what registers
+    /// this transfer's output seals (incl. the change seal) as spendable RGB state.
+    pub fascia: Fascia,
     pub txid: Txid,
     /// vout of the recipient output (always 1).
     pub recipient_vout: u32,
@@ -119,6 +133,18 @@ struct PendingWithdrawal {
     pub input_outpoints: Vec<OutPoint>,
     pub change_vout: Option<u32>,
     pub change_amount: i64,
+    /// Kept until `finalize_withdrawal` so the transition can be merged into the Stock once the
+    /// withdrawal is signed (and therefore certain to be broadcast).
+    pub fascia: Fascia,
+}
+
+/// Result of a finalized withdrawal, kept so a repeated `finalize_withdrawal` is a no-op
+/// returning the same values instead of failing with "no pending withdrawal".
+#[derive(Clone, Debug)]
+struct FinalizedWithdrawal {
+    pub txid: Txid,
+    pub recipient_outpoint: String,
+    pub change_outpoint: Option<String>,
 }
 
 pub struct RgbEngine {
@@ -132,6 +158,8 @@ pub struct RgbEngine {
     tss_address: Address,
     resolver: BtcdResolver,
     pending_withdrawals: HashMap<String, PendingWithdrawal>,
+    /// Withdrawals already finalized, by txid: makes a repeated finalize idempotent.
+    finalized_withdrawals: HashMap<String, FinalizedWithdrawal>,
     /// Txs built by `build_transfer` that are not yet broadcast (withdrawal anchors awaiting TSS
     /// signature). Shared with `resolver` so pre-broadcast consignment validation can resolve them.
     local_anchors: Arc<Mutex<HashMap<Txid, Transaction>>>,
@@ -183,6 +211,7 @@ impl RgbEngine {
             tss_address,
             resolver,
             pending_withdrawals: HashMap::new(),
+            finalized_withdrawals: HashMap::new(),
             local_anchors,
         })
     }
@@ -790,6 +819,7 @@ impl RgbEngine {
             input_amounts,
             input_btc_values: all_input_btc,
             consignment,
+            fascia,
             txid,
             recipient_vout: 1,
             change_vout: if change_amount > 0 { Some(2) } else { None },
@@ -863,6 +893,7 @@ impl RgbEngine {
                 input_outpoints,
                 change_vout: outcome.change_vout,
                 change_amount: outcome.change_amount,
+                fascia: outcome.fascia.clone(),
             },
         );
         Ok(outcome)
@@ -876,14 +907,44 @@ impl RgbEngine {
     ) -> Result<(Txid, String, Option<String>)> {
         let tx = signed_psbt.clone().extract_tx()?;
         let txid = tx.compute_txid();
-        // Anchor is being broadcast; drop it from the local resolver cache (btcd will own it now).
-        self.local_anchors.lock().unwrap().remove(&txid);
 
+        // Idempotent re-finalize (e.g. the bridge retrying after a restart): return the values
+        // recorded by the first call instead of double-applying the transition.
+        if let Some(fin) = self.finalized_withdrawals.get(&txid.to_string()) {
+            return Ok((fin.txid, fin.recipient_outpoint.clone(), fin.change_outpoint.clone()));
+        }
+
+        // Keep the pending entry until the Stock merge succeeded, so a failure here leaves the
+        // withdrawal retryable instead of dropping it.
         let pending = self
             .pending_withdrawals
-            .remove(&txid.to_string())
+            .get(&txid.to_string())
+            .cloned()
             .ok_or_else(|| anyhow!("no pending withdrawal for txid {txid}"))?;
         assert_eq!(pending.txid, txid, "pending withdrawal txid mismatch");
+
+        // Merge our own transfer into the Stock. The bridge builds the withdrawal transition
+        // itself, so - unlike the deposit path, where `provide_consignment` -> `accept_transfer`
+        // records the received seal - nothing else would ever register this transition's output
+        // seals. Without it the RGB state of the change seal is missing and the next withdrawal
+        // fails with "outpoint <txid>:<vout> has no <contract> state".
+        //
+        // Done here (the PSBT is signed, broadcast is imminent) rather than at build time: a
+        // built-but-never-signed withdrawal must not leave a tentative transition in the Stock,
+        // since tentative witnesses take priority over mined ones. The anchor is still in
+        // `local_anchors` (resolved as tentative) because the tx is broadcast only after this
+        // call returns.
+        let resolver = BtcdResolver {
+            rpc: self.rpc.clone(),
+            chain_net: self.chain_net,
+            local_anchors: self.local_anchors.clone(),
+        };
+        self.stock
+            .consume_fascia(pending.fascia.clone(), resolver)
+            .map_err(|e| anyhow!("consume_fascia: {e:?}"))?;
+
+        // Anchor is being broadcast; drop it from the local resolver cache (btcd will own it now).
+        self.local_anchors.lock().unwrap().remove(&txid);
 
         for o in &pending.input_outpoints {
             let key = o.to_string();
@@ -911,6 +972,14 @@ impl RgbEngine {
         self.save()?;
         let recipient_outpoint = format!("{txid}:1");
         let change_outpoint = pending.change_vout.map(|v| format!("{txid}:{v}"));
+        self.finalized_withdrawals.insert(
+            txid.to_string(),
+            FinalizedWithdrawal {
+                txid,
+                recipient_outpoint: recipient_outpoint.clone(),
+                change_outpoint: change_outpoint.clone(),
+            },
+        );
         Ok((txid, recipient_outpoint, change_outpoint))
     }
 
