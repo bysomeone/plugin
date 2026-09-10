@@ -394,7 +394,9 @@ func (a *Adapter) refreshSealStatuses() {
 		}
 		rsp, err := sc.ListSeals(a.ctx, &pb.ListSealsRequest{AssetSymbol: contract.sidecarAssetSymbol()})
 		if err != nil {
-			continue // 侧车不可用时保持本地视图，由后续校验/重试兜底
+			// 刻意 fail-closed 降级：侧车读不到时保持本地视图（不提升任何 seal），随后
+			// HR-5 的 pending-mint 检查会按本地状态拒绝，而不是拿一份可能过期的状态放行。
+			continue
 		}
 		for _, s := range rsp.GetSeals() {
 			outpoint := s.GetOutpoint()
