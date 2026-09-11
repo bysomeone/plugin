@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 
 	"github.com/33cn/chain33/common/merkle"
@@ -33,6 +34,17 @@ func merkelProof2String(merkleProof [][]byte) string {
 }
 
 func (r *rgbx) checkWithdrawConfirm(txHash, confirmHash string, confirm *rtypes.ConfirmTx, pendingTx *rtypes.PendingTx) error {
+	// S3：同一笔提现 burn 只允许结算（放款）一次。已消费则直接拒绝。
+	// 该守卫落在合约级 statedb（共识状态）上，而不是 LocalDB 的 pending.Confirmed 标记：
+	// dapp CheckTx 在出块执行阶段会被每个节点重跑（chain33 executor/execenv.go Exec → CheckTx），
+	// 读节点私有数据会让"区块是否合法"依赖各节点本地库，且本地库丢失/落后时同一 burn 会被二次结算
+	// （第二次再从共享锁仓地址销毁一遍，侵蚀其他 pending 提现的锁定额度）。与充值侧 formatDepositUsedKey 对称。
+	_, err := r.GetStateDB().Get(formatWithdrawUsedKey(confirm.GetTxHash()))
+	if !errors.Is(err, types.ErrNotFound) {
+		elog.Error("checkWithdrawConfirm burn already used", "txHash", txHash, "confirmHash", confirmHash,
+			"burnTxHash", hex.EncodeToString(confirm.GetTxHash()), "err", err)
+		return ErrWithdrawAlreadyConfirmed
+	}
 	btcTx, err := r.validateBtcTxProof(txHash, confirm.GetBtcTxProof())
 	if err != nil {
 		elog.Error("checkWithdrawConfirm validate btc tx proof", "txHash", txHash, "confirmHash", confirmHash,
