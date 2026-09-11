@@ -259,10 +259,11 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 			return fmt.Errorf("input %s is not a TSS-controlled utxo", key)
 		}
 	}
-	// 用侧车的 seal 状态对齐本地 SealIndex，再判定 pending-mint。
-	// 提现产生的 change seal 在侧车侧由 sync() 在其上链后提升为 minted，但 Go 侧只在
-	// FinalizeWithdrawal 时把它登记为 pending-mint（见 Withdraw），此后再没有任何路径提升它；
-	// 不刷新的话，下一笔提现会因为这里（HR-5）被永久拒绝，即"连续两笔提现"必失败。
+	// 用侧车的 seal 状态双向对齐本地 SealIndex（提升 pending-mint→minted；退休 consumed），
+	// 再判定 pending-mint。提现产生的 change seal 在侧车侧由 sync() 在其上链后提升为 minted，
+	// 但 Go 侧只在 FinalizeWithdrawal 时把它登记为 pending-mint（见 Withdraw），此后再没有任何
+	// 路径提升或退休它；不刷新的话，下一笔提现会因为这里（HR-5）被永久拒绝，即"连续两笔提现"
+	// 必失败，且本地会永久残留与侧车分叉的垃圾条目。
 	// 侧车的 ListSeals 读的是同一份账本，且本函数前一步的 BuildWithdrawal 已经 sync 过，
 	// 因此这里只读、不触发一次昂贵的钱包重扫。
 	a.refreshSealStatuses()
@@ -375,12 +376,24 @@ func (a *Adapter) putKnownWithdrawTxid(txid string) error {
 	return a.store.Put(txidBucket, []byte(txid), []byte("withdraw"))
 }
 
-// refreshSealStatuses 用侧车的 seal 视图对齐本地 SealIndex（pending-mint -> minted）。
+// refreshSealStatuses 用侧车的 seal 视图**双向**对齐本地 SealIndex。
 //
 // 侧车是 seal 生命周期的权威：提现的 change seal 由侧车 sync() 在其锚定交易上链后提升为
-// minted。Go 侧只在 FinalizeWithdrawal 之后把它登记为 pending-mint，此后没有任何路径提升，
-// 于是下一笔提现会被 HR-5 的 pending-mint 检查永久拒绝（连续的第二次提现必失败）。
-// 两侧状态一致时本调用无副作用（MarkMinted 只提升 pending-mint），因此可以安全地每次校验都跑。
+// minted，被后一笔提现花掉时由 finalize_withdrawal 置为 consumed。Go 侧只在 FinalizeWithdrawal
+// 之后把它登记为 pending-mint，此后没有任何路径提升或退休，因此本地与侧车一旦分叉（账本重建、
+// 合约重发、reorg、锚定 tx 一直不上链）就会留下永久垃圾条目，且没有自愈路径。
+//
+// 判据只认侧车**显式报告**，因为 ListSeals 返回该资产的全部 seal（含 consumed——引擎从不从账本
+// 里删除 seal，只改状态）：
+//   - 侧车报 minted、本地 pending-mint → MarkMinted（保持既有行为：change seal 上链后可用）；
+//   - 侧车报 consumed、本地仍挂 pending-mint/minted → MarkConsumed（退休，终态）；
+//   - 侧车报 pending-mint，或**响应里没有这个 outpoint** → 不动本地。后者尤其关键：账本重建
+//     （侧车 /data 被清空重建）后侧车会大面积"不认识"陈旧 outpoint，那不是"已消费"，按它清退
+//     会把仍在链上背书的 seal 误退休——宁可留着垃圾条目也不清退。
+//
+// 退休只改状态、不删条目：IsSealOutpoint 对登记过的 outpoint 一律 true，consumed 条目仍留在
+// BTC 费池排除名单里（HR-5 的护栏不因退休而削弱）。
+// 两侧状态一致时本调用无副作用（提升/退休都幂等），因此可以安全地每次校验都跑。
 // 只读侧车、不触发 sync：调用方（BuildWithdrawal）刚刚 sync 过同一份账本。
 func (a *Adapter) refreshSealStatuses() {
 	sc := a.sidecar.Load()
@@ -394,17 +407,28 @@ func (a *Adapter) refreshSealStatuses() {
 		}
 		rsp, err := sc.ListSeals(a.ctx, &pb.ListSealsRequest{AssetSymbol: contract.sidecarAssetSymbol()})
 		if err != nil {
-			// 刻意 fail-closed 降级：侧车读不到时保持本地视图（不提升任何 seal），随后
+			// 刻意 fail-closed 降级：侧车读不到时保持本地视图（既不提升也不退休），随后
 			// HR-5 的 pending-mint 检查会按本地状态拒绝，而不是拿一份可能过期的状态放行。
 			continue
 		}
 		for _, s := range rsp.GetSeals() {
 			outpoint := s.GetOutpoint()
-			if s.GetStatus() != SealStatusMinted || outpoint == "" {
+			if outpoint == "" {
 				continue
 			}
-			if a.seals.IsPendingMint(outpoint) {
-				_ = a.seals.MarkMinted(outpoint)
+			local, ok := a.seals.Get(outpoint)
+			if !ok {
+				continue // 侧车知道、本地未登记：由充值/提现路径登记，不在此处补建
+			}
+			switch s.GetStatus() {
+			case SealStatusMinted:
+				if local.Status == SealStatusPendingMint {
+					_ = a.seals.MarkMinted(outpoint)
+				}
+			case SealStatusConsumed:
+				if local.Status != SealStatusConsumed {
+					_ = a.seals.MarkConsumed(outpoint)
+				}
 			}
 		}
 	}

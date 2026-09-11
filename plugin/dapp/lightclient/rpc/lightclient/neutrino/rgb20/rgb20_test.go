@@ -301,12 +301,17 @@ func crossCheckWithdrawValidation(closedSeal string) *pb.ConsignmentValidation {
 //
 // 反向同样要锁住：侧车仍报 pending-mint、或侧车读不到（fail-closed 降级）时，必须按本地
 // 视图拒绝，而不能放行未确认的 seal。
+//
+// 对账是双向的（退休方向）：侧车显式报 consumed 时必须把本地条目退休为 consumed（终态），
+// 否则本地与侧车分叉后留下永久垃圾条目、无自愈路径；而侧车**不认识**该 outpoint
+// （账本重建后大面积出现）不是"已消费"，绝不能据此清退。
 func Test_WithdrawValidate_RefreshSealStatusFromSidecar(t *testing.T) {
 	const sealOutpoint = "1111111111111111111111111111111111111111111111111111111111111111:0"
 
 	cases := []struct {
 		name          string
-		sidecarStatus string
+		sidecarStatus string // 空 = 侧车列表里没有该 outpoint（账本重建 / 本桥的账本不认识它）
+		localStatus   string // 本地初始状态（空 = pending-mint）
 		listSealsErr  error
 		wantErr       string
 		wantLocal     string
@@ -328,6 +333,22 @@ func Test_WithdrawValidate_RefreshSealStatusFromSidecar(t *testing.T) {
 			wantErr:      "pending-mint",
 			wantLocal:    SealStatusPendingMint,
 		},
+		{
+			name:          "sidecar consumed retires local pending-mint (no HR-5 rejection)",
+			sidecarStatus: SealStatusConsumed,
+			wantLocal:     SealStatusConsumed,
+		},
+		{
+			name:          "sidecar consumed retires local minted",
+			sidecarStatus: SealStatusConsumed,
+			localStatus:   SealStatusMinted,
+			wantLocal:     SealStatusConsumed,
+		},
+		{
+			name:        "sidecar does not know the outpoint (ledger rebuilt) must not retire",
+			wantErr:     "pending-mint",
+			wantLocal:   SealStatusPendingMint,
+		},
 	}
 
 	for _, tc := range cases {
@@ -341,12 +362,17 @@ func Test_WithdrawValidate_RefreshSealStatusFromSidecar(t *testing.T) {
 			adapter, cleanup := newTestAdapter(t, mock, &fakeBridge{})
 			defer cleanup()
 
-			// 本地视图：该 change seal 由上一笔提现的 FinalizeWithdrawal 登记为 pending-mint。
+			// 本地视图：该 change seal 由上一笔提现的 FinalizeWithdrawal 登记为 pending-mint
+			// （或被前一次对账提升为 minted）。
+			local := tc.localStatus
+			if local == "" {
+				local = SealStatusPendingMint
+			}
 			require.NoError(t, adapter.seals.Add(&Seal{
 				Outpoint:    sealOutpoint,
 				AssetSymbol: "RGB20_USDT",
 				Amount:      1000,
-				Status:      SealStatusPendingMint,
+				Status:      local,
 			}))
 
 			err := adapter.ValidateWithdrawPsbt(&ValidateWithdrawRequest{
@@ -365,8 +391,33 @@ func Test_WithdrawValidate_RefreshSealStatusFromSidecar(t *testing.T) {
 			seal, ok := adapter.seals.Get(sealOutpoint)
 			require.True(t, ok)
 			require.Equal(t, tc.wantLocal, seal.Status)
+			// 护栏不因退休而削弱：登记过的 outpoint（含已 consumed）一律不进 BTC 费池。
+			require.True(t, adapter.seals.IsSealOutpoint(sealOutpoint))
+			if tc.wantLocal == SealStatusMinted {
+				require.Len(t, adapter.seals.ListMinted("RGB20_USDT"), 1)
+			} else {
+				require.Empty(t, adapter.seals.ListMinted("RGB20_USDT"))
+			}
 		})
 	}
+}
+
+// Test_SealIndex_MarkConsumed_Idempotent 退休是终态：重复 MarkConsumed 不改变状态，
+// 也不把条目从费池排除名单里删掉。
+func Test_SealIndex_MarkConsumed_Idempotent(t *testing.T) {
+	idx := newSealIndex(newMemStore())
+	op := "2222222222222222222222222222222222222222222222222222222222222222:1"
+	require.NoError(t, idx.Add(&Seal{Outpoint: op, AssetSymbol: "RGB20_USDT", Amount: 1}))
+	require.NoError(t, idx.MarkMinted(op))
+	require.NoError(t, idx.MarkConsumed(op))
+	require.NoError(t, idx.MarkConsumed(op)) // 幂等
+	seal, ok := idx.Get(op)
+	require.True(t, ok)
+	require.Equal(t, SealStatusConsumed, seal.Status)
+	require.True(t, idx.IsSealOutpoint(op))
+	require.False(t, idx.IsPendingMint(op))
+	require.Empty(t, idx.ListMinted("RGB20_USDT"))
+	require.Len(t, idx.ListByStatus(SealStatusConsumed, "RGB20_USDT"), 1)
 }
 
 func Test_WithdrawStickySealAndTxidMap(t *testing.T) {
