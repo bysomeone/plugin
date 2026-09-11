@@ -94,7 +94,9 @@ func (s *SealIndex) MarkMinted(outpoint string) error {
 	return s.store.Put(sealBucket, []byte(outpoint), data)
 }
 
-// MarkConsumed 标记 seal 已消费（提现被花费）。
+// MarkConsumed 标记 seal 已消费（终态：提现被花费，或侧车报告该 seal 已关闭）。
+// 已 consumed 的条目幂等返回、不重复写库。只改状态、不删条目：consumed 的 outpoint 仍是
+// 已登记 seal，IsSealOutpoint 继续为 true（费池排除护栏不因退休而削弱）。
 func (s *SealIndex) MarkConsumed(outpoint string) error {
 	var data []byte
 	s.mu.Lock()
@@ -102,6 +104,10 @@ func (s *SealIndex) MarkConsumed(outpoint string) error {
 	if !ok {
 		s.mu.Unlock()
 		return fmt.Errorf("seal %s not found", outpoint)
+	}
+	if seal.Status == SealStatusConsumed {
+		s.mu.Unlock()
+		return nil
 	}
 	seal.Status = SealStatusConsumed
 	data = mustJSON(seal)
