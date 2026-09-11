@@ -25,6 +25,7 @@ type MockSidecar struct {
 	// 可配置行为
 	ValidateResp    []*pb.ConsignmentValidation // 依次返回；耗尽后返回 valid=false
 	BuildResp       *pb.BuildWithdrawalResponse
+	BuildErr        error // 非空则 BuildWithdrawal 返回该错误（驱动不可恢复失败路径）
 	FinalizeResp    *pb.FinalizeWithdrawalResponse
 	ParseResp       *pb.ParseBtcTxResponse
 	ListSealsErr    error // 非空则 ListSeals 返回该错误（驱动 fail-closed 降级路径）
@@ -154,6 +155,9 @@ func (m *MockSidecar) ListAssets(_ context.Context, _ *pb.ListAssetsRequest) (*p
 func (m *MockSidecar) BuildWithdrawal(_ context.Context, _ *pb.BuildWithdrawalRequest) (*pb.BuildWithdrawalResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.BuildErr != nil {
+		return nil, m.BuildErr
+	}
 	if m.BuildResp != nil {
 		return m.BuildResp, nil
 	}

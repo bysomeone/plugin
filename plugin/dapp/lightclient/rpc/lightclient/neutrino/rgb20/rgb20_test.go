@@ -13,6 +13,8 @@ import (
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func validValidation(synced uint64) *pb.ConsignmentValidation {
@@ -345,9 +347,9 @@ func Test_WithdrawValidate_RefreshSealStatusFromSidecar(t *testing.T) {
 			wantLocal:     SealStatusConsumed,
 		},
 		{
-			name:        "sidecar does not know the outpoint (ledger rebuilt) must not retire",
-			wantErr:     "pending-mint",
-			wantLocal:   SealStatusPendingMint,
+			name:      "sidecar does not know the outpoint (ledger rebuilt) must not retire",
+			wantErr:   "pending-mint",
+			wantLocal: SealStatusPendingMint,
 		},
 	}
 
@@ -432,4 +434,60 @@ func Test_WithdrawStickySealAndTxidMap(t *testing.T) {
 
 	require.NoError(t, adapter.persistStickySeal(chain33Hash, buildTestPSBT(t)))
 	require.NotEmpty(t, adapter.GetStickySeal(chain33Hash))
+}
+
+// Test_Withdraw_UnrecoverableClassification 锁住"该提现永远不可能成功"的判定（A1 生产侧）：
+//   - 新版侧车在 gRPC 层显式标记 FailedPrecondition；
+//   - 只回文本的侧车按固定措辞兜底（账本重建 → 资产被重发 → pending 的 invoice 指向老 asset id）；
+//   - 暂时性失败（侧车持仓不足，后续充值可补）必须仍然可重试，不能误判成永久失败。
+func Test_Withdraw_UnrecoverableClassification(t *testing.T) {
+	cases := []struct {
+		name          string
+		buildErr      error
+		wantClass     string
+		unrecoverable bool
+	}{
+		{
+			name:          "sidecar marks failed-precondition (invoice contract mismatch)",
+			buildErr:      status.Error(codes.FailedPrecondition, "invoice contract rgb:aaa != asset contract rgb:bbb"),
+			wantClass:     unrecoverableClassAssetMismatch,
+			unrecoverable: true,
+		},
+		{
+			name:          "legacy sidecar, text only (invoice contract mismatch)",
+			buildErr:      errors.New("rpc error: code = Unknown desc = invoice contract rgb:aaa != asset contract rgb:bbb"),
+			wantClass:     unrecoverableClassAssetMismatch,
+			unrecoverable: true,
+		},
+		{
+			name:          "legacy sidecar, text only (asset not issued)",
+			buildErr:      errors.New("asset USDT not issued"),
+			wantClass:     unrecoverableClassAssetGone,
+			unrecoverable: true,
+		},
+		{
+			name:          "transient: insufficient seals is retryable",
+			buildErr:      errors.New("insufficient USDT: need 500000, have 0 (across 0 minted seals)"),
+			unrecoverable: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := NewMockSidecar()
+			mock.BuildErr = tc.buildErr
+			adapter, cleanup := newTestAdapter(t, mock, &fakeBridge{})
+			defer cleanup()
+
+			_, err := adapter.WithdrawFlow(context.Background(), &WithdrawRequest{
+				Chain33TxHash:    []byte("chain33-withdraw-hash"),
+				Amount:           500000,
+				RecipientInvoice: "rgb:invoice",
+				AssetSymbol:      "RGB20_USDT",
+			})
+			require.Error(t, err)
+			class, ok := IsUnrecoverableWithdraw(err)
+			require.Equal(t, tc.unrecoverable, ok, "err=%v", err)
+			require.Equal(t, tc.wantClass, class)
+		})
+	}
 }

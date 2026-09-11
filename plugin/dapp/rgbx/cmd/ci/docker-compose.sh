@@ -404,20 +404,54 @@ function build_mature_coinbase_utxo() {
     echo "${coinbase_tx}:${vout}:${amount_sats}:${pk_script}"
 }
 
+# wait_no_withdraw_pending_for_user <from_addr> [tx_hash]
+#
+# 无 tx_hash：等该地址的提现 pending 全部清空（旧行为，BTC 场景用）。
+# 有 tx_hash：等"本轮发出的这一笔"（hex，带 0x 前缀）走完 —— 先等它真的出现在 pending 列表里
+# （提现交易落块后 chain33 才登记 pending；不先等它出现的话，紧接着的一次查询会"看不到"它而
+# 被误判为已完成，后面的断言就在提现还没被桥处理时跑），再等它从列表里消失（= 桥提交的
+# rgbx Confirm 已执行，这是"这笔提现真的走完了"的判据）。
+#
+# 为什么要按笔判定：chain33 对提现**没有**取消/超时路径（checktx 明确拒绝 Timeout=true 的
+# withdraw confirm：ErrWithdrawConfirmTimeoutNotAllowed），上一轮失败遗留的 pending 会永远留在
+# 列表里。而每轮 run_rgb20_env 都会重建侧车账本、重新发行资产（见该函数注释：不重发的话桥的
+# 可支配余额会随付款耗尽），资产 id 一变，老 pending 里的 invoice 就永远不可能被这一版资产满足
+# ——把它算在本轮头上会让环境"一次失败、此后每个 run 必失败"。老 pending 由桥侧停在那里并报
+# 明确错误（lightclient neutrino：UNRECOVERABLE 日志 + 落盘状态），本轮只对本轮这一笔负责。
 function wait_no_withdraw_pending_for_user() {
     local from_addr="$1"
-    local retries=30
+    local tx_hash="${2:-}"
+    local retries=45
     local i
     local cnt=0
+    local seen=0
+    # pending 列表里的 txHash 与 CLI 返回的提现哈希是同一个 0x 十六进制串（chain33 的 CLI JSON
+    # 把 bytes 渲染成 hex），统一小写后直接比。
+    local want_hash=""
+    if [ -n "${tx_hash}" ]; then
+        want_hash=$(echo "${tx_hash}" | tr 'A-Z' 'a-z')
+    fi
     for ((i = 0; i < retries; i++)); do
-        cnt=$(${MAIN_CLI} rgbx listPendByFrom -f "${from_addr}" | jq '[.pendingList[]? | select(.actionType == 106)] | length')
-        if [ "${cnt}" -eq 0 ]; then
+        local pend_hashes
+        pend_hashes=$(${MAIN_CLI} rgbx listPendByFrom -f "${from_addr}" |
+            jq -r '[.pendingList[]? | select(.actionType == 106) | .txHash | ascii_downcase]')
+        cnt=$(echo "${pend_hashes}" | jq 'length')
+        if [ -n "${want_hash}" ]; then
+            if echo "${pend_hashes}" | jq -e --arg h "${want_hash}" 'index($h) != null' >/dev/null; then
+                seen=1
+            elif [ "${seen}" -eq 1 ]; then
+                if [ "${cnt}" -gt 0 ]; then
+                    log_step "  (this run's withdrawal confirmed; ${cnt} pending(s) left by earlier runs stay put)"
+                fi
+                return 0
+            fi
+        elif [ "${cnt}" -eq 0 ]; then
             return 0
         fi
         mine_btcd_blocks 1
         sleep 2
     done
-    fail "withdraw pending not cleared for ${from_addr}， cnt=${cnt}"
+    fail "withdraw pending not cleared for ${from_addr}， txHash=${tx_hash:-any}， cnt=${cnt}， seen=${seen}"
 }
 
 function query_latest_received_sats() {

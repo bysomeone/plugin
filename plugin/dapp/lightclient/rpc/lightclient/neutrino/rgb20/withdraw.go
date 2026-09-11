@@ -3,11 +3,15 @@ package rgb20
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	pb "github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20/pb"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/txscript"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -53,6 +57,74 @@ type ValidateWithdrawRequest struct {
 // RGB 提现收款输出只承载 dust（侧车硬编码 546 sat）使接收方 UTXO 可花；其它 BTC 必须
 // 找零回 TSS。此上限防止"费输入"被用来向任意地址超付（extfiltrate）。
 const rgb20RecipientDustCap int64 = 100_000
+
+// UnrecoverableWithdrawError 标记"重试永远不可能成功"的 RGB20 提现失败：链上 pending 指向的
+// 状态在侧车已不存在（最典型的是账本被重建后资产被重新发行 → pending 的 invoice 编码的是老
+// asset_id，而 asset id 由 genesis seal 派生，重试不可能"变回来"）。调用方据此停止重试并落盘
+// 状态，而不是每秒重试、无限刷屏。
+//
+// 注意：这不改变任何资金处置 —— 该 pending 会留在链上（用户已锁仓的资产如何处置属产品决策，
+// 桥不做自动退款）。
+type UnrecoverableWithdrawError struct {
+	// Class 机器可判定的失败分类（如 "asset-contract-mismatch"），用于日志/状态检索。
+	Class string
+	// Reason 侧车给出的原始错误。
+	Reason error
+}
+
+func (e *UnrecoverableWithdrawError) Error() string {
+	return fmt.Sprintf("unrecoverable rgb20 withdrawal (%s): %v", e.Class, e.Reason)
+}
+
+func (e *UnrecoverableWithdrawError) Unwrap() error { return e.Reason }
+
+// IsUnrecoverableWithdraw 判定 err 是否为不可恢复的提现失败，并返回其分类。
+func IsUnrecoverableWithdraw(err error) (string, bool) {
+	var e *UnrecoverableWithdrawError
+	if errors.As(err, &e) {
+		return e.Class, true
+	}
+	return "", false
+}
+
+// 判定"不可恢复"的两条依据（fail-closed，只收窄不放宽）：
+//  1. 侧车 gRPC 状态码 FailedPrecondition —— 侧车用它显式标记"重试无法成功"（engine
+//     PermanentError，见 rgb-sidecar service.rs）；
+//  2. 侧车文本里出现下面这些"目标状态已不存在"的固定说法 —— 兼容尚未带该状态码的侧车
+//     （另一份侧车源码 / 未升级的部署），两者语义一致，不会把暂时性失败误判为永久失败。
+//
+// 刻意不包含 "insufficient ...": 桥的持仓可以随后续充值变得充足，那是可恢复的。
+const (
+	unrecoverableClassAssetMismatch = "asset-contract-mismatch"
+	unrecoverableClassAssetGone     = "asset-not-issued"
+
+	unrecoverableMarkerContractMismatch = "!= asset contract "
+	unrecoverableMarkerAssetNotIssued   = "not issued"
+)
+
+// classifyWithdrawSidecarError 把侧车 BuildWithdrawal 的失败分为"可重试"与"不可恢复"。
+func classifyWithdrawSidecarError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	switch {
+	case status.Code(err) == codes.FailedPrecondition:
+		// 侧车已显式标记；按下述文本进一步定类（纯标记性，class 缺失时用通用分类）。
+		if strings.Contains(msg, unrecoverableMarkerContractMismatch) {
+			return &UnrecoverableWithdrawError{Class: unrecoverableClassAssetMismatch, Reason: err}
+		}
+		if strings.Contains(msg, unrecoverableMarkerAssetNotIssued) {
+			return &UnrecoverableWithdrawError{Class: unrecoverableClassAssetGone, Reason: err}
+		}
+		return &UnrecoverableWithdrawError{Class: "permanent", Reason: err}
+	case strings.Contains(msg, unrecoverableMarkerContractMismatch):
+		return &UnrecoverableWithdrawError{Class: unrecoverableClassAssetMismatch, Reason: err}
+	case strings.Contains(msg, unrecoverableMarkerAssetNotIssued):
+		return &UnrecoverableWithdrawError{Class: unrecoverableClassAssetGone, Reason: err}
+	}
+	return err
+}
 
 // resolveChangeAddress 返回 RGB20 提现找零地址：优先 config.changeAddress，留空则用桥
 // TSS P2WPKH 地址自动填充（config.go 注释承诺的语义；DKG 完成后 TSS 地址才可用）。
@@ -110,7 +182,9 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 		FeeRate:          uint32(req.FeeRate),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("sidecar BuildWithdrawal: %w", err)
+		// 分类在这一层做（而不是调用方）：只有这里看得到侧车的原始 gRPC 错误码。
+		// 可重试的失败原样返回；不可恢复的失败包成 UnrecoverableWithdrawError 供调用方停下。
+		return nil, fmt.Errorf("sidecar BuildWithdrawal: %w", classifyWithdrawSidecarError(err))
 	}
 
 	// 构造签名节点交叉核对所需参数，先由主节点做一遍相同校验。

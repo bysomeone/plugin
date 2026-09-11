@@ -84,6 +84,21 @@ impl WitnessOrdProvider for BtcdResolver {
     }
 }
 
+/// An error that retrying can never turn into a success, because the request targets state this
+/// sidecar does not hold any more (an asset that was re-issued, an invoice written for a contract
+/// that no longer exists, ...). The gRPC layer reports it as `FAILED_PRECONDITION` so the bridge
+/// stops retrying and surfaces it, instead of hammering the sidecar once per second forever.
+#[derive(Debug)]
+pub struct PermanentError(pub String);
+
+impl std::fmt::Display for PermanentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for PermanentError {}
+
 /// Result of a consignment inspection.
 #[derive(Clone, Debug)]
 pub struct ConsignmentInspection {
@@ -513,7 +528,6 @@ impl RgbEngine {
                 s.status = SealStatus::Consumed;
             }
         }
-
         self.save()?;
         Ok(self.ledger.receive(&rec.receive_id).cloned().expect("just settled"))
     }
@@ -633,12 +647,18 @@ impl RgbEngine {
         let asset = self
             .ledger
             .asset(symbol)
-            .ok_or_else(|| anyhow!("asset {symbol} not issued"))?;
+            .ok_or_else(|| PermanentError(format!("asset {symbol} not issued")))?;
         let contract_id = ContractId::from_str(&asset.asset_id)?;
         let invoice = parse_invoice(recipient_invoice)?;
         if let Some(cid) = invoice.contract_id {
             if cid != contract_id {
-                return Err(anyhow!("invoice contract {cid} != asset contract {contract_id}"));
+                // The invoice names the contract the payer must be holding. A mismatch means this
+                // sidecar's asset was re-issued (its ledger was rebuilt), so the invoice can never
+                // be honoured by this sidecar — no amount of retrying changes that.
+                return Err(PermanentError(format!(
+                    "invoice contract {cid} != asset contract {contract_id}"
+                ))
+                .into());
             }
         }
         let recipient_script = invoice

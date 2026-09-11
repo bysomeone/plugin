@@ -280,10 +280,13 @@ type confirmWithdraw struct {
 }
 
 var (
-	withdrawStateBucket      = []byte("rgbx-withdraw-state")
-	withdrawStatusSent       = []byte("broadcasted")
-	withdrawStatusConfirmed  = []byte("confirmed")
-	withdrawStickyUTXOBucket = []byte("rgbx-withdraw-sticky-utxo")
+	withdrawStateBucket     = []byte("rgbx-withdraw-state")
+	withdrawStatusSent      = []byte("broadcasted")
+	withdrawStatusConfirmed = []byte("confirmed")
+	// withdrawStatusUnrecoverable 该提现重试永远不可能成功（如侧车已无 pending 指向的资产），
+	// 桥已停止重试并把它落盘：链上 pending 会保留（不自动退款），该状态即"停在这里"的凭据。
+	withdrawStatusUnrecoverable = []byte("unrecoverable")
+	withdrawStickyUTXOBucket    = []byte("rgbx-withdraw-sticky-utxo")
 
 	depositStateBucket     = []byte("rgbx-deposit-state")
 	depositStatusProcessed = []byte("processed")
@@ -469,6 +472,29 @@ func (n *neutrinoClient) processRgb20Withdraw(pending *rtypes.PendingTx) error {
 	return err
 }
 
+// retryRgb20Withdraw 处理/重试一笔 RGB20 提现，返回"是否应继续重试"。
+//
+// 不可恢复的失败（pending 指向的资产侧车已不存在，见 rgb20.IsUnrecoverableWithdraw）在这里
+// 终止重试：把 withdrawStatusUnrecoverable 落盘（可查询的终态）、只报一次 ERROR 日志，并让
+// 调用方把它移出重试队列。链上 pending 不动 —— 桥不做自动退款，已锁仓资产如何处置属产品决策。
+func (n *neutrinoClient) retryRgb20Withdraw(p *rtypes.PendingTx, logMsg string) bool {
+	err := n.processRgb20Withdraw(p)
+	if err == nil {
+		return false
+	}
+	txHash := hex.EncodeToString(p.GetTxHash())
+	if class, unrecoverable := rgb20.IsUnrecoverableWithdraw(err); unrecoverable {
+		if setErr := n.setWithdrawState(p.GetTxHash(), withdrawStatusUnrecoverable); setErr != nil {
+			log.Error("withdrawalProcessor setWithdrawState unrecoverable", "txHash", txHash, "err", setErr)
+		}
+		log.Error("withdrawalProcessor rgb20 withdraw UNRECOVERABLE stop retrying",
+			"txHash", txHash, "assetSymbol", p.GetAssetSymbol(), "class", class, "err", err)
+		return false
+	}
+	log.Error(logMsg, "txHash", txHash, "err", err)
+	return true
+}
+
 // withdrawalProcessor 监听chain33主链上比特币提现请求, 构造提现交易到比特币网络，并向chain33主链提交rgbx confirm交易
 func (n *neutrinoClient) withdrawalProcessor() {
 	withdrawalChan := n.bw.GetWithdrawChannel()
@@ -495,8 +521,7 @@ func (n *neutrinoClient) withdrawalProcessor() {
 			tempRgb20 := rgb20WithdrawRetry
 			rgb20WithdrawRetry = rgb20WithdrawRetry[:0]
 			for _, p := range tempRgb20 {
-				if err := n.processRgb20Withdraw(p); err != nil {
-					log.Error("withdrawalProcessor rgb20 retry", "txHash", hex.EncodeToString(p.GetTxHash()), "err", err)
+				if n.retryRgb20Withdraw(p, "withdrawalProcessor rgb20 retry") {
 					rgb20WithdrawRetry = append(rgb20WithdrawRetry, p)
 				}
 			}
@@ -521,12 +546,18 @@ func (n *neutrinoClient) withdrawalProcessor() {
 				log.Debug("withdrawalProcessor hasWithdrawState", "txHash", hex.EncodeToString(pending.GetTxHash()), "state", string(state))
 				continue
 			}
+			// 已判定不可恢复的提现（见下方 processRgb20Withdraw 分支）：链上 pending 因为不做
+			// 自动退款而仍然存在，pullPendingTx 每次全量重扫（StartHeight 恒为 0）都会重新投递它，
+			// 这里按落盘状态短路，避免每轮重扫都重试一次、无限刷屏。
+			if bytes.Equal(state, withdrawStatusUnrecoverable) {
+				log.Debug("withdrawalProcessor skip unrecoverable withdraw", "txHash", hex.EncodeToString(pending.GetTxHash()))
+				continue
+			}
 			// RGB20 提现：路由到 rgb20 适配器（invoice→BuildWithdrawal→TSS signPsbt→Finalize→广播→txid↔pending）。
 			if n.isRgb20Asset(pending.GetAssetSymbol()) {
 				log.Debug("withdrawalProcessor rgb20 withdraw", "txHash", hex.EncodeToString(pending.GetTxHash()),
 					"assetSymbol", pending.GetAssetSymbol())
-				if err := n.processRgb20Withdraw(pending); err != nil {
-					log.Error("withdrawalProcessor rgb20 withdraw", "txHash", hex.EncodeToString(pending.GetTxHash()), "err", err)
+				if n.retryRgb20Withdraw(pending, "withdrawalProcessor rgb20 withdraw") {
 					rgb20WithdrawRetry = append(rgb20WithdrawRetry, pending)
 				}
 				continue
