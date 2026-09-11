@@ -392,11 +392,46 @@ function run_rgb20_sidecar_smoke() {
 }
 
 # =====================================================================
+# 纯 genesis seal 提现探针（A2 回归）
+# =====================================================================
+
+# 必须在 run_rgb20_env 之后、任何充值之前跑：此刻侧车账本只有一枚 genesis seal，提现的锚定
+# tx 尚未广播（侧车只能从本地 anchor 缓存解析它）。若 recipient_amount 只从 btcd 解析，这里
+# 会得到 0，Go 桥的 ValidateWithdrawPsbt 即以 "withdraw amount exceeds sealed balance:
+# consignment=0 expected=…" 拒绝 —— 即"跳过充值直接提现必失败"的根因。
+# 重复 run（账本保留、已有链上历史锚）时探针仍会通过，作为回归保护。
+function run_rgb20_sidecar_genesis_withdraw_probe() {
+    log_step "RGB20 genesis-only withdrawal probe: consignment amount must be resolved from the local anchor"
+    local user_invoice tss_address
+    user_invoice=$(curl -s -X POST http://127.0.0.1:50064/sim/user_invoice \
+        -H 'Content-Type: application/json' \
+        -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${RGB20_WITHDRAW_AMOUNT}}" | jq -r '.invoice // empty')
+    assert_non_empty "${user_invoice}" "rgb20 genesis probe user invoice empty"
+    tss_address=$(${MAIN_CLI} rgbx getCross -s "${RGB20_SYMBOL}" | jq -r '.tssAddress // empty')
+    assert_non_empty "${tss_address}" "rgb20 genesis probe tss address empty"
+
+    local repo_root
+    repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
+    (
+        cd "${repo_root}"
+        RGB_SIDECAR_ADDR=127.0.0.1:50061 \
+        RGB_SIDECAR_ASSET_SYMBOL="${RGB20_SIDECAR_SYMBOL}" \
+        RGB_SIDECAR_USER_INVOICE="${user_invoice}" \
+        RGB_SIDECAR_TSS_ADDRESS="${tss_address}" \
+        RGB_SIDECAR_WITHDRAW_AMOUNT="${RGB20_WITHDRAW_AMOUNT}" \
+            go test ./plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20/ \
+            -run Test_SidecarLive_GenesisOnlyWithdrawal -v 2>&1 | tail -20
+    ) || fail "rgb20 genesis-only withdrawal probe failed"
+    log_step "RGB20 genesis-only withdrawal probe OK"
+}
+
+# =====================================================================
 # 入口（testcase.sh 调用）
 # =====================================================================
 
 function run_rgb20_all() {
     run_rgb20_env
+    run_rgb20_sidecar_genesis_withdraw_probe
     scenario_rgb20_deposit
     scenario_rgb20_withdraw
     scenario_rgb20_two_withdrawals
