@@ -10,7 +10,7 @@ use bitcoin::psbt::Psbt;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
-use crate::engine::{ConsignmentInspection, RgbEngine};
+use crate::engine::{ConsignmentInspection, PermanentError, RgbEngine};
 use crate::pb::rgb_sidecar_server::RgbSidecar;
 use crate::pb::*;
 
@@ -29,8 +29,14 @@ impl RgbSidecarService {
     }
 }
 
-fn err(e: impl std::fmt::Display) -> Status {
-    Status::internal(format!("{e}"))
+/// Map an engine error to a gRPC status. Errors that no retry can fix are reported as
+/// `FAILED_PRECONDITION` — the Go bridge keys on that code to stop retrying a withdrawal that can
+/// never succeed (see `engine::PermanentError`) instead of retrying it once per second forever.
+fn err(e: anyhow::Error) -> Status {
+    match e.downcast::<PermanentError>() {
+        Ok(p) => Status::failed_precondition(p.0),
+        Err(e) => Status::internal(format!("{e}")),
+    }
 }
 
 fn psbt_to_bytes(psbt: &Psbt) -> Vec<u8> {

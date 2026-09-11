@@ -121,6 +121,14 @@ function run_rgb20_env() {
     export RGB20_TSS_PUBKEY="${pubkey}"
 
     # 停占位 pubkey 的侧车，清空其数据目录，用 GG18 公钥发行 USDT，再启动侧车。
+    #
+    # 每轮必须重建账本并重新发行（而不是保留既有资产）：账户从 genesis 领到 100 USDT 后，充值
+    # 的"付款方"由侧车自己用它的 seal 模拟（simulate_user_pay 花掉桥的 seal、找零回到 TSS 脚本），
+    # 而账本只登记"收到的 seal"，桥的可支配余额会随每次付款变少 —— 保留账本时下一次 run 连
+    # 充值发票都付不出来（实测 "insufficient USDT: need 1000000, have 0 (across 0 minted seals)"）。
+    # 重发会换掉 asset id，从而让上一轮遗留的 pending 变成"永远不可能成功"—— 这部分由桥的
+    # 不可恢复提现处理（停止重试 + 落盘状态 + 明确报错，见 lightclient neutrino）与下面
+    # wait_no_withdraw_pending_for_user 的"只认本轮这一笔"共同消化，不再让环境永久不可重跑。
     compose_cmd stop rgb-sidecar >/dev/null 2>&1 || true
     compose_cmd run --rm --no-deps rgb-sidecar sh -c 'rm -rf /data/* /data/.[!.]* 2>/dev/null || true' >/dev/null 2>&1 || true
 
@@ -227,8 +235,8 @@ function rgb20_withdraw_once() {
     withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
     assert_length "${withdraw_hash}" 66 "rgb20 withdraw tx hash (${label})"
 
-    # 3. 等桥确认销毁（pending 清除 = rgbx Confirm 已提交）
-    wait_no_withdraw_pending_for_user "${USER_MAIN_ADDR}"
+    # 3. 等桥确认销毁（本轮这笔 pending 清除 = rgbx Confirm 已提交）
+    wait_no_withdraw_pending_for_user "${USER_MAIN_ADDR}" "${withdraw_hash}"
 
     # 4. 断言余额减少（-a 口径 *1e8 = min units，显示口径 /1e8）
     expected=$(awk "BEGIN{printf \"%.8f\", ${before} - ${amt}}")
@@ -321,8 +329,8 @@ function scenario_rgb20_two_withdrawals() {
     log_step "scenario: RGB20 two consecutive withdrawals (second must spend the first's change seal)"
 
     # 余额沿用前序场景（deposit 充值 → withdraw 提现剩下的那部分）：本场景要连提两笔，
-    # 合计不超过剩余额。判据用侧车账本的资产余额（= 可被提现花掉的 RGB 数量），而不是
-    # chain33 余额 —— 后者跨 run 累积，而每次 run 都会重建侧车账本。
+    # 合计不超过剩余额。判据用侧车账本的资产余额（= 桥侧可被提现花掉的 RGB 持仓），而不是
+    # chain33 余额 —— 后者是用户已铸造的余额，和桥的持仓不是同一本账。
     local sidecar_before need_min_unit seals_before
     sidecar_before=$(query_rgb20_ledger_spendable)
     need_min_unit=$((RGB20_TWO_WITHDRAW_AMOUNT * 2))
