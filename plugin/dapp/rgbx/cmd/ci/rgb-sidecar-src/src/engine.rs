@@ -1037,6 +1037,23 @@ impl RgbEngine {
         out
     }
 
+    /// The witness transaction behind `wtxid`: this engine's own un-broadcast anchor first (see
+    /// `local_anchors`), then the node.
+    ///
+    /// Withdrawals are validated *before* their anchor tx is broadcast, so btcd cannot resolve it
+    /// yet — only the tx this engine just built can. The cache is local construction, never an
+    /// external claim: it is filled by `build_transfer` (the anchor whose txid the caller holds as
+    /// the PSBT's own txid), so resolving through it cannot vouch for anything the engine did not
+    /// build itself.
+    fn witness_tx(&self, wtxid: &Txid) -> Option<Transaction> {
+        if let Ok(guard) = self.local_anchors.lock() {
+            if let Some(tx) = guard.get(wtxid) {
+                return Some(tx.clone());
+            }
+        }
+        self.rpc.get_transaction(wtxid).ok().flatten()
+    }
+
     /// Inspect opened seals; find the recipient (opened seal at the TSS script).
     fn inspect_opened_seals(
         &self,
@@ -1061,7 +1078,12 @@ impl RgbEngine {
                                 asset_id: asset_id.clone(),
                             });
                             if recipient.is_none() {
-                                if let Ok(Some(tx)) = self.rpc.get_transaction(&wtxid) {
+                                // Resolve through the local anchor cache as well: for a withdrawal
+                                // the anchor is still unbroadcast here, and resolving it only from
+                                // btcd left `recipient_amount` at 0 — the bridge then rejected the
+                                // withdrawal with "consignment=0 expected=…" whenever the bridge
+                                // holds nothing but the genesis seal (no earlier mined anchor).
+                                if let Some(tx) = self.witness_tx(&wtxid) {
                                     if let Some(o) = tx.output.get(vout.to_u32() as usize) {
                                         if o.script_pubkey == self.tss_script {
                                             recipient = Some(outpoint);
