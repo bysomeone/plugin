@@ -353,6 +353,80 @@ func Test_rgbx_checkWithdrawConfirm(t *testing.T) {
 	require.Equal(t, ErrInvalidBtcProofCommitment, err)
 }
 
+// Test_checkWithdrawConfirm_burnReplayGuard S3：同一笔提现 burn 只能结算一次。
+// 走真实 CheckTx 路径——dapp CheckTx 在出块执行阶段被每个节点重跑（chain33 executor/execenv.go Exec → CheckTx），
+// 是共识强制点，因此这里的拒绝等价于"该 burn 不可能被放款两次"。
+func Test_checkWithdrawConfirm_burnReplayGuard(t *testing.T) {
+	r := newRgbx()
+	tx := &types.Transaction{}
+	tx.Sign(types.SECP256K1, testPriv) // from == rgbxCfg.CommitAddress
+
+	// 单交易区块的有效 SPV：header.merkleRoot == btc txid
+	btcTx := wire.NewMsgTx(wire.TxVersion)
+	btcTx.AddTxOut(wire.NewTxOut(1000, []byte{txscript.OP_0, 0x14}))
+	var buf bytes.Buffer
+	require.NoError(t, btcTx.SerializeNoWitness(&buf))
+	txid := btcTx.TxHash()
+
+	api := mockGuardianAPI(t, testCommitAddr)
+	api.On("Query", ltypes.LightclientX, "GetBtcHeader", mock.Anything).Return(
+		&ltypes.BtcHeader{Hash: "hash1", Height: 100, MerkleRoot: txid.String()}, nil)
+
+	dir, state, local := util.CreateTestDB()
+	defer util.CloseTestDB(dir, state)
+	r.SetAPI(api)
+	r.SetStateDB(state)
+	r.SetLocalDB(local)
+
+	burnA := []byte("burnA")
+	burnB := []byte("burnB")
+	withdraw := &rtypes.WithdrawAsset{AssetSymbol: rtypes.RGB20USDTSymbol, Amount: 100}
+	for i, burn := range [][]byte{burnA, burnB} {
+		require.NoError(t, state.Set(formatPayloadKey(burn), types.Encode(withdraw)))
+		require.NoError(t, local.Set(formatPendingTxKey(3, int64(i)), types.Encode(&rtypes.PendingTx{
+			ActionType:    rtypes.TyWithDrawAsset,
+			TxBlockHeight: 3,
+			TxIndex:       int64(i),
+			TxHash:        burn,
+			AssetSymbol:   rtypes.RGB20USDTSymbol,
+		})))
+	}
+
+	action := &rtypes.RgbxAction{}
+	action.Ty = rtypes.TyConfirmAction
+	value := &rtypes.RgbxAction_Confirm{}
+	action.Value = value
+	confirmOf := func(burn []byte, idx int) *rtypes.ConfirmTx {
+		return &rtypes.ConfirmTx{
+			ActionType:    rtypes.TyWithDrawAsset,
+			TxBlockHeight: 3,
+			TxIndex:       int64(idx),
+			TxHash:        burn,
+			BtcTxProof: &rtypes.BtcTxProof{
+				TxData:      buf.Bytes(),
+				BlockHeight: 100,
+				BlockHash:   "hash1",
+				TxIndex:     0,
+			},
+		}
+	}
+
+	// 1) 首次确认通过（等价于升级时链上已存在的历史 pending：无 consumed 标记不构成误判）
+	value.Confirm = confirmOf(burnA, 0)
+	tx.Payload = types.Encode(action)
+	require.NoError(t, r.CheckTx(tx, 0))
+
+	// 2) 结算登记后，同一 burn 再次确认 → 明确错误码拒绝
+	require.NoError(t, state.Set(formatWithdrawUsedKey(burnA), []byte("used")))
+	tx.Payload = types.Encode(action)
+	require.Equal(t, ErrWithdrawAlreadyConfirmed, r.CheckTx(tx, 0))
+
+	// 3) 不同 burn 互不影响
+	value.Confirm = confirmOf(burnB, 1)
+	tx.Payload = types.Encode(action)
+	require.NoError(t, r.CheckTx(tx, 0))
+}
+
 func Test_rgbx_decodeBtcAddressScript_empty(t *testing.T) {
 	r := newRgbx()
 	_, err := r.(*rgbx).decodeBtcAddressScript("")

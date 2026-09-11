@@ -62,6 +62,10 @@ var (
 	ErrGetGuardianNodeAddress           = errors.New("get guardian node address error")
 	ErrGetDkgConfirmations              = errors.New("get dkg confirmations error")
 	ErrInvalidDkgAddress                = errors.New("invalid dkg address")
+	// ErrWithdrawAlreadyConfirmed 同一笔提现 burn 已被结算（放款）过（S3）。
+	// 文案保留 "already confirmed" 子串：桥侧重试路径按该子串把重复提交视为幂等成功
+	// （neutrino commitWithdrawConfirm 对含 "already confirmed" 的错误不再重试）。
+	ErrWithdrawAlreadyConfirmed = errors.New("withdraw already confirmed")
 )
 
 const (

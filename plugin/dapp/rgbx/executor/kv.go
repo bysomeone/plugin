@@ -25,6 +25,8 @@ const (
 	dkgConfirmationsKeyPrefix = KeyPrefixStateDB + "dkg-confirmations-"
 	crossChainInfoKeyPrefix   = KeyPrefixStateDB + "crosschain-info-"
 	depositUsedKeyPrefix      = KeyPrefixStateDB + "deposited-"
+	// withdrawUsedKeyPrefix 提现侧已消费（已结算）burn 集合前缀，与 depositUsedKeyPrefix 对称。
+	withdrawUsedKeyPrefix = KeyPrefixStateDB + "withdrawn-"
 )
 
 // formatDkgConfirmationsKey 按 (symbol, dkgAddress) 索引确认集合（BL-2）。
@@ -40,6 +42,15 @@ func formatCrossChainInfoKey(symbol string) []byte {
 func formatDepositUsedKey(txData []byte) []byte {
 	hash := sha256.Sum256(txData)
 	return append([]byte(depositUsedKeyPrefix), hash[:]...)
+}
+
+// formatWithdrawUsedKey 按提现销毁（chain33 Withdraw 交易）哈希索引已结算的提现（S3）。
+// 与 formatDepositUsedKey 完全对称：充值防双铸，提现防同一 burn 重复放款。
+// 唯一标识取 burn 的 chain33 交易哈希（= payload 键所用的同一个 id），
+// 它在链上稳定、不随重组变化，且是 ConfirmTx 绑定的对象。
+func formatWithdrawUsedKey(burnTxHash []byte) []byte {
+	hash := sha256.Sum256(burnTxHash)
+	return append([]byte(withdrawUsedKeyPrefix), hash[:]...)
 }
 
 func formatSymbol(symbol string) string {

@@ -179,3 +179,56 @@ func Test_rgbx_confirmWithdrawSettlement(t *testing.T) {
 	)
 	require.Error(t, err)
 }
+
+// Test_rgbx_confirmWithdrawSettlement_usedKey S3：提现结算成功登记 consumed 集合，
+// 同一 burn 二次结算被 checkWithdrawConfirm 拒绝，不同 burn 互不影响（与充值侧 deposited- 对称）。
+func Test_rgbx_confirmWithdrawSettlement_usedKey(t *testing.T) {
+	r := newRgbx()
+	burnA, burnB := []byte("burnA"), []byte("burnB")
+
+	dir, state, _ := util.CreateTestDB()
+	defer util.CloseTestDB(dir, state)
+	api := &mocks.QueueProtocolAPI{}
+	r.SetAPI(api)
+	api.On("GetConfig").Return(types.NewChain33Config(types.GetDefaultCfgstring()))
+	r.SetStateDB(state)
+
+	// 两笔待结算提现共用锁仓地址：A=100, B=150
+	require.NoError(t, state.Set(formatPayloadKey(burnA), types.Encode(&rtypes.WithdrawAsset{AssetSymbol: "BTC", Amount: 100})))
+	require.NoError(t, state.Set(formatPayloadKey(burnB), types.Encode(&rtypes.WithdrawAsset{AssetSymbol: "BTC", Amount: 150})))
+	acc, err := r.(*rgbx).newAccount("xBTC")
+	require.NoError(t, err)
+	lockAddr := r.(*rgbx).crossChainLockAddress(acc)
+	_, err = acc.Mint(lockAddr, 250)
+	require.NoError(t, err)
+
+	// 单次结算：成功，且只销毁该 burn 的锁定额度，consumed(burnA) 被登记
+	recpA, err := r.(*rgbx).confirmWithdrawSettlement(&rtypes.ConfirmTx{TxHash: burnA}, "txA", "cA")
+	require.NoError(t, err)
+	require.NotNil(t, recpA)
+	applyStateKV(t, state, recpA.KV)
+	require.Equal(t, int64(150), acc.LoadAccount(lockAddr).GetBalance())
+
+	used, err := state.Get(formatWithdrawUsedKey(burnA))
+	require.NoError(t, err)
+	require.Equal(t, []byte("used"), used)
+
+	// 守卫：同一 burn 被拒（明确错误码）；不同 burn 放行（继续走 SPV 校验）
+	err = r.(*rgbx).checkWithdrawConfirm("txA2", "cA2", &rtypes.ConfirmTx{TxHash: burnA}, &rtypes.PendingTx{AssetSymbol: "BTC"})
+	require.Equal(t, ErrWithdrawAlreadyConfirmed, err)
+	err = r.(*rgbx).checkWithdrawConfirm("txB", "cB", &rtypes.ConfirmTx{TxHash: burnB}, &rtypes.PendingTx{AssetSymbol: "BTC"})
+	require.Equal(t, ErrInvalidBtcTxProof, err)
+
+	// 另一笔 burn 仍可正常结算
+	recpB, err := r.(*rgbx).confirmWithdrawSettlement(&rtypes.ConfirmTx{TxHash: burnB}, "txB", "cB")
+	require.NoError(t, err)
+	applyStateKV(t, state, recpB.KV)
+	require.Equal(t, int64(0), acc.LoadAccount(lockAddr).GetBalance())
+
+	// 升级兼容：consumed 集合是"只增不减的拒绝条件"，未登记的历史 burn 一律不受影响
+	_, err = state.Get(formatWithdrawUsedKey(burnB))
+	require.NoError(t, err)
+	unused, err := state.Get(formatWithdrawUsedKey([]byte("never-settled")))
+	require.ErrorIs(t, err, types.ErrNotFound)
+	require.Nil(t, unused)
+}

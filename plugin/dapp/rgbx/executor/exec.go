@@ -184,6 +184,12 @@ func (r *rgbx) confirmWithdrawSettlement(confirm *rtypes.ConfirmTx, txHash, conf
 			"lockAddr", lockAddr, "symbol", withdraw.GetAssetSymbol(), "amount", withdraw.GetAmount(), "err", err)
 		return nil, err
 	}
+	// S3：登记该笔 burn 已消费（与 Exec_Deposit 登记 deposited- 对称）。
+	// 结算成功才写；写入随回执 KV 生效，重组时随 statedb 一起回滚，因此不会误伤重放。
+	receipt.KV = append(receipt.KV, &types.KeyValue{
+		Key:   formatWithdrawUsedKey(confirm.GetTxHash()),
+		Value: []byte("used"),
+	})
 	return receipt, nil
 }
 
