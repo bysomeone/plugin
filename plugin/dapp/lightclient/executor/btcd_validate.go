@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	dbm "github.com/33cn/chain33/common/db"
@@ -321,10 +322,19 @@ func checkBootstrapAnchor(first *ltypes.BtcHeader, params *chaincfg.Params, ldb 
 	genesisHash := params.GenesisHash.String()
 	checkpoints := btcCheckpointTable[params.Net]
 
+	// reject 拒绝时把"照做就能过"的信息一并给出（L1）：原来的 ErrBtcHeaderNoAnchor 只说被拒了，
+	// 运维既看不到本网络有哪些锚点，也不知道 btcHeaderStartHeight 该填多少 —— 只能猜。
+	reject := func() error {
+		detail := anchorRejectDetail(first, params, checkpoints)
+		elog.Error("checkBootstrapAnchor first btc header cannot be anchored to the real chain "+
+			"(neither genesis, nor a known checkpoint, nor traceable in localdb)", "detail", detail)
+		return fmt.Errorf("%w: %s", ErrBtcHeaderNoAnchor, detail)
+	}
+
 	// 高度 0 只可能是创世块本身。
 	if height == 0 {
 		if first.GetHash() != genesisHash {
-			return ErrBtcHeaderNoAnchor
+			return reject()
 		}
 		return nil
 	}
@@ -340,7 +350,26 @@ func checkBootstrapAnchor(first *ltypes.BtcHeader, params *chaincfg.Params, ldb 
 	if traceHeaderToAnchor(height-1, first.GetPreviousHash(), params, ldb, checkpoints) {
 		return nil
 	}
-	return ErrBtcHeaderNoAnchor
+	return reject()
+}
+
+// anchorRejectDetail 组装 bootstrap 锚点被拒时的可操作信息（错误信息与日志同源）：
+// 本网络已知锚点高度列表、首个头的高度、以及"照做就能过"的期望 btcHeaderStartHeight（= 最高锚点 + 1）。
+func anchorRejectDetail(first *ltypes.BtcHeader, params *chaincfg.Params, checkpoints map[uint64]string) string {
+	heights := make([]uint64, 0, len(checkpoints))
+	for h := range checkpoints {
+		heights = append(heights, h)
+	}
+	sort.Slice(heights, func(i, j int) bool { return heights[i] < heights[j] })
+
+	detail := fmt.Sprintf("net=%s firstHeight=%d firstPrevHash=%s genesisHash=%s knownCheckpointHeights=%v",
+		params.Name, first.GetHeight(), first.GetPreviousHash(), params.GenesisHash.String(), heights)
+	if top, topHash, ok := highestCheckpoint(checkpoints); ok {
+		detail += fmt.Sprintf(" highestCheckpoint=%d:%s expectedBtcHeaderStartHeight=%d", top, topHash, top+1)
+	} else {
+		detail += " highestCheckpoint=none (this net has no anchor: bootstrap only works from genesis, btcHeaderStartHeight=1)"
+	}
+	return detail
 }
 
 // traceHeaderToAnchor 判断"高度 height、hash 为 hash 的头"是否能沿 prevHash 回溯到锚点
