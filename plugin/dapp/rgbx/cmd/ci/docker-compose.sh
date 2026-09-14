@@ -251,12 +251,106 @@ function init_env() {
     config_para_file chain33.para4.toml "${AUTH_ADDR4}" 1 false
 }
 
+function btcd_container_id() {
+    # 无容器时输出为空；查询本身失败也不应让调用方（set -e/pipefail）中断。
+    compose_cmd ps -aq btcd 2>/dev/null | head -1 || true
+}
+
+# btcd regtest 链的当前 tip（"<height>:<bestblockhash>"）。btcd 没在跑/查询失败时返回空，
+# 调用方据此跳过比对（探测失败不应阻断流程）。
+function btcd_chain_tip() {
+    local height hash
+    height=$(${BTC_CTL} --"${BTC_NETWORK}" getblockcount 2>/dev/null) || return 0
+    hash=$(${BTC_CTL} --"${BTC_NETWORK}" getbestblockhash 2>/dev/null) || return 0
+    if [ -n "${height}" ] && [ -n "${hash}" ]; then
+        echo "${height}:${hash}"
+    fi
+    return 0
+}
+
+function chain33_state_volume_preexists() {
+    # 只回答"此刻数据卷是否已存在"。必须在 do_up_only 里、任何 compose 命令之前取快照
+    # （compose run main 那一步会顺带把 main-data 卷创建出来），否则干净环境上会误报。
+    if [ -n "$(docker volume ls -q --filter "name=^${COMPOSE_PROJECT_NAME}_main-data$" 2>/dev/null)" ]; then
+        echo "true"
+    else
+        echo "false"
+    fi
+}
+
+# =====================================================================
+# start_env：**只 up，不 down** —— btcd 的 regtest 链必须跨 run 存活
+# =====================================================================
+# 为什么不能再 `down` 全体后 `up`（这是本 harness 的核心约束，别"优化"回去）：
+#
+#   btcd v0.24.2 在 --regtest 下**每次进程启动都无条件删除区块库**，源码注释即
+#   "The regression test is special in that it needs a clean database for each run"
+#   （btcd/btcd.go）：
+#       func removeRegressionDB(dbPath string) error {
+#           if !cfg.RegressionTest { return nil }      // 唯一的门，没有任何 datadir 保护
+#           ... os.RemoveAll(dbPath) ...
+#       }
+#       func loadBlockDB() { ...; removeRegressionDB(blockDbPath(cfg.DbType)); ... }
+#   而 dbPath = <datadir>/<net>/blocks_ffldb（config.go 里 cfg.DataDir 末尾已拼上网络名
+#   netName(activeNetParams)），所以换 --datadir 也躲不掉 —— docker-compose.yml 里那条
+#   --datadir 注释曾经得出的"可原位恢复"结论是错的。
+#
+#   后果：btcd 一旦被**重建或重启**（进程重新执行 entrypoint），链就回到 genesis；而 chain33
+#   的 lightclient 已把**旧链**的 BTC 头提交上链，头链接不上新链 → ErrBtcHeaderDisorder /
+#   "invalid btc proof block info" → 充值 SPV 永久失败，且无法原地恢复（只能 reset 重跑
+#   DKG，很慢）。这正是"run 第一遍 OK、第二遍必废"的根因。
+#
+#   所以：`run` 能连续跑的前提是 **btcd 容器/进程不被动**；需要全新环境时用 reset（down -v），
+#   那是 reset 的职责，语义不变。
+#
+# 只 up 的语义（compose 只重建"配置/镜像变了"的服务）：
+#   - chain33 各服务（main/para1-4/rgb-sidecar）改了镜像或 toml 时照旧重建，不会跑旧二进制；
+#   - btcd 配置/镜像没变时 compose 判定无需重建 → 容器保持运行、regtest 链不丢。
+# 但"btcd 变了"本身是致命的，故这里显式探测（容器被重建 / 被原地重启 / 链 tip 变了）并**直接
+# 报错要求 reset**，而不是静默沿用旧容器、静默跑到 SPV 上才炸。
 function start_env() {
-    log_step "start docker-compose services"
-    compose_cmd down
-    compose_cmd up --build -d
+    log_step "start docker-compose services (in-place up: btcd container must stay untouched)"
+
+    local btcd_cid_before="" btcd_status_before="" btcd_tip_before=""
+    btcd_cid_before=$(btcd_container_id)
+    if [ -n "${btcd_cid_before}" ]; then
+        btcd_status_before=$(docker inspect -f '{{.State.Status}}' "${btcd_cid_before}" 2>/dev/null || true)
+        if [ "${btcd_status_before}" = "running" ]; then
+            btcd_tip_before=$(btcd_chain_tip)
+            log_step "existing btcd container ${btcd_cid_before:0:12} is running (tip=${btcd_tip_before:-unknown}); preserving it"
+        else
+            log_step "existing btcd container ${btcd_cid_before:0:12} is '${btcd_status_before}'"
+        fi
+    elif [ "${CHAIN33_VOLUME_PREEXISTED:-false}" = "true" ]; then
+        # 容器没了但 chain33 链数据还在（例如有人先 `down` 再 `run`）：btcd 会以新容器从
+        # genesis 起链，而 chain33 若已提交过旧链的 BTC 头就再也接不上。无法在这里断定
+        # chain33 是否已有 BTC 头，故不直接失败，但把话说在前面（真要干净环境请 reset）。
+        log_step "WARNING: no btcd container while chain33 volume ${COMPOSE_PROJECT_NAME}_main-data still exists."
+        log_step "WARNING: a fresh btcd chain will be created; if chain33 already committed BTC headers from the previous chain, deposit SPV will fail. Prefer './docker-compose.sh reset' for a clean environment."
+    fi
+
+    # 只 up（不 down）：见上方注释，btcd --regtest 每次启动清链，down + up 必废头链。
+    compose_cmd up --build -d --remove-orphans
     sleep 8
     compose_cmd ps
+
+    local btcd_cid_after=""
+    btcd_cid_after=$(btcd_container_id)
+    assert_non_empty "${btcd_cid_after}" "btcd container missing after compose up"
+
+    if [ -n "${btcd_cid_before}" ] && [ "${btcd_cid_before}" != "${btcd_cid_after}" ]; then
+        fail "btcd container was RECREATED (${btcd_cid_before:0:12} -> ${btcd_cid_after:0:12}) because its config/image changed. btcd v0.24.2 wipes the regtest chain on every start, so the BTC header chain chain33 already committed is stale and deposits would fail with ErrBtcHeaderDisorder. Run './docker-compose.sh reset' for a clean environment."
+    fi
+    if [ -n "${btcd_cid_before}" ] && [ "${btcd_status_before}" != "running" ]; then
+        fail "btcd container ${btcd_cid_before:0:12} existed but was '${btcd_status_before}'; starting it re-runs btcd (which wipes the regtest chain) while chain33 still holds the old chain's BTC headers. Run './docker-compose.sh reset' for a clean environment."
+    fi
+    if [ -n "${btcd_tip_before}" ]; then
+        local btcd_tip_after
+        btcd_tip_after=$(btcd_chain_tip)
+        if [ -n "${btcd_tip_after}" ] && [ "${btcd_tip_after}" != "${btcd_tip_before}" ]; then
+            fail "btcd regtest chain changed across this start (${btcd_tip_before} -> ${btcd_tip_after}): the chain was reset/restarted under us, so chain33's committed BTC headers are stale. Run './docker-compose.sh reset' for a clean environment."
+        fi
+    fi
 }
 
 function wait_cli_ready() {
@@ -816,6 +910,8 @@ function do_up_only() {
     ensure_btcd_network_consistency
     mkdir -p "${ROOT_DIR}/btcd-data"
     init_env
+    # 快照（必须在下面任何 compose 命令之前）：留到 start_env 判"btcd 容器没了但链数据还在"。
+    CHAIN33_VOLUME_PREEXISTED=$(chain33_state_volume_preexists)
     prepare_btcd_mining_identity
     start_env
     wait_btcd_ready
@@ -834,8 +930,10 @@ function do_down() {
 }
 
 # 一次性全量清空：删容器 + 删卷（main/para/DKG、btcd 链），下次 up 从零重建。
-# 用于 btcd 清链等导致 chain33 头链与 BTC 链错位、无法原地恢复的场景。
-# 注意：容器重启不会走到这里——已通过 btcd --datadir 修复让 down/up 可原位恢复。
+# 用于 btcd 清链等导致 chain33 头链与 BTC 链错位、无法原地恢复的场景 —— 只要 btcd 被重建或
+# 重启（含 down 后 up、容器 stop 后 start、镜像/配置变更导致的重建），regtest 链就回到 genesis，
+# chain33 已提交的旧链 BTC 头必然错位，这是**唯一**的恢复路径。
+# 反过来：想连续跑 run 就不要碰 btcd 容器（见 start_env 的说明）。
 function do_reset() {
     log_step "reset: remove containers AND volumes (DKG/chain state will be rebuilt on next up)"
     compose_cmd down -v --remove-orphans
