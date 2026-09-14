@@ -21,26 +21,36 @@ import (
 	"github.com/btcsuite/btcwallet/walletdb"
 )
 
-// headerPublisher 提交比特币区块头到链上
+/*
+ * submitBitcoinHeaders 把 btcd/neutrino 的 canonical 头链提交到 chain33。
+ *
+ * 关键改动（B3 的中继侧配套）：**每个 tick 先与链上 canonical 头链对账，再决定从哪个高度提交**，
+ * 而不是拿一个内存变量单调推进。BTC 重组后中继能自己回退到一致高度重发；对不上的错位（回退深度
+ * 超限、起点/锚点配置错位）显式报错并停在那个状态，不再无限重试同一个批。算法与错误语义见
+ * btc_header_sync.go。
+ */
 func (n *neutrinoClient) submitBitcoinHeaders() {
 
-	nextSubmitHeight := n.cfg.BtcHeaderStartHeight
+	reconciler := &btcHeaderReconciler{
+		chain:       &chain33BtcHeaderView{n: n},
+		local:       &neutrinoBtcHeaderView{n: n},
+		startHeight: n.cfg.BtcHeaderStartHeight,
+		maxDepth:    maxBtcHeaderReorgDepth,
+	}
+	// 启动期等主链可查询（与改造前一致）：查不通时不提交，交给后续 tick 继续重试。
 	n.waitUntilDone("wait getChain33BtcLastHeader", func() bool {
-		if lastHeader := n.getChain33BtcLastHeader(); lastHeader != nil {
-			if lastHeader.GetHeight() > 0 {
-				nextSubmitHeight = lastHeader.GetHeight() + 1
-			}
-			return true
-		}
-		return false
+		_, err := reconciler.chain.chainTipHeader()
+		return err == nil
 	}, 0)
 
-	log.Info("submitBitcoinHeaders start", "nextSubmitHeight", nextSubmitHeight)
+	log.Info("submitBitcoinHeaders start", "startHeight", n.cfg.BtcHeaderStartHeight,
+		"maxReorgDepth", maxBtcHeaderReorgDepth, "batchSize", btcHeaderBatchSize)
 
 	interval := n.cfg.BtcBlockInterval/3 + 1
 	ticker := time.NewTicker(time.Second * time.Duration(interval))
 	defer ticker.Stop()
-	const batchSize = 16
+
+	state := &btcHeaderSyncState{}
 	for {
 		select {
 		case <-n.ctx.Done():
@@ -49,60 +59,138 @@ func (n *neutrinoClient) submitBitcoinHeaders() {
 		case <-ticker.C:
 
 			best := n.getBestBlock()
-			if best == nil {
+			if best == nil || best.Height <= 0 {
 				continue
 			}
-
-			confirmedHeight := uint64(best.Height) - uint64(n.cfg.BlockConfirmations)
-			headers := make([]*ltypes.BtcHeader, 0, batchSize)
-			for height := nextSubmitHeight; height <= confirmedHeight && len(headers) < batchSize; height++ {
-				header, err := n.neutrinoCS.BlockHeaders.FetchHeaderByHeight(uint32(height))
-				if err != nil {
-					log.Error("submitBitcoinHeaders FetchHeaderByHeight", "height", height, "err", err)
-					break
-				}
-				headerHash := header.BlockHash().String()
-				headers = append(headers, &ltypes.BtcHeader{
-					Hash:          headerHash,
-					Confirmations: uint64(best.Height) - height + 1,
-					Height:        height,
-					Version:       uint32(header.Version),
-					MerkleRoot:    header.MerkleRoot.String(),
-					Time:          header.Timestamp.Unix(),
-					Nonce:         uint64(header.Nonce),
-					Bits:          int64(header.Bits),
-					PreviousHash:  header.PrevBlock.String(),
-				})
-			}
-			if len(headers) > 0 {
-				payload := &ltypes.BtcHeaders{Headers: headers}
-				n.submitMainchainTxUntilSuccess(ltypes.LightclientX, ltypes.NameBtcHeadersAction, payload)
-				lastHeader := headers[len(headers)-1]
-				nextSubmitHeight = lastHeader.GetHeight() + 1
-				log.Debug("submitBitcoinHeaders", "commitHeight", lastHeader.GetHeight(),
-					"hash", lastHeader.GetHash(), "nextSubmitHeight", nextSubmitHeight)
-			}
+			n.submitBtcHeadersOnce(reconciler, state, uint64(best.Height))
 
 		}
 	}
 }
 
-func (n *neutrinoClient) getChain33BtcLastHeader() *ltypes.BtcHeader {
-	reply, err := n.mainChainGrpc.QueryChain(n.ctx, &types.ChainExecutor{
-		Driver:   ltypes.LightclientX,
-		FuncName: "GetBtcLastHeader",
-	})
-	if err != nil {
-		log.Error("getChain33BtcLastHeader", "query err", err)
-		return nil
+// btcConfirmedHeight 本地视图里"已经足够确认、可以提交"的最高高度。
+// 本地 tip 还不到配置的确认数时返回 0（改造前这里会 uint64 下溢成极大的高度，进而按高度查一堆
+// 根本还不存在的头）。
+func (n *neutrinoClient) btcConfirmedHeight(localTip uint64) uint64 {
+	confirmations := uint64(n.cfg.BlockConfirmations)
+	if localTip <= confirmations {
+		return 0
 	}
-	data := &ltypes.BtcHeader{}
-	err = types.Decode(reply.GetMsg(), data)
-	if err != nil {
-		log.Error("getChain33BtcLastHeader", "decode err", err)
-		return nil
+	return localTip - confirmations
+}
+
+// buildBtcHeaderBatch 组装 [from, to] 的逐高度头。中途取不到头就截断（保持连续），
+// 第一个头就取不到时返回空批。
+func (n *neutrinoClient) buildBtcHeaderBatch(from, to, bestHeight uint64) []*ltypes.BtcHeader {
+	headers := make([]*ltypes.BtcHeader, 0, to-from+1)
+	for height := from; height <= to; height++ {
+		header, err := n.neutrinoCS.BlockHeaders.FetchHeaderByHeight(uint32(height))
+		if err != nil {
+			log.Error("buildBtcHeaderBatch FetchHeaderByHeight", "height", height, "err", err)
+			break
+		}
+		headers = append(headers, &ltypes.BtcHeader{
+			Hash:          header.BlockHash().String(),
+			Confirmations: bestHeight - height + 1,
+			Height:        height,
+			Version:       uint32(header.Version),
+			MerkleRoot:    header.MerkleRoot.String(),
+			Time:          header.Timestamp.Unix(),
+			Nonce:         uint64(header.Nonce),
+			Bits:          int64(header.Bits),
+			PreviousHash:  header.PrevBlock.String(),
+		})
 	}
-	return data
+	return headers
+}
+
+// submitBtcHeadersOnce 对账一次并提交一批头。
+//
+// 所有错误都只影响本轮：可自愈的问题（查询失败、主链未就绪、本地还没追上）等下一轮；不可自愈的问题
+// （链上明确拒收、回退深度超限、起点与锚点不配套）显式报错并停在那个状态，同一个状态只报一次。
+// 同一批在途时不会每个 tick 都重发（见 btcHeaderSyncState）。
+func (n *neutrinoClient) submitBtcHeadersOnce(r *btcHeaderReconciler, st *btcHeaderSyncState, localTip uint64) {
+
+	plan, err := r.plan(localTip)
+	if err != nil {
+		switch {
+		case errors.Is(err, errBtcReconcileLocalBehind):
+			// btcd 还在这条链上往前同步（重启/重建头库）：等它追上，不是错误。
+			// 状态是"本地落后"，与每一轮的具体高度无关，故用固定 key（否则每轮都会刷一条）。
+			if st.report.allow("local-behind") {
+				log.Info("submitBitcoinHeaders waiting for the local btc header view to catch up", "err", err)
+			}
+		default:
+			// 不可自愈：允许窗口内找不到任何一致高度（超深重组 / 换网 / 起点与锚点不配套）。
+			// 显式报错，同一状态只报一次，停在这里等运维处理（重新 bootstrap）。
+			if st.report.allow("unreconcilable") {
+				log.Error("submitBitcoinHeaders cannot reconcile the local btc header view with the on-chain chain, "+
+					"header submission is stalled until this changes (re-bootstrap or check btcHeaderStartHeight against the anchor)",
+					"err", err, "localTip", localTip)
+			}
+		}
+		return
+	}
+	st.report.reset()
+
+	now := time.Now()
+	from, to, reason := st.beginSubmit(plan, n.btcConfirmedHeight(localTip), now)
+	switch reason {
+	case btcHeaderSubmitPlanHalted:
+		// 同一个计划刚被链上明确拒收过：在它变化之前不再重复提交（不刷屏），等对账给出新计划。
+		log.Debug("submitBtcHeadersOnce plan halted after an unrecoverable rejection", "plan", plan.key())
+		return
+	case btcHeaderSubmitNothingConfirmed:
+		return
+	case btcHeaderSubmitAlreadyInFlight:
+		log.Debug("submitBtcHeadersOnce batch already in flight", "next", plan.nextSubmitHeight,
+			"pendingTop", st.pendingTop)
+		return
+	}
+
+	headers := n.buildBtcHeaderBatch(from, to, localTip)
+	if len(headers) == 0 {
+		return
+	}
+	top := headers[len(headers)-1].GetHeight()
+	payload := &ltypes.BtcHeaders{Headers: headers}
+	txHash, submitErr := n.submitMainchainTx(ltypes.LightclientX, ltypes.NameBtcHeadersAction, payload)
+	result := classifyBtcHeaderSubmitErr(submitErr)
+
+	switch result {
+	case btcHeaderSubmitAccepted, btcHeaderSubmitDuplicateAccepted:
+		duplicate := result == btcHeaderSubmitDuplicateAccepted
+		st.finishSubmit(plan, from, top, now, result)
+		// 提交被受理 = 提交侧的问题（临时失败/拒收/空转）已经过去，允许下次重新报告。
+		st.submitReport.reset()
+		if plan.rolledBack {
+			log.Info("submitBtcHeadersOnce resubmitted after rollback", "from", from, "to", top,
+				"matchedHeight", plan.matchedHeight, "chainTip", plan.chainTipHeight,
+				"localTip", plan.localTipHeight, "probes", plan.probes, "txHash", txHash, "duplicate", duplicate)
+		} else {
+			log.Debug("submitBtcHeadersOnce submitted", "from", from, "to", top,
+				"chainTip", plan.chainTipHeight, "txHash", txHash, "duplicate", duplicate)
+		}
+		// 反复把同一批当成新交易提交、链上 canonical 链却毫无推进：报一次（不停心跳，也不刷屏）。
+		if st.futileSubmits >= maxBtcHeaderFutileSubmits && st.submitReport.allow("futile:"+plan.key()) {
+			log.Error("submitBtcHeadersOnce the same batch keeps being resubmitted without advancing the "+
+				"on-chain chain (the local chain may be lighter than the on-chain canonical chain, or chain33 is not producing blocks)",
+				"from", from, "to", top, "chainTip", plan.chainTipHeight, "count", st.futileSubmits)
+		}
+	case btcHeaderSubmitRejected:
+		// 确定性拒收：重试同一批永远不会成功，记下这个计划并显式报错（只报一次）。
+		st.finishSubmit(plan, from, top, now, result)
+		if st.submitReport.allow("rejected:" + submitErr.Error()) {
+			log.Error("submitBtcHeadersOnce btc header batch rejected by chain33, stop resubmitting this batch",
+				"from", from, "to", top, "plan", plan.key(), "err", submitErr)
+		}
+	default:
+		// 可自愈：网络/主链未就绪/费用等，下一轮重试（同一个错只报一次，避免每轮刷屏）。
+		if st.submitReport.allow("transient:" + submitErr.Error()) {
+			log.Warn("submitBtcHeadersOnce submit btc headers failed, retry next round",
+				"from", from, "to", top, "err", submitErr)
+		}
+	}
 }
 
 // depositWatcher 监听比特币充值交易, 并向chain33主链提交rgbx deposit交易
