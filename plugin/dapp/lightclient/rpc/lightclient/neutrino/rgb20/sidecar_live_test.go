@@ -133,7 +133,7 @@ func Test_AdapterLive_DepositFlow(t *testing.T) {
 //	RGB_SIDECAR_ADDR            侧车 gRPC（默认 127.0.0.1:50061）
 //	RGB_SIDECAR_ASSET_SYMBOL    侧车资产符号（默认 USDT）
 //	RGB_SIDECAR_USER_INVOICE    用户收款 invoice（test-sim /sim/user_invoice，收款方在 TSS 之外）
-//	RGB_SIDECAR_TSS_ADDRESS     桥 TSS P2WPKH 地址（chain33 getCross 的 tssAddress），提现找零
+//	RGB_SIDECAR_TSS_ADDRESS     桥 TSS P2WPKH 地址（chain33 getCrossChainInfo 的 tssAddress），提现找零
 //	RGB_SIDECAR_WITHDRAW_AMOUNT 提现额（最小单位，默认 500000）
 //
 // 未设置 RGB_SIDECAR_USER_INVOICE 时跳过（不作为常规单测依赖）。

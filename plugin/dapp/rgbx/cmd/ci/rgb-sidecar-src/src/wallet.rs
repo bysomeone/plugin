@@ -40,7 +40,7 @@ pub struct BtcWallet {
 
 impl BtcWallet {
     pub fn new(rpc: Arc<BtcdRpc>, tss_pubkey_hex: &str, network: Network) -> Result<Self> {
-        // chain33 getCross returns pubkey with a "0x" prefix; strip it before hex parsing.
+        // chain33 getCrossChainInfo returns pubkey with a "0x" prefix; strip it before hex parsing.
         let hex = tss_pubkey_hex.strip_prefix("0x").unwrap_or(tss_pubkey_hex);
         let pubkey = CompressedPublicKey::from_str(hex)
             .map_err(|e| anyhow!("invalid TSS pubkey {tss_pubkey_hex}: {e}"))?;

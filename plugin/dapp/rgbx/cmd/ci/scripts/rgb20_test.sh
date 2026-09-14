@@ -49,7 +49,7 @@ function para1_logs_since() {
 function query_pending_withdraw_amount() {
     local from_addr="$1"
     local tx_hash="$2"
-    ${MAIN_CLI} rgbx listPendByFrom -f "${from_addr}" |
+    ${MAIN_CLI} rgbx listPendingTxByFrom -f "${from_addr}" |
         jq -r --arg h "$(echo "${tx_hash}" | tr 'A-Z' 'a-z')" \
         '[.pendingList[]? | select(.actionType == 106) | select((.txHash | ascii_downcase) == $h) | .amount] | first // empty'
 }
@@ -79,7 +79,7 @@ function wait_rgb20_dkg_commit() {
     for ((i = 0; i < retries; i++)); do
         set +e
         local info
-        info=$(${MAIN_CLI} rgbx getCross -s "${RGB20_SYMBOL}" 2>/dev/null)
+        info=$(${MAIN_CLI} rgbx getCrossChainInfo -s "${RGB20_SYMBOL}" 2>/dev/null)
         local rc=$?
         set -e
         if [ "${rc}" -eq 0 ]; then
@@ -96,7 +96,7 @@ function wait_rgb20_dkg_commit() {
 }
 
 function rgb20_tss_pubkey() {
-    ${MAIN_CLI} rgbx getCross -s "${RGB20_SYMBOL}" | jq -r '.pubkey // empty'
+    ${MAIN_CLI} rgbx getCrossChainInfo -s "${RGB20_SYMBOL}" | jq -r '.pubkey // empty'
 }
 
 # 等侧车 gRPC 端口就绪（50061，host 映射）。
@@ -314,7 +314,7 @@ function scenario_rgb20_withdraw() {
 #   - 侧车侧：提现转移没 merge 进 Stock → build_transfer 报 "outpoint <txid>:<vout> has no state"（e538fc299 修）；
 #   - Go 侧：change seal 只在 FinalizeWithdrawal 时被登记为 pending-mint，此后无路径提升 →
 #     下一笔提现被 HR-5（"closed seal ... is pending-mint"）永久拒绝（afcb7b934 修）。
-# 因此本场景同时校验"两笔都成功 burn + 余额递减 + listPendByFrom 清空"与"第二笔的输入确实是
+# 因此本场景同时校验"两笔都成功 burn + 余额递减 + listPendingTxByFrom 清空"与"第二笔的输入确实是
 # 第一笔的 change seal"（缺任一修复时第二笔都会卡在 pending 直到超时）。
 
 # 侧车账本视图（seal 生命周期的权威）：engine 每次状态变更后把账本落盘到 /data/ledger.json。
@@ -519,7 +519,7 @@ function run_rgb20_sidecar_genesis_withdraw_probe() {
         -H 'Content-Type: application/json' \
         -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${RGB20_WITHDRAW_AMOUNT}}" | jq -r '.invoice // empty')
     assert_non_empty "${user_invoice}" "rgb20 genesis probe user invoice empty"
-    tss_address=$(${MAIN_CLI} rgbx getCross -s "${RGB20_SYMBOL}" | jq -r '.tssAddress // empty')
+    tss_address=$(${MAIN_CLI} rgbx getCrossChainInfo -s "${RGB20_SYMBOL}" | jq -r '.tssAddress // empty')
     assert_non_empty "${tss_address}" "rgb20 genesis probe tss address empty"
 
     local repo_root

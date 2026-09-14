@@ -11,11 +11,11 @@ import (
 
 func listPendingTxCMD() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "listPend",
+		Use:     "listPendingTx",
 		Aliases: []string{"lp"},
 		Short:   "list pending tx",
 		Run:     listPending,
-		Example: "listPend -s startHeight -i startIndex -c count",
+		Example: "listPendingTx -s startHeight -i startIndex -c count",
 	}
 	listPendingFlags(cmd)
 	return cmd
@@ -45,11 +45,11 @@ func listPending(cmd *cobra.Command, _ []string) {
 
 func getPendingTxCMD() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "getPend",
+		Use:     "getPendingTx",
 		Aliases: []string{"gp"},
 		Short:   "get pending tx by height",
 		Run:     getPending,
-		Example: "getPend -h height -i index",
+		Example: "getPendingTx -h height -i index",
 	}
 	getPendingFlags(cmd)
 	return cmd
@@ -127,11 +127,11 @@ func getConfirmedHeight(cmd *cobra.Command, _ []string) {
 
 func getCrossChainInfoCMD() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "getCross",
+		Use:     "getCrossChainInfo",
 		Aliases: []string{"gc"},
 		Short:   "get cross-chain info",
 		Run:     getCrossChainInfo,
-		Example: "getCross -s BTC",
+		Example: "getCrossChainInfo -s BTC",
 	}
 	getCrossChainInfoFlags(cmd)
 	return cmd
@@ -154,11 +154,11 @@ func getCrossChainInfo(cmd *cobra.Command, _ []string) {
 
 func listPendingTxByFromCMD() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:     "listPendByFrom",
+		Use:     "listPendingTxByFrom",
 		Aliases: []string{"lpf"},
 		Short:   "list pending tx by from address",
 		Run:     listPendingByFrom,
-		Example: "listPendByFrom -f 1xxxxxxxxxxxxxxxx",
+		Example: "listPendingTxByFrom -f 1xxxxxxxxxxxxxxxx",
 	}
 	listPendingTxByFromFlags(cmd)
 	return cmd
