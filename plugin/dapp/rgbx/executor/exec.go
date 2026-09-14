@@ -20,7 +20,7 @@ func (r *rgbx) Exec_Mint(mint *rtypes.MintAsset, tx *types.Transaction, index in
 
 	txHash := hex.EncodeToString(tx.Hash())
 	elog.Debug("Exec_Mint", "txHash", txHash, "symbol", mint.Symbol,
-		"amount", mint.TotalAmount, "gensisOut", mint.GetGenesisOut().ToString())
+		"amount", mint.TotalAmount, "genesisOut", mint.GetGenesisOut().ToString())
 	receipt.KV = append(receipt.KV, &types.KeyValue{
 		Key:   formatPayloadKey(tx.Hash()),
 		Value: types.Encode(mint),

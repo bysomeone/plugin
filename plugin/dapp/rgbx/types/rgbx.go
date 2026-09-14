@@ -103,7 +103,7 @@ func (r *rgbxType) GetPayload() types.Message {
 	return &RgbxAction{}
 }
 
-// GeTypeMap 获取合约action的id和name信息
+// GetTypeMap 获取合约action的id和name信息
 func (r *rgbxType) GetTypeMap() map[string]int32 {
 	return actionMap
 }
