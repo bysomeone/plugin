@@ -204,6 +204,35 @@ bootstrap（链上还没有任何 BTC 头）时，首个头的父块必须正好
   - 含义：节点角色标识（用于区分官方/验证角色）
   - 要求：同一节点在全网配置必须稳定一致
 
+### 4.4 `[rpc.sub.light.neutrino.rgb20]`
+
+RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentListen` / `contracts` / `precision` /
+`changeAddress`）见 `RGB_USDT_INTEGRATION.md`；这里只说明与签名侧去重相关的一项。
+
+- `signedDepositTTL` (int64)
+  - 含义：**签名侧"已签集合"的保留期（TTL），单位 = BTC 区块数**（不是秒/小时）。
+  - 作用：签名节点在签出 `threshold_sig`（= chain33 铸币授权）**成功之后**，把那笔 BTC 付款交易的
+    `txid` 记进本地已签集合（顶层 bucket `rgb20-signed-deposit`，与 receive/seal 同一个 KVStore）；
+    同一个 `txid` 再来时直接拒绝签名，不再进入签名轮次。付款交易所在 BTC 高度记为锚点，
+    `链上 canonical tip 高度 - 记录高度 >= signedDepositTTL` 即视为过期：过期记录被清掉，
+    同一 `txid` 允许再次签名。
+  - `0` 或 `-1`（任何 ≤ 0 的值，**默认 0**）：**只增不删** —— 已签记录永久保留，永不因 TTL 被清理，
+    也不做任何链上高度查询（默认配置下这条机制零查询、零行为变化）。
+  - 正数：按 BTC 块数保留。参考值：`144` ≈ 1 天（10 分钟/块）、`1008` ≈ 1 周、`4320` ≈ 1 个月。
+    取值越大，同一个 `txid` 能被重复签名的窗口越窄（越保守）；但**过期后同一 txid 会被重新放行**，
+    这是 TTL 的固有取舍，链上 txid 去重（`formatDepositUsedTxIDKey`）不受影响，仍是最终兜底。
+  - **改配置重启立即生效**：启动时若 TTL 为正，会**立刻做一次清理**，把已过期的旧记录（包括之前
+    TTL=0 期间攒下的、或从更大的 TTL 调小后超期的记录）一并删掉；清理在后台执行（取链上高度可能
+    因启动竞态失败，会按 3s 间隔重试），不阻塞节点启动。之后在每次标记成功时顺带清理一次。
+  - 单位选 BTC 高度而不是时钟：高度由链决定，四个签名节点看到的是同一个、单调的计数，不受本机
+    时钟漂移/回拨影响，也不要求节点自己有 neutrino 头库（validator 节点的本地 bestBlock 是空的）。
+    代价是 TTL 判定要读一次链上 tip（lightclient 的 `GetBtcLastHeader` 查询，带 5s 超时），
+    因此只在 TTL > 0 且确有一条记录要判定时才查。
+  - 失败取向（fail-closed）：TTL > 0 但链上高度取不到时，**保持拒绝**（按"仍在保留期"处理），
+    不会因为查询失败就放行重复签名。
+  - 注意：这条去重是**纵深防御**，不是铸币闸门 —— 即使重复签出 `threshold_sig`，链上也会按 txid
+    拒绝第二笔铸造（不多铸）；它挡住的是"给协调者多余的签名产物 + 白跑签名轮次"。
+
 ## 5. Bitcoin 节点关键配置项
 
 以下示例使用 `bitcoin.conf` 格式说明关键配置（btcd/bitcoin-core 参数名有差异时，以节点实现文档为准）：
@@ -342,6 +371,10 @@ certFile="/path/to/rpc.cert"
 peers=["1addrA","1addrB","1addrC","1addrD"]
 threshold=3
 rank=0 # 官方节点；第三方节点配置为 rank=1，且 isOfficialNode=false
+
+[rpc.sub.light.neutrino.rgb20]
+# 签名侧已签集合的保留期（BTC 块数）：0/-1 = 只增不删（默认，不清理）；正数 = 过期后同一 txid 可再签
+signedDepositTTL=0
 ```
 
 第三方节点相对官方节点的最小差异：
@@ -370,3 +403,9 @@ rank=0 # 官方节点；第三方节点配置为 rank=1，且 isOfficialNode=fal
 - 提交头数过大（`ErrBtcHeadersTooMany`）：单笔超过 64 个头会被拒（中继自身 batchSize=64，正好在上限，
   且会截断更大的批）。自行写中继脚本时同样要 ≤ 64
 - 批内高度重复/跳高（`ErrBtcHeaderDuplicateHeight`）：中继必须按高度逐个 +1 提交，不能跳块或重发
+- 重复签名被拒（`deposit tx ... already signed by this node`）：该付款交易 txid 已在本地已签集合里
+  （见 4.4）。属预期行为，不是故障；确需放行只能等 TTL 到期（或把 `signedDepositTTL` 调小后重启，
+  启动清理会立即删掉超期记录）
+- `signedDepositTTL` 配了正数却像"没生效"：TTL 以**付款交易所在高度**为锚点，付款高度与链上 tip
+  差距超过 TTL 的记录本就已过期（一签字就过期），对这类老付款不提供去重——去重窗口是"付款后
+  TTL 个块内"

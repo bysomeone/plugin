@@ -2,8 +2,10 @@ package neutrino
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"fmt"
+	"time"
 
 	"github.com/33cn/chain33/common/merkle"
 	"github.com/33cn/chain33/types"
@@ -14,6 +16,9 @@ import (
 	"github.com/btcsuite/btcd/wire"
 )
 
+// btcTipHeightQueryTimeout 链上 BTC tip 高度查询的超时（已签集合 TTL 判定用）。
+const btcTipHeightQueryTimeout = 5 * time.Second
+
 // 以下方法使 neutrinoClient 实现 rgb20.Chain33Bridge（充值侧）。
 
 // GetMainchainHeight 返回主链最新高度。
@@ -21,9 +26,35 @@ func (n *neutrinoClient) GetMainchainHeight() int64 {
 	return n.getMainchainHeight()
 }
 
-// GetBtcTipHeight 返回本地 lightclient 已知的 BTC 链尖高度。
-func (n *neutrinoClient) GetBtcTipHeight() int64 {
-	return int64(n.getBestBlockHeight())
+// BtcTipHeight 返回链上 lightclient 头链的 canonical tip 高度（BTC 高度）。
+//
+// 用途：签名侧"已签集合"的 TTL 判定（rgb20/signedset.go）——用它当"当前高度"，比墙上时钟可靠：
+// 高度由链决定，四个签名节点看到的是同一个、单调的计数，不受本机时钟漂移/回拨影响，也不需要
+// 节点自己有 neutrino 头库（validator 节点的本地 bestBlock 是空的）。
+//
+// 链上还没有任何头时返回 0（执行器的 GetBtcLastHeader 对"没有头"返回空头）：TTL 判定据此
+// 认为"什么都还没过期"，即保持拒绝（fail-closed）。
+//
+// 查询加超时：TTL 判定失败时上层按"仍在保留期"处理，绝不能把签名轮次挂死。
+func (n *neutrinoClient) BtcTipHeight() (uint64, error) {
+	if n.mainChainGrpc == nil {
+		return 0, fmt.Errorf("main chain grpc client not initialized")
+	}
+	ctx, cancel := context.WithTimeout(n.ctx, btcTipHeightQueryTimeout)
+	defer cancel()
+	reply, err := n.mainChainGrpc.QueryChain(ctx, &types.ChainExecutor{
+		Driver:   ltypes.LightclientX,
+		FuncName: "GetBtcLastHeader",
+		Param:    types.Encode(&types.ReqNil{}),
+	})
+	if err != nil {
+		return 0, fmt.Errorf("query btc tip header: %w", err)
+	}
+	header := &ltypes.BtcHeader{}
+	if err := types.Decode(reply.GetMsg(), header); err != nil {
+		return 0, fmt.Errorf("decode btc tip header: %w", err)
+	}
+	return header.GetHeight(), nil
 }
 
 // BuildSpvProof 构造 RGB 充值付款交易的存在性证明（SPV，对 lightclient 头）。
