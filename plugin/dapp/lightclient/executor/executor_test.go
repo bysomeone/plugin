@@ -437,6 +437,37 @@ func TestBtcHeadersDuplicateHeight(t *testing.T) {
 	})
 }
 
+// TestCommitAddressRequired 覆盖 B2：commitAddress 留空时运行期也必须拒绝写头链。
+func TestCommitAddressRequired(t *testing.T) {
+	require.Error(t, validateCommitAddress(""))
+	require.Contains(t, validateCommitAddress("").Error(), "commitAddress")
+	require.NoError(t, validateCommitAddress("1KSBd17H7ZK8iT37aJztFB22XGwsPTdwE4"))
+
+	dir, stateDB, localDB := util.CreateTestDB()
+	defer util.CloseTestDB(dir, stateDB)
+
+	cli := newLightclient().(*lightclient)
+	setupTestDriver(t, cli)
+	cli.SetStateDB(stateDB)
+	cli.SetLocalDB(localDB)
+
+	commitAddr, commitPriv := util.Genaddress()
+	lightCfg.BtcNetName = "regtest"
+	lightCfg.CommitAddress = commitAddr
+	defer func() { lightCfg.CommitAddress = commitAddr }()
+
+	// 留空后，任何人都不得再提交头（fail-closed），即便交易由原授权地址签名。
+	lightCfg.CommitAddress = ""
+	regtest := &chaincfg.RegressionNetParams
+	h1 := mineBtcHeaderFrom(t, regtest.GenesisHash.String(), 1, regtest.PowLimitBits, types.Now().Add(-time.Hour))
+	tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{h1}}, commitPriv)
+	require.Equal(t, ErrIllegalCommitAddress, cli.CheckTx(tx, 0))
+
+	lightCfg.CommitAddress = commitAddr
+	tx = buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{h1}}, commitPriv)
+	require.NoError(t, cli.CheckTx(tx, 0))
+}
+
 // TestBtcChainContextCheckpoints 覆盖 B5 的锚点表：VerifyCheckpoint / FindPreviousCheckpoint 返回真实值。
 func TestBtcChainContextCheckpoints(t *testing.T) {
 	regtest := &chaincfg.RegressionNetParams

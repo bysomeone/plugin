@@ -28,8 +28,16 @@
   - 含义：BTC 网络类型
   - 常用值：`regtest`、`testnet`、`mainnet`
 - `commitAddress`
-  - 含义：提交 lightclient 相关交易的授权地址
+  - 含义：提交 BTC 区块头交易（等 lightclient 交易）的唯一授权地址
+  - **必填**：只要配置了 `[exec.sub.lightclient]` 段，`commitAddress` 为空将导致**节点启动失败**
+    （启动期直接报错退出），错误信息里会给出配置方法。
+  - 原因：BTC 头链是充值的信任根，链上没有任何原生锚点，"谁能写头链"完全由该地址决定；
+    留空等于向全网开放 BTC 头写入权（任何人可提交任意头 → 可伪造充值）。因此启动期与
+    运行期（`CheckTx`）都按 fail-closed 处理：留空即拒绝一切头部提交。
   - 要求：应为受控地址，且与运维密钥管理策略一致
+  - 停用方式：确实不需要该执行器时，**删除 `[exec.sub.lightclient]` 段**并保持
+    `[fork.sub.lightclient] Enable=-1`（此时不做必填校验）。
+  - 过渡说明：本校验是过渡兜底，待头链锚点/治理方案（B4）落地后 `commitAddress` 计划降级为可选。
 - `allowRegtestTimeWarp`
   - 含义：仅用于 regtest 测试场景的时间容错开关
   - 建议：仅在 regtest 打开，生产网络关闭
@@ -243,6 +251,7 @@ peerblockfilters=1
 - `btcNetName == netName == BTC 节点 network`
 - 主链 `guardianParachainTitle == 平行链 Title`
 - `commitAddress/commitAddr/authAccount` 与私钥管理匹配
+- 主链 `[exec.sub.lightclient].commitAddress` **非空**（留空节点起不来）
 - mainnet/testnet 上线前：`btcCheckpointTable` 已填近期高度，且与 `btcHeaderStartHeight-1` 对得上
 - `blockConfirmations` 符合环境安全要求（测试可低，生产应高）
 - `btcRPC.host/user/pass/TLS` 与 BTC 节点一致
@@ -322,6 +331,8 @@ rank=0 # 官方节点；第三方节点配置为 rank=1，且 isOfficialNode=fal
 - 多官方节点：多个 `isOfficialNode=true` 节点并行处理，导致重复提交/状态竞争
 - 确认数过低：测试通过但生产抗重组能力不足
 - 授权地址不匹配：`commitAddress/commitAddr/authAccount` 与私钥不对应
+- `commitAddress` 留空：节点启动失败（`[exec.sub.lightclient].commitAddress must not be empty`），
+  见 2.1；不是 bug，是防止头链写入权对全网开放
 - 首个 BTC 头被拒（`ErrBtcHeaderNoAnchor`）：bootstrap 起点既不是创世、也没命中锚点表。
   检查 `btcHeaderStartHeight` 与 `btcCheckpointTable` 是否配套（见 2.1.1）
 - 提交头数过大（`ErrBtcHeadersTooMany`）：单笔超过 64 个头的自定义中继需分批提交
