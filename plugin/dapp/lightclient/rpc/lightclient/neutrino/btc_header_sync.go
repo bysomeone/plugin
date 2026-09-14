@@ -69,6 +69,9 @@ var (
 	// 链上可能发生过超深重组、换过网络/起点，或 btcHeaderStartHeight 与链上起点（B5 锚点）不配套。
 	// 不可自愈，必须显式报错并停在这里（运维重新 bootstrap）。
 	errBtcReconcileNoCommonHeader = errors.New("btc header reconcile: no common canonical header within the allowed depth")
+	// errBtcAnchorQueryUnsupported 链上的 lightclient 执行器没有 GetBtcCheckpoint 查询（旧节点）。
+	// L2 的 bootstrap 起点断言对此降级：WARN 一次后照常提交，不做硬依赖。
+	errBtcAnchorQueryUnsupported = errors.New("btc header reconcile: the on-chain lightclient executor does not support the btc checkpoint query")
 )
 
 // btcChainHeaderView 链上（chain33 lightclient 执行器）的 canonical 头链只读视图。
@@ -77,6 +80,9 @@ type btcChainHeaderView interface {
 	chainTipHeader() (*ltypes.BtcHeader, error)
 	// chainHeaderHashAt 返回链上该高度的 canonical 头 hash；found=false 表示链上该高度没有头。
 	chainHeaderHashAt(height uint64) (hash string, found bool, err error)
+	// chainAnchor 返回链上执行器（lightclient）本网络最高的有效锚点；链上不支持该查询（旧节点）时
+	// 返回 errBtcAnchorQueryUnsupported，本网络没有锚点（regtest 等）时返回高度 0 的空头。
+	chainAnchor() (*ltypes.BtcHeader, error)
 }
 
 // btcLocalHeaderView 本地（btcd/neutrino）canonical 头链的只读视图。
@@ -93,6 +99,8 @@ type btcHeaderReconciler struct {
 	startHeight uint64
 	// maxDepth 允许的最大回退深度，必须与执行器 maxBtcReorgDepth 一致。
 	maxDepth uint64
+	// anchor bootstrap 起点与链上锚点的配套断言（L2，只在 bootstrap 分支生效）。
+	anchor btcBootstrapAnchorGuard
 }
 
 // btcHeaderSyncPlan 一轮对账的结论。
@@ -176,6 +184,73 @@ func (r *btcHeaderReconciler) plan(localTipHeight uint64) (*btcHeaderSyncPlan, e
 	}
 	return nil, fmt.Errorf("%w: chainTip=%d localTip=%d probes=%d",
 		errBtcReconcileNoCommonHeader, chainTip, localTipHeight, plan.probes)
+}
+
+// btcBootstrapAnchorGuard 中继的 bootstrap 起点断言（L2）：把"btcHeaderStartHeight 与本网络锚点不配套"
+// 从运行期的 ErrBtcHeaderNoAnchor（执行器 checkBootstrapAnchor 拒收）提前成中继启动期的显式 ERROR。
+//
+// 背景：bootstrap（链上还没有任何 BTC 头）时首个头必须锚定到真实链，执行器只接受
+// "首个头的父块 == 本网络锚点"。锚点来自 btcd chaincfg（见执行器 btcCheckpointTable），中继无法靠
+// chain33 之外的任何信息知道它，于是配置写错时表现为：每个 batch 都被确定性拒收（ErrBtcHeaderNoAnchor），
+// 中继把该计划标记为 halted 后静默停在那里，链上头链停在空链状态 —— 除了翻执行器日志没有别的线索。
+// 这里在提交前用执行器的 Query_GetBtcCheckpoint 拿到同一个锚点，一次说清楚该填多少。
+//
+// 只在 bootstrap 分支断言：BtcHeaderStartHeight 只在"链上 tip==0"时被使用（见 btcHeaderSyncPlan.plan），
+// 头链一旦长起来，起点由对账得出，配置值就失效了（执行器侧同样只在链上 tip==0 时用它）。
+// 因此这里不做常驻校验，避免在正常运行的链上误报。
+//
+// 不硬依赖：查询不被支持（旧执行器）或失败（主链未就绪）时 WARN 一次后照常提交；
+// 本网络没有锚点（regtest 等）时也照常提交（那种网络只能从创世起，由执行器兜底）。
+type btcBootstrapAnchorGuard struct {
+	// anchorHeight 链上执行器给出的本网络最高锚点高度；anchorRead=true 表示已经问过（锚点是编译期
+	// 常量，一个进程生命周期内只问一次；查询不被支持时也置位，旧执行器不会在运行中变新）。
+	anchorHeight uint64
+	anchorRead   bool
+	// report 同一个问题状态只报一次，避免每个 tick 刷屏。
+	report btcHeaderReportLimiter
+}
+
+// check 判断本轮能否提交 bootstrap 批次；false 表示起点与链上锚点不配套，必须不发交易（fail-closed）。
+func (g *btcBootstrapAnchorGuard) check(chain btcChainHeaderView, startHeight uint64) bool {
+	if !g.anchorRead {
+		anchor, err := chain.chainAnchor()
+		switch {
+		case errors.Is(err, errBtcAnchorQueryUnsupported):
+			// 旧执行器：拿不到锚点就不做这个断言（升级主链后自动生效）。
+			g.anchorRead = true
+			log.Warn("submitBitcoinHeaders the on-chain lightclient executor does not support the btc "+
+				"checkpoint query, skip the bootstrap start-height assertion", "err", err,
+				"btcHeaderStartHeight", startHeight)
+			return true
+		case err != nil:
+			// 查询失败（主链未就绪/网络抖动）：本轮不判定，下一轮再问（只报一次，不刷屏）。
+			if g.report.allow("query-error") {
+				log.Warn("submitBitcoinHeaders read the on-chain btc checkpoint failed, retry on the next tick",
+					"err", err)
+			}
+			return true
+		}
+		g.anchorRead = true
+		g.anchorHeight = anchor.GetHeight()
+	}
+	if g.anchorHeight == 0 {
+		// 本网络没有锚点（regtest/testnet4/signet/simnet）：只能从创世起，合法性由执行器的锚点校验兜底。
+		return true
+	}
+	if startHeight == g.anchorHeight+1 {
+		g.report.reset()
+		return true
+	}
+	// 不配套：链上会拒收每一个 bootstrap 批（且是"重试同一批永远不会成功"的确定性拒收），
+	// 因此在源头断开：限流 ERROR + 不发交易，等配置改对（重启）或链上锚点变化。
+	if g.report.allow(fmt.Sprintf("mismatch:%d:%d", g.anchorHeight, startHeight)) {
+		log.Error("submitBitcoinHeaders btcHeaderStartHeight does not match the on-chain btc checkpoint, "+
+			"refusing to submit btc headers (fail-closed): the first bootstrap header's parent must be a "+
+			"known anchor, otherwise the main chain rejects it with ErrBtcHeaderNoAnchor",
+			"btcHeaderStartHeight", startHeight, "anchorHeight", g.anchorHeight,
+			"expectedBtcHeaderStartHeight", g.anchorHeight+1)
+	}
+	return false
 }
 
 // btcHeaderBatchRange 计算本批覆盖的高度区间 [from, to]；没有可提交的高度时 ok=false。
@@ -378,6 +453,29 @@ func (v *chain33BtcHeaderView) chainHeaderHashAt(height uint64) (string, bool, e
 		return "", false, nil
 	}
 	return header.GetHash(), true, nil
+}
+
+// btcChainAnchorQuery 执行器侧返回"本网络最高有效锚点"的查询名（executor/query.go 的
+// Query_GetBtcCheckpoint）。
+const btcChainAnchorQuery = "GetBtcCheckpoint"
+
+// chainAnchor 读链上执行器维护的本网络最高锚点（bootstrap 信任根）。
+func (v *chain33BtcHeaderView) chainAnchor() (*ltypes.BtcHeader, error) {
+	header := &ltypes.BtcHeader{}
+	if err := v.query(btcChainAnchorQuery, nil, header); err != nil {
+		if isBtcAnchorQueryUnsupported(err) {
+			return nil, fmt.Errorf("%w: %v", errBtcAnchorQueryUnsupported, err)
+		}
+		return nil, err
+	}
+	return header, nil
+}
+
+// isBtcAnchorQueryUnsupported 判断错误是不是"链上执行器没有这个查询方法"（旧节点）。
+// chain33 的 DriverBase.Query 对未知的 Query_ 函数返回 ErrActionNotSupport（system/dapp/query.go），
+// 据此把"不支持"与"查询失败"（主链未就绪/网络抖动，下一轮重试）区分开。
+func isBtcAnchorQueryUnsupported(err error) bool {
+	return err != nil && strings.Contains(err.Error(), types.ErrActionNotSupport.Error())
 }
 
 func (v *chain33BtcHeaderView) query(funcName string, param []byte, out types.Message) error {

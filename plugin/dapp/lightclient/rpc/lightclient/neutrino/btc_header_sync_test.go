@@ -18,6 +18,22 @@ type fakeChainHeaderView struct {
 	tipErr    error
 	hashErr   error
 	probes    int
+	// anchor 链上执行器给出的本网络最高锚点（nil = 本网络没有锚点，返回高度 0 的空头，等价 regtest）；
+	// anchorErr 模拟"查询不支持"（errBtcAnchorQueryUnsupported）或"查询失败"。
+	anchor      *ltypes.BtcHeader
+	anchorErr   error
+	anchorReads int
+}
+
+func (f *fakeChainHeaderView) chainAnchor() (*ltypes.BtcHeader, error) {
+	f.anchorReads++
+	if f.anchorErr != nil {
+		return nil, f.anchorErr
+	}
+	if f.anchor == nil {
+		return &ltypes.BtcHeader{}, nil
+	}
+	return f.anchor, nil
 }
 
 func (f *fakeChainHeaderView) chainTipHeader() (*ltypes.BtcHeader, error) {
@@ -224,8 +240,10 @@ func Test_btcHeaderBatchRange(t *testing.T) {
 		wantTo    uint64
 		wantOk    bool
 	}{
-		{name: "full batch", next: 10, confirmed: 100, size: 16, wantFrom: 10, wantTo: 25, wantOk: true},
+		{name: "full batch (batch size)", next: 10, confirmed: 1000, size: btcHeaderBatchSize, wantFrom: 10, wantTo: 10 + uint64(btcHeaderBatchSize) - 1, wantOk: true},
+		{name: "full batch 16", next: 10, confirmed: 100, size: 16, wantFrom: 10, wantTo: 25, wantOk: true},
 		{name: "truncated by confirmations", next: 95, confirmed: 100, size: 16, wantFrom: 95, wantTo: 100, wantOk: true},
+		{name: "truncated at b7 limit", next: 900000, confirmed: 900010, size: btcHeaderBatchSize, wantFrom: 900000, wantTo: 900010, wantOk: true},
 		{name: "single header", next: 100, confirmed: 100, size: 16, wantFrom: 100, wantTo: 100, wantOk: true},
 		{name: "nothing confirmed yet", next: 101, confirmed: 100, size: 16, wantOk: false},
 		{name: "no start height", next: 0, confirmed: 100, size: 16, wantOk: false},
@@ -240,6 +258,7 @@ func Test_btcHeaderBatchRange(t *testing.T) {
 			}
 			require.Equal(t, tt.wantFrom, from)
 			require.Equal(t, tt.wantTo, to)
+			require.Equal(t, tt.next, from, "批必须从对账给出的高度起，不能跨过它")
 			// B7：批内高度必须逐个 +1，且不超过执行器上限。
 			require.LessOrEqual(t, int(to-from+1), btcHeaderBatchSize)
 		})
@@ -407,4 +426,118 @@ func Test_btcHeaderReportLimiter_reportsOncePerState(t *testing.T) {
 
 	l.reset()
 	require.True(t, l.allow("unreconcilable:chainTip=200"), "对账恢复正常后，下次出错再报")
+}
+
+// ---- L2：bootstrap 起点断言（btcBootstrapAnchorGuard）----
+
+// Test_btcBootstrapAnchorGuard_matchingStartHeightIsAccepted 起点 = 锚点 + 1：放行，且锚点只问一次。
+func Test_btcBootstrapAnchorGuard_matchingStartHeightIsAccepted(t *testing.T) {
+	chain := &fakeChainHeaderView{anchor: &ltypes.BtcHeader{Height: 810000, Hash: testBtcHash(0xaa, 810000)}}
+	g := &btcBootstrapAnchorGuard{}
+
+	require.True(t, g.check(chain, 810001))
+	require.True(t, g.check(chain, 810001), "断言通过后每轮都放行")
+	require.Equal(t, 1, chain.anchorReads, "锚点在进程内不变，只问一次")
+}
+
+// Test_btcBootstrapAnchorGuard_mismatchIsFailClosed 起点与锚点不配套：不发交易（fail-closed），
+// 且不重复去问链上（限流 ERROR 的前提是状态没变）。
+func Test_btcBootstrapAnchorGuard_mismatchIsFailClosed(t *testing.T) {
+	chain := &fakeChainHeaderView{anchor: &ltypes.BtcHeader{Height: 810000, Hash: testBtcHash(0xaa, 810000)}}
+	g := &btcBootstrapAnchorGuard{}
+
+	require.False(t, g.check(chain, 810000), "起点必须等于锚点高度+1，不是锚点高度本身")
+	require.False(t, g.check(chain, 1), "相差很多也一样拒")
+	require.Equal(t, 1, chain.anchorReads)
+
+	// 配对了（运维改配置后重启/换新实例）：恢复提交。
+	g = &btcBootstrapAnchorGuard{}
+	require.True(t, g.check(chain, 810001))
+}
+
+// Test_btcBootstrapAnchorGuard_unsupportedQueryDegrades 旧执行器没有该查询：WARN 一次后照常提交，
+// 不做硬依赖（升级主链后自动生效），且不重试风暴。
+func Test_btcBootstrapAnchorGuard_unsupportedQueryDegrades(t *testing.T) {
+	chain := &fakeChainHeaderView{anchorErr: fmt.Errorf("%w: rpc error: ErrActionNotSupport", errBtcAnchorQueryUnsupported)}
+	g := &btcBootstrapAnchorGuard{}
+
+	require.True(t, g.check(chain, 1))
+	require.True(t, g.check(chain, 1))
+	require.Equal(t, 1, chain.anchorReads, "旧执行器不会在运行中变新，不再重问")
+}
+
+// Test_btcBootstrapAnchorGuard_queryErrorRetriesNextTick 查询失败（主链未就绪/网络抖动）：
+// 本轮不判定（不做误报），下一轮重试；重试成功后按锚点正常判定。
+func Test_btcBootstrapAnchorGuard_queryErrorRetriesNextTick(t *testing.T) {
+	chain := &fakeChainHeaderView{anchorErr: errors.New("rpc error: code = Unavailable desc = connection refused")}
+	g := &btcBootstrapAnchorGuard{}
+
+	require.True(t, g.check(chain, 1), "查询失败不做判定，恢复后照常提交")
+	require.Equal(t, 1, chain.anchorReads)
+
+	chain.anchorErr = nil
+	chain.anchor = &ltypes.BtcHeader{Height: 810000, Hash: testBtcHash(0xaa, 810000)}
+	require.True(t, g.check(chain, 810001), "下一轮拿到锚点后按锚点判定")
+	require.Equal(t, 2, chain.anchorReads)
+}
+
+// Test_btcBootstrapAnchorGuard_noAnchorNetSkips 本网络没有锚点（regtest/testnet4/signet/simnet）：
+// 只能从创世起，断言不适用 → 照常提交（合法性由执行器的锚点校验兜底）。
+func Test_btcBootstrapAnchorGuard_noAnchorNetSkips(t *testing.T) {
+	chain := &fakeChainHeaderView{} // anchor=nil → 返回高度 0 的空头
+	g := &btcBootstrapAnchorGuard{}
+
+	require.True(t, g.check(chain, 1))
+	require.True(t, g.check(chain, 840001))
+	require.Equal(t, 1, chain.anchorReads)
+}
+
+// Test_isBtcAnchorQueryUnsupported 区分"旧执行器没有这个查询"与"查询失败"。
+func Test_isBtcAnchorQueryUnsupported(t *testing.T) {
+	require.True(t, isBtcAnchorQueryUnsupported(errors.New("rpc error: desc = ErrActionNotSupport")))
+	require.True(t, isBtcAnchorQueryUnsupported(fmt.Errorf("query GetBtcCheckpoint: %w", errors.New("ErrActionNotSupport"))))
+	require.False(t, isBtcAnchorQueryUnsupported(errors.New("connection refused")))
+	require.False(t, isBtcAnchorQueryUnsupported(nil))
+}
+
+// Test_btcHeaderSubmitCycle_bootstrapMismatchBlocksSubmit 把 L2 放回提交循环里看：
+// bootstrap（链上 tip==0）时起点与锚点不配套 → 对账照常给出计划，但一个头都不提交；
+// 配对上（或本网络没有锚点、或旧节点不支持查询）→ 照常提交。
+func Test_btcHeaderSubmitCycle_bootstrapMismatchBlocksSubmit(t *testing.T) {
+	newCycle := func(anchor *ltypes.BtcHeader, startHeight uint64) (*btcHeaderReconciler, *btcHeaderSyncState) {
+		chain := &fakeChainHeaderView{tipHeight: 0, anchor: anchor}
+		local := &fakeLocalHeaderView{hashes: testBtcChain(0xaa, 1, 100)}
+		r := &btcHeaderReconciler{chain: chain, local: local, startHeight: startHeight, maxDepth: maxBtcHeaderReorgDepth}
+		return r, &btcHeaderSyncState{}
+	}
+	mainnetAnchor := &ltypes.BtcHeader{Height: 810000, Hash: testBtcHash(0xaa, 810000)}
+
+	// 不配套：对账本身没问题（计划 nextSubmitHeight = startHeight），但 guard 挡住提交。
+	r, st := newCycle(mainnetAnchor, 800000)
+	plan, err := r.plan(100)
+	require.NoError(t, err)
+	require.Zero(t, plan.chainTipHeight, "链上还没有头 = bootstrap 分支")
+	require.Equal(t, uint64(800000), plan.nextSubmitHeight)
+	require.False(t, r.anchor.check(r.chain, r.startHeight), "起点必须等于锚点+1")
+	_, _, reason := st.beginSubmit(plan, 900000, time.Now())
+	require.Equal(t, btcHeaderSubmitReady, reason, "计划本身是可提交的 —— 挡住它的是 L2 的锚点断言")
+
+	// 配套：提交照常（批大小 = btcHeaderBatchSize，从 startHeight 起连续）。
+	r, st = newCycle(mainnetAnchor, 810001)
+	plan, err = r.plan(100)
+	require.NoError(t, err)
+	require.True(t, r.anchor.check(r.chain, r.startHeight))
+	from, to, reason := st.beginSubmit(plan, 900000, time.Now())
+	require.Equal(t, btcHeaderSubmitReady, reason)
+	require.Equal(t, uint64(810001), from)
+	require.Equal(t, uint64(810001)+uint64(btcHeaderBatchSize)-1, to)
+
+	// 没有锚点的网络（regtest）：不做断言，从配置的起点提交。
+	r, st = newCycle(nil, 1)
+	plan, err = r.plan(100)
+	require.NoError(t, err)
+	require.True(t, r.anchor.check(r.chain, r.startHeight))
+	from, _, reason = st.beginSubmit(plan, 900000, time.Now())
+	require.Equal(t, btcHeaderSubmitReady, reason)
+	require.Equal(t, uint64(1), from)
 }

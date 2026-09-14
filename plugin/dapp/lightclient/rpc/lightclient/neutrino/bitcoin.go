@@ -133,6 +133,13 @@ func (n *neutrinoClient) submitBtcHeadersOnce(r *btcHeaderReconciler, st *btcHea
 	}
 	st.report.reset()
 
+	// L2：只在 bootstrap（链上 tip==0，此时才用得上 cfg.BtcHeaderStartHeight）断言起点与链上锚点配套。
+	// 不配套就是"每个 batch 都被执行器以 ErrBtcHeaderNoAnchor 确定性拒收"，这里直接不发交易（fail-closed），
+	// 并把期望值打进日志；链上不支持该查询（旧执行器）或本网络没有锚点时降级为照常提交。
+	if plan.chainTipHeight == 0 && !r.anchor.check(r.chain, r.startHeight) {
+		return
+	}
+
 	now := time.Now()
 	from, to, reason := st.beginSubmit(plan, n.btcConfirmedHeight(localTip), now)
 	switch reason {
