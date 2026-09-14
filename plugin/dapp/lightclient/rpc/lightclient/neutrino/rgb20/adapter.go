@@ -24,6 +24,18 @@ type Config struct {
 	Precision uint32
 	// MinConfirmations 充值铸造所需 BTC 确认数（默认与桥的 blockConfirmations 对齐）。
 	MinConfirmations uint32
+	// HeaderRelayConfirmations 中继提交头链时**保留的确认深度** B
+	// （= [rpc.sub.light.neutrino].blockConfirmations，默认 6）。
+	//
+	// 头链提交只到 best - B（neutrino/bitcoin.go 的 btcConfirmedHeight），因此中继提交任何东西的
+	// 那一刻，链上可见的头链 tip 至多到 best - B。充值提交前的本地深度门控
+	// （deposit.go 的 checkSubmitDepth）用它把链上判据换算成本地判据：
+	//
+	//	链上：canonical tip >= H + N - 1   （H = 付款交易高度，N = 链上 minBtcConfirmations）
+	//	本地：best         >= H + B + N - 1
+	//
+	// 0 = 未配置（等价于"头链不保留深度"，只影响门控的保守程度，不影响链上校验）。
+	HeaderRelayConfirmations uint32
 	// SignedDepositTTL 签名侧"已签集合"的保留期（TTL），单位 = BTC 区块数。
 	// <= 0（默认 0）= 只增不删（永久保留）；正数 = 已签记录保留 N 个 BTC 块，到期后可被清理、
 	// 同一 txid 允许再次签名。语义与重启行为见 CONFIG.md 4.4 与 signedset.go。
@@ -133,6 +145,13 @@ type Chain33Bridge interface {
 	// 已签集合的 TTL 判定用它当"当前高度"：所有节点（含没有本地 neutrino 头库的 validator 节点）
 	// 都查主链，结果一致、单调，且不受本机时钟漂移影响；链上还没有任何头时返回 0。
 	BtcTipHeight() (uint64, error)
+	// BtcBestHeight 返回本节点 BTC 视图的 best height（中继自己的头链视图，与头链提交同源）。
+	// 充值提交前的本地深度门控用它算"提交那一刻链上可见 tip 到哪"；取不到时返回错误（门控 fail-closed）。
+	BtcBestHeight() (uint64, error)
+	// RgbxMinBtcConfirmations 返回链上 rgbx 执行器生效的最小 BTC 确认数 N（B8）。
+	// 中继不镜像这个值，直接向链上查询（N 的单一真相 = [exec.sub.rgbx].minBtcConfirmations）；
+	// 查询失败时返回错误（门控 fail-closed）。
+	RgbxMinBtcConfirmations() (uint64, error)
 	// BroadcastTx 广播已签提现交易（由 neutrino 主包实现，走 btcwallet）。
 	BroadcastTx(psbtSigned []byte, txid string) error
 	// TSSAddress 返回桥 TSS 的 P2WPKH 地址（regtest bcrt1…/testnet tb1…/mainnet bc1…）。
@@ -194,6 +213,11 @@ type Adapter struct {
 	bridge   Chain33Bridge
 	// signed 已签集合（签名侧去重，A3 后半）。
 	signed *SignedDepositSet
+	// depositSigs 已签充值的落盘产物（签名轮次的产出，提交失败/深度不够时只重发，见 deposit.go 与
+	// depositsig.go）。
+	depositSigs *DepositSignatureStore
+	// depositNotes 充值重试路径的日志限流（30s 轮询会把同一个状态反复带回来，同一个 key 只报一次）。
+	depositNotes *depositNoteOnce
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -210,17 +234,20 @@ func NewAdapter(cfg Config, store KVStore) (*Adapter, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a := &Adapter{
-		cfg:      cfg,
-		store:    store,
-		receives: newReceiveStore(store),
-		seals:    newSealIndex(store),
-		reg:      newRegistry(cfg.Contracts),
-		ctx:      ctx,
-		cancel:   cancel,
+		cfg:          cfg,
+		store:        store,
+		receives:     newReceiveStore(store),
+		seals:        newSealIndex(store),
+		reg:          newRegistry(cfg.Contracts),
+		ctx:          ctx,
+		cancel:       cancel,
+		depositNotes: newDepositNoteOnce(),
 	}
 	// 已签集合：TTL 判定的"当前高度"经 btcTipHeight 走桥接查链上 tip（SetBridge 之后才可用；
 	// TTL <= 0 时根本不会调用它）。
 	a.signed = newSignedDepositSet(store, cfg.SignedDepositTTL, a.btcTipHeight)
+	// 已签充值的落盘产物：与 receive/seal/已签集合共用同一个 KVStore（不引入新存储引擎）。
+	a.depositSigs = newDepositSignatureStore(store)
 	return a, nil
 }
 

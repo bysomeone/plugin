@@ -139,7 +139,10 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 		Precision:         n.cfg.Rgb20.Precision,
 		ChangeAddress:     n.cfg.Rgb20.ChangeAddress,
 		MinConfirmations:  n.cfg.BlockConfirmations,
-		SignedDepositTTL:  n.cfg.Rgb20.SignedDepositTTL,
+		// 头链保留深度 B：头链只提交到 best - B，充值提交前的本地深度门控据此把链上判据换算成本地判据。
+		// 与头链提交（bitcoin.go 的 btcConfirmedHeight）取同一个配置项，不允许各自取值。
+		HeaderRelayConfirmations: n.cfg.BlockConfirmations,
+		SignedDepositTTL:         n.cfg.Rgb20.SignedDepositTTL,
 	}
 	for _, c := range n.cfg.Rgb20.Contracts {
 		rgbCfg.Contracts = append(rgbCfg.Contracts, rgb20.Contract{

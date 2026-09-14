@@ -54,7 +54,27 @@ type fakeBridge struct {
 	btcTip    uint64
 	btcTipErr error
 	tipCalls  int
+	// bestHeight/err 本地 BTC best height（深度门控用）；minConfs 链上 rgbx 最小确认数 N。
+	bestHeight  uint64
+	bestErr     error
+	minConfs    uint64
+	minConfsErr error
+	signCalls   int // 签名轮次被驱动的次数（断言"重试只重发、不重签"）
+	submitCalls int // 提交尝试次数（含失败）
+	// submitAttempts 全部提交尝试（含失败）；submitted 仅成功的那些。
+	submitAttempts []*rtypes.DepositAsset
+	submitErr      error
+	// depthSet 是否用 setDepth 显式设置过深度门控输入（未设置时给"总是够深"的测试默认值）。
+	depthSet bool
+	// signFn 可按次改写签名结果（默认返回 sig 或固定值）。
+	signFn func(*DepositSignPayload) ([]byte, error)
 }
+
+// 深度门控的测试默认值：未显式配置时"永远够深"，不让门控干扰与它无关的用例。
+const (
+	defaultTestBtcBestHeight = uint64(1_000_000)
+	defaultTestRgbxMinConfs  = uint64(6)
+)
 
 func (f *fakeBridge) GetMainchainHeight() int64 { return 100 }
 
@@ -81,8 +101,29 @@ func (f *fakeBridge) BuildSpvProof(txid string) (*SpvProof, error) {
 func (f *fakeBridge) SubmitDeposit(dep *rtypes.DepositAsset) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.submitCalls++
+	f.submitAttempts = append(f.submitAttempts, dep)
+	if f.submitErr != nil {
+		return f.submitErr
+	}
 	f.submitted = append(f.submitted, dep)
 	return nil
+}
+
+// submitCallCount 提交尝试次数（含失败的提交：用来断言"深度不够时根本不提交"）。
+func (f *fakeBridge) submitCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.submitCalls
+}
+
+// submitAttemptList 全部提交尝试（含失败），用于比对"重发的是同一份已签对象"。
+func (f *fakeBridge) submitAttemptList() []*rtypes.DepositAsset {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*rtypes.DepositAsset, len(f.submitAttempts))
+	copy(out, f.submitAttempts)
+	return out
 }
 
 func (f *fakeBridge) VerifyDepositSpv(*rtypes.BtcTxProof) error {
@@ -91,11 +132,26 @@ func (f *fakeBridge) VerifyDepositSpv(*rtypes.BtcTxProof) error {
 
 func (f *fakeBridge) SubmitConfirm(*rtypes.ConfirmTx) error { return nil }
 
-func (f *fakeBridge) SignDepositMessage(*DepositSignPayload) ([]byte, error) {
-	if f.sig != nil {
-		return f.sig, nil
+func (f *fakeBridge) SignDepositMessage(p *DepositSignPayload) ([]byte, error) {
+	f.mu.Lock()
+	f.signCalls++
+	fn := f.signFn
+	sig := f.sig
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(p)
+	}
+	if sig != nil {
+		return sig, nil
 	}
 	return []byte("threshold-sig"), nil
+}
+
+// signCallCount 签名轮次被驱动的次数。
+func (f *fakeBridge) signCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.signCalls
 }
 
 func (f *fakeBridge) SignPsbt(psbtBytes []byte) ([]byte, error) {
@@ -110,6 +166,60 @@ func (f *fakeBridge) BtcTipHeight() (uint64, error) {
 	defer f.mu.Unlock()
 	f.tipCalls++
 	return f.btcTip, f.btcTipErr
+}
+
+// BtcBestHeight 本地 best height（深度门控用）。
+// 未用 setDepth 显式配置时给一个"深度永远够"的默认值：既有用例关心的是别的路径，不该被门控挡住；
+// 深度门控自己的用例一律显式 setDepth。
+func (f *fakeBridge) BtcBestHeight() (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.bestErr != nil {
+		return 0, f.bestErr
+	}
+	if !f.depthSet {
+		return defaultTestBtcBestHeight, nil
+	}
+	return f.bestHeight, nil
+}
+
+// RgbxMinBtcConfirmations 链上 rgbx 最小确认数 N（B8）。
+func (f *fakeBridge) RgbxMinBtcConfirmations() (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.minConfsErr != nil {
+		return 0, f.minConfsErr
+	}
+	if !f.depthSet {
+		// 未显式配置时用生产默认值（[exec.sub.rgbx].minBtcConfirmations 默认 6）。
+		return defaultTestRgbxMinConfs, nil
+	}
+	return f.minConfs, nil
+}
+
+// setDepth 一次设置深度门控的两个输入（best 与链上 N）。
+func (f *fakeBridge) setDepth(best, minConfs uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bestHeight = best
+	f.minConfs = minConfs
+	f.depthSet = true
+}
+
+// setDepthErrs 让深度门控的两个输入各自失败（fail-closed 用例）。
+func (f *fakeBridge) setDepthErrs(bestErr, minConfsErr error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bestErr = bestErr
+	f.minConfsErr = minConfsErr
+	f.depthSet = true
+}
+
+// setSubmitErr 让后续提交失败（驱动"提交失败 → 只重发"的重试用例）。
+func (f *fakeBridge) setSubmitErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.submitErr = err
 }
 
 // tipCallCount 链上高度查询次数（断言"默认配置零查询"用）。
@@ -153,6 +263,8 @@ func newTestAdapter(t *testing.T, mock *MockSidecar, bridge Chain33Bridge) (*Ada
 			{Symbol: "RGB20_USDT", Precision: 6, MinDeposit: 100, MinWithdraw: 100},
 		},
 		ChangeAddress: "bcrt1qxxxx",
+		// 与生产一致：头链保留深度 B 取 blockConfirmations（生产配置默认为 6）。
+		HeaderRelayConfirmations: 6,
 	}
 	adapter, err := NewAdapter(cfg, newMemStore())
 	require.NoError(t, err)
