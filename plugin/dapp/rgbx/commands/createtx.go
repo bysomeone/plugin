@@ -3,7 +3,6 @@ package commands
 import (
 	"encoding/hex"
 	"fmt"
-	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -72,7 +71,7 @@ func mintAsset(cmd *cobra.Command, args []string) {
 		precision = 8
 	}
 
-	totalAmount = totalAmount * int64(math.Pow(10, float64(precision)))
+	totalAmount = totalAmount * pow10(int(precision))
 
 	if totalAmount < 1 ||
 		totalAmount > rtypes.MaxAssetAmount {
@@ -113,7 +112,9 @@ func mintAsset(cmd *cobra.Command, args []string) {
 
 func transferAssetFlags(cmd *cobra.Command) {
 
-	cmd.Flags().Float64P("amount", "a", 1, "asset amount")
+	// amount 用字符串接收并按十进制精确换算（与 withdraw 同理，见 parseDecimalAmount）：
+	// float64 相乘再截断会少 1 个最小单位。
+	cmd.Flags().StringP("amount", "a", "1", "asset amount")
 	cmd.Flags().StringP("symbol", "s", "", "asset symbol")
 	cmd.Flags().StringP("from", "f", "", "from address, hash:index format for utxo, use sign address if not set")
 	cmd.Flags().StringP("to", "t", "", "to address, hash:index format for utxo")
@@ -128,7 +129,7 @@ func transferAsset(cmd *cobra.Command, args []string) {
 	from, _ := cmd.Flags().GetString("from")
 	to, _ := cmd.Flags().GetString("to")
 	change, _ := cmd.Flags().GetString("change")
-	amount, _ := cmd.Flags().GetFloat64("amount")
+	amountStr, _ := cmd.Flags().GetString("amount")
 	pkScriptStr, _ := cmd.Flags().GetString("pkScript")
 
 	if symbol == "" || len(symbol) > rtypes.MaxAssetSymbolLength {
@@ -147,10 +148,14 @@ func transferAsset(cmd *cobra.Command, args []string) {
 		precision = int(reply.Precision)
 	}
 
-	amount = amount * math.Pow(10, float64(precision))
+	amount, amountErr := parseDecimalAmount(amountStr, precision)
+	if amountErr != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "%v\n", amountErr)
+		return
+	}
 	if amount < 1 ||
 		amount > rtypes.MaxAssetAmount {
-		_, _ = fmt.Fprintf(os.Stderr, "invalid amount: %f, overflow", amount)
+		_, _ = fmt.Fprintf(os.Stderr, "invalid amount: %q, overflow", amountStr)
 		return
 	}
 	pkScript, err := hex.DecodeString(pkScriptStr)
@@ -161,7 +166,7 @@ func transferAsset(cmd *cobra.Command, args []string) {
 
 	transfer := &rtypes.TransferAsset{
 		Symbol:           symbol,
-		Amount:           int64(amount),
+		Amount:           amount,
 		FromUtxo:         from,
 		To:               to,
 		ChangeAddr:       change,

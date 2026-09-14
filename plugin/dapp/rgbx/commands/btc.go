@@ -3,7 +3,6 @@ package commands
 import (
 	"encoding/hex"
 	"fmt"
-	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -422,7 +421,9 @@ func withdrawAssetCMD() *cobra.Command {
 }
 
 func withdrawAssetFlags(cmd *cobra.Command) {
-	cmd.Flags().Float64P("amount", "a", 0, "withdraw amount")
+	// amount 用字符串接收并按十进制精确换算：float64 无法精确表示 0.0006 这类小数，
+	// 相乘再截断会少 1 个最小单位（详见 parseDecimalAmount）。
+	cmd.Flags().StringP("amount", "a", "0", "withdraw amount")
 	cmd.Flags().Int64P("feeRate", "f", 1, "btc fee rate (sat/vbyte)")
 	cmd.Flags().StringP("destinationAddr", "d", "", "btc destination address")
 	cmd.Flags().StringP("assetSymbol", "s", rtypes.BTCSymbol, "cross-chain asset symbol")
@@ -430,14 +431,24 @@ func withdrawAssetFlags(cmd *cobra.Command) {
 }
 
 func withdrawAsset(cmd *cobra.Command, _ []string) {
-	amount, _ := cmd.Flags().GetFloat64("amount")
+	amountStr, _ := cmd.Flags().GetString("amount")
 	feeRate, _ := cmd.Flags().GetInt64("feeRate")
 	destAddr, _ := cmd.Flags().GetString("destinationAddr")
 	symbol, _ := cmd.Flags().GetString("assetSymbol")
 
-	amount = amount * math.Pow(10, 8)
+	amount, err := parseDecimalAmount(amountStr, withdrawAmountDecimals)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "%v\n", err)
+		return
+	}
+	if amount < 1 || amount > rtypes.MaxAssetAmount {
+		_, _ = fmt.Fprintf(os.Stderr, "invalid amount: %q, must be in [1, %d] min units\n",
+			amountStr, int64(rtypes.MaxAssetAmount))
+		return
+	}
+
 	sendCreateTxRPC(cmd, rtypes.NameWithdrawAssetAction, &rtypes.WithdrawAsset{
-		Amount:          int64(amount),
+		Amount:          amount,
 		FeeRate:         feeRate,
 		DestinationAddr: destAddr,
 		AssetSymbol:     symbol,
