@@ -164,6 +164,10 @@ allowRegtestTimeWarp=true
 commitAddress="${AUTH_ADDR1}"
 crossChainAssetPrefix="X"
 guardianParachainTitle="${PARA_TITLE}"
+# CI 显式用 1：本 harness 的 BTC 确认数整体是 1（blockConfirmations=1），E2E 依赖"1 个后续块即确认"
+# 的时序；而被屏蔽的 scenario_user_deposit_via_btc_tx 等待循环不再挖块，一旦重新启用，生产默认值 6
+# 会让它等不到确认而卡死。生产/主网不要照抄这个值（默认 6）。
+minBtcConfirmations=1
 EOF
     fi
 }
