@@ -14,6 +14,12 @@ var (
 	ErrBtcHeaderDuplicateHeight = errors.New("ErrBtcHeaderDuplicateHeight")
 	// ErrBtcHeaderNoAnchor bootstrap 时的首个头无法锚定到该网络的真实链
 	ErrBtcHeaderNoAnchor = errors.New("ErrBtcHeaderNoAnchor")
+	// ErrBtcHeaderUnknownAncestor 首个头的父块不是 canonical 链最近窗口里的已知区块（分叉点无从确认）
+	ErrBtcHeaderUnknownAncestor = errors.New("ErrBtcHeaderUnknownAncestor")
+	// ErrBtcReorgTooDeep 分叉点比当前 tip 旧超过 maxBtcReorgDepth，超出允许回退的深度
+	ErrBtcReorgTooDeep = errors.New("ErrBtcReorgTooDeep")
+	// ErrBtcHeaderContextMissing 挂载点在 canonical 链上，但拿不到它的完整头（localdb 缺数据），无法校验
+	ErrBtcHeaderContextMissing = errors.New("ErrBtcHeaderContextMissing")
 
 	ErrBtcTargetBits        = errors.New("ErrBtcTargetBits")
 	ErrBtcHeaderTimeTooOld  = errors.New("ErrBtcHeaderTimeTooOld")
