@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/33cn/chain33/common/merkle"
@@ -55,6 +57,64 @@ func (n *neutrinoClient) BtcTipHeight() (uint64, error) {
 		return 0, fmt.Errorf("decode btc tip header: %w", err)
 	}
 	return header.GetHeight(), nil
+}
+
+// BtcBestHeight 返回本节点 BTC 视图的 best height（中继自己的头链视图）。
+//
+// 用途：充值提交前的本地深度门控（rgb20/deposit.go 的 checkSubmitDepth）。这里必须与**头链提交**
+// 用同一个 best：中继提交头链时只提交到 best - B（B = cfg.BlockConfirmations，见 bitcoin.go 的
+// btcConfirmedHeight 与 btcwallet.go 的通知阈值），链上可见 tip 由此推出 —— 用别的来源（例如 BTC
+// 全节点 RPC 高度）会得到一个与链上实际可见高度不一致的数，门控就失去意义。
+//
+// 取不到（neutrino 还没同步出 best block）时返回错误：门控据此 fail-closed（宁可不提交）。
+func (n *neutrinoClient) BtcBestHeight() (uint64, error) {
+	best := n.getBestBlock()
+	if best == nil || best.Height <= 0 {
+		return 0, fmt.Errorf("local btc best block not available yet")
+	}
+	return uint64(best.Height), nil
+}
+
+// rgbxMinConfsQuery 执行器侧返回"rgbx 最小 BTC 确认数"的查询名
+// （lightclient executor/query.go 的 Query_GetRgbxMinBtcConfirmations）。
+const rgbxMinConfsQuery = "GetRgbxMinBtcConfirmations"
+
+// errRgbxMinConfsQueryUnsupported 链上的 lightclient 执行器没有这个查询（旧节点）。
+// 与 btc_header_sync.go 的 errBtcAnchorQueryUnsupported 同一套判断（chain33 的 Query 对未知的
+// Query_ 方法返回 ErrActionNotSupport）。
+var errRgbxMinConfsQueryUnsupported = errors.New("on-chain lightclient does not support the rgbx min-confirmations query")
+
+// RgbxMinBtcConfirmations 向主链查询 rgbx 执行器生效的最小 BTC 确认数 N（B8）。
+//
+// N 的单一真相在链上（`[exec.sub.rgbx].minBtcConfirmations`），中继不镜像、不自己再配一份：
+// 每次都问链上（一次本地 gRPC 只读查询，代价可忽略），链改了配置重启后中继无需任何改动即跟随。
+//
+// 查询加超时；失败时返回错误，调用方 fail-closed（算不出 N 就不提交，绝不用猜测值去凑门控）。
+func (n *neutrinoClient) RgbxMinBtcConfirmations() (uint64, error) {
+	if n.mainChainGrpc == nil {
+		return 0, fmt.Errorf("main chain grpc client not initialized")
+	}
+	ctx, cancel := context.WithTimeout(n.ctx, btcTipHeightQueryTimeout)
+	defer cancel()
+	reply, err := n.mainChainGrpc.QueryChain(ctx, &types.ChainExecutor{
+		Driver:   ltypes.LightclientX,
+		FuncName: rgbxMinConfsQuery,
+		Param:    types.Encode(&types.ReqNil{}),
+	})
+	if err != nil {
+		if strings.Contains(err.Error(), types.ErrActionNotSupport.Error()) {
+			return 0, fmt.Errorf("%w: %v", errRgbxMinConfsQueryUnsupported, err)
+		}
+		return 0, fmt.Errorf("query rgbx min btc confirmations: %w", err)
+	}
+	data := &types.Int64{}
+	if err := types.Decode(reply.GetMsg(), data); err != nil {
+		return 0, fmt.Errorf("decode rgbx min btc confirmations: %w", err)
+	}
+	if data.GetData() <= 0 {
+		return 0, fmt.Errorf("invalid rgbx min btc confirmations: %d", data.GetData())
+	}
+	return uint64(data.GetData()), nil
 }
 
 // BuildSpvProof 构造 RGB 充值付款交易的存在性证明（SPV，对 lightclient 头）。
