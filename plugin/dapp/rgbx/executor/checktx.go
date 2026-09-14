@@ -67,6 +67,10 @@ var (
 	// ErrNonCanonicalSpendingTx SpendingTx 尾部带多余字节（非规范编码）——同一笔花费的另一份编码，
 	// 必须拒绝：否则归属 utxo id 会随编码变化（E1 家族 A2，口径同充值侧 parseBtcTxIDStrict）。
 	ErrNonCanonicalSpendingTx = errors.New("non-canonical spending tx encoding")
+	// ErrInsufficientBtcConfirmations B8：证明所在 BTC 区块在 canonical 头链里的确认数不足
+	// （tip.Height < proof.BlockHeight + minBtcConfirmations - 1），或无法确定 tip
+	// （查询失败 / 头链为空）时一律拒绝。错误信息带 tip 高度 / 证明高度 / 要求的 N。
+	ErrInsufficientBtcConfirmations = errors.New("insufficient btc confirmations")
 )
 
 const (
@@ -394,16 +398,17 @@ func (r *rgbx) checkDeposit(txHash string, deposit *rtypes.DepositAsset) error {
 			elog.Error("checkDeposit rgb20 verifyThresholdSig", "txHash", txHash, "symbol", deposit.GetAssetSymbol(), "err", err)
 			return err
 		}
-		return nil
+	} else {
+		if !hasDepositCommitment(btcTx, addr) {
+			elog.Error("checkDeposit commitment mismatch", "txHash", txHash, "depositAddress", addr)
+			return ErrInvalidDepositCommitment
+		}
+		if err = r.validateDepositTxContent(txHash, deposit, btcTx); err != nil {
+			return err
+		}
 	}
-	if !hasDepositCommitment(btcTx, addr) {
-		elog.Error("checkDeposit commitment mismatch", "txHash", txHash, "depositAddress", addr)
-		return ErrInvalidDepositCommitment
-	}
-	if err = r.validateDepositTxContent(txHash, deposit, btcTx); err != nil {
-		return err
-	}
-	return nil
+	// B8：链上最小确认数（放最后，理由见 checkBtcConfirmations 的注释）。
+	return r.checkBtcConfirmations("deposit", txHash, deposit.GetTxProof())
 }
 
 func (r *rgbx) checkConfirm(fromAddr, txHash string, confirm *rtypes.ConfirmTx) error {

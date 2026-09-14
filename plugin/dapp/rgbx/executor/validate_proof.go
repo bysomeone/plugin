@@ -52,18 +52,18 @@ func (r *rgbx) checkWithdrawConfirm(txHash, confirmHash string, confirm *rtypes.
 		return err
 	}
 	// RGB20 分支：跳过链上 OP_RETURN 承诺与链上金额校验（H4：提现 correlation 走 txid↔pending 映射）。
-	if rtypes.IsRgb20Symbol(pendingTx.GetAssetSymbol()) {
-		return nil
+	if !rtypes.IsRgb20Symbol(pendingTx.GetAssetSymbol()) {
+		if !hasWithdrawCommitment(btcTx, confirm.GetTxHash()) {
+			elog.Error("checkWithdrawConfirm commitment mismatch", "txHash", txHash, "confirmHash", confirmHash,
+				"btcProof", btcProof2String(confirm.GetBtcTxProof()))
+			return ErrInvalidBtcProofCommitment
+		}
+		if err = r.validateWithdrawTxContent(txHash, pendingTx, btcTx); err != nil {
+			return err
+		}
 	}
-	if !hasWithdrawCommitment(btcTx, confirm.GetTxHash()) {
-		elog.Error("checkWithdrawConfirm commitment mismatch", "txHash", txHash, "confirmHash", confirmHash,
-			"btcProof", btcProof2String(confirm.GetBtcTxProof()))
-		return ErrInvalidBtcProofCommitment
-	}
-	if err = r.validateWithdrawTxContent(txHash, pendingTx, btcTx); err != nil {
-		return err
-	}
-	return nil
+	// B8：链上最小确认数（放最后，理由见 checkBtcConfirmations 的注释）。
+	return r.checkBtcConfirmations("withdrawConfirm", txHash, confirm.GetBtcTxProof())
 }
 
 func (r *rgbx) validateDepositTxContent(txHash string, deposit *rtypes.DepositAsset, btcTx *wire.MsgTx) error {
@@ -258,6 +258,86 @@ func (r *rgbx) getBtcNetName() (string, error) {
 		return "", err
 	}
 	return msg.(*types.ReplyString).Data, nil
+}
+
+// getBtcCanonicalTip 读 lightclient 的 canonical BTC tip（statedb 里的 btc-lastheader）。
+//
+// 为什么是 GetBtcLastHeader（statedb）而不是 GetBtcHeader（localdb）：
+//   - btc-lastheader 写在 **statedb**，由 lightclient 的 Exec_BtcHeaders 在 canonical 链切换时写入
+//     （B3/B4 之后重组回退也会改写它），是"全网共识可见"的头链 tip；query 带 stateHash，
+//     读到的是**链上状态**、各节点一致 ⇒ 满足"共识判定只依赖共识状态"。
+//   - btc-header-<height> 在 **localdb**，是节点私有的逐高度索引（见 lightclient/executor/kv.go）。
+//     读它做共识判定会让"区块是否合法"依赖各节点本地库（本地库落后/丢失时结论不同），
+//     正是本次要避免的老毛病（对照 checkWithdrawConfirm 里 S3 守卫的同类理由）。
+//
+// 头链还没写入过任何头时，lightclient 返回零值头（Hash == ""）而不是错误，调用方需按"无 tip"处理。
+func (r *rgbx) getBtcCanonicalTip() (*ltypes.BtcHeader, error) {
+	msg, err := r.GetAPI().Query(ltypes.LightclientX, "GetBtcLastHeader", &types.ReqNil{})
+	if err != nil {
+		elog.Error("getBtcCanonicalTip query", "err", err)
+		return nil, err
+	}
+	header, ok := msg.(*ltypes.BtcHeader)
+	if !ok || header == nil {
+		elog.Error("getBtcCanonicalTip invalid header")
+		return nil, types.ErrInvalidParam
+	}
+	return header, nil
+}
+
+// btcConfirmations proofHeight 处的块在 tipHeight 处的确认数（含该块自身）：tip == proofHeight 时为 1。
+// tip 还没到该高度（含 canonical 链被重组回退到该块之前）时为 0 —— 这正是 B8 想让"重组"可见的地方。
+func btcConfirmations(tipHeight, proofHeight uint64) uint64 {
+	if tipHeight < proofHeight {
+		return 0
+	}
+	return tipHeight - proofHeight + 1
+}
+
+// checkBtcConfirmations 链上最小确认数（B8）：要求
+//
+//	canonical tip 高度 >= proof.BlockHeight + N - 1        （N = rgbxCfg.MinBtcConfirmations，默认 6）
+//
+// 即证明所在 BTC 区块在链上被确认至少 N 个块，否则拒绝。
+//
+// 两个调用点（checkDeposit / checkWithdrawConfirm）都把它安排在**其它校验全部通过之后**：
+// 确认深度是**会随时间自愈**的暂时状态（tip 前进即满足）；而被重组回退时它又会重新不满足 ——
+// 后者正是本项要的效果：头链能跟随重组回退（B3/B4）之后，链上"看得见的深度"才有意义。
+// 相比 txid 去重 / 严格解析 / OP_RETURN 承诺 / 金额校验这些**永久性**判定，暂时性的拒绝必须排在后面，
+// 否则"这份证明永远无效"会被报成"确认不足"，把运维引向等待。
+//
+// fail-closed：查询不到 canonical tip（lightclient 不可用、头链为空）时同样拒绝 ——
+// 确定不了深度就不能默认深度足够。
+func (r *rgbx) checkBtcConfirmations(action, txHash string, proof *rtypes.BtcTxProof) error {
+	required := rgbxCfg.MinBtcConfirmations
+	if required <= 0 {
+		// 防御性兜底：initCfg 保证 > 0（<= 0 取默认值）；此处覆盖绕过 Init 直接构造的调用方。
+		required = defaultMinBtcConfirmations
+	}
+	height := proof.GetBlockHeight()
+
+	tip, err := r.getBtcCanonicalTip()
+	if err != nil {
+		elog.Error("checkBtcConfirmations get canonical tip", "action", action, "txHash", txHash,
+			"proofHeight", height, "required", required, "err", err)
+		return fmt.Errorf("%w: tipHeight=unknown proofHeight=%d required=%d err=%v",
+			ErrInsufficientBtcConfirmations, height, required, err)
+	}
+	if tip.GetHash() == "" {
+		elog.Error("checkBtcConfirmations empty canonical tip", "action", action, "txHash", txHash,
+			"proofHeight", height, "required", required)
+		return fmt.Errorf("%w: tipHeight=none proofHeight=%d required=%d",
+			ErrInsufficientBtcConfirmations, height, required)
+	}
+
+	confs := btcConfirmations(tip.GetHeight(), height)
+	if confs < uint64(required) {
+		elog.Error("checkBtcConfirmations insufficient confirmations", "action", action, "txHash", txHash,
+			"tipHeight", tip.GetHeight(), "proofHeight", height, "confirmations", confs, "required", required)
+		return fmt.Errorf("%w: tipHeight=%d proofHeight=%d confirmations=%d required=%d",
+			ErrInsufficientBtcConfirmations, tip.GetHeight(), height, confs, required)
+	}
+	return nil
 }
 
 func (r *rgbx) getBtcHeader(height uint64) (*ltypes.BtcHeader, error) {

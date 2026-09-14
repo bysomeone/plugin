@@ -33,7 +33,15 @@ func mockGuardianAPI(t *testing.T, commitAddr string) *mocks.QueueProtocolAPI {
 	api.On("Query", ltypes.LightclientX, "GetBtcNetName", mock.Anything).Return(&types.ReplyString{Data: "testnet3"}, nil)
 	api.On("Query", paratypes.ParaX, "GetNodeGroupStatus", mock.Anything).Return(
 		&paratypes.ParaNodeGroupStatus{TargetAddrs: commitAddr}, nil)
+	// B8：充值路径会读 canonical tip（statedb）。默认给足深度，深度规则本身由 btc_confirm_test.go 覆盖。
+	api.On("Query", ltypes.LightclientX, "GetBtcLastHeader", mock.Anything).Return(
+		&ltypes.BtcHeader{Hash: "tip", Height: testBtcConfirmedTipHeight()}, nil)
 	return api
+}
+
+// testBtcConfirmedTipHeight 一个足够深的 canonical tip（> 测试里用到的证明高度 + 默认 N - 1）。
+func testBtcConfirmedTipHeight() uint64 {
+	return 100 + uint64(defaultMinBtcConfirmations) - 1
 }
 
 func buildMinimalBtcTx(t *testing.T) []byte {
