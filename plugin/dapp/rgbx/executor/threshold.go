@@ -18,8 +18,8 @@ var (
 )
 
 // computeDepositSignMessage 计算 RGB20 充值 TSS 签名的消息：
-// C = sha256(types.Encode(DepositAsset{threshold_sig:nil}))（确定性 protobuf，B1 精化）。
-// 注意：签名节点与合约必须用同一编码规则；此处对去除 threshold_sig 的 DepositAsset 做 Encode。
+// C = sha256(types.Encode(DepositAsset{thresholdSig:nil}))（确定性 protobuf，B1 精化）。
+// 注意：签名节点与合约必须用同一编码规则；此处对去除 thresholdSig 的 DepositAsset 做 Encode。
 func computeDepositSignMessage(dep *rtypes.DepositAsset) []byte {
 	depWithoutSig := proto.Clone(dep).(*rtypes.DepositAsset)
 	depWithoutSig.ThresholdSig = nil

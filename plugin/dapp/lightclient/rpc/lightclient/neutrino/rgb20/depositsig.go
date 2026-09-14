@@ -21,8 +21,8 @@ import (
  *
  * 因此把签名轮次的产出落盘：**先落盘、再提交**；重试时若已有落盘产物就只重发（不再驱动签名轮次）。
  *
- * 粒度选"完整 DepositAsset"而不是只存 threshold_sig 字节：链上验签的消息是
- * C = sha256(types.Encode(DepositAsset{threshold_sig:nil}))（与 tss.computeRgb20DepositMsg、
+ * 粒度选"完整 DepositAsset"而不是只存 thresholdSig 字节：链上验签的消息是
+ * C = sha256(types.Encode(DepositAsset{thresholdSig:nil}))（与 tss.computeRgb20DepositMsg、
  * rgbx 执行器 computeDepositSignMessage 同口径）—— 金额、目标地址、资产符号、SPV 证明都在这个编码里。
  * 重发时若重新构造 DepositAsset（例如重新取一次 SPV，merkle 分支/高度与签名时不同），签名就对不上了；
  * 存整份对象则"签的是什么就重发什么"，不存在这个风险。
@@ -44,7 +44,7 @@ type SignedDepositArtifact struct {
 	Height    uint64 `json:"height"`    // 付款交易所在 BTC 高度（深度门控与观测用）
 	SessionID string `json:"sessionId"` // 产生签名的 TSS session id（排查用）
 	SignedAt  int64  `json:"signedAt"`  // 签名时间（unix 秒，排查用）
-	// Deposit 签名后的完整充值对象：threshold_sig 已填，TxProof 与签名时的完全一致。
+	// Deposit 签名后的完整充值对象：thresholdSig 已填，TxProof 与签名时的完全一致。
 	Deposit *rtypes.DepositAsset `json:"deposit"`
 
 	// durable 是否已落盘（纯运行时状态，不序列化）。false = 只在内存里（落盘失败），

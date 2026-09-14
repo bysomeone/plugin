@@ -95,8 +95,8 @@ message depositAsset {
     string     depositAddress = 2;
     string     assetSymbol    = 3;
     btcTxProof txProof        = 4;
-    // RGB20 分支的 TSS 阈值签名（DER，对 C=sha256(types.Encode(DepositAsset{threshold_sig:nil}))）
-    bytes      threshold_sig  = 5;
+    // RGB20 分支的 TSS 阈值签名（DER，对 C=sha256(types.Encode(DepositAsset{thresholdSig:nil}))）
+    bytes      thresholdSig   = 5;
 }
 
 message withdrawAsset {
@@ -113,7 +113,7 @@ message crossChainInfo {
     string wrappedSymbol = 2;
     string tssAddress    = 3;
     bytes  pkScript      = 4;
-    // TSS 组公钥（压缩 secp256k1），RGB20 分支验 threshold_sig 用（BL-1）
+    // TSS 组公钥（压缩 secp256k1），RGB20 分支验 thresholdSig 用（BL-1）
     bytes  pubkey        = 5;
 }
 

@@ -250,7 +250,7 @@ RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentLi
 
 - `signedDepositTTL` (int64)
   - 含义：**签名侧"已签集合"的保留期（TTL），单位 = BTC 区块数**（不是秒/小时）。
-  - 作用：签名节点在签出 `threshold_sig`（= chain33 铸币授权）**成功之后**，把那笔 BTC 付款交易的
+  - 作用：签名节点在签出 `thresholdSig`（= chain33 铸币授权）**成功之后**，把那笔 BTC 付款交易的
     `txid` 记进本地已签集合（顶层 bucket `rgb20-signed-deposit`，与 receive/seal 同一个 KVStore）；
     同一个 `txid` 再来时直接拒绝签名，不再进入签名轮次。付款交易所在 BTC 高度记为锚点，
     `链上 canonical tip 高度 - 记录高度 >= signedDepositTTL` 即视为过期：过期记录被清掉，
@@ -269,7 +269,7 @@ RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentLi
     因此只在 TTL > 0 且确有一条记录要判定时才查。
   - 失败取向（fail-closed）：TTL > 0 但链上高度取不到时，**保持拒绝**（按"仍在保留期"处理），
     不会因为查询失败就放行重复签名。
-  - 注意：这条去重是**纵深防御**，不是铸币闸门 —— 即使重复签出 `threshold_sig`，链上也会按 txid
+  - 注意：这条去重是**纵深防御**，不是铸币闸门 —— 即使重复签出 `thresholdSig`，链上也会按 txid
     拒绝第二笔铸造（不多铸）；它挡住的是"给协调者多余的签名产物 + 白跑签名轮次"。
 
 #### 4.4.1 充值提交的深度门控（无配置项）
@@ -284,7 +284,7 @@ RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentLi
 
 #### 4.4.2 签名落盘、重试只重发（无配置项）
 
-充值签名轮次产出的完整 `DepositAsset`（含 `threshold_sig`）会**落盘**（与 receive/seal 同一个 KVStore
+充值签名轮次产出的完整 `DepositAsset`（含 `thresholdSig`）会**落盘**（与 receive/seal 同一个 KVStore
 的顶层 bucket `rgb20-deposit-sig`，key = 付款交易 txid），顺序是**先落盘、再提交**。于是：
 
 - **重试只重发**这份已签对象，不再驱动签名轮次：不再每 30s 空跑一轮 GG18，也不会因为签名节点的

@@ -22,9 +22,9 @@ type DepositRequest struct {
 
 // DepositSignPayload rgb20-deposit 签名轮次消息（BL-3/HR-6）。
 // 主节点经 TssSignNotify.Payload 下发（JSON 编码）；签名节点独立验证后签
-// C = sha256(types.Encode(DepositAsset{threshold_sig:nil}))。
+// C = sha256(types.Encode(DepositAsset{thresholdSig:nil}))。
 type DepositSignPayload struct {
-	Deposit        *rtypes.DepositAsset `json:"deposit"`        // threshold_sig 为空
+	Deposit        *rtypes.DepositAsset `json:"deposit"`        // thresholdSig 为空
 	Consignment    []byte               `json:"consignment"`    // 侧车结算产生的 consignment
 	ReceiveID      string               `json:"receiveId"`      // 归因 receive
 	Chain33Addr    string               `json:"chain33Addr"`    // 地址绑定
@@ -246,7 +246,7 @@ func (a *Adapter) submitDeposit(rec *ReceiveRecord) error {
 			TxIndex:     proof.TxIndex,
 			MerkleProof: proof.MerkleProof,
 		},
-		// threshold_sig 暂空，签名轮次后填充
+		// thresholdSig 暂空，签名轮次后填充
 	}
 	sessionID := fmt.Sprintf("rgbx-deposit-%s-%d", rec.Txid, time.Now().UnixNano())
 	payload := &DepositSignPayload{
@@ -472,7 +472,7 @@ func (a *Adapter) BuildDepositSignMessage(rec *ReceiveRecord, consignment []byte
 		Amount:         rec.Amount,
 		DepositAddress: rec.Chain33Addr,
 		AssetSymbol:    rec.AssetSymbol,
-		// threshold_sig 空；TxProof 由主节点通过 SPV 补齐后填入
+		// thresholdSig 空；TxProof 由主节点通过 SPV 补齐后填入
 	}
 	return &DepositSignPayload{
 		Deposit:        dep,

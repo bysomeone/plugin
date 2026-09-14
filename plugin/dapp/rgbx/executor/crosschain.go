@@ -54,7 +54,7 @@ func (r *rgbx) Exec_CommitDKG(commit *rtypes.CommitDKG, tx *types.Transaction, i
 			WrappedSymbol: formatCrossChainSymbol(symbol),
 			TssAddress:    commit.DkgAddress,
 			PkScript:      commit.PkScript,
-			// RGB20 分支（BL-1）：TSS 组公钥，供 checkDeposit/Exec_Deposit 验 threshold_sig。
+			// RGB20 分支（BL-1）：TSS 组公钥，供 checkDeposit/Exec_Deposit 验 thresholdSig。
 			// 同一 (symbol,address) 的所有 CommitDKG 必须提交相同 pubkey。
 			Pubkey: commit.GetPubkey(),
 		}
@@ -73,7 +73,7 @@ func (r *rgbx) Exec_Deposit(deposit *rtypes.DepositAsset, tx *types.Transaction,
 	receipt := &types.Receipt{Ty: types.ExecOk}
 	txHash := tx.Hash()
 	symbol := ensureCrossChainSymbol(deposit.GetAssetSymbol())
-	// RGB20 分支：防御性复验 threshold_sig（CheckTx 已验，这里防止绕过 CheckTx 直接 Exec）。
+	// RGB20 分支：防御性复验 thresholdSig（CheckTx 已验，这里防止绕过 CheckTx 直接 Exec）。
 	if rtypes.IsRgb20Symbol(deposit.GetAssetSymbol()) {
 		info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
 		if err != nil {

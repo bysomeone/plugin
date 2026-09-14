@@ -163,7 +163,7 @@ func TestSubmitDeposit_FailsClosedWhenGateInputsUnavailable(t *testing.T) {
 }
 
 // TestSubmitDeposit_RetryOnlyResubmits ③：签名产物落盘后，重试只重发、**签名轮次只被驱动一次**；
-// 且重发的对象与签名时那份完全一致（txid/金额/SPV 证明/threshold_sig 都不变，签名才对得上）。
+// 且重发的对象与签名时那份完全一致（txid/金额/SPV 证明/thresholdSig 都不变，签名才对得上）。
 func TestSubmitDeposit_RetryOnlyResubmits(t *testing.T) {
 	bridge := &fakeBridge{}
 	adapter := newDepositTestAdapter(t, bridge, nil)

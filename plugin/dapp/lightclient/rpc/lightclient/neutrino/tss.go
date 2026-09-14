@@ -166,7 +166,7 @@ func (t *tssService) init() {
 	}
 	t.client.submitMainChainTxUntilSuccess(rtypes.RgbxX, rtypes.NameCommitDKGAction, commitDKG)
 	// RGB20 补 CommitDKG（H6）：对每个注册的 RGB20 合约提交带 pubkey 的 CommitDKG，
-	// 否则 checkDeposit/Exec_Deposit 的 RGB20 分支拿不到 CrossChainInfo.Pubkey，无法验 threshold_sig。
+	// 否则 checkDeposit/Exec_Deposit 的 RGB20 分支拿不到 CrossChainInfo.Pubkey，无法验 thresholdSig。
 	if t.client.rgb20 != nil {
 		for _, symbol := range t.client.rgb20.Registry().Symbols() {
 			rgbCommitDKG := &rtypes.CommitDKG{
@@ -399,7 +399,7 @@ func normalizeLowS(sig *ecdsa.Signature) *ecdsa.Signature {
 }
 
 // computeRgb20DepositMsg 计算 RGB20 充值 TSS 签名的消息：
-// C = sha256(types.Encode(DepositAsset{threshold_sig:nil}))，与 rgbx 合约 computeDepositSignMessage 一致。
+// C = sha256(types.Encode(DepositAsset{thresholdSig:nil}))，与 rgbx 合约 computeDepositSignMessage 一致。
 func computeRgb20DepositMsg(dep *rtypes.DepositAsset) []byte {
 	d := proto.Clone(dep).(*rtypes.DepositAsset)
 	d.ThresholdSig = nil
