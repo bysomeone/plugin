@@ -114,6 +114,8 @@ type Chain33Bridge interface {
 	// BuildSpvProof 构造付款 BTC 交易的存在性证明（SPV，对 lightclient 头）。
 	BuildSpvProof(txid string) (*SpvProof, error)
 	// VerifyDepositSpv 签名节点独立验证充值 SPV 证明（对 lightclient 头）。
+	// 实现方必须同时拒绝非规范编码的 TxData（尾部多余字节，A3）：txid 口径的 SPV 本身
+	// 无法区分"同一笔交易的另一份编码"，见 neutrino/rgb20deposit.go。
 	VerifyDepositSpv(proof *rtypes.BtcTxProof) error
 	// SubmitDeposit 提交 rgbx Deposit 交易（RGB20 分支：验 threshold_sig 后铸造）。
 	SubmitDeposit(dep *rtypes.DepositAsset) error

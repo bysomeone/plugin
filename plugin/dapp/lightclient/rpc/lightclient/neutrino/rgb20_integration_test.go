@@ -211,3 +211,33 @@ func Test_normalizeLowS(t *testing.T) {
 	require.False(t, ns.IsOverHalfOrder())
 	require.True(t, norm.Verify(msg, priv.PubKey()))
 }
+
+// Test_VerifyDepositSpv_rejectsNonCanonicalTxData A3（第一半）验收：签名节点在签 C 之前必须拒绝
+// 非规范编码的 TxData（尾部追加字节）——"同一笔支付交易的另一份编码"（txid/merkle 全不变）不得
+// 被签名节点放行，否则签名节点会为被别名化的 deposit 出签名。
+func Test_VerifyDepositSpv_rejectsNonCanonicalTxData(t *testing.T) {
+	tx := wire.NewMsgTx(wire.TxVersion)
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.DoubleHashH([]byte("a3-prevout")), Index: 0}, nil, nil))
+	tx.AddTxOut(wire.NewTxOut(1000, []byte{0x51}))
+	buf := bytes.NewBuffer(make([]byte, 0, tx.SerializeSizeStripped()))
+	require.NoError(t, tx.SerializeNoWitness(buf))
+	raw := buf.Bytes()
+
+	// mainChainGrpc 留空：规范性校验必须先于任何 BTC 头查询。若该校验被去掉，下面的用例会走到
+	// getLightBtcHeader 而 panic（而非返回错误），即测试以失败暴露回归。
+	n := &neutrinoClient{}
+
+	require.EqualError(t, n.VerifyDepositSpv(&rtypes.BtcTxProof{}), "empty spv proof")
+	require.ErrorContains(t, n.VerifyDepositSpv(&rtypes.BtcTxProof{TxData: []byte{0xff, 0xff}}), "decode spv tx")
+
+	for _, extra := range []int{1, 4, 32} {
+		appended := append(append([]byte{}, raw...), bytes.Repeat([]byte{0x00}, extra)...)
+		// 复现前提：尾部追加字节后 txid 不变（SPV 的 txid 口径完全一致），只有原始字节变了。
+		var parsed wire.MsgTx
+		require.NoError(t, parsed.DeserializeNoWitness(bytes.NewReader(appended)))
+		require.Equal(t, tx.TxHash(), parsed.TxHash())
+
+		err := n.VerifyDepositSpv(&rtypes.BtcTxProof{TxData: appended})
+		require.ErrorContainsf(t, err, "non-canonical", "尾部 %d 字节的 TxData 必须被签名节点拒绝", extra)
+	}
+}

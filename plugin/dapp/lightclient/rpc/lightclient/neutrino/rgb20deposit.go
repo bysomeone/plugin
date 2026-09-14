@@ -113,13 +113,23 @@ func (n *neutrinoClient) buildSpvFromPending(pending *btcPendingTx) (*rgb20.SpvP
 
 // VerifyDepositSpv 签名节点独立验证充值 SPV 证明（对 lightclient 头）。
 // 与 rgbx 执行器 validateBtcTxProof 的校验口径一致，供签名节点在签 C 前确认付款交易上链。
+// 另加 TxData 的规范性校验（A3）：与 rgbx 侧 parseBtcTxIDStrict/parseSpendingTxStrict 同一口径，
+// 解析后 reader 必须被完整消费 —— 尾部带多余字节的"另一份编码"不得被签名节点放行。
 func (n *neutrinoClient) VerifyDepositSpv(proof *rtypes.BtcTxProof) error {
 	if proof == nil || len(proof.GetTxData()) == 0 {
 		return fmt.Errorf("empty spv proof")
 	}
+	reader := bytes.NewReader(proof.GetTxData())
 	var btcTx wire.MsgTx
-	if err := btcTx.DeserializeNoWitness(bytes.NewReader(proof.GetTxData())); err != nil {
+	if err := btcTx.DeserializeNoWitness(reader); err != nil {
 		return fmt.Errorf("decode spv tx: %w", err)
+	}
+	// A3（纵深）：btcwire 的 DeserializeNoWitness 只按需读取、不校验 reader 耗尽。给一笔已上链的
+	// 支付交易追加尾部字节后，txid、merkle 证明、金额全部不变，只有原始字节变了 —— 只做 txid 口径
+	// 的 SPV 会放行这类"同一笔交易的另一份编码"，签名节点便为其签出 C（链上由 txid 口径的重复检查兜底，
+	// 但签名节点不应参与放行）。规范编码要求见 rgbx 执行器 checkDeposit/checkConfirm。
+	if reader.Len() != 0 {
+		return fmt.Errorf("non-canonical spv tx data: %d trailing bytes", reader.Len())
 	}
 	header, err := n.getLightBtcHeader(proof.GetBlockHeight())
 	if err != nil {
