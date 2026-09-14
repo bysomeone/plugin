@@ -39,7 +39,13 @@ const maxBtcHeadersPerTx = 64
 
 func (l *lightclient) checkBtcHeaders(tx *types.Transaction, headers *ltypes.BtcHeaders) error {
 
-	if lightCfg.CommitAddress != "" && tx.From() != lightCfg.CommitAddress {
+	// commitAddress 为空时一律拒绝。启动期校验（见 initCfg）已保证正常部署不会留空，
+	// 这里是 fail-closed 兜底：留空意味着"任何人可写头链"，绝不能靠配置疏漏把它打开。
+	if lightCfg.CommitAddress == "" {
+		elog.Error("checkBtcHeaders", "err", "commitAddress not configured, refuse to write btc header chain")
+		return ErrIllegalCommitAddress
+	}
+	if tx.From() != lightCfg.CommitAddress {
 
 		elog.Error("checkBtcHeaders", "from", tx.From(), "configAddress", lightCfg.CommitAddress)
 		return ErrIllegalCommitAddress
