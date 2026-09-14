@@ -58,8 +58,33 @@ func formatWithdrawUsedKey(burnTxHash []byte) []byte {
 	return append([]byte(withdrawUsedKeyPrefix), hash[:]...)
 }
 
+// formatSymbol 归一化 symbol：symbol 是资产的唯一身份（asset key / account key / CrossChainInfo key），
+// 大小写不敏感（"btc" 与 "BTC" 必须落到同一个 key），故统一取大写。
+//
+// 注意 strings.ToUpper 并非单射：非 ASCII 字符会与 ASCII 字母归一化到同一结果
+// （如 "xſ"（U+017F）与 "xs" 都得到 "XS"），使两个不同的 symbol 撞同一个 key —— 可被用来
+// 抢注/别名化另一个 symbol（A6）。因此所有进入共识状态的 symbol 必须先通过
+// isValidSymbolCharset 校验，ToUpper 在该字符集上是单射。
 func formatSymbol(symbol string) string {
 	return strings.ToUpper(symbol)
+}
+
+// isValidSymbolCharset 校验 symbol 只含 ASCII 字母、数字与下划线（A6）。
+// 该字符集是 ToUpper 单射的充分条件（每个字符只映射到自身或对应的大写 ASCII 字母，
+// 且不同字符不会映射到同一结果），可排除 "ſ"→"S"、"ı"→"I"、全角/带音调字符等别名化输入。
+// 下划线是既有合法 symbol 的一部分（rtypes.RGB20USDTSymbol = "RGB20_USDT"），故保留。
+func isValidSymbolCharset(symbol string) bool {
+	if symbol == "" {
+		return false
+	}
+	for i := 0; i < len(symbol); i++ {
+		c := symbol[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func isCrossChainSymbol(symbol string) bool {
