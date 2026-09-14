@@ -80,7 +80,7 @@ type WithdrawNotification struct {
 
 // withdrawRequest 提现请求
 type withdrawRequest struct {
-	chain33WithDrawHash []byte
+	chain33WithdrawHash []byte
 	amount              btcutil.Amount
 	feeRate             btcutil.Amount // sat/byte，0表示使用默认
 	toAddress           string
@@ -683,7 +683,7 @@ func (b *btcWallet) buildWithdrawTx(req *withdrawRequest) (*wire.MsgTx, []int64,
 	}
 
 	// 手动选择UTXO并构建交易
-	tx, inputAmounts, lockedUTXOs, err := b.buildTransaction(outputs, req.feeRate, req.chain33WithDrawHash, true, req.stickyUTXO)
+	tx, inputAmounts, lockedUTXOs, err := b.buildTransaction(outputs, req.feeRate, req.chain33WithdrawHash, true, req.stickyUTXO)
 	if err != nil {
 		return nil, nil, nil, err
 	}

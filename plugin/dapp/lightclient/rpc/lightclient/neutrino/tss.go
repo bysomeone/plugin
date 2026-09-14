@@ -558,13 +558,13 @@ func (t *tssService) validateWithdrawTx(tx *wire.MsgTx, inputAmounts []int64, re
 	btcAddr, err := btcutil.DecodeAddress(req.toAddress, &t.client.neutrinoCfg.ChainParams)
 	if err != nil {
 		log.Error("validateWithdrawTx decode address", "err", err, "address", req.toAddress,
-			"withdrawTxHash", hex.EncodeToString(req.chain33WithDrawHash))
+			"withdrawTxHash", hex.EncodeToString(req.chain33WithdrawHash))
 		return fmt.Errorf("decode address failed")
 	}
 	btcAddrScript, err := txscript.PayToAddrScript(btcAddr)
 	if err != nil {
 		log.Error("validateWithdrawTx pay to addr script", "address", req.toAddress,
-			"withdrawTxHash", hex.EncodeToString(req.chain33WithDrawHash), "err", err)
+			"withdrawTxHash", hex.EncodeToString(req.chain33WithdrawHash), "err", err)
 		return fmt.Errorf("pay to addr script failed")
 	}
 	var withdrawAmount, changeAmount int64
@@ -579,7 +579,7 @@ func (t *tssService) validateWithdrawTx(tx *wire.MsgTx, inputAmounts []int64, re
 		if !bytes.Equal(output.PkScript, btcAddrScript) {
 			log.Error("validateWithdrawTx unexpected output script", "address", req.toAddress,
 				"expected", hex.EncodeToString(btcAddrScript), "actual", hex.EncodeToString(output.PkScript),
-				"withdrawTxHash", hex.EncodeToString(req.chain33WithDrawHash))
+				"withdrawTxHash", hex.EncodeToString(req.chain33WithdrawHash))
 			return fmt.Errorf("unexpected output script")
 		}
 		withdrawAmount += output.Value
@@ -598,7 +598,7 @@ func (t *tssService) validateWithdrawTx(tx *wire.MsgTx, inputAmounts []int64, re
 	// 控制手续费在合理范围内
 	if fee > 2*expectedFee || fee < 0 {
 		log.Error("validateWithdrawSignNotify invalid fee", "fee", fee, "expected", expectedFee,
-			"withdrawTxHash", hex.EncodeToString(req.chain33WithDrawHash))
+			"withdrawTxHash", hex.EncodeToString(req.chain33WithdrawHash))
 		return fmt.Errorf("invalid fee")
 	}
 	// 验证提现的关键是总支出不能超过提现金额，允许的最大磨损不能超过最小找零金额
@@ -606,21 +606,21 @@ func (t *tssService) validateWithdrawTx(tx *wire.MsgTx, inputAmounts []int64, re
 		log.Error("validateWithdrawSignNotify withdraw overflowed",
 			"actualWithdraw", withdrawAmount, "changeAmount", changeAmount,
 			"totalInput", totalInput, "expectWithdraw", int64(req.amount),
-			"withdrawTxHash", hex.EncodeToString(req.chain33WithDrawHash))
+			"withdrawTxHash", hex.EncodeToString(req.chain33WithdrawHash))
 		return fmt.Errorf("withdraw overflowed")
 	}
 	if withdrawAmount > int64(req.amount) || withdrawAmount < minChangeAmount {
 		log.Error("validateWithdrawSignNotify invalid withdraw amount", "actualWithdraw", withdrawAmount,
-			"expectWithdraw", int64(req.amount), "withdrawTxHash", hex.EncodeToString(req.chain33WithDrawHash))
+			"expectWithdraw", int64(req.amount), "withdrawTxHash", hex.EncodeToString(req.chain33WithdrawHash))
 		return fmt.Errorf("invalid withdraw amount")
 	}
 	return nil
 }
 
-func (t *tssService) checkNonOfficialWithdrawSign(chain33WithDrawHash []byte) (*rtypes.PendingTx, error) {
+func (t *tssService) checkNonOfficialWithdrawSign(chain33WithdrawHash []byte) (*rtypes.PendingTx, error) {
 
-	txHash := hex.EncodeToString(chain33WithDrawHash)
-	pendingTx, err := t.client.getRgbxPendingTxByHash(chain33WithDrawHash)
+	txHash := hex.EncodeToString(chain33WithdrawHash)
+	pendingTx, err := t.client.getRgbxPendingTxByHash(chain33WithdrawHash)
 	if err != nil {
 		log.Error("checkNonOfficialWithdrawSign getRgbxPendingTxByHash", "txHash", txHash, "err", err)
 		return nil, err
@@ -631,24 +631,24 @@ func (t *tssService) checkNonOfficialWithdrawSign(chain33WithDrawHash []byte) (*
 	return pendingTx, nil
 }
 
-func (t *tssService) checkStickyInput(chain33WithDrawHash []byte, tx *wire.MsgTx) error {
+func (t *tssService) checkStickyInput(chain33WithdrawHash []byte, tx *wire.MsgTx) error {
 	if len(tx.TxIn) == 0 {
 		return fmt.Errorf("withdraw tx has no inputs")
 	}
 	stickyOutPoint := tx.TxIn[len(tx.TxIn)-1].PreviousOutPoint.String()
 	// 验证绑定的哈希是否一致
 	expectedHash := t.client.getExpectedWithdrawHash(stickyOutPoint)
-	if len(expectedHash) > 0 && !bytes.Equal(expectedHash, chain33WithDrawHash) {
+	if len(expectedHash) > 0 && !bytes.Equal(expectedHash, chain33WithdrawHash) {
 		log.Error("checkStickyInput sticky input mismatch", "expected", hex.EncodeToString(expectedHash),
-			"actual", hex.EncodeToString(chain33WithDrawHash), "stickyOutPoint", stickyOutPoint)
+			"actual", hex.EncodeToString(chain33WithdrawHash), "stickyOutPoint", stickyOutPoint)
 		return fmt.Errorf("invalid sticky input")
 	}
 
 	// 如果本地已记录过成功签名的绑定utxo，后续请求必须一致
-	expectUTXO := t.client.getWithdrawStickyUTXO(chain33WithDrawHash)
+	expectUTXO := t.client.getWithdrawStickyUTXO(chain33WithdrawHash)
 	if expectUTXO != nil && expectUTXO.OutPoint.String() != stickyOutPoint {
 		log.Error("checkStickyInput sticky input changed", "expected", expectUTXO.OutPoint.String(),
-			"actual", stickyOutPoint, "chain33WithDrawHash", hex.EncodeToString(chain33WithDrawHash))
+			"actual", stickyOutPoint, "chain33WithdrawHash", hex.EncodeToString(chain33WithdrawHash))
 		return fmt.Errorf("invalid sticky input")
 	}
 	return nil
@@ -709,23 +709,23 @@ func (t *tssService) handleSignNotify(msg []byte) {
 	}
 
 	if notify.TxType == transactionTypeWithdraw {
-		chain33WithDrawHash := notify.Payload
-		if err = t.checkStickyInput(chain33WithDrawHash, tx); err != nil {
+		chain33WithdrawHash := notify.Payload
+		if err = t.checkStickyInput(chain33WithdrawHash, tx); err != nil {
 			log.Error("handleSignNotify checkStickyInput", "err", err,
-				"withDrawHash", hex.EncodeToString(chain33WithDrawHash), "btcHash", tx.TxHash().String())
+				"withDrawHash", hex.EncodeToString(chain33WithdrawHash), "btcHash", tx.TxHash().String())
 			return
 		}
-		pendingTx, err := t.checkNonOfficialWithdrawSign(chain33WithDrawHash)
+		pendingTx, err := t.checkNonOfficialWithdrawSign(chain33WithdrawHash)
 		if err != nil {
 			log.Error("handleSignNotify checkNonOfficialWithdrawSign", "type", notify.TxType,
-				"withDrawHash", hex.EncodeToString(chain33WithDrawHash), "btcHash", tx.TxHash().String(), "err", err)
+				"withDrawHash", hex.EncodeToString(chain33WithdrawHash), "btcHash", tx.TxHash().String(), "err", err)
 			return
 		}
 		req := pending2WithdrawRequest(pendingTx)
 		err = t.validateWithdrawTx(tx, inputAmounts, req)
 		if err != nil {
 			log.Error("handleSignNotify validateWithdrawTx", "err", err,
-				"withdrawHash", hex.EncodeToString(chain33WithDrawHash), "btcHash", tx.TxHash().String())
+				"withdrawHash", hex.EncodeToString(chain33WithdrawHash), "btcHash", tx.TxHash().String())
 			return
 		}
 	}

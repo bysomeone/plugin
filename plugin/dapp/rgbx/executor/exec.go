@@ -141,7 +141,7 @@ func (r *rgbx) Exec_Confirm(confirm *rtypes.ConfirmTx, tx *types.Transaction, in
 	if confirm.GetTimeout() {
 		return &types.Receipt{Ty: types.ExecOk}, nil
 	}
-	if confirm.ActionType == rtypes.TyWithDrawAsset {
+	if confirm.ActionType == rtypes.TyWithdrawAsset {
 		return r.confirmWithdrawSettlement(confirm, txHash, confirmHash)
 	}
 

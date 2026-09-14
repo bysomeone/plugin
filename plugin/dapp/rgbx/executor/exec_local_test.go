@@ -141,14 +141,14 @@ func TestRgbx_ExecLocal_WithdrawAsset(t *testing.T) {
 	defer util.CloseTestDB(dir, db)
 	r.SetLocalDB(local)
 	kvSet, err := r.ExecLocal(tx, &types.ReceiptData{Logs: []*types.ReceiptLog{{
-		Ty: rtypes.TyPendingTxLog, Log: types.Encode(&rtypes.PendingTx{ActionType: rtypes.TyWithDrawAsset})}}}, 0)
+		Ty: rtypes.TyPendingTxLog, Log: types.Encode(&rtypes.PendingTx{ActionType: rtypes.TyWithdrawAsset})}}}, 0)
 	require.Nil(t, err)
 	testSetKV(t, db, kvSet, false)
 
 	pendTx := &rtypes.PendingTx{}
 	key := formatPendingTxKey(0, 0)
 	require.Nil(t, readDB(local, key, pendTx))
-	require.Equal(t, int32(rtypes.TyWithDrawAsset), pendTx.ActionType)
+	require.Equal(t, int32(rtypes.TyWithdrawAsset), pendTx.ActionType)
 
 	kvSet, err = r.ExecDelLocal(tx, nil, 0)
 	require.Nil(t, err)

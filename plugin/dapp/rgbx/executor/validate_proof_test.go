@@ -400,7 +400,7 @@ func Test_checkWithdrawConfirm_burnReplayGuard(t *testing.T) {
 	for i, burn := range [][]byte{burnA, burnB} {
 		require.NoError(t, state.Set(formatPayloadKey(burn), types.Encode(withdraw)))
 		require.NoError(t, local.Set(formatPendingTxKey(3, int64(i)), types.Encode(&rtypes.PendingTx{
-			ActionType:    rtypes.TyWithDrawAsset,
+			ActionType:    rtypes.TyWithdrawAsset,
 			TxBlockHeight: 3,
 			TxIndex:       int64(i),
 			TxHash:        burn,
@@ -414,7 +414,7 @@ func Test_checkWithdrawConfirm_burnReplayGuard(t *testing.T) {
 	action.Value = value
 	confirmOf := func(burn []byte, idx int) *rtypes.ConfirmTx {
 		return &rtypes.ConfirmTx{
-			ActionType:    rtypes.TyWithDrawAsset,
+			ActionType:    rtypes.TyWithdrawAsset,
 			TxBlockHeight: 3,
 			TxIndex:       int64(idx),
 			TxHash:        burn,

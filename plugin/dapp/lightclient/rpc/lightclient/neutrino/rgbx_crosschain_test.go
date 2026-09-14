@@ -30,10 +30,10 @@ func Test_pending2WithdrawRequest(t *testing.T) {
 		Amount:        100_000,
 		FeeRate:       10,
 		TargetAddress: "bcrt1qexample",
-		ActionType:    rtypes.TyWithDrawAsset,
+		ActionType:    rtypes.TyWithdrawAsset,
 	}
 	req := pending2WithdrawRequest(pending)
-	require.Equal(t, pending.GetTxHash(), req.chain33WithDrawHash)
+	require.Equal(t, pending.GetTxHash(), req.chain33WithdrawHash)
 	require.Equal(t, int64(100_000), int64(req.amount))
 	require.Equal(t, int64(10), int64(req.feeRate))
 	require.Equal(t, "bcrt1qexample", req.toAddress)

@@ -128,7 +128,7 @@ func (r *rgbx) pullPendingTx() {
 					continue
 				}
 				r.pendingCache.addTx(txHash, tx)
-				if tx.GetActionType() == rtypes.TyWithDrawAsset {
+				if tx.GetActionType() == rtypes.TyWithdrawAsset {
 					r.client.withdrawReqChan <- tx
 					continue
 				}

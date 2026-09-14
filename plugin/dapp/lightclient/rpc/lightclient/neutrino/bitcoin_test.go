@@ -87,12 +87,12 @@ func TestPending2WithdrawRequest(t *testing.T) {
 		Amount:        amount,
 		FeeRate:       feeRate,
 		TargetAddress: toAddress,
-		ActionType:    rtypes.TyWithDrawAsset,
+		ActionType:    rtypes.TyWithdrawAsset,
 	}
 
 	req := pending2WithdrawRequest(pending)
 
-	assert.Equal(t, chain33Hash, req.chain33WithDrawHash)
+	assert.Equal(t, chain33Hash, req.chain33WithdrawHash)
 	assert.Equal(t, btcutil.Amount(amount), req.amount)
 	assert.Equal(t, btcutil.Amount(feeRate), req.feeRate)
 	assert.Equal(t, toAddress, req.toAddress)
