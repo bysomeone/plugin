@@ -8,6 +8,8 @@ var (
 	ErrBtcGetLastHeader     = errors.New("ErrBtcGetLastHeader")
 	ErrIllegalCommitAddress = errors.New("ErrIllegalCommitAddress")
 	ErrBtcHeaderDisorder    = errors.New("ErrBtcHeaderDisorder")
+	// ErrBtcHeaderNoAnchor bootstrap 时的首个头无法锚定到该网络的真实链
+	ErrBtcHeaderNoAnchor = errors.New("ErrBtcHeaderNoAnchor")
 
 	ErrBtcTargetBits        = errors.New("ErrBtcTargetBits")
 	ErrBtcHeaderTimeTooOld  = errors.New("ErrBtcHeaderTimeTooOld")
