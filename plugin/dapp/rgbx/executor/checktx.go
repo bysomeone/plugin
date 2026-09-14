@@ -11,9 +11,7 @@ import (
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
-	"github.com/btcsuite/btcd/wire"
 )
 
 var (
@@ -66,6 +64,9 @@ var (
 	// 文案保留 "already confirmed" 子串：桥侧重试路径按该子串把重复提交视为幂等成功
 	// （neutrino commitWithdrawConfirm 对含 "already confirmed" 的错误不再重试）。
 	ErrWithdrawAlreadyConfirmed = errors.New("withdraw already confirmed")
+	// ErrNonCanonicalSpendingTx SpendingTx 尾部带多余字节（非规范编码）——同一笔花费的另一份编码，
+	// 必须拒绝：否则归属 utxo id 会随编码变化（E1 家族 A2，口径同充值侧 parseBtcTxIDStrict）。
+	ErrNonCanonicalSpendingTx = errors.New("non-canonical spending tx encoding")
 )
 
 const (
@@ -447,16 +448,18 @@ func (r *rgbx) checkConfirm(fromAddr, txHash string, confirm *rtypes.ConfirmTx) 
 		return nil
 	}
 
-	btcSpendHash := chainhash.DoubleHashH(confirm.GetUtxoProof().GetSpendingTx()).String()
-	spendingTx := wire.MsgTx{}
-	err = spendingTx.DeserializeNoWitness(bytes.NewReader(confirm.GetUtxoProof().GetSpendingTx()))
+	// A2：SpendingTx 必须是规范编码（解析后无尾部多余字节）。btcwire 的 DeserializeNoWitness
+	// 不做该项校验，给同一笔花费追加尾部字节后输入/OP_RETURN 承诺比对都不变、只有原始字节变，
+	// 而归属 utxo id 由该交易导出 → 同一笔花费会被记到另一个 owner id。
+	// 归属 id 的口径同时改为解析后的交易身份 TxHash()（见 Exec_Confirm），与充值侧 txid 口径一致。
+	spendingTx, err := parseSpendingTxStrict(txHash, confirm.GetUtxoProof().GetSpendingTx())
 	if err != nil {
-		elog.Error("checkConfirm decode spending tx", "action", action,
+		elog.Error("checkConfirm parse spending tx", "action", action,
 			"txHash", txHash, "confirmTxHash", hex.EncodeToString(confirm.GetTxHash()),
-			"btcSpendingTx", hex.EncodeToString(confirm.GetUtxoProof().GetSpendingTx()),
-			"decode err", err)
-		return ErrDecodeBtcTx
+			"btcSpendingTxLen", len(confirm.GetUtxoProof().GetSpendingTx()), "err", err)
+		return err
 	}
+	btcSpendHash := spendingTx.TxHash().String()
 
 	spendingInputIdx := int(confirm.GetUtxoProof().GetSpendingInputIdx())
 	if spendingInputIdx >= len(spendingTx.TxIn) {

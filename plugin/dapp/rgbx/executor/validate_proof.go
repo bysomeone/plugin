@@ -182,6 +182,33 @@ func parseBtcTxIDStrict(txHash string, txData []byte) ([]byte, error) {
 	return txID.CloneBytes(), nil
 }
 
+// parseSpendingTxStrict 解析 UtxoSpendingProof.SpendingTx 并要求其为规范编码（E1 家族 A2）。
+// 与充值侧 parseBtcTxIDStrict 同一口径：解析后 reader 必须被完整消费，尾部多余字节直接拒绝。
+//
+// btcwire 的 DeserializeNoWitness 只按需读取、不校验 reader 是否耗尽：给同一笔花费追加尾部字节后，
+// 解析结果（输入 outpoint、OP_RETURN 承诺）完全不变，只有原始字节变了。因此
+//   - SpendingTx 必须能被严格解析（本函数）；
+//   - 归属 utxo id 必须由解析后的交易身份 TxHash() 导出，不能对原始字节取 DoubleHashH，
+//     否则同一笔花费可被记到另一个 owner id（见 Exec_Confirm）。
+func parseSpendingTxStrict(txHash string, txData []byte) (*wire.MsgTx, error) {
+	if len(txData) == 0 {
+		elog.Error("parseSpendingTxStrict empty spending tx", "txHash", txHash)
+		return nil, ErrDecodeBtcTx
+	}
+	reader := bytes.NewReader(txData)
+	spendingTx := &wire.MsgTx{}
+	if err := spendingTx.DeserializeNoWitness(reader); err != nil {
+		elog.Error("parseSpendingTxStrict decode spending tx", "txHash", txHash, "err", err)
+		return nil, ErrDecodeBtcTx
+	}
+	if reader.Len() != 0 {
+		elog.Error("parseSpendingTxStrict trailing bytes after spending tx", "txHash", txHash,
+			"txDataLen", len(txData), "trailingLen", reader.Len())
+		return nil, ErrNonCanonicalSpendingTx
+	}
+	return spendingTx, nil
+}
+
 func (r *rgbx) validateBtcTxProof(txHash string, proof *rtypes.BtcTxProof) (*wire.MsgTx, error) {
 	if proof == nil || len(proof.GetTxData()) == 0 {
 		elog.Error("validateBtcTxProof empty btc proof", "txHash", txHash)
