@@ -404,7 +404,7 @@ Sticky 机制强制要求：**同一提现请求的所有重试必须复用最�
 IsOfficialNode = true                    # 必须: 标记为官方节点，负责提交区块头和SPV
 
 # BTC区块头同步
-BtcHeaderStartHeight = 840000            # 首次同步的起始高度(建议当前高度-1000)
+BtcHeaderStartHeight = 810001            # 首次同步的起始高度 = 本网络最高锚点 + 1（mainnet 当前 810000；见 CONFIG.md 2.1.1）
 BlockConfirmations = 6                   # 提交前需要的确认数
 BtcBlockInterval = 600                   # BTC平均出块间隔(秒)
 
