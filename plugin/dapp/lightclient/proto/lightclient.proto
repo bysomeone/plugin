@@ -23,12 +23,39 @@ message BtcHeader {
     string nextHash      = 11;
 }
 
+// BtcChainNode 头链索引项：canonical 链上某个区块的高度、hash 与其累积工作量。
+// work 是自本链第一次记录状态时那个节点（work=0）起算的累积值（256-bit 大端，允许少于 32 字节，
+// 空 bytes 表示 0），只用于分支之间比较大小，绝对值无外部含义。
+message BtcChainNode {
+    uint64 height = 1;
+    string hash   = 2;
+    bytes  work   = 3;
+}
+
+// BtcChainState 头链状态（statedb，共识数据）：canonical 链最近 btcWorkWindowSize 个区块的索引窗口。
+// 窗口里的任何一个节点都可以作为竞争分支的挂载点（分叉点），其 work 就是该分支的起算工作量；
+// 窗口大小与允许回退的最大深度配套，因此状态不会无限增长。
+message BtcChainState {
+    // nodes 按高度升序，最后一个即当前 canonical tip。
+    repeated BtcChainNode nodes = 1;
+}
+
 message BtcHeadersLog {
     uint64 confirmations = 1;
     uint64 lastHeight    = 2;
     uint64 commitHeight  = 3;
     string lastHash      = 4;
     string commitHash    = 5;
+    // ---- B3/B4（reorg 回退 + 按累积工作量选链）新增字段 ----
+    // forkHeight 本批首个头所挂载的父块高度（bootstrap 时为首个头的父块高度，可能为 0）。
+    uint64 forkHeight        = 6;
+    // canonicalSwitched 本批是否把 canonical tip 切换成了本批 tip（false = 本批是更轻的分叉，只验不切）。
+    bool   canonicalSwitched = 7;
+    // tipWork 本批 tip 的累积工作量（大端），便于排查"为什么没切换"。
+    bytes  tipWork           = 8;
+    // reorgRuleVersion 写出本日志的规则版本；0 表示 B3/B4 之前的老日志（历史区块重放会看到），
+    // ExecLocal 据此走兼容分支（只按高度写入、不做回退删除）。
+    uint32 reorgRuleVersion  = 9;
 }
 
 message BtcHeaders {

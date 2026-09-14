@@ -51,7 +51,12 @@ func (l *lightclient) checkBtcHeaders(tx *types.Transaction, headers *ltypes.Btc
 		return ErrIllegalCommitAddress
 	}
 
-	prevHeader, err := getBtcLastHeader(l.GetStateDB())
+	state, err := loadBtcChainState(l.GetStateDB(), l.GetLocalDB())
+	if err != nil {
+		elog.Error("checkBtcHeaders", "loadBtcChainState err", err)
+		return ErrBtcGetLastHeader
+	}
+	tipHeader, err := getBtcLastHeader(l.GetStateDB())
 	if err != nil {
 		elog.Error("checkBtcHeaders", "getBtcLastHeader err", err)
 		return ErrBtcGetLastHeader
@@ -83,13 +88,34 @@ func (l *lightclient) checkBtcHeaders(tx *types.Transaction, headers *ltypes.Btc
 	params := ltypes.GetBtcChainParams(lightCfg.BtcNetName)
 	chainCtx := newBtcChainContext(params)
 	timeSource := blockchain.NewMedianTime()
-	isBootstrap := prevHeader == nil || prevHeader.GetHash() == ""
+
+	// B3/B4：本批必须挂到 canonical 链最近窗口里的某个节点上（分叉点可回退但深度受限），
+	// 且挂载/选链决策与 Exec 同源（见 planBtcHeaders）。超深度的分叉在这里就被拒（fail-closed）。
+	if _, err = planBtcHeaders(state, list); err != nil {
+		elog.Error("checkBtcHeaders planBtcHeaders reject", "firstHeight", list[0].GetHeight(),
+			"firstHash", list[0].GetHash(), "prevHash", list[0].GetPreviousHash(), "err", err)
+		return err
+	}
+
+	// isBootstrap：链上还没有任何 BTC 头，首个头必须锚定到真实链（创世/已知锚点/localDB 可回溯），
+	// 否则任何人都能自造一条短链作为头链起点（见 checkBootstrapAnchor）。
+	isBootstrap := len(state.GetNodes()) == 0
 	var prevCtx blockchain.HeaderCtx
+	var prevHeader *ltypes.BtcHeader
 	if !isBootstrap {
+		attach, err := findBtcAttachNode(state, list[0])
+		if err != nil {
+			elog.Error("checkBtcHeaders findBtcAttachNode reject", "height", list[0].GetHeight(),
+				"hash", list[0].GetHash(), "prevHash", list[0].GetPreviousHash(), "err", err)
+			return err
+		}
+		// 挂载点的完整头：校验难度调整与时间需要它的 bits/时间戳/祖先链。
+		prevHeader, err = resolveBtcAttachHeader(attach, tipHeader, l.GetLocalDB())
+		if err != nil {
+			return err
+		}
 		prevCtx = newBtcHeaderContext(prevHeader, nil, l.GetLocalDB())
 	} else if err = checkBootstrapAnchor(list[0], params, l.GetLocalDB()); err != nil {
-		// 链上还没有任何 BTC 头：首个头必须锚定到真实链（创世/已知锚点/localDB 可回溯），
-		// 否则任何人都能自造一条短链作为头链起点（见 checkBootstrapAnchor）。
 		elog.Error("checkBtcHeaders bootstrap anchor reject", "height", list[0].GetHeight(),
 			"hash", list[0].GetHash(), "prevHash", list[0].GetPreviousHash(), "err", err)
 		return err
@@ -97,8 +123,8 @@ func (l *lightclient) checkBtcHeaders(tx *types.Transaction, headers *ltypes.Btc
 
 	for _, h := range list {
 
-		// 首次提交也要保证本批 headers 内部严格连续；仅首个header允许无前置锚点。
-		if prevHeader.GetHash() != "" && (prevHeader.Height+1 != h.GetHeight() || prevHeader.Hash != h.PreviousHash) {
+		// 本批与挂载点（首个头）以及批内头之间必须严格连续：高度逐个 +1 且 prevHash 对得上。
+		if prevHeader != nil && (prevHeader.Height+1 != h.GetHeight() || prevHeader.Hash != h.PreviousHash) {
 			elog.Error("checkBtcHeaders", "prevHeight", prevHeader.Height, "prevHash", prevHeader.Hash,
 				"commitHeight", h.GetHeight(), "commitPrevHash", h.GetPreviousHash())
 			return ErrBtcHeaderDisorder

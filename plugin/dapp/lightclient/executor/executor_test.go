@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math/big"
 	"testing"
 	"time"
 
@@ -112,10 +113,21 @@ func TestLightclientCheckBtcHeaders(t *testing.T) {
 		require.Equal(t, types.ErrInvalidParam, cli.CheckTx(tx, 0))
 	})
 
-	t.Run("header disorder", func(t *testing.T) {
+	t.Run("unknown ancestor", func(t *testing.T) {
+		// B3/B4：首个头的父块必须是 canonical 链最近窗口里的已知区块。这里把 prevHash 改成零值，
+		// 高度对得上（100）但 hash 对不上，属于"分叉点无从确认"，fail-closed。
 		bad := cloneHeader(next)
 		bad.PreviousHash = chainhash.Hash{}.String()
 		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{bad}}, commitPriv)
+		require.Equal(t, ErrBtcHeaderUnknownAncestor, cli.CheckTx(tx, 0))
+	})
+
+	t.Run("batch internal disorder", func(t *testing.T) {
+		// 批内头之间必须严格连续（高度 +1 且 prevHash 对得上）。
+		third := mineBtcHeader(t, next, 102, regtest.PowLimitBits, ts.Add(3*time.Minute))
+		bad := cloneHeader(third)
+		bad.PreviousHash = chainhash.Hash{}.String()
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{next, bad}}, commitPriv)
 		require.Equal(t, ErrBtcHeaderDisorder, cli.CheckTx(tx, 0))
 	})
 
@@ -311,20 +323,29 @@ func TestLightclientExecBtcHeaders(t *testing.T) {
 		setupTestDriver(t, cli)
 		cli.SetStateDB(stateDB)
 
-		prev := &ltypes.BtcHeader{Height: 100, Hash: "prevhash"}
+		prev := &ltypes.BtcHeader{Height: 100, Hash: "prevhash", Bits: int64(chaincfg.RegressionNetParams.PowLimitBits)}
 		require.NoError(t, stateDB.Set(btcLastHeaderKey(), types.Encode(prev)))
-		commit := &ltypes.BtcHeader{Height: 101, Hash: "commithash", Confirmations: 6}
+		commit := &ltypes.BtcHeader{Height: 101, Hash: "commithash", PreviousHash: prev.Hash,
+			Bits: int64(chaincfg.RegressionNetParams.PowLimitBits), Confirmations: 6}
 
 		recp, err := cli.Exec_BtcHeaders(&ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{commit}}, &types.Transaction{}, 0)
 		require.NoError(t, err)
 		require.EqualValues(t, types.ExecOk, recp.Ty)
-		require.Len(t, recp.KV, 1)
+		// B3/B4：切换 canonical tip 时同时写 tip 与链索引窗口
+		require.Len(t, recp.KV, 2)
 		require.Equal(t, btcLastHeaderKey(), recp.KV[0].Key)
+		require.Equal(t, btcChainStateKey(), recp.KV[1].Key)
 
 		saved := &ltypes.BtcHeader{}
 		require.NoError(t, types.Decode(recp.KV[0].Value, saved))
 		require.Equal(t, commit.Height, saved.Height)
 		require.Equal(t, commit.Hash, saved.Hash)
+
+		state := &ltypes.BtcChainState{}
+		require.NoError(t, types.Decode(recp.KV[1].Value, state))
+		require.Equal(t, []uint64{100, 101}, chainHeights(state))
+		require.Equal(t, commit.Hash, state.GetNodes()[1].GetHash())
+		require.NotEmpty(t, state.GetNodes()[1].GetWork, "每个候选节点都要带累积工作量")
 
 		require.Len(t, recp.Logs, 1)
 		log := &ltypes.BtcHeadersLog{}
@@ -334,6 +355,11 @@ func TestLightclientExecBtcHeaders(t *testing.T) {
 		require.Equal(t, commit.Height, log.CommitHeight)
 		require.Equal(t, commit.Hash, log.CommitHash)
 		require.Equal(t, commit.Confirmations, log.Confirmations)
+		// B3/B4 新增字段：扩展是"挂载在旧 tip 上"的切换
+		require.EqualValues(t, 100, log.ForkHeight)
+		require.True(t, log.CanonicalSwitched)
+		require.EqualValues(t, btcReorgRuleVersion, log.ReorgRuleVersion)
+		require.NotEmpty(t, log.TipWork)
 	})
 }
 
@@ -348,16 +374,32 @@ func TestLightclientExecLocalBtcHeaders(t *testing.T) {
 
 	h1 := &ltypes.BtcHeader{Height: 11, Hash: "h11"}
 	h2 := &ltypes.BtcHeader{Height: 12, Hash: "h12"}
+	// 旧 canonical 头：高度 11..12 上原来的头，切换后它们的可查性必须被撤掉
+	old1 := &ltypes.BtcHeader{Height: 11, Hash: "old11"}
+	old2 := &ltypes.BtcHeader{Height: 12, Hash: "old12"}
+	require.NoError(t, localDB.Set(btcHeaderKey(old1.Height), types.Encode(old1)))
+	require.NoError(t, localDB.Set(btcHeaderHashHeightKey(old1.Hash), types.Encode(&types.Int64{Data: int64(old1.Height)})))
+	require.NoError(t, localDB.Set(btcHeaderKey(old2.Height), types.Encode(old2)))
+
 	tx := &types.Transaction{Execer: []byte(ltypes.LightclientX)}
-	dbSet, err := cli.ExecLocal_BtcHeaders(&ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{h1, h2}}, tx, nil, 0)
+	receiptData := &types.ReceiptData{Logs: []*types.ReceiptLog{
+		{Ty: ltypes.TyBtcHeadersLog, Log: types.Encode(&ltypes.BtcHeadersLog{
+			LastHeight: 12, ForkHeight: 10, CanonicalSwitched: true,
+			TipWork: big.NewInt(1).Bytes(), ReorgRuleVersion: btcReorgRuleVersion,
+		})},
+	}}
+	dbSet, err := cli.ExecLocal_BtcHeaders(&ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{h1, h2}}, tx, receiptData, 0)
 	require.NoError(t, err)
 	require.NotNil(t, dbSet)
-	require.GreaterOrEqual(t, len(dbSet.KV), 4)
 
 	require.True(t, hasKV(dbSet.KV, btcHeaderKey(h1.Height)))
 	require.True(t, hasKV(dbSet.KV, btcHeaderHashHeightKey(h1.Hash)))
 	require.True(t, hasKV(dbSet.KV, btcHeaderKey(h2.Height)))
 	require.True(t, hasKV(dbSet.KV, btcHeaderHashHeightKey(h2.Hash)))
+	// 被替换掉的旧 canonical 高度（11、12 = [forkHeight+1, lastHeight]）与旧 hash 索引一起删除
+	require.True(t, hasKV(dbSet.KV, btcHeaderHashHeightKey(old1.Hash)))
+	require.Equal(t, []byte(nil), kvValue(dbSet.KV, btcHeaderKey(old1.Height)))
+	require.Equal(t, []byte(nil), kvValue(dbSet.KV, btcHeaderKey(old2.Height)))
 }
 
 // TestBtcHeadersPerTxLimit 覆盖 B7：单笔交易的头数上限。
@@ -594,6 +636,16 @@ func hasKV(kvs []*types.KeyValue, key []byte) bool {
 		}
 	}
 	return false
+}
+
+// kvValue 取 key 对应的 value；key 不存在返回 (nil, false) 语义下的 nil（测试里只用于断言"删除"）。
+func kvValue(kvs []*types.KeyValue, key []byte) []byte {
+	for _, kv := range kvs {
+		if bytes.Equal(kv.Key, key) {
+			return kv.GetValue()
+		}
+	}
+	return nil
 }
 
 func cloneHeader(h *ltypes.BtcHeader) *ltypes.BtcHeader {

@@ -21,6 +21,11 @@ func btcLastHeaderKey() []byte {
 	return []byte(KeyPrefixStateDB + "btc-lastheader")
 }
 
+// btcChainStateKey B3/B4：canonical 头链最近若干节点的索引窗口（含每个节点的累积工作量）
+func btcChainStateKey() []byte {
+	return []byte(KeyPrefixStateDB + "btc-chainstate")
+}
+
 // localdb
 
 func btcHeaderKey(height uint64) []byte {
