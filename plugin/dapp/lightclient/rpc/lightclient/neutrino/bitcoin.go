@@ -161,7 +161,7 @@ func (n *neutrinoClient) submitBtcHeadersOnce(r *btcHeaderReconciler, st *btcHea
 	}
 	top := headers[len(headers)-1].GetHeight()
 	payload := &ltypes.BtcHeaders{Headers: headers}
-	txHash, submitErr := n.submitMainchainTx(ltypes.LightclientX, ltypes.NameBtcHeadersAction, payload)
+	txHash, submitErr := n.submitMainChainTx(ltypes.LightclientX, ltypes.NameBtcHeadersAction, payload)
 	result := classifyBtcHeaderSubmitErr(submitErr)
 
 	switch result {
@@ -277,7 +277,7 @@ func (n *neutrinoClient) commitDepositTx(pendingTx *btcPendingTx) error {
 			MerkleProof: spv.GetBranchProof(),
 		},
 	}
-	n.submitMainchainTxUntilSuccess(rtypes.RgbxX, rtypes.NameDepositAssetAction, deposit)
+	n.submitMainChainTxUntilSuccess(rtypes.RgbxX, rtypes.NameDepositAssetAction, deposit)
 	if err = n.setDepositState(pendingTx.txHash[:], depositStatusProcessed); err != nil {
 		log.Error("commitDepositTx setDepositState processed", "txHash", pendingTx.txHash.String(), "err", err)
 	}
@@ -673,7 +673,7 @@ func (n *neutrinoClient) withdrawalProcessor() {
 
 func (n *neutrinoClient) commitWithdrawConfirm(confirm *rtypes.ConfirmTx, confirmHash string) (string, error) {
 
-	txHash, err := n.submitMainchainTx(rtypes.RgbxX, rtypes.NameConfirmAction, confirm)
+	txHash, err := n.submitMainChainTx(rtypes.RgbxX, rtypes.NameConfirmAction, confirm)
 	if err != nil && !strings.Contains(err.Error(), "already confirmed") {
 		return "", err
 	}

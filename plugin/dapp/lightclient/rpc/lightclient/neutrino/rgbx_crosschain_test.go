@@ -5,7 +5,7 @@ import (
 	"math"
 	"testing"
 
-	lighttypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
+	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
@@ -111,7 +111,7 @@ func Test_tssService_parseTxFromNotify(t *testing.T) {
 	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{}, nil, nil))
 	buf := bytes.NewBuffer(nil)
 	require.NoError(t, tx.SerializeNoWitness(buf))
-	notify := &lighttypes.TssSignNotify{
+	notify := &ltypes.TssSignNotify{
 		BtcTxData:    buf.Bytes(),
 		InputAmounts: []int64{1000},
 	}

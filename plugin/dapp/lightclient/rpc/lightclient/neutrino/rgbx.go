@@ -108,7 +108,7 @@ func (r *rgbx) pullPendingTx() {
 		case <-r.client.ctx.Done():
 			return
 		case <-ticker.C:
-			req.EndHeight = r.client.getMainchainHeight() - r.requiredConfs + 1
+			req.EndHeight = r.client.getMainChainHeight() - r.requiredConfs + 1
 			if req.EndHeight < req.StartHeight {
 				continue
 			}
@@ -303,7 +303,7 @@ func (r *rgbx) createConfirmPayload(info *utxoSpendInfo, pendTx *rtypes.PendingT
 	return confirm, nil
 }
 
-func (r *rgbx) commitPendingTx(request *confrimRequest) error {
+func (r *rgbx) commitPendingTx(request *confirmRequest) error {
 
 	confirmHash := request.spendingInfo.pendingTxHash
 	confirm, err := r.createConfirmPayload(request.spendingInfo, request.pendTx)
@@ -311,9 +311,9 @@ func (r *rgbx) commitPendingTx(request *confrimRequest) error {
 		log.Error("commitPendingTx createConfirmPayload", "confirmHash", confirmHash, "err", err)
 		return err
 	}
-	txHash, err := r.client.submitMainchainTx(rtypes.RgbxX, rtypes.NameConfirmAction, confirm)
+	txHash, err := r.client.submitMainChainTx(rtypes.RgbxX, rtypes.NameConfirmAction, confirm)
 	if err != nil && !strings.Contains(err.Error(), "already confirmed") {
-		log.Error("commitPendingTx submitMainchainTx", "txHash", txHash, "confirmHash", confirmHash, "err", err)
+		log.Error("commitPendingTx submitMainChainTx", "txHash", txHash, "confirmHash", confirmHash, "err", err)
 		return err
 	}
 
@@ -322,14 +322,14 @@ func (r *rgbx) commitPendingTx(request *confrimRequest) error {
 	return nil
 }
 
-type confrimRequest struct {
+type confirmRequest struct {
 	spendingInfo *utxoSpendInfo
 	pendTx       *rtypes.PendingTx
 }
 
 func (r *rgbx) handleCommitPendingTx() {
 	ticker := time.NewTicker(time.Second * 10)
-	retryList := make([]*confrimRequest, 0, 8)
+	retryList := make([]*confirmRequest, 0, 8)
 	for {
 		select {
 
@@ -343,7 +343,7 @@ func (r *rgbx) handleCommitPendingTx() {
 				log.Error("handleCommitPendingTx pendingTx not found", "pendingTxHash", info.pendingTxHash)
 				continue
 			}
-			request := &confrimRequest{spendingInfo: info, pendTx: pendTx}
+			request := &confirmRequest{spendingInfo: info, pendTx: pendTx}
 			if err := r.commitPendingTx(request); err != nil {
 				log.Error("handleCommitPendingTx commitPendingTx", "confirmHash", info.pendingTxHash, "err", err)
 				retryList = append(retryList, request)

@@ -76,7 +76,7 @@ const (
 	defaultTestRgbxMinConfs  = uint64(6)
 )
 
-func (f *fakeBridge) GetMainchainHeight() int64 { return 100 }
+func (f *fakeBridge) GetMainChainHeight() int64 { return 100 }
 
 func (f *fakeBridge) BuildSpvProof(txid string) (*SpvProof, error) {
 	// 与真实实现一致（neutrino/rgb20deposit.go:31）：空 txid 直接失败。首次归因若拿着

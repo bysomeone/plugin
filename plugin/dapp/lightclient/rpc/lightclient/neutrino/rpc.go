@@ -173,39 +173,39 @@ func (n *neutrinoClient) getRgbxPendingTxByHash(txHash []byte) (*rtypes.PendingT
 	return n.getRgbxPendingTx(detail.GetHeight(), detail.GetIndex())
 }
 
-func (n *neutrinoClient) submitMainchainTx(exec string, action string, payload types.Message) (string, error) {
+func (n *neutrinoClient) submitMainChainTx(exec string, action string, payload types.Message) (string, error) {
 	tx, err := n.createTx(exec, action, types.Encode(payload))
 	if err != nil {
-		log.Error("submitMainchainTx", "createTx err", err)
+		log.Error("submitMainChainTx", "createTx err", err)
 		return "", err
 	}
 	txHash := hex.EncodeToString(tx.Hash())
 	tx.Fee, err = tx.GetRealFee(n.getProperFeeRate())
 	if err != nil {
-		log.Error("submitMainchainTx", "txHash", txHash, "GetRealFee err", err)
+		log.Error("submitMainChainTx", "txHash", txHash, "GetRealFee err", err)
 		return "", err
 	}
 	tx.Sign(types.EncodeSignID(secp256k1.ID, n.commitAddressType), n.getCommitKey())
 	err = n.sendTx2MainChain(tx)
 	if err != nil {
-		log.Error("submitMainchainTx", "txHash", txHash, "sendTx2MainChain err", err)
+		log.Error("submitMainChainTx", "txHash", txHash, "sendTx2MainChain err", err)
 		return "", err
 	}
 	return txHash, nil
 }
 
-func (n *neutrinoClient) submitMainchainTxUntilSuccess(exec string, action string, payload types.Message) {
+func (n *neutrinoClient) submitMainChainTxUntilSuccess(exec string, action string, payload types.Message) {
 
-	n.waitUntilDone("submitMainchainTxUntilSuccess", func() bool {
-		_, err := n.submitMainchainTx(exec, action, payload)
+	n.waitUntilDone("submitMainChainTxUntilSuccess", func() bool {
+		_, err := n.submitMainChainTx(exec, action, payload)
 		return err == nil
 	}, 0)
 }
 
-func (n *neutrinoClient) getMainchainHeight() int64 {
+func (n *neutrinoClient) getMainChainHeight() int64 {
 	reply, err := n.mainChainGrpc.GetLastHeader(n.ctx, &types.ReqNil{})
 	if err != nil {
-		log.Error("getMainchainHeight", "query err", err)
+		log.Error("getMainChainHeight", "query err", err)
 		return 0
 	}
 	return reply.GetHeight()

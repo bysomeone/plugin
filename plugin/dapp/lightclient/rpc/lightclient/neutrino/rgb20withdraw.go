@@ -31,7 +31,7 @@ func (n *neutrinoClient) TSSPkScript() []byte {
 
 // SubmitConfirm 提交 rgbx Confirm 交易（RGB20 提现确认销毁；合约 RGB20 分支跳过 commitment）。
 func (n *neutrinoClient) SubmitConfirm(confirm *rtypes.ConfirmTx) error {
-	_, err := n.submitMainchainTx(rtypes.RgbxX, rtypes.NameConfirmAction, confirm)
+	_, err := n.submitMainChainTx(rtypes.RgbxX, rtypes.NameConfirmAction, confirm)
 	return err
 }
 

@@ -12,7 +12,7 @@ import (
 
 	"github.com/33cn/chain33/common/merkle"
 	"github.com/33cn/chain33/types"
-	lighttypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
+	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
@@ -54,7 +54,7 @@ const (
 	minPendingHeightKey    = "min-pending-height"
 )
 
-// utxoWithdrawLockID UTXO锁定ID
+// utxoLockID UTXO锁定ID
 var utxoLockID = wtxmgr.LockID{
 	'R', 'G', 'B', 'X', '-', 'L', 'O', 'C', 'K',
 	'-', 'I', 'D', '-', 'V', '1', '.', '0', '.', '0',
@@ -1019,8 +1019,8 @@ func (b *btcWallet) broadcastTransaction(tx *wire.MsgTx, btcTxHash string) error
 	return nil
 }
 
-func buildBtcSpv(txHash, blockHash string, blockTime int64, blockHeight uint64, txs [][]byte, txIndex uint32) *lighttypes.BtcSpv {
-	return &lighttypes.BtcSpv{
+func buildBtcSpv(txHash, blockHash string, blockTime int64, blockHeight uint64, txs [][]byte, txIndex uint32) *ltypes.BtcSpv {
+	return &ltypes.BtcSpv{
 		TxHash:      txHash,
 		Time:        blockTime,
 		Height:      blockHeight,
@@ -1071,8 +1071,8 @@ func buildTxHashesFromBlockTxs(blockTxs []*wire.MsgTx, targetTxHash chainhash.Ha
 
 // buildTxExistenceProof 计算交易存在性证明（SPV）
 // 输入: pendingTx（需要包含 tx 和 blockHash）
-// 输出: lighttypes.BtcSpv
-func (b *btcWallet) buildTxExistenceProof(pending *btcPendingTx) (*lighttypes.BtcSpv, error) {
+// 输出: ltypes.BtcSpv
+func (b *btcWallet) buildTxExistenceProof(pending *btcPendingTx) (*ltypes.BtcSpv, error) {
 	if pending == nil || pending.tx == nil {
 		return nil, fmt.Errorf("pending tx data missing")
 	}
