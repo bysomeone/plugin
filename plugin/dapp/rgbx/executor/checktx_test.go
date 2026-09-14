@@ -263,7 +263,7 @@ func Test_checkConfirm(t *testing.T) {
 		},
 		{
 			expectErr: ErrWithdrawConfirmTimeoutNotAllowed,
-			action:    &rtypes.ConfirmTx{Timeout: true, ActionType: rtypes.TyWithDrawAsset},
+			action:    &rtypes.ConfirmTx{Timeout: true, ActionType: rtypes.TyWithdrawAsset},
 		},
 		{
 			expectErr: ErrDecodeBtcTx,
@@ -380,7 +380,7 @@ func newTestnetWitnessAddr(t *testing.T) (addr string, pkScript []byte) {
 func Test_checkWithdraw(t *testing.T) {
 	r := newRgbx()
 	action := &rtypes.RgbxAction{}
-	action.Ty = rtypes.TyWithDrawAsset
+	action.Ty = rtypes.TyWithdrawAsset
 	userAddr, userPriv := util.Genaddress()
 	validDest, _ := newTestnetWitnessAddr(t)
 	tx := &types.Transaction{}

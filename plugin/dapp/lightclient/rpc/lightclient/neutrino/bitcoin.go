@@ -289,7 +289,7 @@ func (n *neutrinoClient) commitDepositTx(pendingTx *btcPendingTx) error {
 
 func pending2WithdrawRequest(chain33Pending *rtypes.PendingTx) *withdrawRequest {
 	return &withdrawRequest{
-		chain33WithDrawHash: chain33Pending.GetTxHash(),
+		chain33WithdrawHash: chain33Pending.GetTxHash(),
 		amount:              btcutil.Amount(chain33Pending.GetAmount()),
 		feeRate:             btcutil.Amount(chain33Pending.GetFeeRate()),
 		toAddress:           chain33Pending.GetTargetAddress(),
@@ -298,7 +298,7 @@ func pending2WithdrawRequest(chain33Pending *rtypes.PendingTx) *withdrawRequest 
 
 func (n *neutrinoClient) processWithdrawRequest(req *withdrawRequest) (err error) {
 
-	txHash := hex.EncodeToString(req.chain33WithDrawHash)
+	txHash := hex.EncodeToString(req.chain33WithdrawHash)
 	tx, inputAmounts, lockedUTXOs, err := n.bw.buildWithdrawTx(req)
 	if err != nil {
 		log.Error("processWithdrawRequest buildWithdrawTx", "txHash", txHash, "err", err)
@@ -319,7 +319,7 @@ func (n *neutrinoClient) processWithdrawRequest(req *withdrawRequest) (err error
 	}
 	lastUTXO := lockedUTXOs[len(lockedUTXOs)-1]
 	expectedHash := n.getExpectedWithdrawHash(lastUTXO.OutPoint.String())
-	if len(expectedHash) > 0 && !bytes.Equal(expectedHash, req.chain33WithDrawHash) {
+	if len(expectedHash) > 0 && !bytes.Equal(expectedHash, req.chain33WithdrawHash) {
 		log.Error("processWithdrawRequest sticky input mismatch", "expected", hex.EncodeToString(expectedHash),
 			"actual", txHash, "stickyOutPoint", lastUTXO.OutPoint.String())
 		return fmt.Errorf("invalid sticky input")
@@ -327,7 +327,7 @@ func (n *neutrinoClient) processWithdrawRequest(req *withdrawRequest) (err error
 
 	// 提现交易构建后，则和最后一个utxo强绑定，后续不能更改
 	if req.stickyUTXO == nil {
-		if err = n.setWithdrawStickyUTXO(req.chain33WithDrawHash, lastUTXO); err != nil {
+		if err = n.setWithdrawStickyUTXO(req.chain33WithdrawHash, lastUTXO); err != nil {
 			log.Error("processWithdrawRequest setWithdrawStickyUTXO", "txHash", txHash, "stickyUTXO", lastUTXO.OutPoint.String(), "err", err)
 			return err
 		}
@@ -340,7 +340,7 @@ func (n *neutrinoClient) processWithdrawRequest(req *withdrawRequest) (err error
 		return err
 	}
 	btcTxHash := tx.TxHash().String()
-	if err = n.tss.processSignBtcTx(tx, transactionTypeWithdraw, inputAmounts, req.chain33WithDrawHash); err != nil {
+	if err = n.tss.processSignBtcTx(tx, transactionTypeWithdraw, inputAmounts, req.chain33WithdrawHash); err != nil {
 		log.Error("processWithdrawRequest processSignBtcTx", "txHash", txHash, "btcTxHash", btcTxHash, "err", err)
 		return err
 	}
@@ -357,10 +357,10 @@ func (n *neutrinoClient) processWithdrawRequest(req *withdrawRequest) (err error
 		txHash:                tx.TxHash(),
 		txType:                transactionTypeWithdraw,
 		withdrawAddress:       req.toAddress,
-		chain33WithdrawTxHash: req.chain33WithDrawHash,
+		chain33WithdrawTxHash: req.chain33WithdrawHash,
 	})
 
-	if setStateErr := n.setWithdrawState(req.chain33WithDrawHash, withdrawStatusSent); setStateErr != nil {
+	if setStateErr := n.setWithdrawState(req.chain33WithdrawHash, withdrawStatusSent); setStateErr != nil {
 		log.Error("processWithdrawRequest setWithdrawState", "txHash", txHash, "btcTxHash", btcTxHash, "err", setStateErr)
 		return setStateErr
 	}
@@ -703,7 +703,7 @@ func (n *neutrinoClient) buildWithdrawConfirm(btcPending *btcPendingTx, pendingT
 	}
 	minPendingHeight := n.rgbx.pendingCache.getMinPendingHeight()
 	return &rtypes.ConfirmTx{
-		ActionType:           rtypes.TyWithDrawAsset,
+		ActionType:           rtypes.TyWithdrawAsset,
 		ConfirmedBlockHeight: minPendingHeight - 1,
 		TxBlockHeight:        pendingTxBlockIndex.GetBlockHeight(),
 		TxIndex:              pendingTxBlockIndex.GetTxIndex(),

@@ -131,7 +131,7 @@ func (n *neutrinoClient) getRgbxWithdrawAsset(txHash []byte) (*rtypes.WithdrawAs
 		log.Error("getRgbxWithdrawAsset decode action", "txHash", fmt.Sprintf("%x", txHash), "err", err)
 		return nil, err
 	}
-	if action.Ty != rtypes.TyWithDrawAsset {
+	if action.Ty != rtypes.TyWithdrawAsset {
 		log.Error("getRgbxWithdrawAsset invalid action", "txHash", fmt.Sprintf("%x", txHash), "action", action.String())
 		return nil, fmt.Errorf("withdraw action not found")
 	}

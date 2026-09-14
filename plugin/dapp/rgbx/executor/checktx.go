@@ -103,7 +103,7 @@ func (r *rgbx) CheckTx(tx *types.Transaction, index int) error {
 		err = r.checkCommitDKG(txHash, tx.From(), action.GetCommitDKG())
 	case rtypes.TyDepositAsset:
 		err = r.checkDeposit(txHash, action.GetDeposit())
-	case rtypes.TyWithDrawAsset:
+	case rtypes.TyWithdrawAsset:
 		err = r.checkWithdraw(tx.From(), txHash, action.GetWithdraw())
 	case rtypes.TyConfirmAction:
 		err = r.checkConfirm(tx.From(), txHash, action.GetConfirm())
@@ -454,7 +454,7 @@ func (r *rgbx) checkConfirm(fromAddr, txHash string, confirm *rtypes.ConfirmTx) 
 		return ErrConfirmedHashNotEqual
 	}
 
-	if confirm.GetActionType() == rtypes.TyWithDrawAsset {
+	if confirm.GetActionType() == rtypes.TyWithdrawAsset {
 		if confirm.Timeout {
 			elog.Error("checkConfirm timeout not supported for withdraw", "action", action,
 				"txHash", txHash, "confirmTxHash", confirmTxHash)

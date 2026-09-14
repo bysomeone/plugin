@@ -142,7 +142,7 @@ func (r *rgbx) Exec_Withdraw(withdraw *rtypes.WithdrawAsset, tx *types.Transacti
 	receipt.Logs = append(receipt.Logs, &types.ReceiptLog{
 		Ty: rtypes.TyPendingTxLog,
 		Log: types.Encode(&rtypes.PendingTx{
-			ActionType:    rtypes.TyWithDrawAsset,
+			ActionType:    rtypes.TyWithdrawAsset,
 			Timestamp:     r.GetBlockTime(),
 			TxBlockHeight: r.GetHeight(),
 			TxIndex:       int64(index),

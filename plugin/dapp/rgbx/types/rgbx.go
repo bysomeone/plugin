@@ -21,7 +21,7 @@ const (
 	TyConfirmAction
 	TyCommitDKGAction
 	TyDepositAsset
-	TyWithDrawAsset
+	TyWithdrawAsset
 
 	NameMintAction      = "Mint"
 	NameTransferAction  = "Transfer"
@@ -59,7 +59,7 @@ var (
 		NameConfirmAction:       TyConfirmAction,
 		NameCommitDKGAction:     TyCommitDKGAction,
 		NameDepositAssetAction:  TyDepositAsset,
-		NameWithdrawAssetAction: TyWithDrawAsset,
+		NameWithdrawAssetAction: TyWithdrawAsset,
 	}
 	//定义log的id和具体log类型及名称，填入具体自定义log类型
 	logMap = map[int64]*types.LogInfo{
@@ -126,7 +126,7 @@ func GetActionName(ty int32) string {
 		return NameCommitDKGAction
 	case TyDepositAsset:
 		return NameDepositAssetAction
-	case TyWithDrawAsset:
+	case TyWithdrawAsset:
 		return NameWithdrawAssetAction
 	default:
 		return "unknownAction"

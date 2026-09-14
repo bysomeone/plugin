@@ -105,7 +105,7 @@ func TestCrossChainDepositWithdrawConfirmExec(t *testing.T) {
 	require.Equal(t, int64(600), accDB.LoadAccount(lockAddr).GetBalance())
 
 	confirm := &rtypes.ConfirmTx{
-		ActionType:           rtypes.TyWithDrawAsset,
+		ActionType:           rtypes.TyWithdrawAsset,
 		TxBlockHeight:        0,
 		TxIndex:              1,
 		TxHash:               withdrawTx.Hash(),
