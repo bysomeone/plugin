@@ -92,6 +92,39 @@ bootstrap（链上还没有任何 BTC 头）时，首个头的父块必须正好
 - `guardianParachainTitle`
   - 含义：受信平行链标题（para title）
   - 要求：与平行链 `Title` 完全一致
+- `minBtcConfirmations` (int64)
+  - 含义：**链上最小确认数 N（B8）**。充值证明 / 提现确认证明所在 BTC 区块，必须在 lightclient 的
+    canonical 头链里被确认至少 N 个块，否则执行器拒绝该交易（`ErrInsufficientBtcConfirmations`）。
+  - 默认行为：未配置或 ≤ 0 一律取 **6**（不允许用 0 表达"不校验深度"）。
+  - 影响：N 越大，"头链看得见的深度"越深，重组导致 mint-on-orphan 的概率越低，但**充值到账更慢约
+    N 个 BTC 块**（主网 ~10N 分钟）。见下面的"中继侧如何使用 N"。
+  - **中继侧如何使用 N（N 的单一真相）**：中继**不镜像**这个值，而是经 lightclient 执行器的只读查询
+    `GetRgbxMinBtcConfirmations` 直接读链上生效值（执行器读的就是本节这一段配置，取值口径一致）。
+    中继不做本地副本 ⇒ 不存在"两处配置人肉配套"，改这里并重启主链即对中继生效。
+    - 中继读不到 N（主链未就绪、或主链执行器还是旧版本、没有这个查询）→ **不提交充值**（fail-closed，
+      限流 WARN，下个轮询周期重试）：算不出深度就不提交，绝不用猜测值凑门控。
+    - CI 里把 N 配成 `1`（`rgbx/cmd/ci/docker-compose.sh`）：那是为了让 E2E 的"1 个后续块即确认"时序
+      成立，**会掩盖"提交那一刻链上可见深度是 0"这类交互问题**（N=1 时深度 0 也够），生产不要照抄。
+
+#### 2.2.1 中继提交充值的深度门控（为什么充值要先等几个块）
+
+中继把 BTC 头链提交到主链时，**只提交到 `best - B`**（B = 4.1 的 `blockConfirmations`，见
+`bitcoin.go` 的 `btcConfirmedHeight`）。而 B8 要求 `链上 canonical tip >= H + N - 1`（H = 付款交易所在
+BTC 高度）。两者相减 ⇒ 中继**刚收到充值通知就提交**的话，那一刻链上可见深度是 0，首笔提交必然被拒。
+
+因此中继在提交前先做本地门控，判据：
+
+```
+best >= H + B + N - 1          （等价于：提交后链上可见深度 >= N）
+```
+
+- **正常路径因此不再产生"注定被链上拒"的提交**：B8 退回为纯兜底（本地判据万一算漏时的最后一道闸）。
+- 代价是**充值到账延迟 ≈ N 个 BTC 块**（主网 ~10N 分钟）。这是与 B8 相同的时延，只是从"被拒后重试"
+  变成"等够了只提交一次"；N 取值是延迟与重组风险的取舍（见 2.2）。
+- 门控过不去时中继**不驱动签名轮次**（那是最贵的一步，一轮 GG18 30s 起）、也不提交，只在下个 30s
+  轮询重新判断，直到 best 长够。
+- 头链本身落后（例如刚 bootstrap、或头链提交停滞）时本地判据可能偏乐观：那种情况下链上仍会按 B8
+  拒绝，重试走"只重发"（见 4.4.2），代价可控。
 
 ## 3. Chain33 平行链配置项
 
@@ -154,6 +187,10 @@ bootstrap（链上还没有任何 BTC 头）时，首个头的父块必须正好
 - `blockConfirmations` (uint32)
   - 含义：BTC 确认数门限
   - 影响：区块头提交、pending 拉取、充值/提现确认时机
+  - 说明（头链保留深度 B）：中继提交头链时只提交到 `best - B`，因此"提交那一刻链上可见的 tip"
+    也由它决定。**B 与链上 `[exec.sub.rgbx].minBtcConfirmations`（N）是同一个门控的两个参数**：
+    中继提交充值前要求 `best >= H + B + N - 1`（见 2.2.1），改动任一个都会改变充值到账时延。
+  - 默认行为：未设置时为 6。
 - `btcHeaderStartHeight` (uint64)
   - 含义：首次提交 BTC header 的起始高度。**只在链上头链为空时使用**：链上 `tip==0` 时它是提交起点，
     头链长起来之后起点由"与链上对账"得出（见中继的对账逻辑），这个配置值就失效了。
@@ -207,7 +244,9 @@ bootstrap（链上还没有任何 BTC 头）时，首个头的父块必须正好
 ### 4.4 `[rpc.sub.light.neutrino.rgb20]`
 
 RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentListen` / `contracts` / `precision` /
-`changeAddress`）见 `RGB_USDT_INTEGRATION.md`；这里只说明与签名侧去重相关的一项。
+`changeAddress`）见 `RGB_USDT_INTEGRATION.md`；这里说明与签名侧去重、充值重试相关的两项。
+本节的配置项都**不需要**与主链 `[exec.sub.rgbx]` 人肉对齐：链上最小确认数 N 由中继直接查链上
+（见 2.2），本节只描述行为。
 
 - `signedDepositTTL` (int64)
   - 含义：**签名侧"已签集合"的保留期（TTL），单位 = BTC 区块数**（不是秒/小时）。
@@ -232,6 +271,34 @@ RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentLi
     不会因为查询失败就放行重复签名。
   - 注意：这条去重是**纵深防御**，不是铸币闸门 —— 即使重复签出 `threshold_sig`，链上也会按 txid
     拒绝第二笔铸造（不多铸）；它挡住的是"给协调者多余的签名产物 + 白跑签名轮次"。
+
+#### 4.4.1 充值提交的深度门控（无配置项）
+
+见 2.2.1：充值提交前要求 `best >= H + B + N - 1`（B = 4.1 `blockConfirmations`，N = 链上
+`minBtcConfirmations`）。行为要点：
+
+- 不够深时**不签名、不提交**，只在下个 30s 轮询重新判断；够深时**一次提交即成**。
+- 到账延迟 ≈ N 个 BTC 块（主网 ~10N 分钟），与 B8 的时延相同，只是改成"等够了再提交一次"。
+- 取不到 best（neutrino 还没同步出 best block）或读不到链上 N → 不提交（fail-closed），日志限流
+  WARN/ERROR（同一个 receive 只报一次）。
+
+#### 4.4.2 签名落盘、重试只重发（无配置项）
+
+充值签名轮次产出的完整 `DepositAsset`（含 `threshold_sig`）会**落盘**（与 receive/seal 同一个 KVStore
+的顶层 bucket `rgb20-deposit-sig`，key = 付款交易 txid），顺序是**先落盘、再提交**。于是：
+
+- **重试只重发**这份已签对象，不再驱动签名轮次：不再每 30s 空跑一轮 GG18，也不会因为签名节点的
+  "已签集合"（4.4）而"每 30s 失败一次、记录永不 minted"（TTL ≤ 0 的默认配置下原本是永久卡死）。
+- 签名轮次只在"没有可用产物"时驱动一次；铸造成功后产物被清掉（不只增不删）。
+- 重发被链上按 btc-txid 去重拒绝（`duplicate deposit proof`）时按**已铸造**处理：这是链上已认过这笔
+  付款交易的信号（多半是上次提交其实进了链、只是本地没记上 minted），否则会每 30s 重发一次、永远停在
+  settled。
+- 重启/崩溃不影响：产物在盘上，重启后继续重发。**落盘失败就不提交**（下一轮重试落盘；进程若在落盘
+  成功前重启，则退化为下面那条异常）。
+- **异常态**（本节点已签过这笔付款交易、但本地没有签名产物：落盘后进程重启且数据目录被清、从旧快照
+  恢复等）：中继**不重签**（其它签名节点的已签集合会拒绝这一轮，重签只会每 30s 白等一轮 GG18 超时），
+  而是限流报一条 ERROR 并**停止推进这条记录**。自愈出口：把 `signedDepositTTL` 配成正数并重启，
+  等已签集合过期后该记录会重新正常签名；或从备份恢复该 bucket。
 
 ## 5. Bitcoin 节点关键配置项
 
@@ -311,6 +378,8 @@ peerblockfilters=1
   校验（不一致会 fail-closed 并打印期望值），但**上线前要人工确认所有节点同一个 build**：不同 build 的
   锚点集合不同，头链会在某个高度静默停滞
 - `blockConfirmations` 符合环境安全要求（测试可低，生产应高）
+- 链上 `[exec.sub.rgbx].minBtcConfirmations`（N）符合上线要求（默认 6）：它就是充值到账延迟
+  （≈ N 个 BTC 块）与重组风险的那个旋钮；中继**不需要**配任何镜像值，它直接查链上（见 2.2）
 - `btcRPC.host/user/pass/TLS` 与 BTC 节点一致
 - 全部 TSS 节点的 `peers/threshold` 一致，且 `rank` 分配无冲突
 
@@ -409,3 +478,16 @@ signedDepositTTL=0
 - `signedDepositTTL` 配了正数却像"没生效"：TTL 以**付款交易所在高度**为锚点，付款高度与链上 tip
   差距超过 TTL 的记录本就已过期（一签字就过期），对这类老付款不提供去重——去重窗口是"付款后
   TTL 个块内"
+- 充值迟迟不到账（比预期晚几个块）：正常行为，见 2.2.1/4.4.1 —— 中继会等
+  `best >= H + B + N - 1` 才提交（延迟 ≈ N 个 BTC 块）。想缩短就把链上 `minBtcConfirmations`（N）
+  调小（代价是重组风险，见 2.2），**不要**去改 `blockConfirmations`（它同时是头链保留深度与充值通知
+  阈值，改了会同时影响头链提交与既有确认语义）
+- 充值一直不提交、日志里 `deposit depth gate: ... confirmations unavailable`：中继读不到链上 N
+  （主链未就绪，或主链执行器是旧版本、没有 `GetRgbxMinBtcConfirmations` 查询）。中继按 fail-closed
+  不提交（见 2.2），升级主链执行器即恢复，不需要改中继配置
+- 充值不提交、日志里 `already signed this deposit tx but the signed artifact is missing`：本节点签过
+  这笔交易但本地签名产物丢了（见 4.4.2 的异常态）。按日志提示处理（配正数 `signedDepositTTL` 重启让
+  已签集合过期，或从备份恢复 `rgb20-deposit-sig` bucket），**不要**手工去清已签集合绕过
+- E2E/CI 里看不出"提交那一刻链上深度是 0"的坑：CI 把 `blockConfirmations=1` 与
+  `minBtcConfirmations=1` 一起配（见 2.2 与 4.1），N=1 时深度 0 也够，等于把这条交互掩盖了。本地验证
+  必须显式用 N > 1（单测已覆盖，见 `rgb20/deposit_retry_test.go`）
