@@ -50,6 +50,10 @@ type fakeBridge struct {
 	spvProof   *SpvProof
 	sig        []byte
 	signedPSBT []byte
+	// btcTip/btcTipErr 链上 BTC tip 高度（已签集合 TTL 判定用）；tipCalls 记查询次数。
+	btcTip    uint64
+	btcTipErr error
+	tipCalls  int
 }
 
 func (f *fakeBridge) GetMainchainHeight() int64 { return 100 }
@@ -101,7 +105,32 @@ func (f *fakeBridge) SignPsbt(psbtBytes []byte) ([]byte, error) {
 	return psbtBytes, nil
 }
 
-func (f *fakeBridge) GetBtcTipHeight() int64               { return 200 }
+func (f *fakeBridge) BtcTipHeight() (uint64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tipCalls++
+	return f.btcTip, f.btcTipErr
+}
+
+// tipCallCount 链上高度查询次数（断言"默认配置零查询"用）。
+func (f *fakeBridge) tipCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.tipCalls
+}
+
+func (f *fakeBridge) setTip(tip uint64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.btcTip = tip
+}
+
+func (f *fakeBridge) setTipErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.btcTipErr = err
+}
+
 func (f *fakeBridge) BroadcastTx(_ []byte, _ string) error { return nil }
 
 func (f *fakeBridge) TSSAddress() string {
@@ -270,6 +299,8 @@ func Test_ValidateDepositConsignment(t *testing.T) {
 			Amount:         1000,
 			DepositAddress: "addr",
 			AssetSymbol:    "RGB20_USDT",
+			// 签名侧去重要从 TxProof.TxData 严格解析 txid，这里给一笔规范编码的付款交易。
+			TxProof: &rtypes.BtcTxProof{TxData: testDepositTxData(t, 1), BlockHeight: 100},
 		},
 		Consignment:    []byte("consignment"),
 		ReceiveID:      "recv-1",
@@ -278,9 +309,10 @@ func Test_ValidateDepositConsignment(t *testing.T) {
 	}
 	require.NoError(t, adapter.ValidateDepositConsignment(payload))
 
-	// 地址绑定不匹配应拒绝
+	// 地址绑定不匹配应拒绝（TxProof 保持有效，确保拒绝来自地址绑定这一条）
 	bad := *payload
-	bad.Deposit = &rtypes.DepositAsset{Amount: 1000, DepositAddress: "other", AssetSymbol: "RGB20_USDT"}
+	bad.Deposit = &rtypes.DepositAsset{Amount: 1000, DepositAddress: "other", AssetSymbol: "RGB20_USDT",
+		TxProof: payload.Deposit.TxProof}
 	require.Error(t, adapter.ValidateDepositConsignment(&bad))
 
 	// 已 minted 去重

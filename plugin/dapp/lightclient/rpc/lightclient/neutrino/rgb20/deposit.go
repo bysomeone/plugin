@@ -248,13 +248,20 @@ func (a *Adapter) BuildDepositSignMessage(rec *ReceiveRecord, consignment []byte
 }
 
 // ValidateDepositConsignment 签名节点对 rgb20-deposit 消息做独立校验（BL-3）：
-// 去重 + 地址绑定 + 金额匹配 + 侧车 ValidateConsignment + 同步高度门槛。
+// 去重（本节点已签集合 + 本地 receive 已 minted）+ 地址绑定 + 金额匹配 +
+// 侧车 ValidateConsignment + 同步高度门槛。
 func (a *Adapter) ValidateDepositConsignment(payload *DepositSignPayload) error {
 	if payload == nil || payload.Deposit == nil {
 		return fmt.Errorf("invalid rgb20-deposit payload")
 	}
 	if len(payload.Consignment) == 0 {
 		return fmt.Errorf("empty consignment")
+	}
+	// A3（签名侧去重）：本节点已为这笔付款交易签过则直接拒绝，不进入签名轮次。
+	// 原先的去重只有下面的"本地 receive 已 minted 则拒"，而 validator 节点的本地 store 里
+	// 通常没有 receive 记录，那条检查对它们形同虚设。txid 严格从 TxProof.TxData 解析（见 signedset.go）。
+	if err := a.CheckDepositSigned(payload); err != nil {
+		return err
 	}
 	// 本地 receive 可能存在（官方节点）也可能不存在（validator 节点：receive 只在官方节点
 	// 通过 CreateReceive 创建，validator 的本地 store 没有）。validator 节点退化为用

@@ -748,7 +748,8 @@ func (t *tssService) handleSignNotify(msg []byte) {
 }
 
 // handleRgb20DepositSign 签名节点处理 rgb20-deposit 轮次：
-// 独立验证（去重 + 地址绑定 + 金额 + 侧车 ValidateConsignment + 同步高度门槛），通过后签 C。
+// 独立验证（本地已签集合去重 + 地址绑定 + 金额 + 侧车 ValidateConsignment + 同步高度门槛），
+// 通过后签 C，**签名成功后**把付款交易 txid 登记进已签集合（A3）。
 func (t *tssService) handleRgb20DepositSign(notify *lighttypes.TssSignNotify) error {
 	if t.client.rgb20 == nil {
 		return fmt.Errorf("rgb20 adapter not configured")
@@ -768,6 +769,11 @@ func (t *tssService) handleRgb20DepositSign(notify *lighttypes.TssSignNotify) er
 	res := t.signMsg(msg, payload.SessionID, notify.Signers)
 	if res.err != nil {
 		return res.err
+	}
+	// A3（签名侧去重）：**签名成功后**才登记该付款交易 txid（幂等）——签名失败不登记，
+	// 避免把 txid 烧掉、误伤合法重试。登记失败只记日志：签名已经产出，链上 txid 去重仍是兜底。
+	if err := t.client.rgb20.MarkDepositSigned(payload); err != nil {
+		log.Error("handleRgb20DepositSign mark signed", "err", err, "receiveId", payload.ReceiveID)
 	}
 	log.Debug("handleRgb20DepositSign signed", "receiveId", payload.ReceiveID, "sessionId", payload.SessionID)
 	return nil

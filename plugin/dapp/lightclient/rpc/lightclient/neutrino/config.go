@@ -72,6 +72,13 @@ type rgb20Config struct {
 	Precision uint32 `json:"precision"`
 	// ChangeAddress 提现找零地址（TSS P2WPKH 地址）；留空则由 TSS 地址自动填充。
 	ChangeAddress string `json:"changeAddress"`
+	// SignedDepositTTL 签名侧"已签集合"的保留期（TTL），单位 = **BTC 区块数**。
+	// 语义：签名节点在签 threshold_sig 成功后把付款交易 txid 记进本地已签集合，之后的同一 txid
+	// 直接拒绝签名；链上 tip 高度 - 记录高度 >= 本值即视为过期，过期记录被清理、同一 txid 可再签。
+	// 0 / -1（或任何 <= 0）= 只增不删（永久保留，默认值）。
+	// 改成正数后**重启立即生效**：启动时按新 TTL 清理一次旧记录（含只增不删期间攒下的）。
+	// 详见 CONFIG.md 4.4 与 rgb20/signedset.go。
+	SignedDepositTTL int64 `json:"signedDepositTTL"`
 }
 
 // rgb20Contract RGB20 资产合约注册项。

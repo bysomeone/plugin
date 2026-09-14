@@ -24,6 +24,10 @@ type Config struct {
 	Precision uint32
 	// MinConfirmations 充值铸造所需 BTC 确认数（默认与桥的 blockConfirmations 对齐）。
 	MinConfirmations uint32
+	// SignedDepositTTL 签名侧"已签集合"的保留期（TTL），单位 = BTC 区块数。
+	// <= 0（默认 0）= 只增不删（永久保留）；正数 = 已签记录保留 N 个 BTC 块，到期后可被清理、
+	// 同一 txid 允许再次签名。语义与重启行为见 CONFIG.md 4.4 与 signedset.go。
+	SignedDepositTTL int64
 }
 
 // Contract 一个 RGB20 资产的合约注册项。
@@ -125,8 +129,10 @@ type Chain33Bridge interface {
 	SignDepositMessage(payload *DepositSignPayload) ([]byte, error)
 	// SignPsbt 通过 TSS 对 PSBT 签名，返回已签 PSBT 字节。
 	SignPsbt(psbtBytes []byte) ([]byte, error)
-	// GetBtcTipHeight 返回本地 lightclient 已知的 BTC 链尖高度。
-	GetBtcTipHeight() int64
+	// BtcTipHeight 返回链上 lightclient 头链的 canonical tip 高度（BTC 高度）。
+	// 已签集合的 TTL 判定用它当"当前高度"：所有节点（含没有本地 neutrino 头库的 validator 节点）
+	// 都查主链，结果一致、单调，且不受本机时钟漂移影响；链上还没有任何头时返回 0。
+	BtcTipHeight() (uint64, error)
 	// BroadcastTx 广播已签提现交易（由 neutrino 主包实现，走 btcwallet）。
 	BroadcastTx(psbtSigned []byte, txid string) error
 	// TSSAddress 返回桥 TSS 的 P2WPKH 地址（regtest bcrt1…/testnet tb1…/mainnet bc1…）。
@@ -162,6 +168,12 @@ type RGB20Adapter interface {
 	SetBridge(b Chain33Bridge)
 	// ValidateDepositConsignment 签名节点对 rgb20-deposit 消息做独立校验。
 	ValidateDepositConsignment(payload *DepositSignPayload) error
+	// CheckDepositSigned 签名侧去重（A3 后半）：payload 的付款交易已签过则返回错误。
+	CheckDepositSigned(payload *DepositSignPayload) error
+	// MarkDepositSigned 登记 payload 的付款交易为已签（幂等，须在签名成功之后调用）。
+	MarkDepositSigned(payload *DepositSignPayload) error
+	// PruneSignedDeposits 按当前 TTL 清理过期的已签记录（启动/改配置重启后立即执行一次）。
+	PruneSignedDeposits() error
 	// ValidateWithdrawPsbt 签名节点对 rgb20 提现 PSBT+consignment 做交叉核对（BL-4/HR-3）。
 	ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error
 	// BuildDepositSignMessage 构造 rgb20-deposit 签名消息（主节点侧）。
@@ -180,6 +192,8 @@ type Adapter struct {
 	reg      *Registry
 	cfg      Config
 	bridge   Chain33Bridge
+	// signed 已签集合（签名侧去重，A3 后半）。
+	signed *SignedDepositSet
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -204,7 +218,18 @@ func NewAdapter(cfg Config, store KVStore) (*Adapter, error) {
 		ctx:      ctx,
 		cancel:   cancel,
 	}
+	// 已签集合：TTL 判定的"当前高度"经 btcTipHeight 走桥接查链上 tip（SetBridge 之后才可用；
+	// TTL <= 0 时根本不会调用它）。
+	a.signed = newSignedDepositSet(store, cfg.SignedDepositTTL, a.btcTipHeight)
 	return a, nil
+}
+
+// btcTipHeight 取链上 BTC canonical tip 高度（已签集合 TTL 判定用，见 signedset.go）。
+func (a *Adapter) btcTipHeight() (uint64, error) {
+	if a.bridge == nil {
+		return 0, fmt.Errorf("chain33 bridge not set")
+	}
+	return a.bridge.BtcTipHeight()
 }
 
 // Connect 建立侧车 gRPC 连接（unix socket 优先）。所有节点都需要（签名节点只读校验）。
