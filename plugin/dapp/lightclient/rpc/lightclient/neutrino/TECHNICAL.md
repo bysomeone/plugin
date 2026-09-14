@@ -537,7 +537,7 @@ plugin/dapp/rgbx/executor/
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| chain33WithDrawHash | 字节数组 | chain33 提现交易的哈希，作为唯一标识 |
+| chain33WithdrawHash | 字节数组 | chain33 提现交易的哈希，作为唯一标识 |
 | amount | btcutil.Amount | 提现金额，以 satoshi 为单位 |
 | feeRate | btcutil.Amount | 交易费率，单位 sat/vByte |
 | toAddress | 字符串 | 目标 BTC 收款地址 |

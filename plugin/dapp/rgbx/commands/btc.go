@@ -58,7 +58,7 @@ func btcDepositTxCMD() *cobra.Command {
 		Short: "build, sign and broadcast btc deposit tx",
 		Run:   btcDepositTx,
 		Example: "btcDepositTx --net regtest --rpcHost 127.0.0.1:18443 " +
-			"--wif <wif> --utxo <txid:vout:amountSats:pkScriptHex> --tssAddress <btcAddr> --chain33Address <addr> " +
+			"--wif <wif> --utxo <txid:vout:amountSats:pkScriptHex> --tssAddress <btcAddr> --depositAddress <addr> " +
 			"--amount 100000 --fee 300",
 	}
 	cmd.Flags().String("net", "regtest", "bitcoin network: mainnet|testnet|regtest|simnet")
@@ -70,11 +70,11 @@ func btcDepositTxCMD() *cobra.Command {
 	cmd.Flags().String("wif", "", "sender private key in WIF format")
 	cmd.Flags().String("utxo", "", "single input utxo, format: txid:vout:amountSats:pkScriptHex")
 	cmd.Flags().String("tssAddress", "", "tss deposit address")
-	cmd.Flags().String("chain33Address", "", "chain33 deposit address for OP_RETURN rgbx:deposit:<addr>")
+	cmd.Flags().String("depositAddress", "", "chain33 deposit address for OP_RETURN rgbx:deposit:<addr>")
 	cmd.Flags().Int64("amount", 0, "deposit amount in satoshis")
 	cmd.Flags().Int64("fee", 0, "tx fee in satoshis")
 	cmd.Flags().String("changeAddress", "", "optional change address, default from private key")
-	markRequired(cmd, "wif", "utxo", "tssAddress", "chain33Address", "amount", "fee")
+	markRequired(cmd, "wif", "utxo", "tssAddress", "depositAddress", "amount", "fee")
 	return cmd
 }
 
@@ -124,7 +124,7 @@ func btcDepositTx(cmd *cobra.Command, _ []string) {
 	wifStr, _ := cmd.Flags().GetString("wif")
 	utxoRaw, _ := cmd.Flags().GetString("utxo")
 	tssAddrStr, _ := cmd.Flags().GetString("tssAddress")
-	chain33Addr, _ := cmd.Flags().GetString("chain33Address")
+	chain33Addr, _ := cmd.Flags().GetString("depositAddress")
 	amount, _ := cmd.Flags().GetInt64("amount")
 	fee, _ := cmd.Flags().GetInt64("fee")
 	changeAddrStr, _ := cmd.Flags().GetString("changeAddress")

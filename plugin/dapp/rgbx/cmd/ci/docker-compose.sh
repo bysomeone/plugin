@@ -535,7 +535,7 @@ function wait_no_withdraw_pending_for_user() {
     fi
     for ((i = 0; i < retries; i++)); do
         local pend_hashes
-        pend_hashes=$(${MAIN_CLI} rgbx listPendByFrom -f "${from_addr}" |
+        pend_hashes=$(${MAIN_CLI} rgbx listPendingTxByFrom -f "${from_addr}" |
             jq -r '[.pendingList[]? | select(.actionType == 106) | .txHash | ascii_downcase]')
         cnt=$(echo "${pend_hashes}" | jq 'length')
         if [ -n "${want_hash}" ]; then
@@ -602,7 +602,7 @@ function prepare_accounts() {
 
 # Phase 5 DKG 修复（追加）：para 钱包 seed/解锁/AUTH 私钥导入。
 # para 重启后钱包需要重新解锁，且 import 的 AUTH 账户需要重新导入（否则 TSS 拿不到 commit 私钥，
-# submitMainchainTx 一直失败重试，BTC/RGB20 CrossChainInfo 建不出来）。
+# submitMainChainTx 一直失败重试，BTC/RGB20 CrossChainInfo 建不出来）。
 function prepare_para_accounts() {
     save_seed_and_unlock "${PARA1_CLI}" || true
     save_seed_and_unlock "${PARA2_CLI}" || true
@@ -739,7 +739,7 @@ function prepare_para_tss_peers() {
 #      CommitDKG 提交被 para 链 rgbx 拒绝（ErrGetGuardianNodeAddress）后无限重试挂起；
 #      重启后 nodegroup 已就绪，DKG keygen 在 4 节点间重开并提交成功；
 #   3. 重启后 para 钱包重新上锁，须再次解锁（save_seed_and_unlock），否则 TSS 拿不到 commit 私钥，
-#      submitMainchainTx 一直失败重试（这是"init 完成但 BTC getCross 为空"的又一阻塞点）；
+#      submitMainChainTx 一直失败重试（这是"init 完成但 BTC getCrossChainInfo 为空"的又一阻塞点）；
 #   4. 等主链 BTC CrossChainInfo.tssAddress 落地（4 个 guardian 均提交 CommitDKG 后创建）。
 # 这样 compose up 即"环境就绪"，测试阶段只跑用例、不碰初始化时序。
 function init_chain33_dkg() {
@@ -824,7 +824,7 @@ function ensure_btc_crosschain_prerequisite() {
     log_step "check BTC cross-chain prerequisite only (no mint bootstrap)"
     set +e
     local info
-    info=$(${MAIN_CLI} rgbx getCross -s "${MINT_SYMBOL}" 2>/dev/null)
+    info=$(${MAIN_CLI} rgbx getCrossChainInfo -s "${MINT_SYMBOL}" 2>/dev/null)
     local rc=$?
     set -e
     if [ "${rc}" -ne 0 ]; then
@@ -844,7 +844,7 @@ function wait_auto_dkg_commit() {
     for ((i = 0; i < retries; i++)); do
         set +e
         local info
-        info=$(${MAIN_CLI} rgbx getCross -s "${MINT_SYMBOL}" 2>/dev/null)
+        info=$(${MAIN_CLI} rgbx getCrossChainInfo -s "${MINT_SYMBOL}" 2>/dev/null)
         local rc=$?
         set -e
         if [ "${rc}" -eq 0 ]; then

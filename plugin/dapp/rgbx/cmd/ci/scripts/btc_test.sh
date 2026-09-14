@@ -9,7 +9,7 @@ function scenario_user_deposit_via_btc_tx() {
     assert_non_empty "${utxo}" "funding utxo empty"
 
     local tss_addr
-    tss_addr=$(${MAIN_CLI} rgbx getCross -s "${MINT_SYMBOL}" | jq -r '.tssAddress // empty')
+    tss_addr=$(${MAIN_CLI} rgbx getCrossChainInfo -s "${MINT_SYMBOL}" | jq -r '.tssAddress // empty')
     assert_non_empty "${tss_addr}" "tssAddress empty before deposit"
 
     local deposit_tx_hash
@@ -23,7 +23,7 @@ function scenario_user_deposit_via_btc_tx() {
         --wif "${BTC_FUNDING_WIF}" \
         --utxo "${utxo}" \
         --tssAddress "${tss_addr}" \
-        --chain33Address "${USER_MAIN_ADDR}" \
+        --depositAddress "${USER_MAIN_ADDR}" \
         --amount "${BTC_DEPOSIT_AMOUNT_SATS}" \
         --fee 500)
     assert_length "${deposit_tx_hash}" 64 "btc deposit tx hash length mismatch"
@@ -91,14 +91,14 @@ function scenario_user_withdraw_auto_confirm() {
 function scenario_restart_recovery() {
     log_step "scenario: restart recovery and pending continuity"
     local before
-    before=$(${MAIN_CLI} rgbx listPend -s 0 -i 0 -c 20 | jq -r '.pendingList | length')
+    before=$(${MAIN_CLI} rgbx listPendingTx -s 0 -i 0 -c 20 | jq -r '.pendingList | length')
 
     compose_cmd restart main >/dev/null
     wait_cli_ready "${MAIN_CLI}"
     save_seed_and_unlock "${MAIN_CLI}" || true
 
     local after
-    after=$(${MAIN_CLI} rgbx listPend -s 0 -i 0 -c 20 | jq -r '.pendingList | length')
+    after=$(${MAIN_CLI} rgbx listPendingTx -s 0 -i 0 -c 20 | jq -r '.pendingList | length')
     assert_true "$([ "${after}" -ge 0 ] && echo true || echo false)" "pending list query failed after restart"
     log_step "pending continuity check before=${before}, after=${after}"
 }
