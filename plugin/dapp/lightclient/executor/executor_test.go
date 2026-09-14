@@ -209,7 +209,7 @@ func TestBtcHeadersBootstrapAnchor(t *testing.T) {
 		// 攻击者自造链：Bits 直接取网络最大目标（powLimit），秒挖出头，且父块不是创世。
 		orphan := mineBtcHeaderFrom(t, chainhash.Hash{}.String(), 1, regtest.PowLimitBits, ts)
 		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{orphan}}, commitPriv)
-		require.Equal(t, ErrBtcHeaderNoAnchor, cli.CheckTx(tx, 0))
+		require.ErrorIs(t, cli.CheckTx(tx, 0), ErrBtcHeaderNoAnchor)
 	})
 
 	t.Run("first header directly on regtest genesis is accepted", func(t *testing.T) {
@@ -248,7 +248,7 @@ func TestBtcHeadersBootstrapAnchor(t *testing.T) {
 		// 父块 hash 与锚点不符：锚点表命中失败，且 localDB 无历史可回溯。
 		other := mineBtcHeaderFrom(t, chainhash.Hash{}.String(), 5, regtest.PowLimitBits, ts.Add(5*time.Minute))
 		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{other}}, commitPriv)
-		require.Equal(t, ErrBtcHeaderNoAnchor, cli.CheckTx(tx, 0))
+		require.ErrorIs(t, cli.CheckTx(tx, 0), ErrBtcHeaderNoAnchor)
 	})
 
 	t.Run("first header traceable through localdb to genesis is accepted", func(t *testing.T) {
@@ -285,7 +285,7 @@ func TestBtcHeadersBootstrapAnchor(t *testing.T) {
 
 		h5 := mineBtcHeader(t, h4, 5, regtest.PowLimitBits, ts.Add(4*time.Minute))
 		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{h5}}, commitPriv)
-		require.Equal(t, ErrBtcHeaderNoAnchor, cli.CheckTx(tx, 0))
+		require.ErrorIs(t, cli.CheckTx(tx, 0), ErrBtcHeaderNoAnchor)
 	})
 
 	t.Run("first header on a non-genesis network is rejected", func(t *testing.T) {
@@ -296,7 +296,7 @@ func TestBtcHeadersBootstrapAnchor(t *testing.T) {
 		// 用 mainnet 创世 hash 冒充 regtest 链的父块：网络不匹配，同样拒绝。
 		h1 := mineBtcHeaderFrom(t, chaincfg.MainNetParams.GenesisHash.String(), 1, regtest.PowLimitBits, ts)
 		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{h1}}, commitPriv)
-		require.Equal(t, ErrBtcHeaderNoAnchor, cli.CheckTx(tx, 0))
+		require.ErrorIs(t, cli.CheckTx(tx, 0), ErrBtcHeaderNoAnchor)
 	})
 }
 
@@ -432,7 +432,7 @@ func TestBtcHeadersPerTxLimit(t *testing.T) {
 	t.Run("at limit falls through to the next check", func(t *testing.T) {
 		// 64 个头不会被上限拒绝（会因自造 hash 在后面的锚点校验被拒，这里只断言不是 ErrBtcHeadersTooMany）。
 		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: batch(maxBtcHeadersPerTx)}, commitPriv)
-		require.Equal(t, ErrBtcHeaderNoAnchor, cli.CheckTx(tx, 0))
+		require.ErrorIs(t, cli.CheckTx(tx, 0), ErrBtcHeaderNoAnchor)
 	})
 
 	t.Run("over limit is rejected", func(t *testing.T) {

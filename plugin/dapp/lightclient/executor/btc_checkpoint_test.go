@@ -3,7 +3,9 @@ package executor
 import (
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/33cn/chain33/types"
 	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -232,4 +234,63 @@ func TestQueryGetBtcCheckpoint(t *testing.T) {
 	require.True(t, ok)
 	require.Zero(t, anchor.GetHeight())
 	require.Empty(t, anchor.GetHash())
+}
+
+// TestCheckBootstrapAnchorRejectDetail 覆盖 L1：bootstrap 锚点被拒时，错误（与日志同源）必须带上
+// "照做就能过"的信息 —— 本网络已知锚点高度列表、首个头高度、期望的 btcHeaderStartHeight。
+func TestCheckBootstrapAnchorRejectDetail(t *testing.T) {
+	regtest := &chaincfg.RegressionNetParams
+	ts := types.Now().Add(-time.Hour)
+
+	t.Run("net without anchors tells the operator to start from genesis", func(t *testing.T) {
+		first := mineBtcHeaderFrom(t, chainhash.Hash{}.String(), 1, regtest.PowLimitBits, ts)
+		err := checkBootstrapAnchor(first, regtest, nil)
+		require.ErrorIs(t, err, ErrBtcHeaderNoAnchor)
+
+		msg := err.Error()
+		// 中继按错误码文本分类"确定性拒收"（btcHeaderRejectedErrs），包装后必须仍然带哨兵文本。
+		require.Contains(t, msg, "ErrBtcHeaderNoAnchor")
+		require.Contains(t, msg, "net=regtest")
+		require.Contains(t, msg, "firstHeight=1")
+		require.Contains(t, msg, "genesisHash="+regtest.GenesisHash.String())
+		require.Contains(t, msg, "knownCheckpointHeights=[]")
+		require.Contains(t, msg, "highestCheckpoint=none")
+		require.Contains(t, msg, "btcHeaderStartHeight=1")
+	})
+
+	t.Run("net with anchors tells the operator the expected start height", func(t *testing.T) {
+		cp100 := mineBtcHeaderFrom(t, regtest.GenesisHash.String(), 100, regtest.PowLimitBits, ts)
+		cp200 := mineBtcHeader(t, cp100, 200, regtest.PowLimitBits, ts.Add(time.Minute))
+		btcCheckpointTable[regtest.Net] = map[uint64]string{100: cp100.Hash, 200: cp200.Hash}
+		defer delete(btcCheckpointTable, regtest.Net)
+
+		first := mineBtcHeaderFrom(t, chainhash.Hash{}.String(), 5, regtest.PowLimitBits, ts)
+		err := checkBootstrapAnchor(first, regtest, nil)
+		require.ErrorIs(t, err, ErrBtcHeaderNoAnchor)
+
+		msg := err.Error()
+		require.Contains(t, msg, "knownCheckpointHeights=[100 200]")
+		require.Contains(t, msg, "highestCheckpoint=200:"+cp200.Hash)
+		require.Contains(t, msg, "expectedBtcHeaderStartHeight=201")
+		require.Contains(t, msg, "firstHeight=5")
+	})
+
+	t.Run("genesis hash mismatch also carries the detail", func(t *testing.T) {
+		// 高度 0 但 hash 不是本网络创世：同样是 ErrBtcHeaderNoAnchor，同样要给出可操作信息。
+		bogus := &ltypes.BtcHeader{Height: 0, Hash: strings.Repeat("cd", 32)}
+		err := checkBootstrapAnchor(bogus, regtest, nil)
+		require.ErrorIs(t, err, ErrBtcHeaderNoAnchor)
+		require.Contains(t, err.Error(), "firstHeight=0")
+		require.Contains(t, err.Error(), "genesisHash="+regtest.GenesisHash.String())
+	})
+
+	t.Run("a header on the highest anchor is accepted", func(t *testing.T) {
+		// L1 只改拒绝路径的信息，不改判定：父块正好是最高锚点仍然通过。
+		cp100 := mineBtcHeaderFrom(t, regtest.GenesisHash.String(), 100, regtest.PowLimitBits, ts)
+		btcCheckpointTable[regtest.Net] = map[uint64]string{100: cp100.Hash}
+		defer delete(btcCheckpointTable, regtest.Net)
+
+		h101 := mineBtcHeader(t, cp100, 101, regtest.PowLimitBits, ts.Add(time.Minute))
+		require.NoError(t, checkBootstrapAnchor(h101, regtest, nil))
+	})
 }
