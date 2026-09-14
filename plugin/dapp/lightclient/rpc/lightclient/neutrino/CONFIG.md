@@ -34,6 +34,27 @@
   - 含义：仅用于 regtest 测试场景的时间容错开关
   - 建议：仅在 regtest 打开，生产网络关闭
 
+### 2.1.1 BTC 头链锚点（bootstrap 信任根）
+
+头链在链上**没有原生锚点**，若放任不管就是"谁先提交谁定义这条链"：攻击者把难度位设成网络最大目标
+（PoW sanity 只校验"自己的 hash ≤ 自己声明的 Bits"，必过）即可秒挖出第一个头，并在同一个难度调整
+窗口内一路自造头，凭空造出承载伪造充值交易的"比特币链"。因此 bootstrap（链上还没有任何 BTC 头）
+时的首个头必须锚定到**该网络的真实链**，满足以下之一才被接受：
+
+1. **直接接创世**：高度为 1 且 `previousHash` == 该网络创世 hash（由 btcd `chaincfg` 给出，无需维护）；
+2. **命中已知锚点**：`previousHash` == 锚点表中高度 `height-1` 的区块 hash；
+3. **localDB 可回溯**：沿 `previousHash` 逐级回查本地已存的头，最终到达创世或某个锚点。
+
+锚点表定义在 `plugin/dapp/lightclient/executor/btcd_validate.go` 的 `btcCheckpointTable`：
+
+- 格式：`网络 → 高度 → 该高度区块的 hash`（`getblockhash` 的输出口径）；键为 btcd 的 `wire.BitcoinNet`。
+- **填法**：从任意可信全节点执行 `getblockhash <height>`，把 `(height, hash)` 填进去。
+- **mainnet 必须填一个近期高度**（当前为 `TODO` 占位）：否则无法从创世（几百万个头）同步，
+  bootstrap 实际不可用。高度取**已深度确认**的近期高度（如某个难度调整周期的边界），随版本滚动更新。
+- 该表同时用于同步过程校验：链走到表中高度时头 hash 必须与表一致，否则整条链都不是真实链。
+- **regtest 不要填**：regtest 链每次启动都会重建（btcd `removeRegressionDB`），填了反而是错锚点，
+  也会弄挂 CI。
+
 ### 2.2 `[exec.sub.rgbx]`
 
 - `commitAddress`
@@ -110,6 +131,10 @@
 - `btcHeaderStartHeight` (uint64)
   - 含义：首次提交 BTC header 的起始高度
   - 默认行为：未设置时从 1 开始
+  - 注意：该高度同时决定 bootstrap 时首个头的高度，必须能通过主链的锚点校验
+    （见 2.1.1）。regtest 用默认值 1（即创世之后第一个块）；mainnet 若设成近期高度，
+    必须在锚点表 `btcCheckpointTable` 里填上对应高度 `btcHeaderStartHeight-1` 的区块 hash，
+    否则首个提交会被拒（`ErrBtcHeaderNoAnchor`）。
 - `maxUtxoRescanTime` (int64)
   - 含义：UTXO 重扫超时（单位：小时）
   - 特性：0 表示不超时；内部会转为秒

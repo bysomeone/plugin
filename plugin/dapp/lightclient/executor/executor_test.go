@@ -8,6 +8,7 @@ import (
 
 	"github.com/33cn/chain33/client/mocks"
 	"github.com/33cn/chain33/common/crypto"
+	dbm "github.com/33cn/chain33/common/db"
 	"github.com/33cn/chain33/types"
 	"github.com/33cn/chain33/util"
 	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
@@ -158,11 +159,132 @@ func TestLightclientCheckBtcHeadersBootstrap(t *testing.T) {
 
 	regtest := &chaincfg.RegressionNetParams
 	ts := types.Now().Add(-time.Hour)
-	h1 := mineBtcHeader(t, nil, 1, regtest.PowLimitBits, ts)
+	// 现有 CI 链就是从 btcHeaderStartHeight=1（即 regtest 创世之后第一个块）长起来的：
+	// 首个头的 previousHash 必须等于创世 hash，新增的锚点校验必须仍然放行。
+	h1 := mineBtcHeaderFrom(t, regtest.GenesisHash.String(), 1, regtest.PowLimitBits, ts)
 	h2 := mineBtcHeader(t, h1, 2, regtest.PowLimitBits, ts.Add(time.Minute))
 
 	tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{h1, h2}}, commitPriv)
 	require.NoError(t, cli.CheckTx(tx, 0))
+}
+
+// TestBtcHeadersBootstrapAnchor 覆盖 B5：bootstrap 时首个头必须锚定到该网络的真实链。
+func TestBtcHeadersBootstrapAnchor(t *testing.T) {
+	regtest := &chaincfg.RegressionNetParams
+	genesisHash := regtest.GenesisHash.String()
+	ts := types.Now().Add(-time.Hour)
+
+	// 每轮用独立的 DB，避免状态互相污染。
+	newCli := func(t *testing.T) (*lightclient, dbm.KV, func()) {
+		t.Helper()
+		dir, stateDB, localDB := util.CreateTestDB()
+		cli := newLightclient().(*lightclient)
+		setupTestDriver(t, cli)
+		cli.SetStateDB(stateDB)
+		cli.SetLocalDB(localDB)
+		commitAddr, commitPriv := util.Genaddress()
+		lightCfg.CommitAddress = commitAddr
+		lightCfg.BtcNetName = "regtest"
+		t.Cleanup(func() { util.CloseTestDB(dir, stateDB) })
+		return cli, localDB, func() { _ = commitPriv }
+	}
+
+	t.Run("self-mined first header on a bogus parent is rejected", func(t *testing.T) {
+		cli, _, _ := newCli(t)
+		commitAddr, commitPriv := util.Genaddress()
+		lightCfg.CommitAddress = commitAddr
+		// 攻击者自造链：Bits 直接取网络最大目标（powLimit），秒挖出头，且父块不是创世。
+		orphan := mineBtcHeaderFrom(t, chainhash.Hash{}.String(), 1, regtest.PowLimitBits, ts)
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{orphan}}, commitPriv)
+		require.Equal(t, ErrBtcHeaderNoAnchor, cli.CheckTx(tx, 0))
+	})
+
+	t.Run("first header directly on regtest genesis is accepted", func(t *testing.T) {
+		cli, _, _ := newCli(t)
+		commitAddr, commitPriv := util.Genaddress()
+		lightCfg.CommitAddress = commitAddr
+		h1 := mineBtcHeaderFrom(t, genesisHash, 1, regtest.PowLimitBits, ts)
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{h1}}, commitPriv)
+		require.NoError(t, cli.CheckTx(tx, 0))
+	})
+
+	t.Run("first header on a known checkpoint is accepted", func(t *testing.T) {
+		cli, _, _ := newCli(t)
+		commitAddr, commitPriv := util.Genaddress()
+		lightCfg.CommitAddress = commitAddr
+
+		checkpoint := mineBtcHeaderFrom(t, genesisHash, 4, regtest.PowLimitBits, ts)
+		btcCheckpointTable[regtest.Net] = map[uint64]string{4: checkpoint.Hash}
+		defer delete(btcCheckpointTable, regtest.Net)
+
+		// 高度 5、父块正好是锚点 4，且 localDB 里没有任何历史头。
+		h5 := mineBtcHeader(t, checkpoint, 5, regtest.PowLimitBits, ts.Add(5*time.Minute))
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{h5}}, commitPriv)
+		require.NoError(t, cli.CheckTx(tx, 0))
+	})
+
+	t.Run("first header found on a different checkpoint hash is rejected", func(t *testing.T) {
+		cli, _, _ := newCli(t)
+		commitAddr, commitPriv := util.Genaddress()
+		lightCfg.CommitAddress = commitAddr
+
+		checkpoint := mineBtcHeaderFrom(t, genesisHash, 4, regtest.PowLimitBits, ts)
+		btcCheckpointTable[regtest.Net] = map[uint64]string{4: checkpoint.Hash}
+		defer delete(btcCheckpointTable, regtest.Net)
+
+		// 父块 hash 与锚点不符：锚点表命中失败，且 localDB 无历史可回溯。
+		other := mineBtcHeaderFrom(t, chainhash.Hash{}.String(), 5, regtest.PowLimitBits, ts.Add(5*time.Minute))
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{other}}, commitPriv)
+		require.Equal(t, ErrBtcHeaderNoAnchor, cli.CheckTx(tx, 0))
+	})
+
+	t.Run("first header traceable through localdb to genesis is accepted", func(t *testing.T) {
+		cli, localDB, _ := newCli(t)
+		commitAddr, commitPriv := util.Genaddress()
+		lightCfg.CommitAddress = commitAddr
+
+		// localDB 里已有 1..4 的连续头（stateDB tip 丢失但 localDB 保留的场景）。
+		h1 := mineBtcHeaderFrom(t, genesisHash, 1, regtest.PowLimitBits, ts)
+		h2 := mineBtcHeader(t, h1, 2, regtest.PowLimitBits, ts.Add(time.Minute))
+		h3 := mineBtcHeader(t, h2, 3, regtest.PowLimitBits, ts.Add(2*time.Minute))
+		h4 := mineBtcHeader(t, h3, 4, regtest.PowLimitBits, ts.Add(3*time.Minute))
+		for _, h := range []*ltypes.BtcHeader{h1, h2, h3, h4} {
+			require.NoError(t, localDB.Set(btcHeaderKey(h.Height), types.Encode(h)))
+		}
+
+		h5 := mineBtcHeader(t, h4, 5, regtest.PowLimitBits, ts.Add(4*time.Minute))
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{h5}}, commitPriv)
+		require.NoError(t, cli.CheckTx(tx, 0))
+	})
+
+	t.Run("broken localdb chain does not anchor", func(t *testing.T) {
+		cli, localDB, _ := newCli(t)
+		commitAddr, commitPriv := util.Genaddress()
+		lightCfg.CommitAddress = commitAddr
+
+		// localDB 在高度 3 处断链（缺一个头），回溯必须失败。
+		h1 := mineBtcHeaderFrom(t, genesisHash, 1, regtest.PowLimitBits, ts)
+		h2 := mineBtcHeader(t, h1, 2, regtest.PowLimitBits, ts.Add(time.Minute))
+		h4 := &ltypes.BtcHeader{Height: 4, Hash: "deadbeef", PreviousHash: h2.Hash}
+		require.NoError(t, localDB.Set(btcHeaderKey(h1.Height), types.Encode(h1)))
+		require.NoError(t, localDB.Set(btcHeaderKey(h2.Height), types.Encode(h2)))
+		require.NoError(t, localDB.Set(btcHeaderKey(h4.Height), types.Encode(h4)))
+
+		h5 := mineBtcHeader(t, h4, 5, regtest.PowLimitBits, ts.Add(4*time.Minute))
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{h5}}, commitPriv)
+		require.Equal(t, ErrBtcHeaderNoAnchor, cli.CheckTx(tx, 0))
+	})
+
+	t.Run("first header on a non-genesis network is rejected", func(t *testing.T) {
+		cli, _, _ := newCli(t)
+		commitAddr, commitPriv := util.Genaddress()
+		lightCfg.CommitAddress = commitAddr
+
+		// 用 mainnet 创世 hash 冒充 regtest 链的父块：网络不匹配，同样拒绝。
+		h1 := mineBtcHeaderFrom(t, chaincfg.MainNetParams.GenesisHash.String(), 1, regtest.PowLimitBits, ts)
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: []*ltypes.BtcHeader{h1}}, commitPriv)
+		require.Equal(t, ErrBtcHeaderNoAnchor, cli.CheckTx(tx, 0))
+	})
 }
 
 func TestLightclientExecBtcHeaders(t *testing.T) {
@@ -257,6 +379,14 @@ func mineBtcHeader(t *testing.T, prev *ltypes.BtcHeader, height uint64, bits uin
 	if prev != nil {
 		prevHash = prev.Hash
 	}
+	return mineBtcHeaderFrom(t, prevHash, height, bits, ts)
+}
+
+// mineBtcHeaderFrom 挖一个指定 previousHash 的头。bootstrap 场景下首个头的 previousHash
+// 必须是该网络的创世 hash（见 checkBootstrapAnchor）。
+func mineBtcHeaderFrom(t *testing.T, prevHash string, height uint64, bits uint32, ts time.Time) *ltypes.BtcHeader {
+	t.Helper()
+
 	pre, err := chainhash.NewHashFromStr(prevHash)
 	require.NoError(t, err)
 	merkle := chainhash.DoubleHashH([]byte{byte(height), byte(height >> 8)})

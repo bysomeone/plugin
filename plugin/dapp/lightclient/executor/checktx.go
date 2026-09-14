@@ -46,7 +46,8 @@ func (l *lightclient) checkBtcHeaders(tx *types.Transaction, headers *ltypes.Btc
 		return ErrBtcGetLastHeader
 	}
 
-	if len(headers.GetHeaders()) < 1 {
+	list := headers.GetHeaders()
+	if len(list) < 1 {
 		elog.Error("checkBtcHeaders", "err", "commit empty headers")
 		return types.ErrInvalidParam
 	}
@@ -58,9 +59,15 @@ func (l *lightclient) checkBtcHeaders(tx *types.Transaction, headers *ltypes.Btc
 	var prevCtx blockchain.HeaderCtx
 	if !isBootstrap {
 		prevCtx = newBtcHeaderContext(prevHeader, nil, l.GetLocalDB())
+	} else if err = checkBootstrapAnchor(list[0], params, l.GetLocalDB()); err != nil {
+		// 链上还没有任何 BTC 头：首个头必须锚定到真实链（创世/已知锚点/localDB 可回溯），
+		// 否则任何人都能自造一条短链作为头链起点（见 checkBootstrapAnchor）。
+		elog.Error("checkBtcHeaders bootstrap anchor reject", "height", list[0].GetHeight(),
+			"hash", list[0].GetHash(), "prevHash", list[0].GetPreviousHash(), "err", err)
+		return err
 	}
 
-	for _, h := range headers.GetHeaders() {
+	for _, h := range list {
 
 		if h.GetHash() == "" {
 			elog.Error("checkBtcHeaders nil header")
@@ -96,7 +103,9 @@ func (l *lightclient) checkBtcHeaders(tx *types.Transaction, headers *ltypes.Btc
 				prevCtx = newBtcHeaderContext(h, prevCtx, l.GetLocalDB())
 				continue
 			}
-			if err = blockchain.CheckBlockHeaderContext(btcHeader, prevCtx, blockchain.BFNone, chainCtx, true); err != nil {
+			// skipCheckpoint=false：启用锚点表校验（见 btcChainContext.VerifyCheckpoint）。
+			chainCtx.setCheckHeight(int32(h.GetHeight()))
+			if err = blockchain.CheckBlockHeaderContext(btcHeader, prevCtx, blockchain.BFNone, chainCtx, false); err != nil {
 				// regtest 批量导入场景下，连续快速挖块可能出现同秒时间戳。
 				err = mapBtcHeaderVerifyErr(err)
 				if !(lightCfg.AllowRegtestTimeWarp && lightCfg.BtcNetName == "regtest" && err == ErrBtcHeaderTimeTooOld) {
