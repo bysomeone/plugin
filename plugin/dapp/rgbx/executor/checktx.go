@@ -331,6 +331,25 @@ func (r *rgbx) checkWithdraw(fromAddr, txHash string, withdraw *rtypes.WithdrawA
 	return nil
 }
 
+// checkDepositDuplicate 充值防双铸检查（E1 修复 B）。
+// 旧口径（TxData 原始字节哈希）可被"同一笔交易的另一份编码"绕过：追加尾部字节后 key 变化、
+// 重复检查不触发，而 merkle/金额/OP_RETURN 校验沿用同一份解析结果 → 同一笔真实充值可重复铸币。
+// 故唯一标识改用交易的规范化身份：先对 TxData 做严格解析（尾部多余字节直接拒绝），
+// 再以解析后交易的 btc txid 查重。txid 对同一笔交易恒定、不随 TxData 的编码变化，
+// 因此"同一笔真实充值的另一份编码"必然命中同一 key。
+func (r *rgbx) checkDepositDuplicate(txHash string, deposit *rtypes.DepositAsset) error {
+	txID, err := parseBtcTxIDStrict(txHash, deposit.GetTxProof().GetTxData())
+	if err != nil {
+		return err
+	}
+	if _, err = r.GetStateDB().Get(formatDepositUsedTxIDKey(txID)); !errors.Is(err, types.ErrNotFound) {
+		elog.Error("checkDeposit duplicate proof", "txHash", txHash, "symbol", deposit.GetAssetSymbol(),
+			"proofID", "btc-txid", "btcTxID", hex.EncodeToString(txID), "err", err)
+		return ErrDuplicateDepositProof
+	}
+	return nil
+}
+
 func (r *rgbx) checkDeposit(txHash string, deposit *rtypes.DepositAsset) error {
 	if deposit.GetAmount() <= 0 {
 		elog.Error("checkDeposit amount", "txHash", txHash, "amount", deposit.GetAmount())
@@ -341,10 +360,8 @@ func (r *rgbx) checkDeposit(txHash string, deposit *rtypes.DepositAsset) error {
 		elog.Error("checkDeposit address invalid", "txHash", txHash, "address", addr)
 		return ErrInvalidDepositAddress
 	}
-	_, err := r.GetStateDB().Get(formatDepositUsedKey(deposit.GetTxProof().GetTxData()))
-	if !errors.Is(err, types.ErrNotFound) {
-		elog.Error("checkDeposit duplicate proof", "txHash", txHash, "symbol", deposit.GetAssetSymbol(), "err", err)
-		return ErrDuplicateDepositProof
+	if err := r.checkDepositDuplicate(txHash, deposit); err != nil {
+		return err
 	}
 	btcTx, err := r.validateBtcTxProof(txHash, deposit.GetTxProof())
 	if err != nil {
