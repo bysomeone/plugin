@@ -119,6 +119,13 @@ func (r *rgbx) checkMint(txHash string, mint *rtypes.MintAsset) error {
 		return ErrInvalidSymbolLength
 	}
 
+	// A6：symbol 进入白名单字符集校验（formatSymbol 的 ToUpper 只在 ASCII 字母/数字/下划线上单射），
+	// 否则 "xſ" 这类输入会与 "xs" 归一化为同一个 asset key，可抢注/别名化已有 symbol。
+	if !isValidSymbolCharset(mint.GetSymbol()) {
+		elog.Error("checkMint invalid symbol charset", "txHash", txHash, "symbol", mint.Symbol)
+		return ErrInvalidAssetSymbol
+	}
+
 	if isCrossChainSymbol(mint.GetSymbol()) {
 		return ErrInvalidAssetSymbol
 	}
@@ -228,6 +235,12 @@ func (r *rgbx) checkCrossChainTransfer(txHash, fromAddr string, transfer *rtypes
 func (r *rgbx) checkCommitDKG(txHash, fromAddr string, commitDKG *rtypes.CommitDKG) error {
 
 	symbol := commitDKG.GetAssetSymbol()
+	// A6：同 checkMint —— CrossChainInfo 以 formatSymbol(symbol) 为 key，别名化 symbol 会写到
+	// 另一个资产的 key 上（例如占用/抢先注册 RGB20_USDT 的 CrossChainInfo，进而影响充值验签）。
+	if !isValidSymbolCharset(symbol) {
+		elog.Error("checkCommitDKG invalid symbol charset", "txHash", txHash, "symbol", symbol)
+		return ErrInvalidAssetSymbol
+	}
 	pkScript, err := r.decodeBtcAddressScript(commitDKG.GetDkgAddress())
 	if err != nil || !bytes.Equal(pkScript, commitDKG.GetPkScript()) {
 		elog.Error("checkCommitDKG decode btc address script", "txHash", txHash,

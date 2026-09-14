@@ -79,6 +79,16 @@ func Test_checkMint(t *testing.T) {
 			action:    &rtypes.MintAsset{Symbol: "aaaabbbbccccdddde"},
 		},
 		{
+			// A6：非白名单字符（ToUpper 非单射，"xſ" 与 "xs" 归一化相同）必须被拒，
+			// 否则可与已有 symbol 撞同一个 asset key（抢注/别名化）。
+			expectErr: ErrInvalidAssetSymbol,
+			action:    &rtypes.MintAsset{Symbol: "xſ", TotalAmount: 1},
+		},
+		{
+			expectErr: ErrInvalidAssetSymbol,
+			action:    &rtypes.MintAsset{Symbol: "us-dt", TotalAmount: 1},
+		},
+		{
 			expectErr: ErrInvalidAssetAmount,
 			action:    &rtypes.MintAsset{Symbol: "test"},
 		},
@@ -310,6 +320,49 @@ func Test_checkConfirm(t *testing.T) {
 		value.Confirm = tc.action.(*rtypes.ConfirmTx)
 		testCheck(t, r, tx, action, tc.expectErr, idx)
 	}
+}
+
+// Test_isValidSymbolCharset A6：formatSymbol 的 ToUpper 只在 ASCII 字母/数字/下划线上单射，
+// 白名单之外的字符会与 ASCII 字母归一化到同一结果（别名化），必须拒绝。
+func Test_isValidSymbolCharset(t *testing.T) {
+	for _, ok := range []string{"BTC", "btc", "RGB20_USDT", "normal1", "x9", "A_b_9"} {
+		require.Truef(t, isValidSymbolCharset(ok), "合法 symbol: %q", ok)
+	}
+	for _, bad := range []string{"", "xſ", "uſdt", "İ", "us-dt", "us dt", "us.dt", "usdt√", "全角Ａ"} {
+		require.Falsef(t, isValidSymbolCharset(bad), "非法 symbol: %q", bad)
+	}
+
+	// 复现前提：ToUpper 对白名单外字符非单射（"xſ" 与 "xs" 得到同一个 key），
+	// 这正是为什么必须在入口处按字符集拒绝，而不是只依赖 formatSymbol 归一化。
+	require.Equal(t, formatSymbol("xs"), formatSymbol("xſ"))
+	require.Equal(t, formatAssetKey("XS"), formatAssetKey("xſ"))
+
+	// 白名单内归一化保持单射（大小写仍是同一个资产，这是既有语义）
+	require.Equal(t, formatSymbol("btc"), formatSymbol("BTC"))
+	require.NotEqual(t, formatSymbol("usdt"), formatSymbol("usdc"))
+}
+
+// Test_checkMint_rejectsAliasedSymbol A6 验收：别名化 symbol 无法抢注已有 symbol 的 asset key。
+// 已有 "USDT" 资产时，mint "uſdt"（ToUpper 后同为 "USDT"）必须在入口被拒，
+// 而不是被当作 "USDT" 的重复资产（ErrDuplicateAssetSymbol）——否则 key 的所有权口径就乱了。
+func Test_checkMint_rejectsAliasedSymbol(t *testing.T) {
+	r := newRgbx()
+	dir, state, _ := util.CreateTestDB()
+	defer util.CloseTestDB(dir, state)
+	api := &mocks.QueueProtocolAPI{}
+	r.SetAPI(api)
+	api.On("GetConfig").Return(testCfg)
+	r.SetStateDB(state)
+
+	// 未注册 "USDT" 时也不能用别名占位（否则合法 USDT 之后会被判为重复）
+	err := r.(*rgbx).checkMint("tx", &rtypes.MintAsset{Symbol: "uſdt", TotalAmount: 1})
+	require.Equal(t, ErrInvalidAssetSymbol, err)
+
+	// 合法 symbol 正常通过
+	err = r.(*rgbx).checkMint("tx", &rtypes.MintAsset{
+		Symbol: "USDT", TotalAmount: 1, GenesisOut: &rtypes.OutPoint{Hash: "hash", PkScript: []byte("pk")},
+	})
+	require.NoError(t, err)
 }
 
 func newTestnetWitnessAddr(t *testing.T) (addr string, pkScript []byte) {
