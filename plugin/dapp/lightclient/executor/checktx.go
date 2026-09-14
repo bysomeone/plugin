@@ -33,8 +33,9 @@ func (l *lightclient) CheckTx(tx *types.Transaction, index int) error {
 }
 
 // maxBtcHeadersPerTx 单笔交易允许提交的最大 BTC 头数量。
-// 中继（neutrino submitBitcoinHeaders）自身 batchSize=16，这里留 4 倍余量；
-// 上限的作用是把"一笔交易把区块/mempool 灌满"的成本固定下来——原先只校验 >= 1，没有上界。
+// 中继（neutrino submitBitcoinHeaders）的 batchSize 正好等于这个值（64：mainnet 追平 10 万头需要的
+// 提交速度，见 neutrino/btc_header_sync.go），因此这里是**硬边界**：调小会把中继的正常批次拒掉，
+// 调大等于放宽"一笔交易把区块/mempool 灌满"的成本上限——原先只校验 >= 1，没有上界。
 const maxBtcHeadersPerTx = 64
 
 func (l *lightclient) checkBtcHeaders(tx *types.Transaction, headers *ltypes.BtcHeaders) error {
