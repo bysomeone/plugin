@@ -25,7 +25,7 @@ func btcProof2String(txProof *rtypes.BtcTxProof) string {
 		txProof.GetTxIndex(), hex.EncodeToString(txProof.GetTxData()))
 }
 
-func merkelProof2String(merkleProof [][]byte) string {
+func merkleProof2String(merkleProof [][]byte) string {
 	result := ""
 	for _, proof := range merkleProof {
 		result += hex.EncodeToString(proof) + "|"
@@ -245,7 +245,7 @@ func (r *rgbx) validateBtcTxProof(txHash string, proof *rtypes.BtcTxProof) (*wir
 	if !bytes.Equal(merkleRoot, headerMerkleRoot.CloneBytes()) {
 		elog.Error("validateBtcTxProof merkle root not match", "txHash", txHash,
 			"expectMerkleRoot", header.GetMerkleRoot(), "actualMerkleRoot", hex.EncodeToString(merkleRoot),
-			"merkleProof", merkelProof2String(proof.GetMerkleProof()))
+			"merkleProof", merkleProof2String(proof.GetMerkleProof()))
 		return nil, ErrInvalidBtcProofMerkle
 	}
 	return &btcTx, nil

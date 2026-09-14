@@ -27,13 +27,13 @@ var (
 	ErrTxAlreadyConfirmed               = errors.New("tx already confirmed")
 	ErrConfirmedHashNotEqual            = errors.New("confirmed hash not equal")
 	ErrSpendingInputNotEqual            = errors.New("spending input not equal")
-	ErrOpRetOutputPkScriptNotEqual      = errors.New("ErrOpRetOutputPkScriptNotEqual")
-	ErrInvalidCommitAddress             = errors.New("ErrInvalidCommitAddress")
-	ErrFromUtxoPkScriptNotSet           = errors.New("ErrFromUtxoPkScriptNotSet")
-	ErrInvalidAssetPrecision            = errors.New("ErrInvalidAssetPrecision")
-	ErrInvalidAssetSender               = errors.New("ErrInvalidAssetSender")
+	ErrOpRetOutputPkScriptNotEqual      = errors.New("op return output pkScript not equal")
+	ErrInvalidCommitAddress             = errors.New("invalid commit address")
+	ErrFromUtxoPkScriptNotSet           = errors.New("from utxo pkScript not set")
+	ErrInvalidAssetPrecision            = errors.New("invalid asset precision")
+	ErrInvalidAssetSender               = errors.New("invalid asset sender")
 	ErrInvalidFromUtxo                  = errors.New("invalid from utxo")
-	ErrInvalidSpendingTxIn              = errors.New("ErrInvalidSpendingTxIn")
+	ErrInvalidSpendingTxIn              = errors.New("invalid spending tx input")
 	ErrInvalidWithdrawAmount            = errors.New("invalid withdraw amount")
 	ErrInvalidWithdrawDestination       = errors.New("invalid withdraw destination")
 	ErrInvalidWithdrawDestinationScript = errors.New("invalid withdraw destination script")
@@ -54,12 +54,15 @@ var (
 	ErrInvalidCrossChainInfo            = errors.New("invalid cross chain info")
 	ErrNewAccountDB                     = errors.New("new account db error")
 	ErrGetCrossChainInfo                = errors.New("get cross chain info error")
-	ErrDuplicateDepositProof            = errors.New("duplicate deposit proof")
-	ErrInvalidGuardianCommitter         = errors.New("invalid guardian committer")
-	ErrDuplicateDKGCommit               = errors.New("duplicate dkg commit")
-	ErrGetGuardianNodeAddress           = errors.New("get guardian node address error")
-	ErrGetDkgConfirmations              = errors.New("get dkg confirmations error")
-	ErrInvalidDkgAddress                = errors.New("invalid dkg address")
+	// ErrDuplicateDepositProof 充值证明的 btc-txid 已被用于铸造（E1 去重）。
+	// 文案保留 "duplicate deposit proof" 子串：桥侧按它把重发视为"链上已认过这笔付款交易"，
+	// 进而把该笔充值按已铸造处理（neutrino rgb20/deposit.go 的 depositAlreadyConsumedMarker）。
+	ErrDuplicateDepositProof    = errors.New("duplicate deposit proof")
+	ErrInvalidGuardianCommitter = errors.New("invalid guardian committer")
+	ErrDuplicateDKGCommit       = errors.New("duplicate dkg commit")
+	ErrGetGuardianNodeAddress   = errors.New("get guardian node address error")
+	ErrGetDkgConfirmations      = errors.New("get dkg confirmations error")
+	ErrInvalidDkgAddress        = errors.New("invalid dkg address")
 	// ErrWithdrawAlreadyConfirmed 同一笔提现 burn 已被结算（放款）过（S3）。
 	// 文案保留 "already confirmed" 子串：桥侧重试路径按该子串把重复提交视为幂等成功
 	// （neutrino commitWithdrawConfirm 对含 "already confirmed" 的错误不再重试）。

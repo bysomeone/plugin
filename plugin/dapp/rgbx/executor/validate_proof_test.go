@@ -18,7 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func Test_btcProof2String_and_merkelProof2String(t *testing.T) {
+func Test_btcProof2String_and_merkleProof2String(t *testing.T) {
 	proof := &rtypes.BtcTxProof{
 		BlockHeight: 12,
 		BlockHash:   "abc",
@@ -31,8 +31,8 @@ func Test_btcProof2String_and_merkelProof2String(t *testing.T) {
 	require.Contains(t, s, "3")
 	require.Contains(t, s, "0102")
 
-	require.Equal(t, "", merkelProof2String(nil))
-	require.Contains(t, merkelProof2String([][]byte{{0xaa}, {0xbb}}), "aa")
+	require.Equal(t, "", merkleProof2String(nil))
+	require.Contains(t, merkleProof2String([][]byte{{0xaa}, {0xbb}}), "aa")
 }
 
 func Test_hasExpectedOpReturnData_and_commitments(t *testing.T) {
