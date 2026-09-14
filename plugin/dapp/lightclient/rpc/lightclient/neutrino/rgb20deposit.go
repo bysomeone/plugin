@@ -258,7 +258,7 @@ func (n *neutrinoClient) getLightBtcHeader(height uint64) (*ltypes.BtcHeader, er
 	return header, nil
 }
 
-// SubmitDeposit 提交 rgbx Deposit 交易（RGB20 分支由合约验 threshold_sig 后铸造）。
+// SubmitDeposit 提交 rgbx Deposit 交易（RGB20 分支由合约验 thresholdSig 后铸造）。
 func (n *neutrinoClient) SubmitDeposit(dep *rtypes.DepositAsset) error {
 	_, err := n.submitMainChainTx(rtypes.RgbxX, rtypes.NameDepositAssetAction, dep)
 	return err

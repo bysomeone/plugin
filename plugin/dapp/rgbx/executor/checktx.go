@@ -390,7 +390,7 @@ func (r *rgbx) checkDeposit(txHash string, deposit *rtypes.DepositAsset) error {
 		return err
 	}
 	// RGB20 分支：跳过链上 OP_RETURN 承诺与链上金额校验（RGB 金额在 consignment 内，由侧车验证），
-	// 改验 TSS 阈值签名 threshold_sig（btcec 直验 C=sha256(Encode(DepositAsset{threshold_sig:nil}))）。
+	// 改验 TSS 阈值签名 thresholdSig（btcec 直验 C=sha256(Encode(DepositAsset{thresholdSig:nil}))）。
 	if rtypes.IsRgb20Symbol(deposit.GetAssetSymbol()) {
 		info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
 		if err != nil {

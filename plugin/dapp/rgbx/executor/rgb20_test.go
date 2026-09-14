@@ -53,7 +53,7 @@ func buildMinimalBtcTx(t *testing.T) []byte {
 	return buf.Bytes()
 }
 
-// Test_thresholdSig_verify 验证 threshold_sig 验签路径（B1：btcec 直验 C，禁用 VerifyBytes 双重哈希）。
+// Test_thresholdSig_verify 验证 thresholdSig 验签路径（B1：btcec 直验 C，禁用 VerifyBytes 双重哈希）。
 func Test_thresholdSig_verify(t *testing.T) {
 	priv, err := btcec.NewPrivateKey()
 	require.NoError(t, err)
@@ -91,7 +91,7 @@ func Test_thresholdSig_verify(t *testing.T) {
 	require.Error(t, verifyThresholdSig(nil, good))
 }
 
-// Test_computeDepositSignMessage_deterministic 消息确定性：去掉 threshold_sig 前后一致。
+// Test_computeDepositSignMessage_deterministic 消息确定性：去掉 thresholdSig 前后一致。
 func Test_computeDepositSignMessage_deterministic(t *testing.T) {
 	dep := &rtypes.DepositAsset{
 		Amount:         1,
@@ -104,7 +104,7 @@ func Test_computeDepositSignMessage_deterministic(t *testing.T) {
 	m2 := computeDepositSignMessage(dep)
 	require.Equal(t, m1, m2)
 
-	// 与 sha256(types.Encode(DepositAsset{threshold_sig:nil})) 一致
+	// 与 sha256(types.Encode(DepositAsset{thresholdSig:nil})) 一致
 	dep.ThresholdSig = nil
 	raw := types.Encode(dep)
 	h := sha256.Sum256(raw)
@@ -174,7 +174,7 @@ func Test_checkCommitDKG_rgb20_pubkey(t *testing.T) {
 	}
 }
 
-// Test_checkDeposit_rgb20_thresholdSig RGB20 deposit 跳过 commitment、验 threshold_sig。
+// Test_checkDeposit_rgb20_thresholdSig RGB20 deposit 跳过 commitment、验 thresholdSig。
 func Test_checkDeposit_rgb20_thresholdSig(t *testing.T) {
 	r := newRgbx()
 	action := &rtypes.RgbxAction{}
@@ -224,12 +224,12 @@ func Test_checkDeposit_rgb20_thresholdSig(t *testing.T) {
 		Pubkey:      pub,
 	})))
 
-	// RGB20 分支：SPV 通过 + threshold_sig 验签通过，CheckTx 返回 nil。
+	// RGB20 分支：SPV 通过 + thresholdSig 验签通过，CheckTx 返回 nil。
 	value.Deposit = dep
 	tx.Payload = types.Encode(action)
 	require.NoError(t, r.CheckTx(tx, 0))
 
-	// 篡改 threshold_sig 应失败
+	// 篡改 thresholdSig 应失败
 	bad := proto.Clone(dep).(*rtypes.DepositAsset)
 	bad.ThresholdSig = []byte("bad")
 	value.Deposit = bad

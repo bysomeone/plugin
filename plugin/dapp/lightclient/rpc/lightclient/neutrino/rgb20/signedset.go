@@ -12,7 +12,7 @@ import (
 /*
  * 签名侧"已签集合"（A3 后半）。
  *
- * 背景：签名节点在签 threshold_sig（= chain33 铸币授权）之前做的去重，原先只有"本地 receive 已
+ * 背景：签名节点在签 thresholdSig（= chain33 铸币授权）之前做的去重，原先只有"本地 receive 已
  * minted 则拒"（ValidateDepositConsignment 里的那段）—— 而 validator 节点的本地 store 里通常
  * 根本没有 receive 记录（receive 由官方节点经 CreateReceive 创建），等于完全没有去重：协调者可以
  * 对同一笔 BTC 付款反复发起签名轮次，让每个签名节点反复产出签名产物、反复跑 GG18。
@@ -37,7 +37,7 @@ import (
 // bucket 不存在 = 空集 = 与引入本机制前完全一致的行为（不引入新存储引擎，复用同一 KVStore）。
 var signedDepositBucket = []byte("rgb20-signed-deposit")
 
-// SignedDeposit 本节点已为某笔充值付款交易签过 threshold_sig 的记录。
+// SignedDeposit 本节点已为某笔充值付款交易签过 thresholdSig 的记录。
 type SignedDeposit struct {
 	Txid string `json:"txid"`
 	// Height 付款交易所在的 BTC 高度（取自签名前已校验的 SPV 证明，TxProof.BlockHeight）。
