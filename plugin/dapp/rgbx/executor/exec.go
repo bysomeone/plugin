@@ -7,7 +7,6 @@ import (
 	log "github.com/33cn/chain33/common/log/log15"
 	"github.com/33cn/chain33/types"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 )
 
@@ -146,7 +145,18 @@ func (r *rgbx) Exec_Confirm(confirm *rtypes.ConfirmTx, tx *types.Transaction, in
 		return r.confirmWithdrawSettlement(confirm, txHash, confirmHash)
 	}
 
-	spendHash := chainhash.DoubleHashH(confirm.GetUtxoProof().GetSpendingTx()).String()
+	// A2：归属 utxo id 取自 SpendingTx 的规范身份（解析后交易的 btc txid），不再对原始字节取
+	// DoubleHashH：后者对"同一笔花费的另一份编码"（尾部追加字节）会给出不同的 owner id，
+	// 使同一笔花费被记到另一个 owner 名下（checkConfirm 已按规范编码拒绝，这里再兜底一次：
+	// 解析失败即视为承诺不成立，仅标记、不改变任何资产归属）。
+	spendingTx, err := parseSpendingTxStrict(txHash, confirm.GetUtxoProof().GetSpendingTx())
+	if err != nil {
+		elog.Error("Exec_Confirm parse spending tx", "action", action,
+			"txHash", txHash, "confirmHash", confirmHash,
+			"btcSpendingTxLen", len(confirm.GetUtxoProof().GetSpendingTx()), "err", err)
+		return &types.Receipt{Ty: types.ExecOk}, nil
+	}
+	spendHash := spendingTx.TxHash().String()
 	// 绑定资产的utxo已经在btc链上花费，但op return不存在或承诺数据不正确，
 	// 交易仅做标记并返回，相关资产永久冻结，无法转移
 	commitment, _ := txscript.NullDataScript(confirm.GetTxHash())

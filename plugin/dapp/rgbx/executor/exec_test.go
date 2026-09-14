@@ -1,9 +1,11 @@
 package executor
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/33cn/chain33/client/mocks"
+	"github.com/33cn/chain33/common/db"
 	"github.com/33cn/chain33/system/dapp"
 	"github.com/33cn/chain33/types"
 	"github.com/33cn/chain33/util"
@@ -11,6 +13,7 @@ import (
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -99,6 +102,18 @@ func TestRgbx_Exec_Confirm(t *testing.T) {
 	mintScript1, _ := txscript.NullDataScript([]byte(collect))
 	transferScript, _ := txscript.NullDataScript([]byte(normal1))
 	transferScript1, _ := txscript.NullDataScript([]byte(collect1))
+
+	// A2：归属 utxo id 取解析后交易的 txid，故 SpendingTx 必须是规范编码的真实交易字节。
+	spendTx := &wire.MsgTx{Version: 2}
+	spendTx.TxIn = append(spendTx.TxIn,
+		wire.NewTxIn(&wire.OutPoint{Hash: chainhash.DoubleHashH([]byte("confirm-outs")), Index: 0}, nil, nil))
+	spendTx.TxOut = append(spendTx.TxOut,
+		wire.NewTxOut(0, []byte("opret")), wire.NewTxOut(1000, []byte("owner")))
+	spendBuf := bytes.NewBuffer(make([]byte, 0, spendTx.SerializeSizeStripped()))
+	require.Nil(t, spendTx.SerializeNoWitness(spendBuf))
+	spendRaw := spendBuf.Bytes()
+	ownerUtxo := rtypes.FormatUtxo(spendTx.TxHash().String(), 1)
+
 	tcArr := []*testCase{
 		{
 			expectErr: nil,
@@ -106,23 +121,23 @@ func TestRgbx_Exec_Confirm(t *testing.T) {
 		},
 		{
 			expectErr: nil,
-			action:    &rtypes.ConfirmTx{UtxoProof: &rtypes.UtxoSpendingProof{}},
+			action:    &rtypes.ConfirmTx{UtxoProof: &rtypes.UtxoSpendingProof{SpendingTx: spendRaw}},
 		},
 		{
 			expectErr: nil,
-			action:    &rtypes.ConfirmTx{ActionType: rtypes.TyMintAction, TxHash: []byte(normal), UtxoProof: &rtypes.UtxoSpendingProof{OpRetOutputPkScript: mintScript}},
+			action:    &rtypes.ConfirmTx{ActionType: rtypes.TyMintAction, TxHash: []byte(normal), UtxoProof: &rtypes.UtxoSpendingProof{SpendingTx: spendRaw, OpRetOutputPkScript: mintScript}},
 		},
 		{
 			expectErr: nil,
-			action:    &rtypes.ConfirmTx{ActionType: rtypes.TyMintAction, TxHash: []byte(collect), UtxoProof: &rtypes.UtxoSpendingProof{OpRetOutputPkScript: mintScript1}},
+			action:    &rtypes.ConfirmTx{ActionType: rtypes.TyMintAction, TxHash: []byte(collect), UtxoProof: &rtypes.UtxoSpendingProof{SpendingTx: spendRaw, OpRetOutputPkScript: mintScript1}},
 		},
 		{
 			expectErr: nil,
-			action:    &rtypes.ConfirmTx{TxHash: []byte(normal1), UtxoProof: &rtypes.UtxoSpendingProof{OpRetOutputPkScript: transferScript}},
+			action:    &rtypes.ConfirmTx{TxHash: []byte(normal1), UtxoProof: &rtypes.UtxoSpendingProof{SpendingTx: spendRaw, OpRetOutputPkScript: transferScript}},
 		},
 		{
 			expectErr: nil,
-			action:    &rtypes.ConfirmTx{TxHash: []byte(collect1), UtxoProof: &rtypes.UtxoSpendingProof{OpRetOutputPkScript: transferScript1}},
+			action:    &rtypes.ConfirmTx{TxHash: []byte(collect1), UtxoProof: &rtypes.UtxoSpendingProof{SpendingTx: spendRaw, OpRetOutputPkScript: transferScript1}},
 		},
 	}
 
@@ -163,16 +178,86 @@ func TestRgbx_Exec_Confirm(t *testing.T) {
 	require.Nil(t, readDB(state, formatAssetKey(collect), asset))
 	require.Equal(t, formatSymbol(collect), asset.Symbol)
 	require.Equal(t, rtypes.Collectible, rtypes.AssetType(asset.Type))
-	owner := rtypes.FormatUtxo(chainhash.DoubleHashH(nil).String(), 1)
-	require.Equal(t, owner, asset.Owner)
+	// 归属 id = 解析后 spending tx 的规范 txid + opReturn 后一个输出索引
+	require.Equal(t, ownerUtxo, asset.Owner)
 
 	// check transfer
 	require.Nil(t, readDB(state, formatAssetKey(collect1), asset))
 	require.Equal(t, addr, asset.Owner)
 	require.Equal(t, int64(0), accDB.LoadAccount(utxoAddr).Balance)
 	require.Equal(t, int64(1), accDB.LoadAccount(addr).Balance)
-	changeAddr := rtypes.FormatUtxo(chainhash.DoubleHashH(nil).String(), 1)
-	require.Equal(t, int64(1), accDB.LoadAccount(changeAddr).Balance)
+	require.Equal(t, int64(1), accDB.LoadAccount(ownerUtxo).Balance)
+}
+
+// TestRgbx_Exec_Confirm_ownerIsCanonicalTxID A2 验收：
+//   - 归属 utxo id 与解析后 SpendingTx 的规范身份（btc txid）一致，而不是原始字节的 DoubleHashH；
+//   - 同一笔花费的"另一份编码"（尾部追加字节）不再改变归属：Exec 不产生任何状态变更（冻结），
+//     CheckTx 侧则直接拒绝（见 Test_checkConfirm 的 ErrNonCanonicalSpendingTx 用例）。
+func TestRgbx_Exec_Confirm_ownerIsCanonicalTxID(t *testing.T) {
+	symbol := "owner1"
+	mintScript, _ := txscript.NullDataScript([]byte(symbol))
+
+	spendTx := &wire.MsgTx{Version: 2}
+	spendTx.TxIn = append(spendTx.TxIn,
+		wire.NewTxIn(&wire.OutPoint{Hash: chainhash.DoubleHashH([]byte("a2-prevout")), Index: 0}, nil, nil))
+	spendTx.TxOut = append(spendTx.TxOut,
+		wire.NewTxOut(0, []byte("opret")), wire.NewTxOut(1000, []byte("owner")))
+	spendBuf := bytes.NewBuffer(make([]byte, 0, spendTx.SerializeSizeStripped()))
+	require.Nil(t, spendTx.SerializeNoWitness(spendBuf))
+	raw := spendBuf.Bytes()
+	appended := append(append([]byte{}, raw...), 0x00, 0x01)
+
+	ownerByTxID := rtypes.FormatUtxo(spendTx.TxHash().String(), 1)
+	// 复现前提：规范编码下 txid 与原始字节哈希一致；而"尾部追加字节"的那份编码在旧口径下
+	// 会得到另一个 owner id —— 同一笔花费被记到另一个 owner 名下（本次修复要消除的差异）。
+	require.Equal(t, ownerByTxID, rtypes.FormatUtxo(chainhash.DoubleHashH(raw).String(), 1))
+	require.NotEqual(t, ownerByTxID, rtypes.FormatUtxo(chainhash.DoubleHashH(appended).String(), 1))
+
+	run := func(t *testing.T, spendingTx []byte) (*types.Receipt, db.DB, *rgbx) {
+		t.Helper()
+		r := newRgbx().(*rgbx)
+		dir, state, _ := util.CreateTestDB()
+		t.Cleanup(func() { util.CloseTestDB(dir, state) })
+		api := &mocks.QueueProtocolAPI{}
+		r.SetAPI(api)
+		api.On("GetConfig").Return(types.NewChain33Config(types.GetDefaultCfgstring()))
+		r.SetStateDB(state)
+		require.Nil(t, state.Set(formatPayloadKey([]byte(symbol)),
+			types.Encode(&rtypes.MintAsset{Symbol: symbol, TotalAmount: 1})))
+
+		recp := testExec(t, r, rtypes.NameConfirmAction, &rtypes.ConfirmTx{
+			ActionType: rtypes.TyMintAction,
+			TxHash:     []byte(symbol),
+			UtxoProof: &rtypes.UtxoSpendingProof{
+				SpendingTx:          spendingTx,
+				OpRetOutputPkScript: mintScript,
+			},
+		}, nil, 0)
+		util.SaveKVList(state, recp.KV)
+		return recp, state, r
+	}
+
+	t.Run("canonical", func(t *testing.T) {
+		_, state, r := run(t, raw)
+		asset := &rtypes.RgbxAsset{}
+		require.Nil(t, readDB(state, formatAssetKey(symbol), asset))
+		require.Equal(t, spendTx.TxHash().String(), asset.GenesisBtcTxHash)
+		// Normal 资产的归属落在账户余额上（assetReceipt 只对 Collectible 写 Owner）
+		acc, err := r.newAccount(symbol)
+		require.Nil(t, err)
+		require.Equal(t, int64(1), acc.LoadAccount(ownerByTxID).Balance)
+	})
+
+	t.Run("trailing-bytes-freezes", func(t *testing.T) {
+		recp, state, r := run(t, appended)
+		require.NotNil(t, recp)
+		require.Empty(t, recp.KV, "非规范编码不得产生任何状态变更")
+		asset := &rtypes.RgbxAsset{}
+		require.Error(t, readDB(state, formatAssetKey(symbol), asset))
+		acc, err := r.newAccount(symbol)
+		require.Nil(t, err)
+		require.Equal(t, int64(0), acc.LoadAccount(ownerByTxID).Balance)
+	})
 }
 
 func TestRgbx_Exec_Deposit(t *testing.T) {

@@ -260,6 +260,15 @@ func Test_checkConfirm(t *testing.T) {
 			action:    &rtypes.ConfirmTx{UtxoProof: &rtypes.UtxoSpendingProof{SpendingTx: []byte("invalidBtcTxData")}},
 		},
 		{
+			// A2：尾部追加字节的同一笔花费（解析结果与 txid 不变）必须被拒，
+			// 否则归属 utxo id 会随编码变化，同一笔花费被记到另一个 owner id。
+			expectErr: ErrNonCanonicalSpendingTx,
+			action: &rtypes.ConfirmTx{UtxoProof: &rtypes.UtxoSpendingProof{
+				SpendingTx:          append(append([]byte{}, buf.Bytes()...), 0x00),
+				OpRetOutputPkScript: []byte("testScript"),
+			}},
+		},
+		{
 			expectErr: ErrInvalidSpendingTxIn,
 			action:    &rtypes.ConfirmTx{UtxoProof: &rtypes.UtxoSpendingProof{SpendingTx: buf.Bytes(), SpendingInputIdx: 2}},
 		},
