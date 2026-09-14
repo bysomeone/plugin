@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -45,6 +46,7 @@ func buildTestPSBT(t *testing.T) []byte {
 type fakeBridge struct {
 	mu         sync.Mutex
 	submitted  []*rtypes.DepositAsset
+	spvTxids   []string // BuildSpvProof 收到的 txid（回归：首次归因必须传结算后的 txid）
 	spvProof   *SpvProof
 	sig        []byte
 	signedPSBT []byte
@@ -52,7 +54,15 @@ type fakeBridge struct {
 
 func (f *fakeBridge) GetMainchainHeight() int64 { return 100 }
 
-func (f *fakeBridge) BuildSpvProof(string) (*SpvProof, error) {
+func (f *fakeBridge) BuildSpvProof(txid string) (*SpvProof, error) {
+	// 与真实实现一致（neutrino/rgb20deposit.go:31）：空 txid 直接失败。首次归因若拿着
+	// Settle() 之前的陈旧记录调用，就会命中这里（"build spv proof: empty txid"）。
+	if txid == "" {
+		return nil, fmt.Errorf("empty txid")
+	}
+	f.mu.Lock()
+	f.spvTxids = append(f.spvTxids, txid)
+	f.mu.Unlock()
 	if f.spvProof == nil {
 		return &SpvProof{
 			TxData:      []byte("tx"),
@@ -172,20 +182,71 @@ func Test_Deposit_Attribution(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "settled", st.Status)
 
-	// 轮询归因
+	// 轮询归因（首次归因即应完成铸造：submitDeposit 用的是 Settle 之后的最新记录）
 	adapter.pollTransfersOnce()
 
 	updated, err := adapter.receives.Get(rec.ReceiveID)
 	require.NoError(t, err)
-	require.Equal(t, ReceiveStatusSettled, updated.Status)
+	require.Equal(t, ReceiveStatusMinted, updated.Status)
 	require.NotEmpty(t, updated.Txid)
 
-	// seal 索引：收款 seal 进入 pending-mint
+	// seal 索引：收款 seal 已在首次归因中提升为 minted
 	require.True(t, adapter.IsSealOutpoint(updated.Seal))
-	require.True(t, adapter.seals.IsPendingMint(updated.Seal))
+	require.False(t, adapter.seals.IsPendingMint(updated.Seal))
+	require.Len(t, adapter.seals.ListMinted("RGB20_USDT"), 1)
 
 	// 已知 RGB txid 已记录
 	require.True(t, adapter.IsKnownRgbTxid(updated.Txid))
+}
+
+// Test_Deposit_FirstAttribution_SubmitsFreshTxid 首次归因必须一次成功，且提交的是「含付款
+// txid 的最新记录」，不是 Settle() 之前取到的陈旧副本。
+//
+// 回归：onSettledTransfer 在首次归因分支里先 Get 出 rec，再调 Settle()（只更新存储，不回写
+// 本地副本），随后拿陈旧的 rec 去 submitDeposit → BuildSpvProof("") →
+// "build spv proof: empty txid"，首次必失败、延迟 30s、下一轮 30s 轮询才自愈（三轮 harness
+// 均复现的"充值首次归因必失败"）。
+func Test_Deposit_FirstAttribution_SubmitsFreshTxid(t *testing.T) {
+	mock := NewMockSidecar()
+	bridge := &fakeBridge{}
+	adapter, cleanup := newTestAdapter(t, mock, bridge)
+	defer cleanup()
+
+	rec, err := adapter.DepositFlow(context.Background(), &DepositRequest{
+		RequestID:   "req-1",
+		AssetSymbol: "RGB20_USDT",
+		Amount:      1000,
+		Chain33Addr: "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk",
+	})
+	require.NoError(t, err)
+
+	// 用户付款并交付 consignment → 侧车 settle，返回含付款 txid 的状态
+	settled, err := adapter.ProvideConsignment(context.Background(), []byte("consignment-bytes"), rec.ReceiveID)
+	require.NoError(t, err)
+	require.Equal(t, "settled", settled.Status)
+	require.NotEmpty(t, settled.Txid)
+
+	// 只驱动一轮归因（不等 30s ticker）：首次就必须成功
+	adapter.pollTransfersOnce()
+
+	// 1. SPV 证明请求拿到的是结算后的付款 txid（陈旧副本会传空串，被桥以 empty txid 拒绝）
+	require.Equal(t, []string{settled.Txid}, bridge.spvTxids)
+	// 2. 充值已提交给链上（首次即成功，无需重试）
+	require.Len(t, bridge.submitted, 1)
+	require.Equal(t, int64(1000), bridge.submitted[0].GetAmount())
+	require.NotNil(t, bridge.submitted[0].GetTxProof())
+	require.NotEmpty(t, bridge.submitted[0].GetTxProof().GetTxData())
+
+	// 3. 本地状态一次性推进到 minted
+	updated, err := adapter.receives.Get(rec.ReceiveID)
+	require.NoError(t, err)
+	require.Equal(t, ReceiveStatusMinted, updated.Status)
+	require.Equal(t, settled.Txid, updated.Txid)
+
+	// 4. 再轮询一轮不应重复提交（幂等）
+	adapter.pollTransfersOnce()
+	require.Len(t, bridge.submitted, 1)
+	require.Len(t, bridge.spvTxids, 1)
 }
 
 func Test_ValidateDepositConsignment(t *testing.T) {

@@ -159,6 +159,13 @@ func (a *Adapter) onSettledTransfer(t *pb.TransferState) error {
 		}); err != nil {
 			return err
 		}
+		// Settle 只更新存储，上面取到的 rec 仍是结算前的副本（Txid/Vout/Seal 都还是空值）。
+		// 必须重新读取：否则 submitDeposit 会拿着空 txid 去构造 SPV proof，首次归因必然失败
+		// （"build spv proof: empty txid"），要等下一轮 30s 轮询拿到 settled 记录才自愈。
+		rec, err = a.receives.Get(t.ReceiveId)
+		if err != nil {
+			return err
+		}
 	}
 	// 触发充值提交（SPV + TSS 签 deposit + 提交）。失败返回 error，由 pollTransfersOnce 记录，
 	// 下轮轮询继续重试（rec.Status 已是 settled，走上面的重试分支）。
