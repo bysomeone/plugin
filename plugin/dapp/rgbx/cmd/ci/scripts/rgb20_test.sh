@@ -34,6 +34,44 @@ function wait_rgb20_balance_not_less_than() {
     fail "rgb20 balance not reached, addr=${addr}, expected>=${expected}"
 }
 
+# para1（官方节点，跑 Go 桥）在 since_epoch（unix 秒）之后新产生的日志。
+# 用于断言"本轮没有出现某个错误"——例如提现覆盖校验失败 / 每秒重试刷屏。
+function para1_logs_since() {
+    local since_epoch="$1"
+    local elapsed=$(( $(date +%s) - since_epoch ))
+    if [ "${elapsed}" -lt 1 ]; then
+        elapsed=1
+    fi
+    compose_cmd logs --no-color --since "${elapsed}s" para1 2>&1 || true
+}
+
+# 本轮这笔提现在链上的 pending 金额（= CLI 换算出的最小单位数，= 实际 burn 额）。
+function query_pending_withdraw_amount() {
+    local from_addr="$1"
+    local tx_hash="$2"
+    ${MAIN_CLI} rgbx listPendByFrom -f "${from_addr}" |
+        jq -r --arg h "$(echo "${tx_hash}" | tr 'A-Z' 'a-z')" \
+        '[.pendingList[]? | select(.actionType == 106) | select((.txHash | ascii_downcase) == $h) | .amount] | first // empty'
+}
+
+# 等 pending 落链后读回金额（CLI 返回 tx hash 与交易执行之间有竞态）。
+function wait_pending_withdraw_amount() {
+    local from_addr="$1"
+    local tx_hash="$2"
+    local retries="${3:-30}"
+    local i amount
+    for ((i = 0; i < retries; i++)); do
+        amount=$(query_pending_withdraw_amount "${from_addr}" "${tx_hash}")
+        if [ -n "${amount}" ] && [ "${amount}" != "null" ]; then
+            echo "${amount}"
+            return 0
+        fi
+        mine_btcd_blocks 1
+        sleep 1
+    done
+    echo ""
+}
+
 function wait_rgb20_dkg_commit() {
     log_step "wait RGB20 DKG commit (RGB20 CrossChainInfo pubkey)"
     local retries=90
@@ -193,6 +231,10 @@ function scenario_rgb20_deposit() {
         -d "{\"psbt\":\"${signed_psbt}\",\"consignment\":\"${cons_hex}\",\"receive_id\":\"${receive_id}\"}" | jq -r '.status // empty')
     assert_eq "${settle_status}" "settled" "rgb20 settle status"
 
+    # 本场景的日志窗口起点（下面断言"首次归因没有报 empty txid"）。
+    local deposit_started_at
+    deposit_started_at=$(date +%s)
+
     # 4.5 上传 consignment 给 Go 桥（submitDeposit 需要；否则 pollTransfers 报
     # "consignment not provided"，铸造不触发）。端点为 base64。侧车对已 settle 的 receive
     # 幂等返回，故此处 200。
@@ -209,6 +251,16 @@ function scenario_rgb20_deposit() {
     expected=$(awk "BEGIN{printf \"%.8f\", ${before} + ${delta}}")
     wait_rgb20_balance_not_less_than "${USER_MAIN_ADDR}" "${expected}"
     log_step "RGB20 deposit OK: balance ${before} -> >= ${expected}"
+
+    # 6. 首次归因必须一次成功。旧实现在首次归因分支里拿着 Settle() 之前的陈旧副本调
+    #    BuildSpvProof，必然报 "build spv proof: empty txid"，要等下一轮 30s 轮询拿到
+    #    settled 记录才自愈（三轮 run 均复现）。这里用日志窗口钉住"不再发生"。
+    local deposit_logs
+    deposit_logs=$(para1_logs_since "${deposit_started_at}")
+    if echo "${deposit_logs}" | grep -q "build spv proof: empty txid"; then
+        fail "deposit first attribution used a stale receive record: $(echo "${deposit_logs}" | grep -m1 'empty txid')"
+    fi
+    log_step "RGB20 deposit: first attribution succeeded without retry (no empty txid)"
 }
 
 # =====================================================================
@@ -375,6 +427,66 @@ function scenario_rgb20_two_withdrawals() {
 }
 
 # =====================================================================
+# 易截断金额的提现（CLI 十进制 → 最小单位换算精确性回归）
+# =====================================================================
+#
+# 旧实现用 int64(amount * math.Pow(10, 8)) 换算：float64 表示不了 0.0006，
+# 0.0006 * 1e8 = 59999.99999999999 → 截断得 59999（1..2,000,000 最小单位中有 159879 个、
+# 即 7.99% 会少 1）。链上 pending 因此比 invoice/放款意图少 1，签名节点的覆盖校验会正确地
+# 以 "withdraw payout exceeds pending amount: payout=60000 pending=59999" 拒绝放款，而该
+# pending 不属于不可恢复类别 —— 桥每秒重试刷屏，用户资产已 burn 却永不出款。
+# 其余场景的金额（500000/200000）恰好落在安全区，覆盖不到这个雷区，故本场景用 60000。
+
+function scenario_rgb20_truncation_withdraw() {
+    log_step "scenario: RGB20 withdraw with truncation-prone amount (${RGB20_TRUNCATION_WITHDRAW_AMOUNT} min units)"
+
+    local sidecar_before
+    sidecar_before=$(query_rgb20_ledger_spendable)
+    assert_true "$(awk "BEGIN{print (${sidecar_before} >= ${RGB20_TRUNCATION_WITHDRAW_AMOUNT})?\"true\":\"false\"}")" \
+        "rgb20 sidecar holdings too low for truncation withdrawal: have=${sidecar_before}, need=${RGB20_TRUNCATION_WITHDRAW_AMOUNT}"
+
+    local before after amt user_invoice withdraw_hash burn_amount expected started_at
+    before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
+    started_at=$(date +%s)
+
+    # 1. 侧车 test-sim 发票：金额用精确的最小单位数
+    user_invoice=$(curl -s -X POST http://127.0.0.1:50064/sim/user_invoice \
+        -H 'Content-Type: application/json' \
+        -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${RGB20_TRUNCATION_WITHDRAW_AMOUNT}}" | jq -r '.invoice // empty')
+    assert_non_empty "${user_invoice}" "rgb20 truncation user invoice empty"
+
+    # 2. chain33 发起提现（-a 口径 = min units / 1e8；旧实现下 ${RGB20_TRUNCATION_WITHDRAW_AMOUNT} 会少 1）
+    amt=$(awk "BEGIN{printf \"%.8f\", ${RGB20_TRUNCATION_WITHDRAW_AMOUNT}/100000000}")
+    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
+    assert_length "${withdraw_hash}" 66 "rgb20 truncation withdraw tx hash"
+
+    # 3. 断言 burn 额（链上 pending）== invoice 额。浮点截断时这里是 59999。
+    burn_amount=$(wait_pending_withdraw_amount "${USER_MAIN_ADDR}" "${withdraw_hash}")
+    assert_non_empty "${burn_amount}" "rgb20 truncation withdraw pending not found (${withdraw_hash})"
+    assert_eq "${burn_amount}" "${RGB20_TRUNCATION_WITHDRAW_AMOUNT}" \
+        "chain33 burn amount != invoice amount (CLI decimal->min unit conversion lost units)"
+
+    # 4. 正常完成：pending 清除 + 余额精确递减。金额不一致时桥永远不放款，这里会超时。
+    wait_no_withdraw_pending_for_user "${USER_MAIN_ADDR}" "${withdraw_hash}"
+    expected=$(awk "BEGIN{printf \"%.8f\", ${before} - ${amt}}")
+    after=$(query_rgb20_balance "${USER_MAIN_ADDR}")
+    assert_balance "${after}" "${expected}" "rgb20 balance not decreased after truncation withdraw"
+
+    # 5. 本轮日志：不许出现覆盖校验失败，也不许出现每秒重试刷屏
+    local logs retries
+    logs=$(para1_logs_since "${started_at}")
+    if echo "${logs}" | grep -q "payout exceeds pending amount"; then
+        fail "rgb20 truncation withdraw rejected by coverage check: $(echo "${logs}" | grep -m1 'payout exceeds pending amount')"
+    fi
+    retries=$(echo "${logs}" | grep -c "withdrawalProcessor rgb20 retry" || true)
+    if [ "${retries}" -ge 10 ]; then
+        fail "rgb20 truncation withdraw retried ${retries} times (spam); burn/payout amount mismatch?"
+    fi
+
+    log_step "RGB20 truncation withdraw OK: burn == invoice == payout == ${RGB20_TRUNCATION_WITHDRAW_AMOUNT} min units (retry logs=${retries})"
+}
+
+# =====================================================================
 # Go↔Rust 互操作 smoke（compose 内暴露的侧车 50061）
 # =====================================================================
 
@@ -435,5 +547,6 @@ function run_rgb20_all() {
     scenario_rgb20_deposit
     scenario_rgb20_withdraw
     scenario_rgb20_two_withdrawals
+    scenario_rgb20_truncation_withdraw
     run_rgb20_sidecar_smoke
 }
