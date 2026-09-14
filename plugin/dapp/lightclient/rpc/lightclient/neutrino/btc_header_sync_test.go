@@ -230,6 +230,14 @@ func Test_btcHeaderReconciler_queryErrorIsNotUnrecoverable(t *testing.T) {
 	require.Nil(t, plan)
 }
 
+// Test_btcHeaderBatchSizeFitsB7Limit 批大小必须正好吃满、且不超过执行器上限（见 btcHeaderBatchSize 的
+// 理由：mainnet 追平速度）。这里的 64 是与执行器 executor/checktx.go 的硬耦合值：执行器侧用
+// "64 收、65 拒"的用例钉住它，两边必须同步改（跨包不可见，无法直接引用）。
+func Test_btcHeaderBatchSizeFitsB7Limit(t *testing.T) {
+	require.Equal(t, 64, maxBtcHeadersPerTx)
+	require.Equal(t, maxBtcHeadersPerTx, btcHeaderBatchSize)
+}
+
 func Test_btcHeaderBatchRange(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -244,6 +252,7 @@ func Test_btcHeaderBatchRange(t *testing.T) {
 		{name: "full batch 16", next: 10, confirmed: 100, size: 16, wantFrom: 10, wantTo: 25, wantOk: true},
 		{name: "truncated by confirmations", next: 95, confirmed: 100, size: 16, wantFrom: 95, wantTo: 100, wantOk: true},
 		{name: "truncated at b7 limit", next: 900000, confirmed: 900010, size: btcHeaderBatchSize, wantFrom: 900000, wantTo: 900010, wantOk: true},
+		{name: "oversized batch size is truncated to the b7 limit", next: 10, confirmed: 1000, size: maxBtcHeadersPerTx + 8, wantFrom: 10, wantTo: 10 + uint64(maxBtcHeadersPerTx) - 1, wantOk: true},
 		{name: "single header", next: 100, confirmed: 100, size: 16, wantFrom: 100, wantTo: 100, wantOk: true},
 		{name: "nothing confirmed yet", next: 101, confirmed: 100, size: 16, wantOk: false},
 		{name: "no start height", next: 0, confirmed: 100, size: 16, wantOk: false},

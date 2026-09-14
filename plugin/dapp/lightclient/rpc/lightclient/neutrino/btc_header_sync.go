@@ -35,7 +35,7 @@ import (
  *
  * 与既有约束的关系：
  *   - B7（单笔 ≤ maxBtcHeadersPerTx=64 头、批内高度必须逐个 +1）：本批区间由 btcHeaderBatchRange
- *     连续生成，批大小固定 16，天然满足；
+ *     连续生成，批大小固定 64 —— 正好等于执行器上限，天然满足但**不得再调大**（见 btcHeaderBatchSize）；
  *   - B5（bootstrap 锚点）：链上还没有任何头时，起点只能用配置的 btcHeaderStartHeight（它必须是
  *     本网络锚点高度 + 1，见 CONFIG.md），不能由本地视图推出来；
  *   - B3/B4（回退深度 24 + 按累积工作量选链）：本文件只负责"从一致点重发"，选链与深度判定仍在执行器。
@@ -46,8 +46,20 @@ import (
 // ErrBtcReorgTooDeep 拒收，中继据此判定为"不可自愈，需要重新 bootstrap"。
 const maxBtcHeaderReorgDepth = 24
 
-// btcHeaderBatchSize 单批提交的最大头数（与改造前一致）。执行器 B7 的上限是 64，这里留 4 倍余量。
-const btcHeaderBatchSize = 16
+// maxBtcHeadersPerTx 执行器 B7 的单笔交易头数上限，与
+// plugin/dapp/lightclient/executor/checktx.go 的同名常量必须一致（跨包不可见，这里复刻一份；
+// 执行器侧有"64 收、65 拒"的用例钉住那个值，这里是它的中继侧镜像）。越界的批会被整批拒收
+// （ErrBtcHeadersTooMany），而中继会把"确定性拒收"当成不可自愈并停止重发，所以两边必须同步改。
+const maxBtcHeadersPerTx = 64
+
+// btcHeaderBatchSize 单批提交的最大头数 = 执行器 B7 的单笔上限，**正好用满**。
+//
+// 为什么是 64（而不是原先的 16）：mainnet 的内置锚点只到 810000（见执行器 btcCheckpointTable），
+// 距当前 tip 有约 10 万个头，而提交速度 ≈ 批大小 / (btcBlockInterval/3)：16 头/批 ≈ 288 头/小时 →
+// 追平要 ~15 天，64 头/批 ≈ 1152 头/小时 → ~4 天，直接决定上线排期。加大批不放松任何一条校验
+// （执行器对每个头都做 PoW/难度/时间/上下文校验），只放大单笔交易的体积：64 头 ≈ 16KB，
+// 远小于 chain33 的 100KB 交易上限（types.MaxTxSize）。
+const btcHeaderBatchSize = maxBtcHeadersPerTx
 
 // btcHeaderBatchRefreshInterval 在途批次的"续期"间隔：本批已经被链上受理、链上却还没把它纳入
 // canonical 时，最多每隔这么久重发一次。两个作用：
@@ -254,8 +266,16 @@ func (g *btcBootstrapAnchorGuard) check(chain btcChainHeaderView, startHeight ui
 }
 
 // btcHeaderBatchRange 计算本批覆盖的高度区间 [from, to]；没有可提交的高度时 ok=false。
-// 区间连续且逐个 +1 —— 执行器 B7 要求同一笔交易内的头高度必须严格 +1，这里由构造保证。
+//
+// 三条由构造保证的不变量（执行器侧对应 B7 的校验）：
+//   - 区间自 nextSubmitHeight 起、连续且逐个 +1（同一笔交易内的头高度必须严格 +1）；
+//   - 区间不超过 "已确认" 高度 confirmedHeight（链上还没有的头不能提交）；
+//   - 区间长度不超过执行器上限 maxBtcHeadersPerTx —— 传入更大的 batchSize 会被截断到上限，
+//     这样即使有人把 btcHeaderBatchSize 调大，也不会发出一个注定被 ErrBtcHeadersTooMany 整批拒收的批。
 func btcHeaderBatchRange(nextSubmitHeight, confirmedHeight uint64, batchSize int) (from, to uint64, ok bool) {
+	if batchSize > maxBtcHeadersPerTx {
+		batchSize = maxBtcHeadersPerTx
+	}
 	if batchSize <= 0 || nextSubmitHeight == 0 || nextSubmitHeight > confirmedHeight {
 		return 0, 0, false
 	}
