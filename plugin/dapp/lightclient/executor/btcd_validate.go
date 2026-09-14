@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"fmt"
+	"math"
 	"time"
 
 	dbm "github.com/33cn/chain33/common/db"
@@ -20,24 +22,126 @@ import (
 //  2. 同步校验：已同步的链走到表中高度时，头 hash 必须与表一致，否则整条链都不是真实链
 //     （见 btcChainContext.VerifyCheckpoint）。
 //
-// 填法：从任意可信全节点执行 `getblockhash <height>`，把 (height, hash) 填进来即可。
-// 高度建议取**已深度确认**的近期高度（如某个难度调整周期的边界），并随版本发布滚动更新。
-// 留空表示该网络只接受"从创世锚定"的 bootstrap（各网络创世 hash 由 btcd chaincfg 给出，
-// 无需在此维护）。regtest 链每次启动都会重建，**不要**给它填 checkpoint。
-var btcCheckpointTable = map[wire.BitcoinNet]map[uint64]string{
-	wire.MainNet: {
-		// TODO(上线前填写)：例如 840000: "<getblockhash 840000 的结果>"。
-		// 不填则 mainnet 只能从创世（高度 1）开始提交头，实际不可用。
-	},
-	wire.TestNet3: {
-		// TODO(上线前填写)：同上，填一个 testnet3 的近期高度。
-	},
-	// 以下网络暂不需要锚点表（testnet4/signet/simnet 未用于生产充值）。
-	wire.TestNet4: {},
-	wire.SigNet:   {},
-	wire.SimNet:   {},
-	// regtest 链每次重建，填了反而是错锚点（btcd 里 regtest 的 Net 就是 wire.TestNet）。
-	wire.TestNet: {},
+// **表的来源（方案 A）**：不再手工维护，而是由 init() 按网络从 btcd chaincfg 的内置 Checkpoints
+// 直接生成（每个网络最后一条锚点见 TestBtcCheckpointTableGolden），运维要更新鲜的起点时优先**升级
+// btcd**；确实需要额外手加时走 extraBtcCheckpoints（只能比 chaincfg 最高锚点更高）。
+//
+// 由此带来两条必须知道的运行约束：
+//   - **锚点集合随 btcd 版本变化**：升级 btcd = 同时改变执行器与中继（neutrino 把头链硬锚在
+//     btcd 的 checkpoint 上，见 blockmanager.findNextHeaderCheckpoint）的锚点集合；
+//   - **所有节点必须同一个 build**：不同 build 的锚点不同，头链走到某个高度时 hash 必然对不上，
+//     表现是"中继自己不报错、链上头链静默停滞"（执行器 VerifyCheckpoint 命中错锚点报
+//     ErrBadCheckpoint→ErrBtcHeaderVerify）。regtest 链每次启动都会重建，任何网络都不该给它填锚点
+//     （btcd 里 regtest 的 Net 就是 wire.TestNet，chaincfg 对它是 nil）。
+var btcCheckpointTable = map[wire.BitcoinNet]map[uint64]string{}
+
+// btcCheckpointNetNames 本执行器维护锚点的网络名，取值与 ltypes.GetBtcChainParams 一一对应。
+//
+// 这里用"网络名"而不是 wire.BitcoinNet 列表，是为了让锚点表与中继共用**同一个** net→params 映射
+// （中继的 neutrino.Config.ChainParams 与执行器都来自 ltypes.GetBtcChainParams）：两边锚点一旦不同源，
+// 就是文件头说的那类静默停滞。
+var btcCheckpointNetNames = []string{"mainnet", "testnet3", "testnet4", "regtest", "simnet", "signet"}
+
+// extraBtcCheckpoints 可选的**编译期**扩展层：在 chaincfg 内置锚点之上追加更高的锚点。
+//
+// 规则（见 buildBtcCheckpointTable，违反即 init() panic 拒绝启动）：
+//  1. 必须**完整包含**本网络 chaincfg 的每一条锚点（同高度同 hash）——少一条或改一条都拒绝；
+//  2. 只允许新增**严格高于** chaincfg 最高锚点的高度；
+//  3. chaincfg 没有锚点的网络（regtest/testnet4/signet/simnet）不允许扩展。
+//
+// 用它做什么：主网需要"比 btcd 内置的最后一个锚点更新鲜"的起点时，**首选升级 btcd**（那样中继侧
+// 的锚点会一起前进，两边天然一致）；只有在不能马上升级 btcd、又必须把 mainnet 起点往前挪时才手加
+// 一条，此时中继侧仍锚在更老的 checkpoint 上（那头链更安全，不会更不安全），运维必须自己保证
+// btcHeaderStartHeight 与这张表（而不是与 chaincfg）配套。
+//
+// 当前为空：所有网络的锚点都来自 chaincfg，不需要扩展。
+var extraBtcCheckpoints = map[wire.BitcoinNet]map[uint64]string{
+	// 示例（当前不启用）：
+	// wire.MainNet: {
+	//	// 必须原样重述 chaincfg 的每一条锚点，再追加更高的一条。
+	//	810000: "000000000000000000028028ca82b6aa81ce789e4eb9e0321b74c3cbaf405dd1",
+	//	840000: "<getblockhash 840000 的结果>",
+	// },
+}
+
+func init() {
+	if err := reloadBtcCheckpointTable(extraBtcCheckpoints); err != nil {
+		// fail-closed：锚点表是信任根，写错一条 = 头链在该高度永久过不去（静默停滞），
+		// 写少一条 = 该网络失去锚点约束。这两张表都是编译期常量，写错属于代码缺陷，必须让它在
+		// 启动/CI 阶段就炸出来，绝不允许带着一张错的表跑起来。
+		panic(err)
+	}
+}
+
+// reloadBtcCheckpointTable 按 btcCheckpointNetNames 重新生成 btcCheckpointTable。
+// 生产上只在 init() 调用一次（表是只读的编译期数据）；单测用它验证扩展层的注入路径，
+// 用完必须用 extraBtcCheckpoints 再调一次恢复原状。
+func reloadBtcCheckpointTable(extra map[wire.BitcoinNet]map[uint64]string) error {
+	for _, name := range btcCheckpointNetNames {
+		params := ltypes.GetBtcChainParams(name)
+		checkpoints, err := buildBtcCheckpointTable(params, extra[params.Net])
+		if err != nil {
+			return err
+		}
+		btcCheckpointTable[params.Net] = checkpoints
+	}
+	return nil
+}
+
+// buildBtcCheckpointTable 把 chaincfg 的内置锚点与扩展层合并成本网络的有效锚点表，并执行扩展层断言。
+//
+// 返回的表恒等于"chaincfg 的全部锚点 + extra 里更高的那些"；extra 与 chaincfg 冲突、少项、
+// 或试图加更低的高度时返回错误（调用方 init() 直接 panic）。纯函数，便于单测覆盖各类违反。
+func buildBtcCheckpointTable(params *chaincfg.Params, extra map[uint64]string) (map[uint64]string, error) {
+	table := make(map[uint64]string, len(params.Checkpoints)+len(extra))
+	// maxHeight chaincfg 内置的最高锚点高度；没有内置锚点时保持 0。
+	var maxHeight uint64
+	builtin := make(map[uint64]string, len(params.Checkpoints))
+	for _, cp := range params.Checkpoints {
+		if cp.Hash == nil {
+			return nil, fmt.Errorf("btc checkpoint: chaincfg %s has a nil hash at height %d", params.Name, cp.Height)
+		}
+		height := uint64(cp.Height)
+		table[height] = cp.Hash.String()
+		builtin[height] = cp.Hash.String()
+		if height > maxHeight {
+			maxHeight = height
+		}
+	}
+	if len(extra) == 0 {
+		return table, nil
+	}
+	if len(builtin) == 0 {
+		return nil, fmt.Errorf("btc checkpoint: extraBtcCheckpoints[%s] is set but chaincfg has no built-in "+
+			"checkpoint for this net, so 'only above the highest chaincfg anchor' cannot be asserted; "+
+			"nets without built-in anchors (regtest/testnet4/signet/simnet) must not be anchored at all",
+			params.Name)
+	}
+	// 规则 1：完整包含 chaincfg（同高度同 hash）。改一条 = 手填错锚点，少一条 = 悄悄丢掉一个锚点。
+	for height, hash := range builtin {
+		got, ok := extra[height]
+		if !ok {
+			return nil, fmt.Errorf("btc checkpoint: extraBtcCheckpoints[%s] must restate every chaincfg anchor "+
+				"unchanged, but height %d (%s) is missing", params.Name, height, hash)
+		}
+		if got != hash {
+			return nil, fmt.Errorf("btc checkpoint: extraBtcCheckpoints[%s] changes the chaincfg anchor at height "+
+				"%d: chaincfg=%s extra=%s", params.Name, height, hash, got)
+		}
+	}
+	// 规则 2：只允许新增严格高于 chaincfg 最高锚点的高度。
+	for height, hash := range extra {
+		if _, ok := builtin[height]; ok {
+			continue
+		}
+		if height <= maxHeight {
+			return nil, fmt.Errorf("btc checkpoint: extraBtcCheckpoints[%s] adds height %d (%s), which is not "+
+				"above the highest chaincfg anchor %d; the extension layer may only add fresher anchors",
+				params.Name, height, hash, maxHeight)
+		}
+		table[height] = hash
+	}
+	return table, nil
 }
 
 type btcChainContext struct {
@@ -102,11 +206,21 @@ func previousCheckpoint(checkpoints map[uint64]string, height int32) (uint64, st
 	if height <= 0 {
 		return 0, "", false
 	}
+	return highestCheckpointBelow(checkpoints, uint64(height))
+}
+
+// highestCheckpoint 取表里最高的锚点（= 本网络最新鲜的信任根，bootstrap 起点就锚在它上面）。
+func highestCheckpoint(checkpoints map[uint64]string) (uint64, string, bool) {
+	return highestCheckpointBelow(checkpoints, math.MaxUint64)
+}
+
+// highestCheckpointBelow 取表中严格小于 limit 的最高锚点；没有则 ok=false。
+func highestCheckpointBelow(checkpoints map[uint64]string, limit uint64) (uint64, string, bool) {
 	var best uint64
 	var bestHash string
 	found := false
 	for h, hash := range checkpoints {
-		if h >= uint64(height) {
+		if h >= limit {
 			continue
 		}
 		if !found || h > best {
@@ -199,11 +313,13 @@ const maxAnchorTraceDepth = 1 << 20
 //	② 命中已知锚点：prevHash == btcCheckpointTable 中 (height-1) 的区块 hash；
 //	③ localDB 可回溯：沿 prevHash 逐级回查已存的头，最终到达创世或某个锚点。
 //
-// 三条都不满足即拒绝。注意 mainnet 必须先在 btcCheckpointTable 里填一个近期高度，否则只能
-// 从创世开始（几百万个头，不可用）。
+// 三条都不满足即拒绝。mainnet/testnet3 的锚点来自 btcd chaincfg（见 btcCheckpointTable），
+// 因此中继的 btcHeaderStartHeight 必须是"本网络最高锚点 + 1"（中继启动期会自己做同样的断言，
+// 见 neutrino 的 btcBootstrapAnchorGuard）。
 func checkBootstrapAnchor(first *ltypes.BtcHeader, params *chaincfg.Params, ldb dbm.KV) error {
 	height := first.GetHeight()
 	genesisHash := params.GenesisHash.String()
+	checkpoints := btcCheckpointTable[params.Net]
 
 	// 高度 0 只可能是创世块本身。
 	if height == 0 {
@@ -217,7 +333,6 @@ func checkBootstrapAnchor(first *ltypes.BtcHeader, params *chaincfg.Params, ldb 
 		return nil
 	}
 	// ② 首个头的父块刚好是一个已知锚点。
-	checkpoints := btcCheckpointTable[params.Net]
 	if hash, ok := checkpoints[height-1]; ok && hash == first.GetPreviousHash() {
 		return nil
 	}
