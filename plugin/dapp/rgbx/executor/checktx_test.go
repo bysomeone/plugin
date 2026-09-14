@@ -383,11 +383,22 @@ func Test_checkDeposit(t *testing.T) {
 	action.Value = value
 
 	depAddr, _ := util.Genaddress()
-	dupProofData := []byte("dup-tx-bytes")
 	var minimalBtcTx wire.MsgTx
 	minimalBtcTx.Version = 2
 	buf := bytes.NewBuffer(make([]byte, 0, minimalBtcTx.SerializeSizeStripped()))
 	require.NoError(t, minimalBtcTx.SerializeNoWitness(buf))
+
+	// 重复充值用例的 TxData 必须是一份可严格解析的合法交易（解析失败会先被 ErrInvalidBtcTxProof 拒掉），
+	// 且 txid 需与下面 ErrGetBtcHeader 用例用的 minimalBtcTx 不同。
+	dupTx := &wire.MsgTx{Version: 2}
+	dupTx.TxOut = append(dupTx.TxOut, wire.NewTxOut(1, []byte{0x51}))
+	dupBuf := bytes.NewBuffer(nil)
+	require.NoError(t, dupTx.SerializeNoWitness(dupBuf))
+	dupProofData := dupBuf.Bytes()
+	dupTxID, err := parseBtcTxIDStrict("dup-tx", dupProofData)
+	require.NoError(t, err)
+	minimalTxID := minimalBtcTx.TxHash()
+	require.NotEqual(t, minimalTxID.CloneBytes(), dupTxID)
 
 	tcArr := []*testCase{
 		{expectErr: ErrInvalidDepositAmount, action: &rtypes.DepositAsset{
@@ -413,7 +424,7 @@ func Test_checkDeposit(t *testing.T) {
 	r.SetAPI(api)
 	api.On("GetConfig").Return(testCfg)
 	r.SetStateDB(state)
-	require.Nil(t, state.Set(formatDepositUsedKey(dupProofData), []byte("1")))
+	require.Nil(t, state.Set(formatDepositUsedTxIDKey(dupTxID), []byte("1")))
 
 	for idx, tc := range tcArr {
 		value.Deposit = tc.action.(*rtypes.DepositAsset)

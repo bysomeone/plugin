@@ -38,7 +38,7 @@ func (r *rgbx) checkWithdrawConfirm(txHash, confirmHash string, confirm *rtypes.
 	// 该守卫落在合约级 statedb（共识状态）上，而不是 LocalDB 的 pending.Confirmed 标记：
 	// dapp CheckTx 在出块执行阶段会被每个节点重跑（chain33 executor/execenv.go Exec → CheckTx），
 	// 读节点私有数据会让"区块是否合法"依赖各节点本地库，且本地库丢失/落后时同一 burn 会被二次结算
-	// （第二次再从共享锁仓地址销毁一遍，侵蚀其他 pending 提现的锁定额度）。与充值侧 formatDepositUsedKey 对称。
+	// （第二次再从共享锁仓地址销毁一遍，侵蚀其他 pending 提现的锁定额度）。与充值侧 formatDepositUsedTxIDKey 对称。
 	_, err := r.GetStateDB().Get(formatWithdrawUsedKey(confirm.GetTxHash()))
 	if !errors.Is(err, types.ErrNotFound) {
 		elog.Error("checkWithdrawConfirm burn already used", "txHash", txHash, "confirmHash", confirmHash,
@@ -154,6 +154,32 @@ func (r *rgbx) decodeBtcAddressScript(addr string) ([]byte, error) {
 		return nil, err
 	}
 	return txscript.PayToAddrScript(decoded)
+}
+
+// parseBtcTxIDStrict 严格解析 BtcTxProof.TxData 并返回解析后交易的 txid（规范身份）。
+// 严格 = 解析后 reader 必须被完整消费（r.Len() == 0），任何尾部多余字节都直接拒绝。
+//
+// E1 修复（A）：btcwire 的 DeserializeNoWitness 只按需读取、不校验 reader 是否耗尽，
+// 给一笔已上链交易追加任意尾部字节后解析结果完全相同（txid、输出、OP_RETURN 承诺、金额都不变），
+// 只有原始字节变了 —— 这让所有"按原始字节取哈希"的身份判断都可被绕过（充值防双铸首当其冲）。
+func parseBtcTxIDStrict(txHash string, txData []byte) ([]byte, error) {
+	if len(txData) == 0 {
+		elog.Error("parseBtcTxIDStrict empty btc tx data", "txHash", txHash)
+		return nil, ErrInvalidBtcTxProof
+	}
+	reader := bytes.NewReader(txData)
+	var btcTx wire.MsgTx
+	if err := btcTx.DeserializeNoWitness(reader); err != nil {
+		elog.Error("parseBtcTxIDStrict decode btc tx", "txHash", txHash, "err", err)
+		return nil, ErrInvalidBtcTxProof
+	}
+	if reader.Len() != 0 {
+		elog.Error("parseBtcTxIDStrict trailing bytes after btc tx", "txHash", txHash,
+			"txDataLen", len(txData), "trailingLen", reader.Len())
+		return nil, ErrInvalidBtcTxProof
+	}
+	txID := btcTx.TxHash()
+	return txID.CloneBytes(), nil
 }
 
 func (r *rgbx) validateBtcTxProof(txHash string, proof *rtypes.BtcTxProof) (*wire.MsgTx, error) {

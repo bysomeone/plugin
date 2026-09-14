@@ -100,10 +100,18 @@ func (r *rgbx) Exec_Deposit(deposit *rtypes.DepositAsset, tx *types.Transaction,
 	receipt.KV = append(receipt.KV, depositReceipt.KV...)
 	receipt.Logs = append(receipt.Logs, depositReceipt.Logs...)
 
-	receipt.KV = append(receipt.KV, &types.KeyValue{
-		Key:   formatDepositUsedKey(deposit.GetTxProof().GetTxData()),
-		Value: []byte("used"),
-	})
+	// 防双铸标记：以解析后 btc 交易的 txid（规范化身份）登记该充值已消费。
+	// CheckTx（同高度先于 Exec 执行）已强制严格解析，此处解析失败不可达；
+	// 若真发生则记日志跳过写入，不让链因一个本不该出现的证明而停机。
+	if txID, err := parseBtcTxIDStrict(hex.EncodeToString(txHash), deposit.GetTxProof().GetTxData()); err != nil {
+		elog.Error("Exec_Deposit parse strict btc tx id", "txHash", hex.EncodeToString(txHash),
+			"symbol", symbol, "err", err)
+	} else {
+		receipt.KV = append(receipt.KV, &types.KeyValue{
+			Key:   formatDepositUsedTxIDKey(txID),
+			Value: []byte("used"),
+		})
+	}
 
 	return receipt, nil
 

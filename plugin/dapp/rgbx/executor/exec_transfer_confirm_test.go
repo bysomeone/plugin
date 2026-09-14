@@ -181,7 +181,7 @@ func Test_rgbx_confirmWithdrawSettlement(t *testing.T) {
 }
 
 // Test_rgbx_confirmWithdrawSettlement_usedKey S3：提现结算成功登记 consumed 集合，
-// 同一 burn 二次结算被 checkWithdrawConfirm 拒绝，不同 burn 互不影响（与充值侧 deposited- 对称）。
+// 同一 burn 二次结算被 checkWithdrawConfirm 拒绝，不同 burn 互不影响（与充值侧 txid 口径去重对称）。
 func Test_rgbx_confirmWithdrawSettlement_usedKey(t *testing.T) {
 	r := newRgbx()
 	burnA, burnB := []byte("burnA"), []byte("burnB")
