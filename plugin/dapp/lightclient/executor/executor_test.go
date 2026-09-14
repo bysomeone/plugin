@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -357,6 +358,140 @@ func TestLightclientExecLocalBtcHeaders(t *testing.T) {
 	require.True(t, hasKV(dbSet.KV, btcHeaderHashHeightKey(h1.Hash)))
 	require.True(t, hasKV(dbSet.KV, btcHeaderKey(h2.Height)))
 	require.True(t, hasKV(dbSet.KV, btcHeaderHashHeightKey(h2.Hash)))
+}
+
+// TestBtcHeadersPerTxLimit 覆盖 B7：单笔交易的头数上限。
+func TestBtcHeadersPerTxLimit(t *testing.T) {
+	dir, stateDB, localDB := util.CreateTestDB()
+	defer util.CloseTestDB(dir, stateDB)
+
+	cli := newLightclient().(*lightclient)
+	setupTestDriver(t, cli)
+	cli.SetStateDB(stateDB)
+	cli.SetLocalDB(localDB)
+
+	commitAddr, commitPriv := util.Genaddress()
+	lightCfg.CommitAddress = commitAddr
+	lightCfg.BtcNetName = "regtest"
+
+	// 高度逐个 +1 但不挖矿：上限校验发生在 PoW/锚点校验之前，只要求 hash 非空。
+	batch := func(n int) []*ltypes.BtcHeader {
+		headers := make([]*ltypes.BtcHeader, 0, n)
+		for i := 1; i <= n; i++ {
+			headers = append(headers, &ltypes.BtcHeader{
+				Height:       uint64(i),
+				Hash:         fmt.Sprintf("hash-%d", i),
+				PreviousHash: fmt.Sprintf("hash-%d", i-1),
+			})
+		}
+		return headers
+	}
+
+	t.Run("at limit falls through to the next check", func(t *testing.T) {
+		// 64 个头不会被上限拒绝（会因自造 hash 在后面的锚点校验被拒，这里只断言不是 ErrBtcHeadersTooMany）。
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: batch(maxBtcHeadersPerTx)}, commitPriv)
+		require.Equal(t, ErrBtcHeaderNoAnchor, cli.CheckTx(tx, 0))
+	})
+
+	t.Run("over limit is rejected", func(t *testing.T) {
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: batch(maxBtcHeadersPerTx + 1)}, commitPriv)
+		require.Equal(t, ErrBtcHeadersTooMany, cli.CheckTx(tx, 0))
+	})
+
+	t.Run("relayer batch size is unaffected", func(t *testing.T) {
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: batch(16)}, commitPriv)
+		require.NotEqual(t, ErrBtcHeadersTooMany, cli.CheckTx(tx, 0))
+	})
+}
+
+// TestBtcHeadersDuplicateHeight 覆盖 B7：同一高度重复提交/跳高被拒。
+func TestBtcHeadersDuplicateHeight(t *testing.T) {
+	dir, stateDB, localDB := util.CreateTestDB()
+	defer util.CloseTestDB(dir, stateDB)
+
+	cli := newLightclient().(*lightclient)
+	setupTestDriver(t, cli)
+	cli.SetStateDB(stateDB)
+	cli.SetLocalDB(localDB)
+
+	commitAddr, commitPriv := util.Genaddress()
+	lightCfg.CommitAddress = commitAddr
+	lightCfg.BtcNetName = "regtest"
+
+	t.Run("duplicate height in one tx", func(t *testing.T) {
+		dup := []*ltypes.BtcHeader{
+			{Height: 10, Hash: "hash-a", PreviousHash: "hash-0"},
+			{Height: 10, Hash: "hash-b", PreviousHash: "hash-a"},
+		}
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: dup}, commitPriv)
+		require.Equal(t, ErrBtcHeaderDuplicateHeight, cli.CheckTx(tx, 0))
+	})
+
+	t.Run("skipped height in one tx", func(t *testing.T) {
+		gap := []*ltypes.BtcHeader{
+			{Height: 10, Hash: "hash-a", PreviousHash: "hash-0"},
+			{Height: 12, Hash: "hash-b", PreviousHash: "hash-a"},
+		}
+		tx := buildCheckTx(t, &ltypes.BtcHeaders{Headers: gap}, commitPriv)
+		require.Equal(t, ErrBtcHeaderDuplicateHeight, cli.CheckTx(tx, 0))
+	})
+}
+
+// TestBtcChainContextCheckpoints 覆盖 B5 的锚点表：VerifyCheckpoint / FindPreviousCheckpoint 返回真实值。
+func TestBtcChainContextCheckpoints(t *testing.T) {
+	regtest := &chaincfg.RegressionNetParams
+	hashAt := func(s string) *chainhash.Hash {
+		h, err := chainhash.NewHashFromStr(s)
+		require.NoError(t, err)
+		return h
+	}
+	const (
+		cp100 = "1111111111111111111111111111111111111111111111111111111111111111"
+		cp200 = "2222222222222222222222222222222222222222222222222222222222222222"
+	)
+
+	// 未配置锚点表的网络：不做任何约束。
+	plain := newBtcChainContext(regtest)
+	require.True(t, plain.VerifyCheckpoint(100, hashAt(cp100)))
+	ctx, err := plain.FindPreviousCheckpoint()
+	require.NoError(t, err)
+	require.Nil(t, ctx)
+
+	btcCheckpointTable[regtest.Net] = map[uint64]string{100: cp100, 200: cp200}
+	defer delete(btcCheckpointTable, regtest.Net)
+
+	chainCtx := newBtcChainContext(regtest)
+	require.Len(t, chainCtx.checkpoints, 2)
+
+	require.True(t, chainCtx.VerifyCheckpoint(100, hashAt(cp100)))
+	require.True(t, chainCtx.VerifyCheckpoint(200, hashAt(cp200)))
+	require.False(t, chainCtx.VerifyCheckpoint(100, hashAt(cp200)))
+	// 表里没有的高度不受约束。
+	require.True(t, chainCtx.VerifyCheckpoint(150, hashAt(cp100)))
+
+	chainCtx.setCheckHeight(250)
+	prev, err := chainCtx.FindPreviousCheckpoint()
+	require.NoError(t, err)
+	require.NotNil(t, prev)
+	require.EqualValues(t, 200, prev.Height())
+
+	// 恰好等于锚点高度时，"之前的锚点"要退到上一个。
+	chainCtx.setCheckHeight(200)
+	prev, err = chainCtx.FindPreviousCheckpoint()
+	require.NoError(t, err)
+	require.NotNil(t, prev)
+	require.EqualValues(t, 100, prev.Height())
+
+	// 锚点之前（含未设置高度）无前置锚点。
+	chainCtx.setCheckHeight(100)
+	prev, err = chainCtx.FindPreviousCheckpoint()
+	require.NoError(t, err)
+	require.Nil(t, prev)
+
+	chainCtx = newBtcChainContext(regtest)
+	prev, err = chainCtx.FindPreviousCheckpoint()
+	require.NoError(t, err)
+	require.Nil(t, prev)
 }
 
 func buildCheckTx(t *testing.T, headers *ltypes.BtcHeaders, priv crypto.PrivKey) *types.Transaction {

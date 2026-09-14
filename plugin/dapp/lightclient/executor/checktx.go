@@ -32,6 +32,11 @@ func (l *lightclient) CheckTx(tx *types.Transaction, index int) error {
 	return err
 }
 
+// maxBtcHeadersPerTx 单笔交易允许提交的最大 BTC 头数量。
+// 中继（neutrino submitBitcoinHeaders）自身 batchSize=16，这里留 4 倍余量；
+// 上限的作用是把"一笔交易把区块/mempool 灌满"的成本固定下来——原先只校验 >= 1，没有上界。
+const maxBtcHeadersPerTx = 64
+
 func (l *lightclient) checkBtcHeaders(tx *types.Transaction, headers *ltypes.BtcHeaders) error {
 
 	if lightCfg.CommitAddress != "" && tx.From() != lightCfg.CommitAddress {
@@ -51,6 +56,23 @@ func (l *lightclient) checkBtcHeaders(tx *types.Transaction, headers *ltypes.Btc
 		elog.Error("checkBtcHeaders", "err", "commit empty headers")
 		return types.ErrInvalidParam
 	}
+	if len(list) > maxBtcHeadersPerTx {
+		elog.Error("checkBtcHeaders", "err", "too many headers in one tx", "count", len(list), "max", maxBtcHeadersPerTx)
+		return ErrBtcHeadersTooMany
+	}
+	// 批内高度必须"逐个 +1"：同一高度重复提交（重放/灌水）与跳高都在这里挡住。
+	// 首个头的高度不在此约束（bootstrap 允许从任意高度起，其合法性由 checkBootstrapAnchor 负责）。
+	for i, h := range list {
+		if h.GetHash() == "" {
+			elog.Error("checkBtcHeaders nil header", "index", i)
+			return types.ErrInvalidParam
+		}
+		if i > 0 && h.GetHeight() != list[i-1].GetHeight()+1 {
+			elog.Error("checkBtcHeaders", "err", "header heights are not strictly increasing by 1",
+				"prevHeight", list[i-1].GetHeight(), "height", h.GetHeight(), "index", i)
+			return ErrBtcHeaderDuplicateHeight
+		}
+	}
 
 	params := ltypes.GetBtcChainParams(lightCfg.BtcNetName)
 	chainCtx := newBtcChainContext(params)
@@ -69,10 +91,6 @@ func (l *lightclient) checkBtcHeaders(tx *types.Transaction, headers *ltypes.Btc
 
 	for _, h := range list {
 
-		if h.GetHash() == "" {
-			elog.Error("checkBtcHeaders nil header")
-			return types.ErrInvalidParam
-		}
 		// 首次提交也要保证本批 headers 内部严格连续；仅首个header允许无前置锚点。
 		if prevHeader.GetHash() != "" && (prevHeader.Height+1 != h.GetHeight() || prevHeader.Hash != h.PreviousHash) {
 			elog.Error("checkBtcHeaders", "prevHeight", prevHeader.Height, "prevHash", prevHeader.Hash,
