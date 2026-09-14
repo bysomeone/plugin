@@ -24,8 +24,11 @@ const defaultBlockCacheSize = 20 * 1024 * 1024 //20 MB
 
 type config struct {
 
-	// IsOfficialNode 是否为官方主节点
-	IsOfficialNode bool
+	// IsOfficialNode 是否为官方主节点。配置键显式写成 isOfficialNode（CONFIG.md 与 CI 的写法）；
+	// 此前该字段没有 json tag，靠 encoding/json 对字段名的大小写不敏感匹配生效，
+	// 于是 TECHNICAL.md / RGB_USDT_INTEGRATION.md 里的 PascalCase 写法（IsOfficialNode）也能用。
+	// 加上 tag 后两种写法仍然都能解析（json 的大小写不敏感匹配是兜底），只是契约在代码里显式了。
+	IsOfficialNode bool `json:"isOfficialNode"`
 	// MaxPeers is the maximum number of connections the client maintains.
 	MaxPeer int `json:"maxPeer"`
 	// BlockCacheSize indicates the size (in bytes) of blocks the block
