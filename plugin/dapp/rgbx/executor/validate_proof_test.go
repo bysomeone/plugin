@@ -344,6 +344,9 @@ func Test_rgbx_checkWithdrawConfirm(t *testing.T) {
 		Height:     1,
 		MerkleRoot: rootHash.String(),
 	}, nil)
+	// B8：链上最小确认数（tip >= 1 + N - 1）。给足深度；深度规则本身见 btc_confirm_test.go。
+	tip := &ltypes.BtcHeader{Hash: "tip", Height: 1 + uint64(defaultMinBtcConfirmations) - 1}
+	api.On("Query", ltypes.LightclientX, "GetBtcLastHeader", mock.Anything).Return(tip, nil)
 
 	err = r.(*rgbx).checkWithdrawConfirm("a", "b", confirm, pending)
 	require.NoError(t, err)
@@ -351,6 +354,20 @@ func Test_rgbx_checkWithdrawConfirm(t *testing.T) {
 	confirmMismatch := &rtypes.ConfirmTx{TxHash: []byte{9, 9, 9}, BtcTxProof: proof}
 	err = r.(*rgbx).checkWithdrawConfirm("a", "b", confirmMismatch, pending)
 	require.Equal(t, ErrInvalidBtcProofCommitment, err)
+
+	// B8：承诺（OP_RETURN）是**永久性**判定、深度是**暂时性**判定；深度不足/头链回退时也必须先报承诺错误，
+	// 否则"这份证明永远无效"会被报成"确认不足"，把运维引向等待。
+	tip.Height = 0
+	require.Equal(t, ErrInvalidBtcProofCommitment, r.(*rgbx).checkWithdrawConfirm("a", "b", confirmMismatch, pending))
+
+	// 深度不足（tip = proof.Height - 1）时，合法证明同样被拒。
+	require.ErrorIs(t, r.(*rgbx).checkWithdrawConfirm("a", "b", confirm, pending), ErrInsufficientBtcConfirmations)
+	// 刚好满足（tip == proof.Height + N - 1）→ 通过。
+	tip.Height = 1 + uint64(defaultMinBtcConfirmations) - 1
+	require.NoError(t, r.(*rgbx).checkWithdrawConfirm("a", "b", confirm, pending))
+	// 少 1 个确认 → 拒。
+	tip.Height = 1 + uint64(defaultMinBtcConfirmations) - 2
+	require.ErrorIs(t, r.(*rgbx).checkWithdrawConfirm("a", "b", confirm, pending), ErrInsufficientBtcConfirmations)
 }
 
 // Test_checkWithdrawConfirm_burnReplayGuard S3：同一笔提现 burn 只能结算一次。
@@ -371,7 +388,6 @@ func Test_checkWithdrawConfirm_burnReplayGuard(t *testing.T) {
 	api := mockGuardianAPI(t, testCommitAddr)
 	api.On("Query", ltypes.LightclientX, "GetBtcHeader", mock.Anything).Return(
 		&ltypes.BtcHeader{Hash: "hash1", Height: 100, MerkleRoot: txid.String()}, nil)
-
 	dir, state, local := util.CreateTestDB()
 	defer util.CloseTestDB(dir, state)
 	r.SetAPI(api)

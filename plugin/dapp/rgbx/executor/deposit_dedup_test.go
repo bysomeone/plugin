@@ -66,6 +66,11 @@ func newE1DepositFixture(t *testing.T) *e1DepositFixture {
 	api.On("Query", ltypes.LightclientX, "GetBtcHeader", mock.Anything).Return(&ltypes.BtcHeader{
 		Hash: "e1-block", Height: 100, MerkleRoot: rootHash.String(),
 	}, nil)
+	// B8：链上最小确认数校验读 canonical tip（statedb）。这里给足深度（>= 100 + 6 - 1），
+	// 本文件只关心 txid 口径，深度是否满足由 btc_confirm_test.go 覆盖。
+	api.On("Query", ltypes.LightclientX, "GetBtcLastHeader", mock.Anything).Return(&ltypes.BtcHeader{
+		Hash: "e1-tip", Height: 100 + uint64(defaultMinBtcConfirmations) - 1,
+	}, nil)
 
 	require.NoError(t, state.Set(formatCrossChainInfoKey("BTC"), types.Encode(&rtypes.CrossChainInfo{
 		AssetSymbol: "BTC", PkScript: f.pkScript,
