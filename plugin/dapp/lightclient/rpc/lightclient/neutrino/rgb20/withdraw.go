@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	pb "github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20/pb"
@@ -250,7 +251,6 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 	}, nil
 }
 
-// ValidateWithdrawPsbt 签名节点交叉核对（BL-4/HR-3）：
 // ValidateWithdrawPsbt 签名节点交叉核对（BL-4/HR-3，放宽版）：
 //  1. 侧车 ValidateConsignment（确定性、只读）校验 RGB 状态转移 + 金额；
 //  2. 所有 PSBT 输入的 prevout 都是 TSS 脚本（受桥控制）：closed RGB seal 之外多出的
@@ -258,8 +258,11 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 //     注：consignment 的 closed_seals 含完整历史（spent seal 的前序转移），故不做
 //     closed_seals ⊆ PSBT 输入的严格核对（deposit 校验同样不做该核对）。
 //  3. 收款输出是唯一离开桥控制的输出且只承载 dust（其余 BTC 找零回 TSS），手续费在合理
-//     范围（防 fee 输入被超收 / 超付 / 抽走桥 BTC）；
-//  4. 被花 seal 面额 ≥ 提现额（防超额提现）；同步高度 ≥ 门槛。
+//     范围（防 fee 输入被超收 / 超付 / 抽走桥 BTC）——这一侧核对的正是「桥可支配的 BTC
+//     （PSBT 全部输入）≥ 离开桥控制的输出 + 手续费」。
+//  4. 可支配额覆盖（S1）：签名节点自己算出「可支配额」= 本笔实际动用的 seal 面额合计，
+//     核对它覆盖提现额，且发给用户的资产不超过链上 pending 提现额（防超付）；同步高度 ≥ 门槛。
+//     算不出可支配额一律拒绝（fail-closed），不采信侧车预计算出的单点数字（S1/A2）。
 func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 	if a.sidecar.Load() == nil {
 		return fmt.Errorf("sidecar unavailable")
@@ -340,7 +343,7 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 	// 必失败，且本地会永久残留与侧车分叉的垃圾条目。
 	// 侧车的 ListSeals 读的是同一份账本，且本函数前一步的 BuildWithdrawal 已经 sync 过，
 	// 因此这里只读、不触发一次昂贵的钱包重扫。
-	a.refreshSealStatuses()
+	sealView := a.refreshSealStatuses()
 
 	// 任何 closed seal 若为 pending-mint 则拒绝（HR-5：不能花未确认的充值 seal）
 	for _, cs := range v.ClosedSeals {
@@ -355,7 +358,7 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 	extIdx := -1
 	var extVal int64
 	for i, out := range p.UnsignedTx.TxOut {
-		if len(out.PkScript) > 0 && out.PkScript[0] == txscript.OP_RETURN {
+		if isOpReturnScript(out.PkScript) {
 			continue
 		}
 		if bytes.Equal(out.PkScript, tssScript) {
@@ -375,6 +378,9 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 	}
 
 	// ---- 手续费合理范围（防费输入被超收）----
+	// 这里核对的正是覆盖式的 BTC 侧：桥可支配的 BTC（= PSBT 全部输入，且上面已逐笔确认受
+	// TSS 控制）≥ 离开桥控制的输出 + 手续费；手续费再给一个上下界，防止费输入被超收
+	// （fee < 0 即输出超过输入，等于把桥的 BTC 赔进去）。
 	var totalOutput int64
 	for _, out := range p.UnsignedTx.TxOut {
 		totalOutput += out.Value
@@ -385,20 +391,134 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 		return fmt.Errorf("invalid fee: fee=%d cap=%d", fee, 2*expectedFee+1000)
 	}
 
-	// 金额上限：consignment 报的 amount 是"历史中第一个 TSS 脚本 opened seal"（充值收据），
-	// 对提现而言 = 本次被花的 seal 面额（或前序 find 到的 TSS 面额），非提现发出额。
-	// 提现的精确发出额由链上 pending 的 targetAddress(invoice) 决定（invoice 编码金额，
-	// sidecar build_transfer 按 invoice 金额发送），此处校验"被花 seal ≥ 提现额"防止超额提现
-	// （相对桥持有）。精确到收款方/金额的交叉核对需要把 invoice 传给签名节点（见报告，
-	// 待办设计点）。诚实的顺序提现下：v.Amount(被花 seal) ≥ expected 恒成立。
-	if v.Amount < req.ExpectedAmount {
-		return fmt.Errorf("withdraw amount exceeds sealed balance: consignment=%d expected=%d", v.Amount, req.ExpectedAmount)
+	// ---- 可支配额覆盖（S1/A2）----
+	// 签名节点自己求出「可支配额」并核对覆盖，不采信侧车预计算出的单点数字：侧车的
+	// ConsignmentValidation.amount 是「历史中第一个 TSS 脚本 opened seal」的面额（充值收据
+	// 口径），对提现只会随 bundle 顺序落到「找零 seal」或「更早的充值收据」上——纯 genesis、
+	// 提现额 > 持仓一半时它就是找零，比提现额小，合法的提现被
+	// "withdraw amount exceeds sealed balance" 误拒（A2）。
+	cov, err := a.resolveWithdrawCoverage(p, v, tssScript, sealView)
+	if err != nil {
+		// 算不出可支配额一律拒绝（fail-closed）：宁可拒绝，也不退化成采信侧车的单个数字。
+		return fmt.Errorf("resolve withdraw coverage: %w", err)
+	}
+	// 防超付：离开桥控制（发给用户）的资产不得超过链上 pending 的提现额。提现的发出额由
+	// pending 的 targetAddress(invoice) 决定（sidecar build_transfer 按 invoice 金额发送），
+	// 而链上只销毁了 pending 的金额——发出多于销毁额即桥自己亏。
+	if cov.Leaving > req.ExpectedAmount {
+		return fmt.Errorf("withdraw payout exceeds pending amount: payout=%d pending=%d", cov.Leaving, req.ExpectedAmount)
+	}
+	// 被花 seal 面额（可支配额）必须覆盖提现额。本桥不收取资产手续费（只有 BTC 矿工费，
+	// 见 RGB_USDT_PRODUCT.md），BTC 侧的「桥可支配的 BTC ≥ 离开桥控制的输出 + 手续费」由
+	// 上面的手续费检查独立核对。
+	if cov.Spendable < req.ExpectedAmount {
+		return fmt.Errorf("withdraw amount exceeds sealed balance: sealed=%d expected=%d", cov.Spendable, req.ExpectedAmount)
 	}
 	// 同步高度门槛（HR-3）
 	if v.SyncedHeight < req.MinSyncedHeight {
 		return fmt.Errorf("sidecar synced height too low: %d < %d", v.SyncedHeight, req.MinSyncedHeight)
 	}
 	return nil
+}
+
+// withdrawCoverage 是本笔提现的覆盖视图（S1/A2），全部由签名节点自己求出。
+type withdrawCoverage struct {
+	// Spendable 可支配额：本笔交易实际动用的 seal 面额合计（资产最小单位）。
+	Spendable int64
+	// Leaving 离开桥控制的资产：锚定在本笔交易上、输出脚本不是 TSS 脚本的 opened seal 面额。
+	Leaving int64
+	// Returned 回流桥控制的资产：锚定在本笔交易上、输出脚本是 TSS 脚本的 opened seal 面额
+	// （找零 seal / 新的桥侧 seal）。
+	Returned int64
+	// Anchored 锚定在本笔交易上的 opened seal 数。
+	Anchored int
+	// LedgerSpent 签名节点自己 seal 账本里可见的、本笔被花 seal 的面额合计（交叉核对用）。
+	LedgerSpent int64
+}
+
+// resolveWithdrawCoverage 由签名节点自己手里的事实独立求出本笔提现的可支配额：
+//
+//	PSBT（即将签名的交易字节）        → 锚定 txid、每个 seal 的输出归属（TSS / 离开桥控制）
+//	consignment（已通过 RGB 共识校验）→ opened seal 的 outpoint 与面额
+//	自己的 seal 账本（ListSeals 视图）→ 被花 seal 的面额（上界交叉核对）
+//
+// 口径（修正 A2）：可支配额 = 本笔交易实际动用的 seal 面额合计，即锚定在「本笔 PSBT 交易」
+// 上的 opened seal 面额之和。RGB 状态转移守恒（输入 = 输出）⇒ 它等于被花 seal 的面额合计。
+// 只认锚定在本交易 txid 上的 opened seal，历史 bundle（更早的充值/提现）里的 opened seal
+// 一律不计入——那正是「提现 > 持仓一半被误拒」的来源。seal 的归属由 PSBT 自己的输出脚本判定，
+// 同样不看侧车的 recipient_seal 字段（它对提现是「历史中第一个 TSS 脚本 opened seal」）。
+//
+// 任一环节算不出来（consignment 没锚定在本交易上、seal 指向交易外的 vout、指向不可花输出、
+// 面额为负）→ 返回错误，由调用方 fail-closed 拒绝。
+func (a *Adapter) resolveWithdrawCoverage(p *psbt.Packet, v *pb.ConsignmentValidation, tssScript []byte, sealView map[string]*pb.SealInfo) (*withdrawCoverage, error) {
+	if p.UnsignedTx == nil {
+		return nil, fmt.Errorf("psbt missing unsigned tx")
+	}
+	// 本笔提现的锚定交易 = 待签名的这笔交易：侧车 build_transfer 以 PSBT 的 txid 作为状态转移的
+	// witness id，收款/找零 seal 都锚在它上面（segwit 签名不改变 txid）。
+	anchor := p.UnsignedTx.TxHash().String()
+	prefix := anchor + ":"
+	cov := &withdrawCoverage{}
+	for _, seal := range v.GetOpenedSeals() {
+		outpoint := seal.GetOutpoint()
+		if !strings.HasPrefix(outpoint, prefix) {
+			continue // 历史 bundle 打开的 seal：不属于本笔动用的资产
+		}
+		amount := seal.GetAmount()
+		if amount < 0 {
+			return nil, fmt.Errorf("invalid seal amount %d at %s", amount, outpoint)
+		}
+		vout, err := strconv.ParseUint(strings.TrimPrefix(outpoint, prefix), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid seal outpoint %s", outpoint)
+		}
+		if vout >= uint64(len(p.UnsignedTx.TxOut)) {
+			return nil, fmt.Errorf("seal %s points outside the transaction", outpoint)
+		}
+		script := p.UnsignedTx.TxOut[vout].PkScript
+		switch {
+		case isOpReturnScript(script):
+			// seal 锚在不可花输出上：资产进不去也出不来，结构非法。
+			return nil, fmt.Errorf("seal %s anchored at an unspendable output", outpoint)
+		case bytes.Equal(script, tssScript):
+			cov.Returned += amount
+		default:
+			cov.Leaving += amount
+		}
+		cov.Anchored++
+	}
+	if cov.Anchored == 0 {
+		return nil, fmt.Errorf("consignment opens no seal at this transaction %s", anchor)
+	}
+	cov.Spendable = cov.Leaving + cov.Returned
+
+	// 交叉核对：用签名节点自己的 seal 账本再算一遍「被花 seal 面额」。只取既被本笔交易花掉
+	// （PSBT 输入）、又被 consignment 关闭（closed_seals）的 outpoint——历史关闭的 seal 不是
+	// 本笔的输入，本地账本里可能残留的陈旧 outpoint 也不在 closed_seals 里，两者都不会被计入。
+	// 账本视图只可能「少算」（genesis seal 未经 Go 侧登记、侧车账本重建后不认识旧 outpoint、
+	// ListSeals 读不到时按 fail-closed 降级），所以只核对上界：本地账本报出的面额合计不得超过
+	// consignment 体现的转移总量，否则两边视图已分叉，宁可拒绝。
+	inputs := make(map[string]struct{}, len(p.Inputs))
+	for _, op := range psbtInputOutpoints(p) {
+		inputs[op] = struct{}{}
+	}
+	for _, cs := range v.GetClosedSeals() {
+		if _, ok := inputs[cs]; !ok {
+			continue
+		}
+		if info, ok := sealView[cs]; ok && info.GetAmount() > 0 {
+			cov.LedgerSpent += info.GetAmount()
+		}
+	}
+	if cov.LedgerSpent > cov.Spendable {
+		return nil, fmt.Errorf("seal face mismatch: local seals=%d consignment=%d", cov.LedgerSpent, cov.Spendable)
+	}
+	return cov, nil
+}
+
+// isOpReturnScript 判断 pkScript 是否为不可花的 OP_RETURN 输出。
+func isOpReturnScript(script []byte) bool {
+	return len(script) > 0 && script[0] == txscript.OP_RETURN
 }
 
 // psbtInputOutpoints 提取 PSBT 输入 prevout outpoint 列表。
@@ -469,11 +589,16 @@ func (a *Adapter) putKnownWithdrawTxid(txid string) error {
 // BTC 费池排除名单里（HR-5 的护栏不因退休而削弱）。
 // 两侧状态一致时本调用无副作用（提升/退休都幂等），因此可以安全地每次校验都跑。
 // 只读侧车、不触发 sync：调用方（BuildWithdrawal）刚刚 sync 过同一份账本。
-func (a *Adapter) refreshSealStatuses() {
+//
+// 顺带把侧车报告的 seal 视图（outpoint → SealInfo）返回给调用方，供 S1 的可支配额交叉核对
+// 复用，省掉一次 ListSeals 往返。视图可能不完整（某个资产符号读不到时按上面的 fail-closed
+// 降级跳过该符号），因此只可用于「本地报出的面额不超过 consignment 体现的总量」这类上界核对。
+func (a *Adapter) refreshSealStatuses() map[string]*pb.SealInfo {
 	sc := a.sidecar.Load()
 	if sc == nil {
-		return
+		return nil
 	}
+	view := make(map[string]*pb.SealInfo)
 	for _, symbol := range a.reg.Symbols() {
 		contract, ok := a.reg.Get(symbol)
 		if !ok {
@@ -490,6 +615,7 @@ func (a *Adapter) refreshSealStatuses() {
 			if outpoint == "" {
 				continue
 			}
+			view[outpoint] = s
 			local, ok := a.seals.Get(outpoint)
 			if !ok {
 				continue // 侧车知道、本地未登记：由充值/提现路径登记，不在此处补建
@@ -506,4 +632,5 @@ func (a *Adapter) refreshSealStatuses() {
 			}
 		}
 	}
+	return view
 }

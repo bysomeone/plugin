@@ -286,13 +286,12 @@ func buildWithdrawValidationPSBT(t *testing.T, sealOutpoint string) []byte {
 }
 
 // crossCheckWithdrawValidation 构造一份"关闭 change seal"的侧车校验结果（其余字段满足门槛）。
-func crossCheckWithdrawValidation(closedSeal string) *pb.ConsignmentValidation {
-	return &pb.ConsignmentValidation{
-		Valid:        true,
-		Amount:       1000,
-		SyncedHeight: 200,
-		ClosedSeals:  []string{closedSeal},
-	}
+// opened seal 必须锚定在本笔 PSBT 的 txid 上：签名节点的可支配额核对（S1）按锚定关系确认
+// consignment 与本笔待签交易相关，并据此算被花 seal 面额（见 withdraw_coverage_test.go）。
+// 这里唯一的输出不是 TSS 脚本（vout 0）⇒ 记在"离开桥控制"一侧，面额 1000 = 提现额。
+func crossCheckWithdrawValidation(t *testing.T, psbtBytes []byte, closedSeal string) *pb.ConsignmentValidation {
+	t.Helper()
+	return anchoredConsignment(t, psbtBytes, 1000, []string{closedSeal}, anchoredSeal{vout: 0, amount: 1000})
 }
 
 // Test_WithdrawValidate_RefreshSealStatusFromSidecar 锁住 afcb7b934 的修复：
@@ -356,7 +355,8 @@ func Test_WithdrawValidate_RefreshSealStatusFromSidecar(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			mock := NewMockSidecar()
-			mock.ValidateResp = []*pb.ConsignmentValidation{crossCheckWithdrawValidation(sealOutpoint)}
+			psbtBytes := buildWithdrawValidationPSBT(t, sealOutpoint)
+			mock.ValidateResp = []*pb.ConsignmentValidation{crossCheckWithdrawValidation(t, psbtBytes, sealOutpoint)}
 			mock.ListSealsErr = tc.listSealsErr
 			if tc.sidecarStatus != "" {
 				mock.seals[sealOutpoint] = &pb.SealInfo{Outpoint: sealOutpoint, Status: tc.sidecarStatus}
@@ -378,7 +378,7 @@ func Test_WithdrawValidate_RefreshSealStatusFromSidecar(t *testing.T) {
 			}))
 
 			err := adapter.ValidateWithdrawPsbt(&ValidateWithdrawRequest{
-				Psbt:            buildWithdrawValidationPSBT(t, sealOutpoint),
+				Psbt:            psbtBytes,
 				Consignment:     []byte("consignment"),
 				ExpectedAmount:  1000,
 				MinSyncedHeight: 100,
