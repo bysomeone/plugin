@@ -20,7 +20,7 @@ import (
 
 // defaultBlockCacheSize is the size (in bytes) of blocks that will be
 // keep in memory if no size is specified.
-const defalutBlockCacheSize = 20 * 1024 * 1024 //20 MB
+const defaultBlockCacheSize = 20 * 1024 * 1024 //20 MB
 
 type config struct {
 
@@ -149,7 +149,7 @@ func (c config) getChainParams() chaincfg.Params {
 func (n *neutrinoClient) initNeutrinoConfig(chainCfg *types.Chain33Config) error {
 
 	if n.cfg.BlockCacheSize < 1024*1024 {
-		n.cfg.BlockCacheSize = defalutBlockCacheSize
+		n.cfg.BlockCacheSize = defaultBlockCacheSize
 	}
 	if n.cfg.MaxPeer < 1 {
 		n.cfg.MaxPeer = 8

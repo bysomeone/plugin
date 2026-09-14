@@ -125,8 +125,8 @@ func (r *Registry) Symbols() []string {
 // Chain33Bridge 是 rgb20 适配器回连 neutrino 主包所需的链上/签名接口。
 // 由 neutrino 主包实现，注入适配器（避免 rgb20 -> neutrino 的导入环）。
 type Chain33Bridge interface {
-	// GetMainchainHeight 返回主链最新高度。
-	GetMainchainHeight() int64
+	// GetMainChainHeight 返回主链最新高度。
+	GetMainChainHeight() int64
 	// BuildSpvProof 构造付款 BTC 交易的存在性证明（SPV，对 lightclient 头）。
 	BuildSpvProof(txid string) (*SpvProof, error)
 	// VerifyDepositSpv 签名节点独立验证充值 SPV 证明（对 lightclient 头）。

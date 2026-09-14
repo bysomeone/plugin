@@ -56,7 +56,7 @@ func Test_config(t *testing.T) {
 		t.Skipf("initNeutrinoConfig needs walletdb/bdb (environment): %v", err)
 	}
 
-	require.True(t, n.cfg.BlockCacheSize == defalutBlockCacheSize)
+	require.True(t, n.cfg.BlockCacheSize == defaultBlockCacheSize)
 	require.True(t, n.cfg.MaxPeer == 8)
 	require.True(t, n.cfg.BtcBlockInterval == 10)
 	require.True(t, n.cfg.BlockConfirmations == 0)

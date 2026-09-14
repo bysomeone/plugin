@@ -23,9 +23,9 @@ const btcTipHeightQueryTimeout = 5 * time.Second
 
 // 以下方法使 neutrinoClient 实现 rgb20.Chain33Bridge（充值侧）。
 
-// GetMainchainHeight 返回主链最新高度。
-func (n *neutrinoClient) GetMainchainHeight() int64 {
-	return n.getMainchainHeight()
+// GetMainChainHeight 返回主链最新高度。
+func (n *neutrinoClient) GetMainChainHeight() int64 {
+	return n.getMainChainHeight()
 }
 
 // BtcTipHeight 返回链上 lightclient 头链的 canonical tip 高度（BTC 高度）。
@@ -260,7 +260,7 @@ func (n *neutrinoClient) getLightBtcHeader(height uint64) (*ltypes.BtcHeader, er
 
 // SubmitDeposit 提交 rgbx Deposit 交易（RGB20 分支由合约验 threshold_sig 后铸造）。
 func (n *neutrinoClient) SubmitDeposit(dep *rtypes.DepositAsset) error {
-	_, err := n.submitMainchainTx(rtypes.RgbxX, rtypes.NameDepositAssetAction, dep)
+	_, err := n.submitMainChainTx(rtypes.RgbxX, rtypes.NameDepositAssetAction, dep)
 	return err
 }
 

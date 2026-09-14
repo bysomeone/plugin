@@ -324,7 +324,7 @@ func classifyBtcHeaderSubmitErr(err error) btcHeaderSubmitResult {
 	}
 	msg := err.Error()
 	// ErrDupTx：同一笔交易已经在 mempool 里（chain33 system/mempool/check.go），
-	// 等价于"本批已经在途"，按已受理处理（改造前的 submitMainchainTxUntilSuccess 也是这个口径）。
+	// 等价于"本批已经在途"，按已受理处理（改造前的 submitMainChainTxUntilSuccess 也是这个口径）。
 	if strings.Contains(msg, "ErrDupTx") || strings.Contains(msg, "duplicate") {
 		return btcHeaderSubmitDuplicateAccepted
 	}

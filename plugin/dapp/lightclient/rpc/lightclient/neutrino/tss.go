@@ -13,7 +13,7 @@ import (
 	"github.com/33cn/chain33/system/crypto/tss"
 	"github.com/33cn/chain33/system/crypto/tss/gg18"
 	"github.com/33cn/chain33/types"
-	"github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
+	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
 	"github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -164,7 +164,7 @@ func (t *tssService) init() {
 		DkgAddress:  t.tssAddress.EncodeAddress(),
 		PkScript:    t.pkScript,
 	}
-	t.client.submitMainchainTxUntilSuccess(rtypes.RgbxX, rtypes.NameCommitDKGAction, commitDKG)
+	t.client.submitMainChainTxUntilSuccess(rtypes.RgbxX, rtypes.NameCommitDKGAction, commitDKG)
 	// RGB20 补 CommitDKG（H6）：对每个注册的 RGB20 合约提交带 pubkey 的 CommitDKG，
 	// 否则 checkDeposit/Exec_Deposit 的 RGB20 分支拿不到 CrossChainInfo.Pubkey，无法验 threshold_sig。
 	if t.client.rgb20 != nil {
@@ -175,7 +175,7 @@ func (t *tssService) init() {
 				PkScript:    t.pkScript,
 				Pubkey:      t.tssPublicKey.SerializeCompressed(),
 			}
-			t.client.submitMainchainTxUntilSuccess(rtypes.RgbxX, rtypes.NameCommitDKGAction, rgbCommitDKG)
+			t.client.submitMainChainTxUntilSuccess(rtypes.RgbxX, rtypes.NameCommitDKGAction, rgbCommitDKG)
 			log.Info("init tssService rgb20 commitDKG", "symbol", symbol, "tssAddress", t.tssAddress.EncodeAddress())
 		}
 	}
@@ -304,7 +304,7 @@ func (t *tssService) processSignBtcTx(tx *wire.MsgTx, txType string, inputAmount
 		log.Error("processSignBtcTx SerializeNoWitness", "err", err)
 		return err
 	}
-	notify := &lighttypes.TssSignNotify{
+	notify := &ltypes.TssSignNotify{
 		InputAmounts: inputAmounts,
 		TxType:       txType,
 		Payload:      payload,
@@ -317,9 +317,9 @@ func (t *tssService) processSignBtcTx(tx *wire.MsgTx, txType string, inputAmount
 	return t.signBtcTx(tx, inputAmounts, signers)
 }
 
-func (t *tssService) signMsg(msg []byte, seesionName string, signers []string) *signResult {
+func (t *tssService) signMsg(msg []byte, sessionName string, signers []string) *signResult {
 	result := &signResult{}
-	sigResult, err := gg18.ProcessSign(signers, msg, t.dkgResult, seesionName)
+	sigResult, err := gg18.ProcessSign(signers, msg, t.dkgResult, sessionName)
 	if err != nil {
 		log.Error("signMsg ProcessSign", "err", err)
 		result.err = err
@@ -515,7 +515,7 @@ func (t *tssService) processSignRgb20Deposit(payload *rgb20.DepositSignPayload) 
 	if err != nil {
 		return nil, fmt.Errorf("marshal deposit payload: %w", err)
 	}
-	notify := &lighttypes.TssSignNotify{
+	notify := &ltypes.TssSignNotify{
 		TxType:  transactionTypeRgb20Deposit,
 		Payload: payloadBytes,
 		Signers: signers,
@@ -533,7 +533,7 @@ func (t *tssService) processSignRgb20Deposit(payload *rgb20.DepositSignPayload) 
 	return res.sig, nil
 }
 
-func (t *tssService) parseTxFromNotify(notify *lighttypes.TssSignNotify) (*wire.MsgTx, []int64, error) {
+func (t *tssService) parseTxFromNotify(notify *ltypes.TssSignNotify) (*wire.MsgTx, []int64, error) {
 	if notify == nil {
 		return nil, nil, types.ErrInvalidParam
 	}
@@ -668,7 +668,7 @@ func (t *tssService) handleSignNotify(msg []byte) {
 		return
 	}
 
-	notify := &lighttypes.TssSignNotify{}
+	notify := &ltypes.TssSignNotify{}
 	err := types.Decode(msg, notify)
 	if err != nil {
 		log.Error("handleSignNotify Decode", "err", err)
@@ -750,7 +750,7 @@ func (t *tssService) handleSignNotify(msg []byte) {
 // handleRgb20DepositSign 签名节点处理 rgb20-deposit 轮次：
 // 独立验证（本地已签集合去重 + 地址绑定 + 金额 + 侧车 ValidateConsignment + 同步高度门槛），
 // 通过后签 C，**签名成功后**把付款交易 txid 登记进已签集合（A3）。
-func (t *tssService) handleRgb20DepositSign(notify *lighttypes.TssSignNotify) error {
+func (t *tssService) handleRgb20DepositSign(notify *ltypes.TssSignNotify) error {
 	if t.client.rgb20 == nil {
 		return fmt.Errorf("rgb20 adapter not configured")
 	}
@@ -780,7 +780,7 @@ func (t *tssService) handleRgb20DepositSign(notify *lighttypes.TssSignNotify) er
 }
 
 // handleRgb20WithdrawSign 签名节点处理 RGB20 提现 PSBT：交叉核对（BL-4/HR-3）后 signPsbt。
-func (t *tssService) handleRgb20WithdrawSign(notify *lighttypes.TssSignNotify) error {
+func (t *tssService) handleRgb20WithdrawSign(notify *ltypes.TssSignNotify) error {
 	if t.client.rgb20 == nil {
 		return fmt.Errorf("rgb20 adapter not configured")
 	}
