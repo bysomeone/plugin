@@ -73,10 +73,12 @@ services:
     command:
       - btcd
       - --regtest
-      # 显式指定非默认 datadir：btcd 的 removeRegressionDB() 在 --regtest 下、且 datadir
-      # 为默认值（~/.btcd/data）时，每次启动都会删掉 regtest 链。指定一个不同路径即可
-      # 跳过删除（仍落在 ./btcd-data 挂载内）。否则每次容器重启都会清链，导致 chain33
-      # lightclient 已存的 BTC 头链与 btcd 新链错位、充值 SPV 永久验不过。
+      # 注意：--datadir 在这里**并不能**阻止 btcd 清链。btcd v0.24.2 的 removeRegressionDB()
+      # 只以 cfg.RegressionTest 为门（btcd.go 里 loadBlockDB 无条件调用它，注释即 "needs a
+      # clean database for each run"），而 dbPath 是 <datadir>/<net>/blocks_ffldb（config.go
+      # 已把网络名拼到 DataDir 末尾）——换路径照样被删。
+      # 结论：regtest 链只在"btcd 容器不被重建/重启"时存活；需要全新环境请用
+      # ./docker-compose.sh reset，别指望改 datadir。详见 docker-compose.sh 的 start_env。
       - --datadir=/root/.btcd/chain
       - --txindex
       - --addrindex
