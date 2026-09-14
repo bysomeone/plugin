@@ -1,8 +1,11 @@
 package executor
 
 import (
+	"encoding/json"
+
 	"github.com/33cn/chain33/types"
 	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
+	rgbxtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 )
 
 func (l *lightclient) Query_GetBtcLastHeader(req *types.ReqNil) (types.Message, error) {
@@ -49,4 +52,61 @@ func (l *lightclient) Query_GetBtcCheckpoint(req *types.ReqNil) (types.Message, 
 		return &ltypes.BtcHeader{}, nil
 	}
 	return &ltypes.BtcHeader{Height: height, Hash: hash}, nil
+}
+
+// rgbxMinBtcConfirmationsDefault 链上最小确认数（B8）的默认值：与 rgbx 执行器
+// （plugin/dapp/rgbx/executor/rgbx.go 的 defaultMinBtcConfirmations）保持一致。
+const rgbxMinBtcConfirmationsDefault = int64(6)
+
+// Query_GetRgbxMinBtcConfirmations 返回本链 rgbx 执行器**实际生效**的最小 BTC 确认数 N（B8）。
+//
+// 存在理由（N 的单一真相）：中继要在提交充值证明之前判断"提交那一刻链上看得见的确认深度够不够"，
+// 就必须知道 N。N 属于 rgbx 执行器（`[exec.sub.rgbx].minBtcConfirmations`，默认 6），中继既不想、
+// 也不该自己再配一份必须人肉对齐的值 —— 于是链上把它暴露成一次只读查询，中继读它就够了：
+//   - 配置只有一份：`[exec.sub.rgbx].minBtcConfirmations`；
+//   - 取值口径只有一份：这里按 json 解码该段，规则与 rgbx 执行器 initCfg 完全一致
+//     （正数用它；未配置 / 非正数一律取默认值 6，不允许用 0 表达"不校验深度"）。
+//
+// 复用 types.Int64，不新增 proto。链上没有 rgbx 执行器（缺 `[exec.sub.rgbx]` 段）时返回默认值 6：
+// 那种链上本来也提交不了 rgbx Deposit（执行器不存在），给默认值不影响任何行为。
+//
+// 中继侧的用法与失败取向见 neutrino 的 RgbxMinBtcConfirmations：查询不到就不提交（fail-closed）。
+func (l *lightclient) Query_GetRgbxMinBtcConfirmations(_ *types.ReqNil) (types.Message, error) {
+	var cfg *types.Chain33Config
+	if api := l.GetAPI(); api != nil {
+		cfg = api.GetConfig()
+	}
+	return &types.Int64{Data: rgbxMinBtcConfirmations(cfg)}, nil
+}
+
+// rgbxMinBtcConfirmations 从链配置里取 rgbx 执行器生效的最小确认数（无配置/取不到时给默认值）。
+func rgbxMinBtcConfirmations(cfg *types.Chain33Config) int64 {
+	if cfg == nil || cfg.GetSubConfig() == nil {
+		return rgbxMinBtcConfirmationsDefault
+	}
+	// 段名 = 执行器名（chain33 pluginmgr 用 `cfg.GetSubConfig().Exec[execName]` 取子配置，见
+	// pluginmgr/base.go 的 InitExec），rgbx 的执行器名就是 rgbxtypes.RgbxX。
+	return rgbxMinBtcConfirmationsFromSub(cfg.GetSubConfig().Exec[rgbxtypes.RgbxX])
+}
+
+// rgbxMinBtcConfirmationsFromSub 解析 `[exec.sub.rgbx]` 段（子配置以 json 存放）。
+// 口径与 rgbx 执行器 initCfg 一致，方向都是 fail-closed：解不出来 / 配了非正数都取默认值 6，
+// 绝不解释成"不做深度校验"。
+func rgbxMinBtcConfirmationsFromSub(sub []byte) int64 {
+	if len(sub) == 0 {
+		return rgbxMinBtcConfirmationsDefault
+	}
+	c := struct {
+		MinBtcConfirmations int64 `json:"minBtcConfirmations"`
+	}{}
+	if err := json.Unmarshal(sub, &c); err != nil {
+		// 同一段字节在启动期由 rgbx 执行器用 types.MustDecode(=json.Unmarshal) 解过，
+		// 解不出来说明 rgbx 那边已经 panic 起不来，这里只是不让查询把它变成 panic。
+		elog.Error("rgbxMinBtcConfirmationsFromSub decode [exec.sub.rgbx]", "err", err)
+		return rgbxMinBtcConfirmationsDefault
+	}
+	if c.MinBtcConfirmations <= 0 {
+		return rgbxMinBtcConfirmationsDefault
+	}
+	return c.MinBtcConfirmations
 }
