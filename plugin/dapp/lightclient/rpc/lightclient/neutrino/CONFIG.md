@@ -55,6 +55,9 @@
 - **regtest 不要填**：regtest 链每次启动都会重建（btcd `removeRegressionDB`），填了反而是错锚点，
   也会弄挂 CI。
 
+此外，单笔交易（`BtcHeaders` action）允许提交的头数上限为 **64**（中继自身 `batchSize=16`，留 4 倍
+余量），且同一笔交易内的头高度必须逐个 +1（重复高度或跳高都会被拒绝）。
+
 ### 2.2 `[exec.sub.rgbx]`
 
 - `commitAddress`
@@ -240,6 +243,7 @@ peerblockfilters=1
 - `btcNetName == netName == BTC 节点 network`
 - 主链 `guardianParachainTitle == 平行链 Title`
 - `commitAddress/commitAddr/authAccount` 与私钥管理匹配
+- mainnet/testnet 上线前：`btcCheckpointTable` 已填近期高度，且与 `btcHeaderStartHeight-1` 对得上
 - `blockConfirmations` 符合环境安全要求（测试可低，生产应高）
 - `btcRPC.host/user/pass/TLS` 与 BTC 节点一致
 - 全部 TSS 节点的 `peers/threshold` 一致，且 `rank` 分配无冲突
@@ -318,3 +322,7 @@ rank=0 # 官方节点；第三方节点配置为 rank=1，且 isOfficialNode=fal
 - 多官方节点：多个 `isOfficialNode=true` 节点并行处理，导致重复提交/状态竞争
 - 确认数过低：测试通过但生产抗重组能力不足
 - 授权地址不匹配：`commitAddress/commitAddr/authAccount` 与私钥不对应
+- 首个 BTC 头被拒（`ErrBtcHeaderNoAnchor`）：bootstrap 起点既不是创世、也没命中锚点表。
+  检查 `btcHeaderStartHeight` 与 `btcCheckpointTable` 是否配套（见 2.1.1）
+- 提交头数过大（`ErrBtcHeadersTooMany`）：单笔超过 64 个头的自定义中继需分批提交
+- 批内高度重复/跳高（`ErrBtcHeaderDuplicateHeight`）：中继必须按高度逐个 +1 提交，不能跳块或重发
