@@ -25,8 +25,12 @@ services:
       - ./btcd-data:/btcd:ro
       - para1-data:/root/paradatadir
     # RGB20（Phase 5）：官方节点 rgb20 适配器 HTTP（充值请求 + consignment 上传 + 测试 sign-psbt）。
+    # 17001：P2WSH 充值地址发放入口（neutrino.depositAddressListen）——桥要先 watch 用户的派生
+    # 脚本才看得见充值，所以地址必须**向桥要**，E2E 用 BRIDGE_DEPOSIT_URL（默认 127.0.0.1:17001）
+    # 从这里领。只有官方节点开这个监听，故只发布 para1。
     ports:
       - "17000:17000"
+      - "17001:17001"
 
   para2:
     build:

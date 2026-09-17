@@ -209,6 +209,14 @@ function config_para_file() {
     perl -i -pe 's/^enable=.*/enable=true/' "${path}"
     perl -i -pe 's/^waitPid=.*/waitPid=false/' "${path}"
 
+    # 用户 BTC 充值地址发放 HTTP（P2WSH C2）。只有官方节点（para1）跑真正的 BTC 桥
+    # （btc wallet + 充值 watch 集），也只有它需要"按需 import 用户充值脚本"这个入口；
+    # 非官方节点开了也没有钱包可发行（请求会 503），只是多一个空转的监听，故这里关掉。
+    local deposit_address_listen=""
+    if [ "${official}" = "true" ]; then
+        deposit_address_listen="0.0.0.0:17001"
+    fi
+
     local toml_peers
     toml_peers=$(join_csv_as_toml_array "${TSS_PEERS}")
     cat >>"${path}" <<EOF
@@ -224,6 +232,9 @@ connectPeers=["${BTC_P2P_ADDR}"]
 btcBlockInterval=2
 blockConfirmations=1
 maxUtxoRescanTime=60
+# 充值地址发放入口（空 = 不开启）。E2E 脚本按 127.0.0.1:17001 领地址，见 docker-compose.yml
+# 里 para1 的 17001 端口发布与 scripts/btc_test.sh 的 BRIDGE_DEPOSIT_URL。
+depositAddressListen="${deposit_address_listen}"
 
 [rpc.sub.light.neutrino.btcRPC]
 host="${BTC_RPC_ADDR}"
