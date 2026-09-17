@@ -65,7 +65,7 @@ function find_tx_spending_from_address() {
     local addr="$1"
     local spent_txid="$2"
     local txs
-    txs=$(${BTC_CTL} --"${BTC_NETWORK}" searchrawtransactions "${addr}" 1 0 20 0 true 2>/dev/null) || true
+    txs=$(${BTC_CTL} --"${BTC_NETWORK}" searchrawtransactions "${addr}" 1 0 100 0 true 2>/dev/null) || true
     [ -n "${txs}" ] || return 0
     echo "${txs}" | jq -r --arg d "${spent_txid}" \
         '[.[] | select(any(.vin[]?; .txid == $d)) | .txid] | first // empty'
@@ -141,14 +141,14 @@ function scenario_user_deposit_sweep() {
     assert_true "$([ -z "${live}" ] || [ "${live}" = "null" ] && echo true || echo false)" \
         "deposit utxo ${deposit_tx}:${deposit_vout} is still unspent after the sweep"
 
-    # 2) 归集额 ≈ 充值额 - 手续费，且**只**少了手续费（不得被抽走）。
+    # 2) 归集额至少覆盖本场景那笔（扣掉手续费）。注意这**不是**"等于充值额"：扫集会把当时所有
+    #    待归集的充值 UTXO 合并成一笔（本场景之前的充值也可能还没被扫），所以下界比对才成立 ——
+    #    只扫了本笔时 swept = 充值额 - 手续费；合并了别的则更大。
     local swept_sats
     swept_sats=$(tx_output_sats_to_address "${sweep_tx}" "${main_pool_addr}")
     assert_non_empty "${swept_sats}" "sweep tx ${sweep_tx} has no output to the main pool"
-    local short
-    short=$((SWEEP_DEPOSIT_AMOUNT_SATS - swept_sats))
-    assert_true "$([ "${short}" -ge 0 ] && [ "${short}" -lt 10000 ] && echo true || echo false)" \
-        "swept amount off: deposited=${SWEEP_DEPOSIT_AMOUNT_SATS} swept=${swept_sats} (diff=${short} sats)"
+    assert_true "$([ "${swept_sats}" -ge $((SWEEP_DEPOSIT_AMOUNT_SATS - 10000)) ] && echo true || echo false)" \
+        "swept amount too small: deposited=${SWEEP_DEPOSIT_AMOUNT_SATS} swept=${swept_sats} (sweep=${sweep_tx})"
 
     # 3) 不变式（规格 §2.3(b)）：桥的任何自有付款都不得落到用户 P2WSH —— 扫集输出回到充值脚本，
     #    就会被该用户回头当成充值证明再认领一次（同一笔 BTC 两边入账）。
@@ -161,7 +161,7 @@ function scenario_user_deposit_sweep() {
     pool_balance=$(query_latest_received_sats "${main_pool_addr}")
     assert_non_empty "${pool_balance}" "main pool balance query failed"
     log_step "PASS: sweep landed: sweepTx=${sweep_tx} depositTx=${deposit_tx} depositAddress=${deposit_addr}" \
-        "swept=${swept_sats}sats mainPool=${main_pool_addr} mainPoolLatestReceived=${pool_balance}sats"
+        "sweptToMainPool=${swept_sats}sats mainPool=${main_pool_addr} mainPoolLatestReceived=${pool_balance}sats"
 }
 
 function scenario_user_transfer_crosschain_asset() {
