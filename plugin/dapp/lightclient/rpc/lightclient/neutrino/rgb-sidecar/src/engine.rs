@@ -156,6 +156,9 @@ pub struct SweepBuild {
 const SWEEP_TX_OVERHEAD_VBYTES: u64 = 11;
 const SWEEP_P2WSH_INPUT_VBYTES: u64 = 100;
 const SWEEP_P2WPKH_OUTPUT_VBYTES: u64 = 31;
+/// 单笔扫集最多合并几个输入。上万个输入的交易会超出标准交易大小上限（中继直接拒），
+/// 且一次失败的爆炸半径过大；剩下的等下一轮再扫。
+const SWEEP_MAX_INPUTS: u32 = 100;
 /// P2WPKH 输出的 dust 门槛（btcd `txscript` 的 dustLimit 同值口径）：归集额减费后低于它，
 /// 这笔扫集没有意义。
 const SWEEP_DUST_LIMIT: u64 = 294;
@@ -354,11 +357,16 @@ impl RgbEngine {
         fee_rate: u64,
         min_utxos: u32,
     ) -> Result<Option<SweepBuild>> {
-        // 确定性顺序（同一批 UTXO ⇒ 同一笔未签交易 ⇒ 同一 txid），便于重试/排障。
-        utxos.sort_by_key(|u| u.outpoint.to_string());
         if (utxos.len() as u32) < min_utxos {
             return Ok(None);
         }
+        // 单笔上限：一笔塞进上万个输入会超出标准交易的大小上限（中继直接拒），也把一次扫集的
+        // 失败面放得过大。取面额最大的若干笔（合并的目的就是把零散 UTXO 变成一笔大额主池 UTXO，
+        // 所以按面额取大是对的），再按 outpoint 排序得到确定性顺序
+        // （同一批 UTXO ⇒ 同一笔未签交易 ⇒ 同一 txid，便于重试/排障）。
+        utxos.sort_by(|a, b| b.value.cmp(&a.value).then_with(|| a.outpoint.to_string().cmp(&b.outpoint.to_string())));
+        utxos.truncate(SWEEP_MAX_INPUTS as usize);
+        utxos.sort_by_key(|u| u.outpoint.to_string());
 
         let n = utxos.len() as u64;
         // 费估算：P2WSH(CHECKSIG, 71 字节 witnessScript) 输入 ≈ 79 vbytes（41 非见证字节 +
@@ -1741,6 +1749,36 @@ mod sweep_tests {
             format!("{err}").contains("not a registered user deposit script"),
             "{err}"
         );
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
+
+    #[test]
+    fn sweep_caps_the_input_count_and_keeps_the_largest() {
+        // 一笔塞进上万个输入会超出标准交易大小上限（中继直接拒），所以单笔有上限；
+        // 截断时保留**面额最大**的那些（合并的目的就是把零散 UTXO 变成一笔大额主池 UTXO）。
+        let mut engine = test_engine();
+        let (a, _b) = two_users(&mut engine);
+        let n = SWEEP_MAX_INPUTS + 5;
+        let utxos: Vec<WalletUtxo> = (0..n)
+            .map(|i| utxo(i, 1_000 + i as u64, a.clone()))
+            .collect();
+        let build = engine
+            .build_sweep_from_utxos(utxos, 2, 1)
+            .unwrap()
+            .expect("应该可扫");
+        assert_eq!(build.input_count, SWEEP_MAX_INPUTS, "单笔输入数必须被截断到上限");
+
+        // 被选中的是面额最大的那批：最小的一笔（1000）必须落选，最大的一笔必须在。
+        let chosen: Vec<u64> = build
+            .psbt
+            .inputs
+            .iter()
+            .map(|i| i.witness_utxo.as_ref().unwrap().value.to_sat())
+            .collect();
+        assert!(chosen.contains(&(1_000 + n as u64 - 1)), "面额最大的必须在");
+        assert!(!chosen.contains(&1_000), "面额最小的必须落选");
+        assert_eq!(build.input_value, chosen.iter().sum::<u64>());
+
         let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
     }
 

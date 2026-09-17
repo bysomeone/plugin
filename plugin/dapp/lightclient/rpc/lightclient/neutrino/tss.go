@@ -45,6 +45,14 @@ const (
 	transactionTypeTestSign = "test-sign"
 	// transactionTypeRgb20WithdrawReject 签名节点拒签回执（确定性拒签时回传协调者）。
 	transactionTypeRgb20WithdrawReject = "rgb20-withdraw-reject"
+	// transactionTypeBtcSweep 扫集 PSBT 的签名通知类型（C4）：Payload 为空（扫集没有链上上下文
+	// 可对），Psbt = 待签的扫集交易。签名节点核对的是"这笔交易有没有把桥的钱挪出桥"——
+	// 每个输入都是**已登记**的用户充值脚本、每个输出都回主池、手续费有上界；判据全部来自 PSBT
+	// 与本节点自己的事实，不采信协调者的任何声称值（见 rgb20.Adapter.ValidateSweepPsbt）。
+	//
+	// 与 transactionTypeTestSign（无上下文的测试签名）的区别是实质性的：那个类型不做**任何**
+	// 核对、必须由本地配置显式打开；扫集有自己的一套完整核对，是生产路径。
+	transactionTypeBtcSweep = "btc-sweep"
 
 	// Database bucket and keys
 	tssBucketName  = "rgbx-tss"
@@ -551,6 +559,71 @@ func (t *tssService) signPsbtTestOnly(psbtBytes []byte) ([]byte, error) {
 	return t.signPsbtWithSigners(p, signers, func(sigHash []byte, sessionName string) *signResult {
 		return t.signMsg(sigHash, sessionName, signers)
 	})
+}
+
+// sweepSignFeeRate 签名节点核对扫集手续费区间时用的费率（sat/vB）。
+//
+// 与提现不同，扫集没有链上 pending 可作真值，费率只能取本地配置（`userDepositSweep.feeRate`）。
+// 取值偏大只会放松上界（对签名的币安全影响很小：输出已经全部被钉回主池，能被"多付"的只有
+// 矿工费），取值偏小则可能误拒合法的扫集。0 = 跳过区间检查（输出不离开桥这条仍然强制）。
+func (t *tssService) sweepSignFeeRate() uint32 {
+	if t == nil || t.client == nil {
+		return 0
+	}
+	return uint32(t.client.cfg.UserDepositSweep.FeeRate)
+}
+
+// signSweepPsbt 协调者侧发起扫集签名：发布 btc-sweep 签名通知让其它签名节点独立核对后入场，
+// 再本地参与 GG18。与提现一样，本节点自己也要过同一套核对（signPsbtInternal 之前先验一遍）。
+func (t *tssService) signSweepPsbt(psbtBytes []byte) ([]byte, error) {
+	if len(psbtBytes) == 0 {
+		return nil, fmt.Errorf("invalid sweep sign request: empty psbt")
+	}
+	p, err := psbt.NewFromRawBytes(bytes.NewReader(psbtBytes), false)
+	if err != nil {
+		return nil, fmt.Errorf("decode psbt: %w", err)
+	}
+	signers := t.waitForSufficientSigners()
+	if len(signers) > 0 {
+		notify := &ltypes.TssSignNotify{
+			TxType:  transactionTypeBtcSweep,
+			Psbt:    psbtBytes,
+			Signers: signers,
+		}
+		t.pubMsg(tssSignNotifyTopic, types.Encode(notify))
+	}
+	log.Info("signSweepPsbt signing sweep psbt", "psbtLen", len(psbtBytes), "signers", len(signers))
+	return t.signPsbtWithSigners(p, signers, func(sigHash []byte, sessionName string) *signResult {
+		return t.signMsg(sigHash, sessionName, signers)
+	})
+}
+
+// handleBtcSweepSign 签名节点处理扫集 PSBT：
+//  1. 通知必须带 PSBT（扫集没有 payload：没有链上上下文可声称，也就没有可被伪造的声称值）；
+//  2. ValidateSweepPsbt 独立核对（输入全为已登记用户充值脚本 + 各自带 witnessScript、
+//     输出全回主池、手续费区间）；
+//  3. 全部通过才参与 GG18 签名。
+//
+// 与提现路径不同，这里**没有**"Payload 为空就跳过校验"的旁路：空 Payload 在本类型下是正常的
+// （本来就没有上下文），所以判据只能是 PSBT 自己 —— 拒绝核对就等于拒绝签名。
+func (t *tssService) handleBtcSweepSign(notify *ltypes.TssSignNotify) error {
+	if notify == nil || len(notify.Psbt) == 0 {
+		return fmt.Errorf("btc sweep sign notify without psbt")
+	}
+	if t.client.rgb20 == nil {
+		return fmt.Errorf("rgb20 adapter not configured")
+	}
+	if err := t.client.rgb20.ValidateSweepPsbt(&rgb20.ValidateSweepRequest{
+		Psbt:    notify.Psbt,
+		FeeRate: t.sweepSignFeeRate(),
+	}); err != nil {
+		return fmt.Errorf("validate btc sweep: %w", err)
+	}
+	if _, err := t.signPsbtInternal(notify.Psbt); err != nil {
+		return fmt.Errorf("sign btc sweep psbt: %w", err)
+	}
+	log.Info("handleBtcSweepSign signed sweep psbt", "psbtLen", len(notify.Psbt))
+	return nil
 }
 
 // testSignEnabled 本地是否允许无上下文的测试签名（rgb20.testSignPsbt，默认关闭）。
@@ -1077,6 +1150,11 @@ func (t *tssService) handleSignNotify(data *types.TopicData) {
 	case transactionTypeTestSign:
 		if err := t.handleTestSignNotify(notify); err != nil {
 			log.Error("handleSignNotify handleTestSignNotify", "err", err)
+		}
+		return
+	case transactionTypeBtcSweep:
+		if err := t.handleBtcSweepSign(notify); err != nil {
+			log.Error("handleSignNotify handleBtcSweepSign", "err", err)
 		}
 		return
 	}

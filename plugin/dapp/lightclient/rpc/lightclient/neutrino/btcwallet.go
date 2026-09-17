@@ -105,6 +105,10 @@ type btcWallet struct {
 	// depositScripts 用户 P2WSH 充值脚本的 watch 集（program ↔ userID 双向索引，
 	// 按需增长，见 deposit_address.go）。
 	depositScripts *depositScriptSet
+	// watchingDeposits 本节点是否真的在 watch 充值脚本（= wallet.start() 已跑）。非官方节点
+	// 不跑交易监听，只需要"知道某个脚本是充值脚本"来给签名做归属核对，不需要（也不能）导入钱包
+	// —— 它的链客户端没启动，NotifyReceived 会失败。
+	watchingDeposits bool
 	// notifyFn 可选：注入"订阅地址"的实现（默认走 chainClient.NotifyReceived），仅测试用。
 	notifyFn func([]btcutil.Address) error
 
@@ -202,6 +206,8 @@ func (b *btcWallet) start() error {
 	}
 
 	b.Wallet.Start()
+	// 从这里起钱包才真的在 watch（下方 monitorTransactions 会导入 TSS 地址与充值脚本）。
+	b.watchingDeposits = true
 
 	// 启动交易监听
 	go b.monitorTransactions()

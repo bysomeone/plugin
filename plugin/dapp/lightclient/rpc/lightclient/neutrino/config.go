@@ -72,6 +72,35 @@ type config struct {
 	// MaxWatchedDepositScripts 用户充值脚本 watch 集上限：达到上限后**拒绝发放新地址**
 	// （明确失败优于静默变慢/静默漏认充值）。<=0 用默认值（defaultMaxWatchedDepositScripts）。
 	MaxWatchedDepositScripts int `json:"maxWatchedDepositScripts"`
+
+	// UserDepositSweep 扫集配置（C4）：把散在用户 P2WSH 充值地址上的 BTC 闲时归集回主池。
+	UserDepositSweep userDepositSweepConfig `json:"userDepositSweep"`
+}
+
+// userDepositSweepConfig 扫集（C4）。只在**发放充值地址的那个节点**（官方节点）上开启：
+// 充值 UTXO 的归属只有它（以及和它共用侧车的节点）看得见。
+//
+// 为什么必须有扫集：P2WSH 充值地址上线后，用户的充值不再进主池 —— 钱停在各自的 P2WSH 上，
+// 而提现只能花主池的 BTC。没有扫集，"钱进得去、出不来"。
+//
+// 时序（规格 §6① 选项 A）：扫集是**纯 UTXO 整理**，不改变任何 RGB 账（入账在铸币那一刻已完成），
+// 所以它不需要卡在铸币前后，只需"闲时按 UTXO 数阈值触发"——攒够 MinUtxos 笔再合并成一次，
+// 手续费才划算。
+type userDepositSweepConfig struct {
+	// Enable 是否开启扫集（默认 false）。
+	Enable bool `json:"enable"`
+	// IntervalSeconds 触发检查间隔（秒）。<=0 用默认值（defaultSweepIntervalSeconds）。
+	IntervalSeconds int `json:"intervalSeconds"`
+	// MinUtxos 触发阈值：可扫的充值 UTXO 少于这个数就不扫（等它攒够）。<=0 用默认值。
+	MinUtxos int `json:"minUtxos"`
+	// FeeRate 扫集的费率（sat/vB）。<=0 用默认值。
+	//
+	// 它同时是签名节点核对扫集手续费区间的费率（见 tssService.sweepSignFeeRate）：扫集没有链上
+	// pending 可作真值，费率只能取本地配置。因此各节点的这个值应当一致，否则签名节点可能拒签
+	// 一笔合法扫集（费率上界按各节点自己的值算）。
+	FeeRate int `json:"feeRate"`
+	// MinConfirmations 只归集达到该确认数的充值 UTXO。<=0 用默认值（defaultSweepMinConfirmations）。
+	MinConfirmations int `json:"minConfirmations"`
 }
 
 // rgb20Config RGB20 跨链桥（RGB20 USDT）配置。

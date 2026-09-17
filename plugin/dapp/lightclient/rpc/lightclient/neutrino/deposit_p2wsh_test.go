@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20/pb"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
@@ -514,4 +515,88 @@ func TestHandleDepositAddressRequest(t *testing.T) {
 	n.handleDepositAddressRequest(rec, httptest.NewRequest(http.MethodDelete, "/rgbx/v1/btc-deposit-address", nil))
 	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
 	assert.Equal(t, 1, b.depositScripts.size(), "失败请求不得改变 watch 集")
+}
+
+// ---- 阶段 C4：跨节点 watch 集分发 ----
+
+// TestMergeRemoteDepositScripts_learnsAnotherNodesEntry 跨节点补齐的核心：
+// 侧车回带的**并集**里可以有一条本节点从没发放过的地址 —— 只要它按 (userID, 本节点的 tssPub)
+// 能重新派生出同一个 program，就必须被收下（这正是签名节点"各自必须持有登记"的落地方式）。
+func TestMergeRemoteDepositScripts_learnsAnotherNodesEntry(t *testing.T) {
+	vectors := loadDepositVectors(t)
+	v2 := vectors[1]
+	pub, err := btcec.ParsePubKey(vectorPub(t, v2))
+	require.NoError(t, err)
+
+	b, _, _ := newTestWallet(t, pub, config{})
+	b.watchingDeposits = true // 官方节点：合并进来的脚本也要导入钱包（它才看得见充值）
+	var notified []btcutil.Address
+	b.notifyFn = func(addrs []btcutil.Address) error {
+		notified = append(notified, addrs...)
+		return nil
+	}
+	require.Equal(t, 0, b.depositScripts.size())
+
+	pkScript, err := hex.DecodeString(v2.PkScript)
+	require.NoError(t, err)
+	b.mergeRemoteDepositScripts([]*pb.DepositScriptEntry{
+		{UserId: v2.UserID, PkScript: pkScript},
+	})
+
+	require.Equal(t, 1, b.depositScripts.size(), "别的节点发放过的条目必须被收下")
+	userID, ok := b.depositScripts.lookupUser(pkScript)
+	assert.True(t, ok, "收下之后，反解归属必须能命中（充值归因/签名归属核对都靠它）")
+	assert.Equal(t, v2.UserID, userID)
+	require.Len(t, notified, 1, "官方节点必须把新脚本导入钱包并订阅")
+	assert.Equal(t, v2.Addresses["regtest"], notified[0].String())
+
+	// 幂等：同一条重复推来不会重复 import/订阅/watch 增长。
+	b.mergeRemoteDepositScripts([]*pb.DepositScriptEntry{
+		{UserId: v2.UserID, PkScript: pkScript},
+	})
+	assert.Equal(t, 1, b.depositScripts.size())
+	assert.Len(t, notified, 1)
+}
+
+// TestMergeRemoteDepositScripts_skipsMismatchedEntries 反向验证：推送内容**不被采信**。
+// 一份与自己群公钥/模板对不上的条目（换过钥、或对方写坏了）必须被丢掉 —— 收下它等于把一个
+// 本节点根本花不掉的脚本记成"用户充值脚本"，让签名节点为不可花费的 UTXO 背书。
+func TestMergeRemoteDepositScripts_skipsMismatchedEntries(t *testing.T) {
+	vectors := loadDepositVectors(t)
+	v1, v2 := vectors[0], vectors[1]
+	pub, err := btcec.ParsePubKey(vectorPub(t, v1))
+	require.NoError(t, err)
+
+	b, _, _ := newTestWallet(t, pub, config{})
+	var notified []btcutil.Address
+	b.notifyFn = func(addrs []btcutil.Address) error {
+		notified = append(notified, addrs...)
+		return nil
+	}
+	// v2 的 program 是用 v1 的公钥派生不出来的（向量 1 的 userID 配向量 0 的公钥）。
+	pkScriptV2, err := hex.DecodeString(v2.PkScript)
+	require.NoError(t, err)
+	b.mergeRemoteDepositScripts([]*pb.DepositScriptEntry{
+		{UserId: v2.UserID, PkScript: pkScriptV2},
+		{}, // 空条目
+		{UserId: "not-an-address", PkScript: pkScriptV2},
+	})
+	assert.Equal(t, 0, b.depositScripts.size(), "对不上的条目一条都不能落地")
+	assert.Empty(t, notified, "被丢弃的条目不得触发钱包导入")
+}
+
+// TestDepositScriptSetEntriesRoundTrip 下发前要把 watch 集导出成 (userID, pkScript) 列表，
+// 导出必须与入库时逐字节一致（下发的是字节，错一个字节侧车就核对不过）。
+func TestDepositScriptSetEntriesRoundTrip(t *testing.T) {
+	vectors := loadDepositVectors(t)
+	v := vectors[0]
+	pkScript, err := hex.DecodeString(v.PkScript)
+	require.NoError(t, err)
+
+	s := newDepositScriptSet()
+	s.add(v.UserID, pkScript)
+	entries := s.entries()
+	require.Len(t, entries, 1)
+	assert.Equal(t, v.UserID, entries[0].userID)
+	assert.Equal(t, pkScript, entries[0].pkScript, "导出的 pkScript 必须与入库的逐字节一致")
 }
