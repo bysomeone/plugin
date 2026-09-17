@@ -2,6 +2,8 @@ package neutrino
 
 import (
 	"bytes"
+	"encoding/asn1"
+	"math/big"
 	"testing"
 
 	"github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20"
@@ -99,9 +101,39 @@ func Test_analyzeTransaction_normalDepositUnchanged(t *testing.T) {
 	require.Equal(t, transactionTypeDeposit, pending.txType)
 }
 
-// Test_signPsbtWithSigners_writesLowSPartialSig signPsbt：sighash 取自 PSBT witness utxo，
-// 写入 partial_sigs，且 high-S 签名被归一化为 low-S。
-func Test_signPsbtWithSigners_writesLowSPartialSig(t *testing.T) {
+// derEncodeSignature 手工 DER 编码 (r, s)。
+//
+// 不用 ecdsa.Signature.Serialize()：btcec/v2 的 Signature 是 decred secp256k1 的类型别名，
+// 其 Serialize() 会把 S 强制归一化为 low-S（保证签名不可锻造），因此 Serialize() 的产物永远
+// 到不了 tss.go 里的 normalizeLowS。要构造"真正 high-S 的签名输入"，只能自己编码 DER。
+func derEncodeSignature(t *testing.T, r, s btcec.ModNScalar) []byte {
+	t.Helper()
+	rBytes, sBytes := r.Bytes(), s.Bytes()
+	der, err := asn1.Marshal(struct {
+		R, S *big.Int
+	}{
+		R: new(big.Int).SetBytes(rBytes[:]),
+		S: new(big.Int).SetBytes(sBytes[:]),
+	})
+	require.NoError(t, err)
+	return der
+}
+
+// Test_signPsbtWithSigners_broadcastTxLowSSig signPsbt：sighash 取自 PSBT witness utxo，
+// high-S 签名被归一化为 low-S，且返回值是已 finalize、可直接广播的交易。
+//
+// 断言对象是"真正会被广播的产物"而非 PSBT 的中间态：signPsbtWithSigners 末尾会 MaybeFinalizeAll，
+// partial_sigs 被搬入 final witness，所以只能从 Extract 出的交易里取签名来验（这也正是侧车
+// extract_tx 后广播的那笔交易，即 49a743974 修的 "Witness program hash mismatch" 回归面）。
+//
+// 为什么不拆成"partial_sigs 中间态"+"finalize 产物"两个测试：finalize 前的中间态无法从该函数的
+// 返回值拿到（它只返回 finalize 后的序列化字节），要构造中间态只能把签名逻辑复制一遍，那样测的是
+// 副本而不是被测函数。故此处合并为对 finalize 产物的一次断言。
+//
+// 反经验证注记：若让"signer 返回的原始字节"绕过整条归一化链直达 witness，本测试即变红（测到了东西）；
+// 但单独摘掉 tss.go 里的 normalizeLowS 调用，本测试仍绿——因为紧随其后的 sig.Serialize() 自身就会
+// 把 S 归一化为 low-S。即该调用在当前依赖版本下是冗余的，low-S 广播不变量实际由 Serialize() 保证。
+func Test_signPsbtWithSigners_broadcastTxLowSSig(t *testing.T) {
 	// 构造含 1 个 P2WPKH 输入的未签 PSBT。
 	priv, err := btcec.NewPrivateKey()
 	require.NoError(t, err)
@@ -124,31 +156,50 @@ func Test_signPsbtWithSigners_writesLowSPartialSig(t *testing.T) {
 	ts := &tssService{tssPublicKey: pub}
 	signed, err := ts.signPsbtWithSigners(p, []string{"peer"}, func(sigHash []byte, _ string) *signResult {
 		sig := ecdsa.Sign(priv, sigHash)
+		r := sig.R()
 		s := sig.S()
 		// 强制 high-S：若为低-S 则取负。
 		if !s.IsOverHalfOrder() {
-			r := sig.R()
-			sNeg := new(btcec.ModNScalar).NegateVal(&s)
-			sig = ecdsa.NewSignature(&r, sNeg)
+			s = *new(btcec.ModNScalar).NegateVal(&s)
 		}
-		s = sig.S()
-		require.True(t, s.IsOverHalfOrder())
-		return &signResult{sig: sig.Serialize()}
+		require.True(t, s.IsOverHalfOrder(), "测试输入必须是 high-S")
+		// 关键：不能走 sig.Serialize()——btcec/decred 的 Serialize 会把 S 强制归一化回 low-S，
+		// 那样这个"high-S 输入"到不了被测的 normalizeLowS，测试就测不出归一化是否还在。
+		// 这里手工 DER 编码，保证送进 signPsbtWithSigners 的确实是 high-S 签名。
+		der := derEncodeSignature(t, r, s)
+		back, err := ecdsa.ParseDERSignature(der)
+		require.NoError(t, err)
+		backS := back.S()
+		require.True(t, backS.IsOverHalfOrder(), "DER 编码后必须仍是 high-S，否则本测试测不到归一化")
+		return &signResult{sig: der}
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, signed)
 
-	// 反序列化检查 partial_sigs 已写入且 low-S。
+	// 返回的 PSBT 应已 finalize（partial_sigs 搬入 final witness），并能 Extract 成可广播交易。
 	out, err := psbt.NewFromRawBytes(bytes.NewReader(signed), false)
 	require.NoError(t, err)
-	require.Len(t, out.Inputs[0].PartialSigs, 1)
-	sigBytes := out.Inputs[0].PartialSigs[0].Signature
+	require.Empty(t, out.Inputs[0].PartialSigs, "finalize 后 partial_sigs 应已搬入 final witness")
+	broadcastTx, err := psbt.Extract(out)
+	require.NoError(t, err)
+
+	// P2WPKH witness = [sig||sighashType, pubkey]。
+	witness := broadcastTx.TxIn[0].Witness
+	require.Len(t, witness, 2, "P2WPKH witness 应为 [sig, pubkey]")
+	sigBytes := witness[0]
 	require.Equal(t, byte(txscript.SigHashAll), sigBytes[len(sigBytes)-1])
 	parsed, err := ecdsa.ParseDERSignature(sigBytes[:len(sigBytes)-1])
 	require.NoError(t, err)
-	ps := parsed.S()
-	require.False(t, ps.IsOverHalfOrder(), "signature must be low-S")
-	require.Equal(t, pub.SerializeCompressed(), out.Inputs[0].PartialSigs[0].PubKey)
+	s := parsed.S()
+	require.False(t, s.IsOverHalfOrder(), "signature must be low-S")
+	require.Equal(t, pub.SerializeCompressed(), witness[1])
+
+	// 该签名必须真的对这笔广播交易有效（签的是本输入的 witness sighash，而非别的消息）。
+	sigHashes := txscript.NewTxSigHashes(broadcastTx, txscript.NewMultiPrevOutFetcher(
+		map[wire.OutPoint]*wire.TxOut{prevOut: {Value: 100000, PkScript: pkScript}}))
+	sigHash, err := txscript.CalcWitnessSigHash(pkScript, sigHashes, txscript.SigHashAll, broadcastTx, 0, 100000)
+	require.NoError(t, err)
+	require.True(t, parsed.Verify(sigHash, pub))
 }
 
 // Test_isRgb20Asset_route 判断 RGB20 pending 是否路由到 rgb20 适配器。
