@@ -62,6 +62,9 @@ func TestCrossChainDepositWithdrawConfirmExec(t *testing.T) {
 		Amount:         1000,
 		DepositAddress: userAddr,
 		AssetSymbol:    "btc",
+		// S2：Exec_Deposit 要按规范 txid 派生 operationId 并登记台账，因此证明必须是可严格解析的
+		// 规范编码（空证明从这一版起直接失败）。Exec 层不校验 merkle/头链/脚本，编码合法即可。
+		TxProof: &rtypes.BtcTxProof{TxData: canonicalBtcTxData(t, "crosschain-deposit", 1000)},
 	}
 	depositTx, err := r.GetExecutorType().CreateTransaction(rtypes.NameDepositAssetAction, deposit)
 	require.Nil(t, err)

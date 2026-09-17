@@ -325,6 +325,12 @@ func Test_checkWithdrawConfirm_btcConfirmations(t *testing.T) {
 	// RGB20 分支（跳过承诺/金额校验）：深度不足必须被拒 —— 这是 B8 对提现路径的净效果。
 	rgb20 := &rtypes.ConfirmTx{TxHash: burnTxHash, BtcTxProof: f.deposit(f.raw).TxProof}
 	rgb20Pending := &rtypes.PendingTx{AssetSymbol: rtypes.RGB20USDTSymbol, Amount: 1}
+	// S2：RGB20 分支的结算前置台账（payload + burn 记录 + 已铸造供应量；链上由
+	// Exec_Withdraw / Exec_Deposit 写入），否则会在深度判定之前先报台账错误。
+	require.NoError(t, f.state.Set(formatPayloadKey(burnTxHash),
+		types.Encode(&rtypes.WithdrawAsset{AssetSymbol: rtypes.RGB20USDTSymbol, Amount: 1})))
+	recordBurnForTest(t, f.r, f.state, rtypes.RGB20USDTSymbol, 1, burnTxHash)
+	mintForTest(t, f.r, f.state, rtypes.RGB20USDTSymbol, "depositor", 1, "b8-withdraw")
 	require.ErrorIs(t, f.r.checkWithdrawConfirm("tx", "confirm", rgb20, rgb20Pending), ErrInsufficientBtcConfirmations)
 
 	// 深度刚好满足 → 通过（RGB20 分支不再有其它链上校验）

@@ -346,6 +346,12 @@ func Test_rgbx_checkWithdrawConfirm(t *testing.T) {
 		AssetSymbol: "BTC",
 		PkScript:    tssScript,
 	})))
+	// S2：结算前置状态 —— payload + burn 台账记录 + 已铸造供应量（链上分别由 Exec_Withdraw /
+	// Exec_Deposit 写入；本用例直接调 checkWithdrawConfirm，故显式补齐）。
+	require.NoError(t, state.Set(formatPayloadKey(confirm.GetTxHash()),
+		types.Encode(&rtypes.WithdrawAsset{AssetSymbol: "btc", Amount: pending.GetAmount()})))
+	recordBurnForTest(t, r.(*rgbx), state, "btc", pending.GetAmount(), confirm.GetTxHash())
+	mintForTest(t, r.(*rgbx), state, "btc", "depositor", pending.GetAmount(), "withdraw-confirm")
 
 	commitData := append([]byte(withdrawCommitmentPrefix), confirm.GetTxHash()...)
 	commitScript, err := txscript.NullDataScript(commitData)
@@ -441,7 +447,10 @@ func Test_checkWithdrawConfirm_burnReplayGuard(t *testing.T) {
 			TxHash:        burn,
 			AssetSymbol:   rtypes.RGB20USDTSymbol,
 		})))
+		// S2：两笔 burn 的锁定时台账记录（链上由 Exec_Withdraw 登记）+ 已铸造供应量
+		recordBurnForTest(t, r.(*rgbx), state, rtypes.RGB20USDTSymbol, withdraw.GetAmount(), burn)
 	}
+	mintForTest(t, r.(*rgbx), state, rtypes.RGB20USDTSymbol, "depositor", 200, "burn-replay")
 
 	action := &rtypes.RgbxAction{}
 	action.Ty = rtypes.TyConfirmAction

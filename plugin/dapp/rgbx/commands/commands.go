@@ -38,6 +38,9 @@ func Cmd() *cobra.Command {
 		listPendingTxCMD(),
 		listPendingTxByFromCMD(),
 		getConfirmedHeightCMD(),
+		getOperationCMD(),
+		getOperationSupplyCMD(),
+		listOperationsCMD(),
 	)
 	return cmd
 }

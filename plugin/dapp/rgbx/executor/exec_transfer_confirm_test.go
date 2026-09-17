@@ -163,6 +163,9 @@ func Test_rgbx_confirmWithdrawSettlement(t *testing.T) {
 	lockAddr := r.(*rgbx).crossChainLockAddress(acc)
 	_, err = acc.Mint(lockAddr, 100)
 	require.NoError(t, err)
+	// S2：结算前必须有对应的提现销毁台账记录（Exec_Withdraw 登记的那条）。这里直接调
+	// confirmWithdrawSettlement，因此显式补上——链上唯一的生产路径是 Exec_Withdraw。
+	recordBurnForTest(t, r.(*rgbx), state, "BTC", 100, wHash)
 
 	recp, err := r.(*rgbx).confirmWithdrawSettlement(
 		&rtypes.ConfirmTx{TxHash: wHash},
@@ -173,11 +176,12 @@ func Test_rgbx_confirmWithdrawSettlement(t *testing.T) {
 
 	wHash2 := []byte("withdraw2")
 	require.NoError(t, state.Set(formatPayloadKey(wHash2), types.Encode(&rtypes.WithdrawAsset{AssetSymbol: "BTC", Amount: 500})))
+	recordBurnForTest(t, r.(*rgbx), state, "BTC", 500, wHash2)
 	_, err = r.(*rgbx).confirmWithdrawSettlement(
 		&rtypes.ConfirmTx{TxHash: wHash2},
 		"txH", "cH",
 	)
-	require.Error(t, err)
+	require.Error(t, err) // 锁仓余额只有 100，销毁 500 失败
 }
 
 // Test_rgbx_confirmWithdrawSettlement_usedKey S3：提现结算成功登记 consumed 集合，
@@ -196,6 +200,9 @@ func Test_rgbx_confirmWithdrawSettlement_usedKey(t *testing.T) {
 	// 两笔待结算提现共用锁仓地址：A=100, B=150
 	require.NoError(t, state.Set(formatPayloadKey(burnA), types.Encode(&rtypes.WithdrawAsset{AssetSymbol: "BTC", Amount: 100})))
 	require.NoError(t, state.Set(formatPayloadKey(burnB), types.Encode(&rtypes.WithdrawAsset{AssetSymbol: "BTC", Amount: 150})))
+	// S2：两笔 burn 的台账记录（链上由 Exec_Withdraw 登记；本用例直接调结算函数，故显式补上）
+	recordBurnForTest(t, r.(*rgbx), state, "BTC", 100, burnA)
+	recordBurnForTest(t, r.(*rgbx), state, "BTC", 150, burnB)
 	acc, err := r.(*rgbx).newAccount("xBTC")
 	require.NoError(t, err)
 	lockAddr := r.(*rgbx).crossChainLockAddress(acc)

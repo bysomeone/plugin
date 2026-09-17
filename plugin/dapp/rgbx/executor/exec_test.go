@@ -275,7 +275,17 @@ func TestRgbx_Exec_Deposit(t *testing.T) {
 	cfg := types.NewChain33Config(types.GetDefaultCfgstring())
 	api.On("GetConfig").Return(cfg)
 	r.SetStateDB(state)
-	testExec(t, r, rtypes.NameDepositAssetAction, deposit, nil, 0)
+
+	// S2 起 Exec_Deposit 是 fail-closed 的：解析不出规范 txid（空/非规范证明）就整笔失败，
+	// 而不是"铸了资产但不写台账"（后者会让供应量少算，把合法的后续提现挡在退出闸门外）。
+	// 生产链上这条路径不可达（CheckTx 的 checkDepositDuplicate 已强制严格解析）。
+	testExec(t, r, rtypes.NameDepositAssetAction, deposit, ErrInvalidBtcTxProof, 0)
+
+	// 规范编码的证明 ⇒ 正常铸造（台账另由 operation_ledger_test.go 断言）
+	deposit.TxProof = &rtypes.BtcTxProof{TxData: canonicalBtcTxData(t, "exec-deposit", deposit.GetAmount())}
+	receipt := testExec(t, r, rtypes.NameDepositAssetAction, deposit, nil, 0)
+	require.NotNil(t, receipt)
+	require.NotEmpty(t, receipt.GetKV())
 }
 
 func TestRgbx_Exec_Withdraw(t *testing.T) {

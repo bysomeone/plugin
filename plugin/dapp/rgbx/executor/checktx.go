@@ -101,6 +101,22 @@ var (
 	// （tip.Height < proof.BlockHeight + minBtcConfirmations - 1），或无法确定 tip
 	// （查询失败 / 头链为空）时一律拒绝。错误信息带 tip 高度 / 证明高度 / 要求的 N。
 	ErrInsufficientBtcConfirmations = errors.New("insufficient btc confirmations")
+	// ErrInvalidOperationID operationId 派生输入非法（提现侧 symbol/burn 哈希异常）。
+	// 与 ErrOperationNotExist 分开：这是"算不出 id"，不是"没记录过"。
+	ErrInvalidOperationID = errors.New("invalid operation id")
+	// ErrOperationNotExist 提现结算时，共识状态里没有对应的提现销毁台账记录（S2）。
+	// 含义：这笔 burn 没有经过 Exec_Withdraw 的锁定登记（或状态被回滚/损坏），不允许放款。
+	ErrOperationNotExist = errors.New("operation not recorded")
+	// ErrOperationMismatch 台账记录与本次结算的**身份**不一致（S2）：kind/symbol/chain33 交易哈希对不上。
+	ErrOperationMismatch = errors.New("operation record mismatch")
+	// ErrOperationAmountMismatch 台账记录的金额与 payload 里的提现金额不一致（S2）。
+	// 含义：本次要销毁的额度不是锁定时登记的那笔额度，拒绝。
+	ErrOperationAmountMismatch = errors.New("operation amount mismatch")
+	// ErrDuplicateOperation 同一 operationId 已被登记（S2）：台账只可新增、不可改/不可重复入账。
+	ErrDuplicateOperation = errors.New("duplicate operation")
+	// ErrInsufficientMintedSupply 待销毁额度超过台账里的"已铸造 − 已销毁"（S2）。
+	// 含义：这笔提现没有对应的充值铸造记录（proof-of-mint 不成立），拒绝放款。
+	ErrInsufficientMintedSupply = errors.New("insufficient minted supply")
 )
 
 const (
