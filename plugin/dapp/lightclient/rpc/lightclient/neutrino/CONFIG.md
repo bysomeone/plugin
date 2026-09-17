@@ -91,7 +91,9 @@
   那是一次显式事件：锚点集合同时影响执行器**和中继**（neutrino 把自己的头链硬锚在 btcd 的 checkpoint 上，
   同步到该高度时 hash 必须相同，否则断 peer 并回滚头库），需要确认"所有节点同一个 build"（不同 build 的
   锚点不同 → 头链走到该高度必然对不上 → **表现是中继自己不报错、链上头链静默停滞**）。
-- **`btcHeaderStartHeight` 应当填 = 本网络最高锚点 + 1**（见 4.1；中继启动期会自己断言这一点）。
+- **头链提交起点 = 本网络最高锚点 + 1**（没有锚点的网络 → `1`）。这是**本地推导**出来的，不是配置项：
+  中继与执行器共用 `ltypes.GetBtcChainParams`，各自从同一份 chaincfg checkpoint 表算出同一个值
+  （见 4.1.1）。
 - **需要更新鲜的起点时，首选升级 btcd**（那样中继侧锚点一起前进，两边天然一致）；确实不能升级时，
   才用编译期的扩展层 `extraBtcCheckpoints` 手加一条：必须**完整重述** chaincfg 的每一条锚点（同高度同
   hash）、只允许新增**更高**的高度、且不给没有内置锚点的网络（regtest/testnet4/signet/simnet）扩展。
@@ -103,7 +105,9 @@
 
 bootstrap（链上还没有任何 BTC 头）时，首个头的父块必须正好是上表里的某个锚点（或能沿 `prevHash` 回溯到
 创世/锚点），否则报 `ErrBtcHeaderNoAnchor` 并拒收；**错误与日志会一并给出照做就能过的信息**：本网络已知
-锚点高度列表、首个头的高度、以及期望的 `btcHeaderStartHeight`（= 最高锚点 + 1）。
+锚点高度列表、首个头的高度、以及期望的首个提交高度（= 最高锚点 + 1）。注意执行器侧这条信息里的日志键名
+仍是 `expectedBtcHeaderStartHeight`（历史名，该项已不是配置项，见 4.1.1）——它给出的值应当与中继本地推出
+的起点一致；两边对不上说明中继与执行器**不是同一个 build**。
 
 此外，单笔交易（`BtcHeaders` action）允许提交的头数上限为 **64**，且同一笔交易内的头高度必须逐个 +1
 （重复高度或跳高都会被拒绝）。中继自身 `batchSize=64`——**正好用满**这个上限（mainnet 内置锚点只到
@@ -219,26 +223,47 @@ best >= H + B + N - 1          （等价于：提交后链上可见深度 >= N�
     也由它决定。**B 与链上 `[exec.sub.rgbx].minBtcConfirmations`（N）是同一个门控的两个参数**：
     中继提交充值前要求 `best >= H + B + N - 1`（见 2.2.1），改动任一个都会改变充值到账时延。
   - 默认行为：未设置时为 6。
-- `btcHeaderStartHeight` (uint64)
-  - 含义：首次提交 BTC header 的起始高度。**只在链上头链为空时使用**：链上 `tip==0` 时它是提交起点，
-    头链长起来之后起点由"与链上对账"得出（见中继的对账逻辑），这个配置值就失效了。
-  - 应当填：**本网络最高锚点 + 1**（锚点由 btcd 内置，mainnet 当前是 `810000` → 填 `810001`；
-    见 2.1.1）。没有锚点的网络（regtest/testnet4/signet/simnet）填 1（创世之后第一个块）。
-  - 默认行为：未设置时回退为 1。**mainnet/testnet3 上不要依赖这个默认值**：从高度 1 起等于从创世同步
-    （几百万个头，实际不可用），而且启动期断言会直接报错（见下）。
-  - **启动期断言（L2）**：链上头链还是空时，中继会向主链查询本网络最高锚点，并断言
-    `btcHeaderStartHeight == 锚点高度 + 1`：
-    - 一致 → 正常提交头；
-    - 不一致 → **限流 ERROR（同一状态只报一次）+ 不发交易（fail-closed）**，日志里给出
-      `expectedBtcHeaderStartHeight`（照做即可），改对配置重启后恢复；
-    - 查询不被支持（主链是旧版执行器，`ErrActionNotSupport`）或查询失败 → WARN 一次后照常提交，
-      **不做硬依赖**（升级主链后自动生效）；
-    - 本网络没有锚点 → 跳过断言（那种网络只能从创世起，由执行器的锚点校验兜底）。
-  - 注意：该高度也用作钱包重扫的下限（`monitorTransactions` 的 rescan 起点），改大它意味着
-    **更早的 BTC 区块不再重扫**，确认无历史充值遗漏后再调。
 - `maxUtxoRescanTime` (int64)
   - 含义：UTXO 重扫超时（单位：小时）
   - 特性：0 表示不超时；内部会转为秒
+
+#### 4.1.1 头链提交起点（无配置项）
+
+- 含义：链上头链还是空（`tip==0`）时，中继从哪个高度开始提交 BTC 头。头链长起来之后起点由"与链上对账"
+  得出，这个起点就不再参与（见中继的对账逻辑）。
+- 取值：**本网络最高锚点 + 1**（锚点由 btcd 内置，见 2.1.1；mainnet 当前 `810000` → `810001`、
+  testnet3 `2344474` → `2344475`）；没有锚点的网络（regtest/testnet4/signet/simnet）→ `1`（创世之后
+  第一个块）。
+- **不需要配置，也没有对应的配置项**：中继与执行器共用 `ltypes.GetBtcChainParams`，各自从同一份 chaincfg
+  checkpoint 表算出同一个值。此前那个 `btcHeaderStartHeight` 配置项已删除；老 TOML 里留着它**无害**
+  （解析时被未知键忽略，也不影响起点推导），不必先清理配置文件。
+- **启动期断言（L2）**：链上头链还是空时，中继会向主链查询本网络最高锚点，并断言"本地推出的起点 ==
+  锚点高度 + 1"：
+  - 一致 → 正常提交头；
+  - 不一致 → **限流 ERROR（同一状态只报一次）+ 不发交易（fail-closed）**。这说明中继与主链执行器
+    **不是同一个 build / 不是同一版 btcd**（两边的锚点表不同源）；日志里给出链上锚点与它期望的起点，
+    让两边同源（升级 btcd / 换同一个 build）后重启即恢复；
+  - 查询不被支持（主链是旧版执行器，`ErrActionNotSupport`）或查询失败 → WARN 一次后照常提交，
+    **不做硬依赖**（升级主链后自动生效）；
+  - 本网络没有锚点 → 跳过断言（那种网络只能从创世起，由执行器的锚点校验兜底）。
+- **不是钱包重扫的下限**：钱包能看见哪些 BTC 交易由它自己的生日（`btcwallet.db` 创建时刻）决定，与起点
+  无关；中继的读/重放窗口是"有 watermark 用 watermark，没有就从钱包自己的最早点读起"，**不设最低高度**
+  （理由见 4.1.2）。
+
+#### 4.1.2 钱包交易重放窗口（无配置项）
+
+- 中继启动时按 `min-pending-height`（水位线，落盘在 `neutrino.db` 的 `rgbx-btcwallet-monitor` bucket）
+  决定从哪个高度重放钱包自己的交易：
+  - **有水位线** → 从水位线重放（停机重启后补齐停机期间的交易）；
+  - **没有水位线**（全新节点 / 只清了 `neutrino.db`）→ **从钱包自己的最早点读起（高度 0，不设下限）**。
+    从 0 读不贵：tx store 按"有交易的块"走游标，成本与区间长度无关。
+- **为什么不留"最低高度"**：钱包能"看见"哪些 BTC 交易完全由它的生日决定（生日 = `btcwallet.db` 创建
+  时刻，neutrino 的 rescan 用 `StartTime=生日` 截断，生日之前的块根本不会被下载 filter），任何最小值都
+  扩大不了"发现历史充值"的能力；而生日 ≥ 桥启动 ≥ 锚点+1 意味着这类下限永远不会 binding（恒为常量的
+  下限没有信息量），钱包从备份恢复时（历史早于那个常量）反而会**截断本该重放的历史**。
+- **推论（重要）**：全新节点首启**看不到首启之前**的充值（生日 = 现在），这与任何配置无关；`btcwallet.db`
+  被清/重建同样看不到（且旧 TSS UTXO 对钱包不可见，那部分 BTC 桥上花不出去），**只能从备份还原
+  `btcwallet.db`**。唯一靠重放能救的是"只清了 `neutrino.db`、钱包 DB 还在"。
 
 ### 4.2 `[rpc.sub.light.neutrino.btcRPC]`
 
@@ -382,10 +407,10 @@ peerblockfilters=1
 - 主链 `guardianParachainTitle == 平行链 Title`
 - `commitAddress/commitAddr/authAccount` 与私钥管理匹配
 - 主链 `[exec.sub.lightclient].commitAddress` **非空**（留空节点起不来）
-- `btcHeaderStartHeight` = **主链执行器那个 build 的"本网络最高锚点 + 1"**（锚点由 btcd 内置，不再手填；
-  当前 mainnet `810000` → `810001`、testnet3 `2344474` → `2344475`）。配套关系由中继启动期断言自动
-  校验（不一致会 fail-closed 并打印期望值），但**上线前要人工确认所有节点同一个 build**：不同 build 的
-  锚点集合不同，头链会在某个高度静默停滞
+- **所有节点同一个 build**（中继与执行器共用 btcd 内置锚点表；不同 build 的锚点集合不同，头链会在某个
+  高度静默停滞）：头链提交起点 = 本网络最高锚点 + 1 由两边各自本地推出、**不需要配置**（当前 mainnet
+  `810000` → `810001`、testnet3 `2344474` → `2344475`；没有锚点的网络 → `1`），配套关系由中继启动期
+  断言自动校验（不同源会 fail-closed 并打印链上锚点与它期望的起点）
 - `blockConfirmations` 符合环境安全要求（测试可低，生产应高）
 - 链上 `[exec.sub.rgbx].minBtcConfirmations`（N）符合上线要求（默认 6）：它就是充值到账延迟
   （≈ N 个 BTC 块）与重组风险的那个旋钮；中继**不需要**配任何镜像值，它直接查链上（见 2.2）
@@ -469,11 +494,18 @@ rank=0 # 官方节点；第三方节点配置为 rank=1，且 isOfficialNode=fal
 - `commitAddress` 留空：节点启动失败（`[exec.sub.lightclient].commitAddress must not be empty`），
   见 2.1；不是 bug，是防止头链写入权对全网开放
 - 首个 BTC 头被拒（`ErrBtcHeaderNoAnchor`）：bootstrap 起点既不是创世、也没命中锚点表。错误信息里
-  已经给出本网络已知锚点高度列表与期望的 `btcHeaderStartHeight`（= 最高锚点 + 1），照做即可（见 2.1.1）。
-  中继侧同一问题会在启动期先报一次 fail-closed 的 ERROR（见 4.1 的 L2 断言），不必等到运行期
-- 启动期 ERROR "btcHeaderStartHeight does not match the on-chain btc checkpoint, refusing to submit btc
-  headers"：与上一条同源，`btcHeaderStartHeight` 与主链执行器的锚点不配套，中继按 fail-closed 不发交易；
-  按日志里的 `expectedBtcHeaderStartHeight` 改配置后重启（见 4.1）
+  已经给出本网络已知锚点高度列表与期望的首个提交高度（= 最高锚点 + 1，日志键名见下），照做即可（见 2.1.1）。
+  中继侧同一问题会在启动期先报一次 fail-closed 的 ERROR（见 4.1.1 的 L2 断言），不必等到运行期。
+  注意该值不是配置项：执行器那条信息里的 `expectedBtcHeaderStartHeight` 是历史键名，它给出的值应当与
+  中继本地推出的起点一致（两边同源，见 4.1.1）
+- 启动期 ERROR "the locally derived bootstrap start height does not match the on-chain btc checkpoint,
+  refusing to submit btc headers"：与上一条同源 —— 中继**本地推出**的起点与主链执行器给出的锚点不配套，
+  说明两者**不是同一个 build / 不是同一版 btcd**（锚点表不同源），中继按 fail-closed 不发交易。
+  让两边同源（升级 btcd / 换同一个 build）后重启即恢复；日志里的 `onChainAnchorHeight` 与
+  `onChainExpectedLocalStartHeight` 说明链上认为该是哪一对值（见 4.1.1）。**没有**配置项可改
+- 读不到历史充值（重启后/换机后老充值不出现）：中继只重放钱包自己看得见的交易，而钱包能看见哪些由它的
+  生日（`btcwallet.db` 创建时刻）决定 —— 全新节点首启、或 `btcwallet.db` 被清/重建，都看不到更早的充值，
+  且**没有任何配置能改变这一点**（唯一恢复途径是从备份还原 `btcwallet.db`，见 4.1.2）
 - 提交头数过大（`ErrBtcHeadersTooMany`）：单笔超过 64 个头会被拒（中继自身 batchSize=64，正好在上限，
   且会截断更大的批）。自行写中继脚本时同样要 ≤ 64
 - 批内高度重复/跳高（`ErrBtcHeaderDuplicateHeight`）：中继必须按高度逐个 +1 提交，不能跳块或重发

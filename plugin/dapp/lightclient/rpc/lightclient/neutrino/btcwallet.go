@@ -324,36 +324,6 @@ func (b *btcWallet) updateMinPendingHeight() {
 	}
 }
 
-// rescanFromHeight 从指定高度开始重新扫描, 需要注意和wallet.SynchronizeRPC的同步关系，可能造成死锁
-func (b *btcWallet) rescanFromHeight(height int32) error {
-
-	log.Debug("rescanFromHeight", "height", height)
-	hash, err := b.chainClient.GetBlockHash(int64(height))
-	if err != nil {
-		return err
-	}
-	stamp := waddrmgr.BlockStamp{
-		Hash:   *hash,
-		Height: height,
-	}
-	if header, err := b.chainClient.GetBlockHeader(hash); err == nil {
-		stamp.Timestamp = header.Timestamp
-	}
-	job := &wallet.RescanJob{
-		InitialSync: true,
-		Addrs:       []btcutil.Address{b.tssAddress},
-		BlockStamp:  stamp,
-	}
-	select {
-	case err := <-b.Wallet.SubmitRescan(job):
-		log.Debug("rescanFromHeight submitRescan done")
-		return err
-	case <-b.client.ctx.Done():
-		return types.ErrChannelClosed
-	}
-
-}
-
 func (b *btcWallet) rescanWalletTxs(start, end int32, rescanChan chan *wallet.GetTransactionsResult) error {
 	b.client.waitUntilDone("walletTxsRescan", func() bool {
 		return b.Wallet.ChainSynced()
@@ -395,13 +365,23 @@ func (b *btcWallet) monitorTransactions() {
 	client := b.Wallet.NtfnServer.TransactionNotifications()
 	b.Wallet.SynchronizeRPC(b.chainClient)
 	b.waitAndImportTSSAddress()
+	// 读/重放窗口：**有 watermark（min-pending-height）就用 watermark；没有就从钱包自己的最早点读起**
+	// （rescanHeight=0 = 不设下限，交给 tx store 自己的游标）。
+	//
+	// 为什么不留任何"最低高度"（无论来自配置还是锚点+1）：钱包能"看见"哪些 BTC 交易完全由它自己的
+	// 生日决定（生日 = btcwallet.db 创建时刻，neutrino 的 rescan 用 StartTime=生日 截断，生日之前的块
+	// 根本不会被下载 filter），所以任何最小值都扩大不了"发现历史充值"的能力。而生日 ≥ 桥启动 ≥
+	// 锚点+1 意味着这类下限**永远不会 binding**（一个恒为常量的下限没有信息量）；更糟的是钱包从备份
+	// 恢复时（历史早于那个常量），下限反而会**截断本该重放的历史**。从 0 读起也不贵：store 读按
+	// "有交易的块"走游标，成本与区间长度无关。
 	rescanHeight := b.loadMinPendingHeight()
 	bestHeight := b.client.getBestBlockHeight()
-	if rescanHeight < int32(b.client.cfg.BtcHeaderStartHeight) {
-		rescanHeight = int32(b.client.cfg.BtcHeaderStartHeight)
-		log.Info("monitorTransactions initial rescan", "height", rescanHeight, "bestHeight", bestHeight)
+	if rescanHeight > 0 {
+		log.Debug("monitorTransactions resume from the minPendingHeight watermark",
+			"height", rescanHeight, "bestHeight", bestHeight)
 	} else {
-		log.Debug("monitorTransactions resume from height", "height", rescanHeight, "bestHeight", bestHeight)
+		log.Info("monitorTransactions no minPendingHeight watermark, replay the wallet's own tx store",
+			"height", rescanHeight, "bestHeight", bestHeight)
 	}
 	b.minPendingHeight = rescanHeight
 	interval := b.client.cfg.BtcBlockInterval/2 + 1
