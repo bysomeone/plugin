@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"encoding/hex"
 	"fmt"
 	"os"
 	"strconv"
@@ -61,7 +60,7 @@ func mintAsset(cmd *cobra.Command, args []string) {
 		return
 	}
 
-	metaHash, err := hex.DecodeString(metaHashStr)
+	metaHash, err := decodeHexAuto(metaHashStr)
 	if err != nil || len(metaHash) > rtypes.MetaHashLen {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid meta hash: %s, decode err:%s", metaHashStr, err)
 		return
@@ -86,7 +85,7 @@ func mintAsset(cmd *cobra.Command, args []string) {
 	}
 
 	hash := strs[0]
-	pkScript, err1 := hex.DecodeString(strs[2])
+	pkScript, err1 := decodeHexAuto(strs[2])
 	index, err2 := strconv.ParseUint(strs[1], 10, 32)
 
 	if err1 != nil || err2 != nil {
@@ -158,7 +157,7 @@ func transferAsset(cmd *cobra.Command, args []string) {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid amount: %q, overflow", amountStr)
 		return
 	}
-	pkScript, err := hex.DecodeString(pkScriptStr)
+	pkScript, err := decodeHexAuto(pkScriptStr)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid pkScript: %s, decode err: %s", pkScriptStr, err)
 		return
