@@ -11,7 +11,7 @@ source "${ROOT_DIR}/scripts/assertions.sh"
 # shellcheck disable=SC1091
 source "${ROOT_DIR}/scripts/bootstrap.sh"
 
-ACTION="run"
+ACTION=""
 PROJECT=""
 if [ "$#" -gt 0 ]; then
     case "${1}" in
@@ -23,6 +23,21 @@ if [ "$#" -gt 0 ]; then
         PROJECT="${1}"
         ;;
     esac
+else
+    # 无参数**不再默认 run**：误敲一次就会对整个环境跑完整 E2E（up + 全部用例，动辄几十分钟，
+    # 还会动链上状态）。交互式终端要求显式确认；非交互调用直接报错退出。
+    if [ -t 0 ]; then
+        echo "no action given: 'run' starts the FULL e2e (up + all testcases) against the current environment."
+        printf "type 'run' to continue (anything else aborts): "
+        read -r confirm
+        if [ "${confirm}" != "run" ]; then
+            echo "aborted: no action given" >&2
+            exit 1
+        fi
+        ACTION="run"
+    else
+        fail "no action given; pass one explicitly, e.g. './docker-compose.sh run' (run|up|down|reset|init|config|test)"
+    fi
 fi
 if [ -z "${PROJECT}" ]; then
     PROJECT="rgbx-ci"
@@ -789,8 +804,35 @@ function init_chain33_dkg() {
     log_step "chain33 DKG init done"
 }
 
+# 主链上已有的 nodegroup addrs（逗号分隔）；查询失败（如链上还没有 nodegroup）返回非 0。
+function nodegroup_addrs_on_main() {
+    set +e
+    local out
+    out=$(${MAIN_CLI} para nodegroup addrs --paraName="${PARA_TITLE}" 2>/dev/null)
+    local rc=$?
+    set -e
+    if [ "${rc}" -ne 0 ]; then
+        return 1
+    fi
+    echo "${out}" | jq -r '.value // empty'
+}
+
 function setup_para_nodegroup_on_main() {
     log_step "setup para nodegroup on main chain"
+
+    # 幂等前置检查（本 harness 可重入的前提）：链上已有 nodegroup 时**跳过 apply/approve**。
+    # 否则第二次 run 的 apply 会回执 ErrParaNodesExisted、随后的 approve 又因找不到本次 apply
+    # 记录而失败 ⇒ 在保留环境上无法原地续跑。而"保留环境"正是必需项：btcd 的 regtest 链
+    # 不能重建（见 start_env），想连续跑就必须能对同一条链重跑。
+    local existing_addrs existing_cnt
+    existing_addrs=$(nodegroup_addrs_on_main) || existing_addrs=""
+    existing_cnt=$(echo "${existing_addrs}" | tr ',' '\n' | sed '/^$/d' | wc -l | xargs)
+    if [ "${existing_cnt}" -ge 1 ]; then
+        log_step "nodegroup already exists on main chain (${existing_cnt} addrs), skip apply/approve (existing)"
+        ${MAIN_CLI} para nodegroup addrs --paraName="${PARA_TITLE}"
+        return 0
+    fi
+
     ${MAIN_CLI} send coins transfer -t "${AUTH_ADDR1}" -a 100 -k "${GENESIS_KEY}" >/dev/null
     ${MAIN_CLI} send coins transfer -t "${AUTH_ADDR2}" -a 100 -k "${GENESIS_KEY}" >/dev/null
     ${MAIN_CLI} send coins transfer -t "${AUTH_ADDR3}" -a 100 -k "${GENESIS_KEY}" >/dev/null
