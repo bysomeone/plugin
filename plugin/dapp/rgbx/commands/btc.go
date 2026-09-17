@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -318,7 +319,7 @@ func commitDKGCMD() *cobra.Command {
 		Aliases: []string{"cdkg"},
 		Short:   "commit dkg address for cross-chain asset",
 		Run:     commitDKG,
-		Example: "commitDKG -s BTC -d <dkgAddress> -p <pkScriptHex>",
+		Example: "commitDKG -s BTC -d <dkgAddress> -p <pkScriptHex> -k <tssPubkeyHex>",
 	}
 	commitDKGFlags(cmd)
 	return cmd
@@ -328,17 +329,42 @@ func commitDKGFlags(cmd *cobra.Command) {
 	cmd.Flags().StringP("assetSymbol", "s", rtypes.BTCSymbol, "cross-chain asset symbol")
 	cmd.Flags().StringP("dkgAddress", "d", "", "dkg/tss bitcoin address")
 	cmd.Flags().StringP("pkScript", "p", "", "dkg address pkScript hex")
-	markRequired(cmd, "dkgAddress", "pkScript")
+	// pubkey 必填：checkCommitDKG 对所有 symbol（含 BTC/XBTC）都要求 33 字节压缩 TSS 群公钥，
+	// 并校验 hash160(pubkey)==pkScript[2:]。缺了它链上必以 ErrInvalidDkgAddress 拒收
+	// （P2WSH 充值地址 = f(userID, pubkey)，执行器要靠它重建充值脚本），所以这里直接
+	// 在 CLI 侧挡住，别让用户提交一份注定被拒的交易。
+	cmd.Flags().StringP("pubkey", "k", "", "tss group pubkey, 33-byte compressed hex")
+	markRequired(cmd, "dkgAddress", "pkScript", "pubkey")
 }
 
 func commitDKG(cmd *cobra.Command, _ []string) {
 	symbol, _ := cmd.Flags().GetString("assetSymbol")
 	dkgAddress, _ := cmd.Flags().GetString("dkgAddress")
 	pkScriptHex, _ := cmd.Flags().GetString("pkScript")
+	pubkeyHex, _ := cmd.Flags().GetString("pubkey")
 
 	pkScript, err := hex.DecodeString(pkScriptHex)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid pkScript: %s, decode err: %v\n", pkScriptHex, err)
+		return
+	}
+	pubkey, err := hex.DecodeString(strings.TrimSpace(pubkeyHex))
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "invalid pubkey: %s, decode err: %v\n", pubkeyHex, err)
+		return
+	}
+	// 与链上 checkCommitDKG 同一把尺子（只接受 33 字节压缩格式，非压缩的同一把钥会派生出
+	// 另一个充值地址），并核对 hash160(pubkey) == pkScript[2:] —— 两者不配套说明地址与公钥
+	// 不是同一个 DKG 结果，链上会拒。
+	normalized, err := rtypes.ParseDepositTssPubKey(pubkey)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "invalid pubkey, require 33-byte compressed secp256k1 hex: %v\n", err)
+		return
+	}
+	if len(pkScript) != 22 || pkScript[0] != txscript.OP_0 || pkScript[1] != 0x14 ||
+		!bytes.Equal(btcutil.Hash160(normalized), pkScript[2:]) {
+		_, _ = fmt.Fprintf(os.Stderr, "pubkey does not match pkScript: hash160(pubkey)=%s, pkScript=%s\n",
+			hex.EncodeToString(btcutil.Hash160(normalized)), pkScriptHex)
 		return
 	}
 
@@ -346,6 +372,7 @@ func commitDKG(cmd *cobra.Command, _ []string) {
 		AssetSymbol: symbol,
 		DkgAddress:  dkgAddress,
 		PkScript:    pkScript,
+		Pubkey:      normalized,
 	})
 }
 

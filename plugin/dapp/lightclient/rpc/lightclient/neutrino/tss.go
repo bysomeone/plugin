@@ -184,13 +184,9 @@ func (t *tssService) init() {
 	// Save DKG result to database with retry
 	t.saveDKGToDB()
 
-	// Commit DKG result to main chain with retry
-	commitDKG := &rtypes.CommitDKG{
-		AssetSymbol: rtypes.BTCSymbol,
-		DkgAddress:  t.tssAddress.EncodeAddress(),
-		PkScript:    t.pkScript,
-	}
-	t.client.submitMainChainTxUntilSuccess(rtypes.RgbxX, rtypes.NameCommitDKGAction, commitDKG)
+	// Commit DKG result to main chain（带 33B 压缩 pubkey），并等到**链上**出现同一把群公钥。
+	// 载荷与核对逻辑见 tss_commit.go：成功判据是链上状态，不是"提交没报错"。
+	t.commitDKGToChain(t.buildCommitDKGPayload(rtypes.BTCSymbol))
 	// RGB20 补 CommitDKG（H6）：对每个注册的 RGB20 合约提交带 pubkey 的 CommitDKG，
 	// 否则 checkDeposit/Exec_Deposit 的 RGB20 分支拿不到 CrossChainInfo.Pubkey，无法验 thresholdSig。
 	if t.client.rgb20 != nil {
