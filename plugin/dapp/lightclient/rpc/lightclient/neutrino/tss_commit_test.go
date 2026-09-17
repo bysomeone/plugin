@@ -2,7 +2,9 @@ package neutrino
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
@@ -109,5 +111,165 @@ func TestBuildCommitDKGPayload_incompleteDKG(t *testing.T) {
 	svc2 := &tssService{}
 	assert.Nil(t, svc2.buildCommitDKGPayload(rtypes.BTCSymbol))
 	// nil 载荷直接返回（不 panic、不空转）。
-	svc2.commitDKGToChain(nil)
+	svc2.commitDKGToChainWith(context.Background(), nil, nil, nil)
+}
+
+/*
+ * 阶段 2：提交/核对循环的三种判据。
+ *
+ * 这三条是 DKG 阶段死锁的根因所在：判据必须落在**链上记录内容**上。
+ * 曾经"链上无记录"（执行器回空记录 + nil error）与"链上是另一把钥"共用同一个 err == nil 分支，
+ * 于是全新链上永远走不到提交分支 —— 表现为 DKG 阶段死锁（不是慢），E2E 里四个 para 只有一条
+ * "carries a different tss pubkey" 日志、main 链上 CrossChainInfo 一直为空。
+ */
+
+// fakeChain 是"主链 CrossChainInfo"的替身：CommitDKG 被接受后记录在案（模拟 Exec_CommitDKG）。
+type fakeChain struct {
+	mu      sync.Mutex
+	infos   map[string]*rtypes.CrossChainInfo
+	submits int
+}
+
+func newFakeChain() *fakeChain {
+	return &fakeChain{infos: make(map[string]*rtypes.CrossChainInfo)}
+}
+
+// query 复刻执行器 Query_GetCrossChainInfo 的真实契约：symbol 不存在时返回**空记录 + nil error**。
+func (c *fakeChain) query(symbol string) (*rtypes.CrossChainInfo, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if info, ok := c.infos[symbol]; ok {
+		return info, nil
+	}
+	return &rtypes.CrossChainInfo{}, nil
+}
+
+// submit 复刻执行器 CheckTx/Exec 的口径：同一 symbol 已有记录 ⇒ ErrDuplicateDKGCommit。
+func (c *fakeChain) submit(_ string, _ string, payload *rtypes.CommitDKG) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	symbol := payload.GetAssetSymbol()
+	if _, ok := c.infos[symbol]; ok {
+		return "", errors.New("duplicate dkg commit")
+	}
+	c.submits++
+	c.infos[symbol] = &rtypes.CrossChainInfo{
+		AssetSymbol: symbol,
+		TssAddress:  payload.GetDkgAddress(),
+		PkScript:    payload.GetPkScript(),
+		Pubkey:      payload.GetPubkey(),
+	}
+	return "fake-tx-hash", nil
+}
+
+func (c *fakeChain) submitCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.submits
+}
+
+func (c *fakeChain) put(info *rtypes.CrossChainInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.infos[info.GetAssetSymbol()] = info
+}
+
+func (c *fakeChain) pubkey(symbol string) []byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.infos[symbol].GetPubkey()
+}
+
+// TestCommitDKGToChain_submitsWhenChainHasNoRecord 链上还没有该 symbol 的记录（执行器回空记录 + nil error）
+// ⇒ 必须判定为"未提交"并**真的提交**，链上出现同一把钥后返回。
+// 反向（修好前）：空记录被当成"链上是另一把钥"⇒ 永不提交 —— 用 ctx 超时兜住，避免测试挂死。
+func TestCommitDKGToChain_submitsWhenChainHasNoRecord(t *testing.T) {
+	svc := newTestTssService(t)
+	chain := newFakeChain()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*commitDKGVerifyInterval)
+	defer cancel()
+	svc.commitDKGToChainWith(ctx, svc.buildCommitDKGPayload(rtypes.BTCSymbol), chain.query, chain.submit)
+
+	require.Equal(t, 1, chain.submitCount(), "链上无记录时必须真的提交（且只提交一次）")
+	require.Equal(t, svc.tssPublicKey.SerializeCompressed(), chain.pubkey(rtypes.BTCSymbol),
+		"链上记录的必须是本地这把群公钥")
+}
+
+// TestCommitDKGToChain_doesNotSubmitWhenChainHasAnotherKey 链上已有该 symbol、但群公钥是另一把：
+// 提交必然被 ErrDuplicateDKGCommit 拒（同一 symbol 只能提交一次），因此不提交，只报 stall。
+func TestCommitDKGToChain_doesNotSubmitWhenChainHasAnotherKey(t *testing.T) {
+	svc := newTestTssService(t)
+	chain := newFakeChain()
+	_, otherPub := testPubkey(t)
+	chain.put(&rtypes.CrossChainInfo{
+		AssetSymbol: rtypes.BTCSymbol, TssAddress: "bcrt1qchain", Pubkey: otherPub})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 第一轮核对就能看出"链上是另一把钥"，取消 ctx 让循环退出（生产上这个形态会一直报 stall，
+	// 由运维介入 —— 不可自愈）。
+	query := func(symbol string) (*rtypes.CrossChainInfo, error) {
+		info, err := chain.query(symbol)
+		cancel()
+		return info, err
+	}
+	svc.commitDKGToChainWith(ctx, svc.buildCommitDKGPayload(rtypes.BTCSymbol), query, chain.submit)
+
+	require.Zero(t, chain.submitCount(), "链上是另一把钥时不该空转提交（必被拒为 duplicate）")
+	require.Equal(t, otherPub, chain.pubkey(rtypes.BTCSymbol), "链上记录不该被本地载荷覆盖")
+}
+
+// TestCommitDKGToChain_skipsSubmitWhenChainAlreadyHasSameKey 链上已有同一把钥 ⇒ 直接确认，不重复提交。
+func TestCommitDKGToChain_skipsSubmitWhenChainAlreadyHasSameKey(t *testing.T) {
+	svc := newTestTssService(t)
+	chain := newFakeChain()
+	chain.put(&rtypes.CrossChainInfo{
+		AssetSymbol: rtypes.BTCSymbol, TssAddress: svc.tssAddress.EncodeAddress(),
+		PkScript: svc.pkScript, Pubkey: svc.tssPublicKey.SerializeCompressed()})
+
+	svc.commitDKGToChainWith(context.Background(), svc.buildCommitDKGPayload(rtypes.BTCSymbol),
+		chain.query, chain.submit)
+
+	require.Zero(t, chain.submitCount(), "链上已有同一把钥，不该重复提交")
+}
+
+// TestEnsureDKGOnChain_commitsEverySymbol 从 DB 载入 DKG 之后的核对/提交（Bug：载入即 return
+// ⇒ 链上永远没有记录，E2E 表现为 wait_auto_dkg_commit 超时）。
+// 覆盖 BTC + RGB20 两个 symbol：都必须被提交上去，且链上记录的 pubkey 是本地这把。
+func TestEnsureDKGOnChain_commitsEverySymbol(t *testing.T) {
+	svc := newTestTssService(t)
+	chain := newFakeChain()
+	symbols := []string{rtypes.BTCSymbol, "RGB20_USDT"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*commitDKGVerifyInterval)
+	defer cancel()
+	svc.ensureDKGOnChainWith(ctx, symbols, chain.query, chain.submit)
+
+	require.Equal(t, len(symbols), chain.submitCount(), "每个 symbol 都要提交（含 RGB20）")
+	for _, symbol := range symbols {
+		require.Equal(t, svc.tssPublicKey.SerializeCompressed(), chain.pubkey(symbol),
+			"链上 %s 的群公钥必须是本地这把", symbol)
+	}
+}
+
+// TestQueryCrossChainInfoBounded_emptyRecordMeansNotOnChain 空记录必须在查询层就被翻译成
+// errCrossChainInfoNotOnChain —— 只按 error 判定的实现会把"链上还没有"漏进"另一把钥"分支。
+func TestQueryCrossChainInfoBounded_emptyRecordMeansNotOnChain(t *testing.T) {
+	n := &neutrinoClient{ctx: context.Background()}
+
+	n.mainChainGrpc = newChainInfoMock(nil)
+	_, err := n.queryCrossChainInfoBounded(rtypes.BTCSymbol)
+	require.ErrorIs(t, err, errCrossChainInfoNotOnChain,
+		"执行器对不存在的 symbol 回的是空记录 + nil error，必须判成'链上还没有'")
+
+	localPub, _ := testPubkey(t)
+	n.mainChainGrpc = newChainInfoMock(map[string]*rtypes.CrossChainInfo{
+		rtypes.BTCSymbol: {AssetSymbol: rtypes.BTCSymbol, TssAddress: "bcrt1qlocal",
+			Pubkey: localPub.SerializeCompressed()},
+	})
+	info, err := n.queryCrossChainInfoBounded(rtypes.BTCSymbol)
+	require.NoError(t, err)
+	require.Equal(t, "bcrt1qlocal", info.GetTssAddress())
+	require.Equal(t, localPub.SerializeCompressed(), info.GetPubkey())
 }

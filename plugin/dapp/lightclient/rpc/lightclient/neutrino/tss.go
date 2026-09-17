@@ -2,6 +2,7 @@ package neutrino
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -133,22 +134,46 @@ func (t *tssService) handleSignTask() {
 }
 
 func (t *tssService) init() {
+	// Phase 5 DKG 修复：本地已有 DKG 结果（重启 / 数据目录保留）时**不重跑** GG18 DKG
+	// —— 但载入之后**必须**继续做链上核对与提交（见 ensureDKGOnChain）。
+	//
+	// 为什么不能载入即 return（踩过一次）：para 首启时 nodegroup 往往还没 approve，
+	// CommitDKG 必被拒，本进程会一直卡在 commitDKGToChain；环境就绪后重启，才轮到这次"载入 + 提交"。
+	// 载入即 return 会跳过提交 ⇒ 链上永远没有 CrossChainInfo，而且客户端一路"看起来正常"
+	// （E2E 表现为 wait_auto_dkg_commit 超时，para 侧连一行 "commitDKG submitted" 都没有）。
+	//
+	// DB 优先（而不是先查主链）是因为主链 grpc 的 QueryChain 在并发/时序下可能永久 hang，
+	// 卡在 tss init 第一步会拖住 dkgCompleted → client.Start → rgb20.Start/serveHTTP(17000)。
+	if err := t.loadDKGFromDB(); err == nil {
+		log.Info("ensureDKG load from local db")
+		t.ensureDKGOnChain()
+		t.dkgCompleted.Store(true)
+		// Phase 5 修复：loadDKGFromDB 分支也必须设置 selfPeerId，否则 handleSignNotify 的
+		// isSigner 检查永远失败（selfPeerId 空），该节点不参与 GG18 签名（sign-psbt 超时）。
+		t.waitSelfPeerId()
+		return
+	}
+
 	// Wait for cross chain info to be available
-	info := t.client.getCrossChainInfo()
+	info := t.client.getCrossChainInfo(rtypes.BTCSymbol)
 	for info == nil {
 		time.Sleep(3 * time.Second)
 		log.Debug("ensureDKG getCrossChainInfo wait 3 seconds...")
-		info = t.client.getCrossChainInfo()
+		info = t.client.getCrossChainInfo(rtypes.BTCSymbol)
 	}
 
 	if info.GetTssAddress() != "" {
-		log.Debug("ensureDKG already exist, loading from database")
+		log.Debug("ensureDKG already exist on chain, loading from database")
 		err := t.loadDKGFromDB()
-		if err != nil {
-			panic("ensureDKG loadDKGFromDB error: " + err.Error())
+		if err == nil {
+			// 与上方同理：链上已有记录仍要走一遍核对/提交（幂等：pubkey 相符即刻返回）。
+			t.ensureDKGOnChain()
+			t.dkgCompleted.Store(true)
+			t.waitSelfPeerId()
+			return
 		}
-		t.dkgCompleted.Store(true)
-		return
+		// DB 中无 DKG 结果（容器重建/数据目录清空）：不 panic，继续走下方重新 DKG。
+		log.Warn("ensureDKG loadDKGFromDB error, redo DKG", "err", err)
 	}
 	log.Info("init tssService starting new DKG process")
 
@@ -184,24 +209,42 @@ func (t *tssService) init() {
 	// Save DKG result to database with retry
 	t.saveDKGToDB()
 
-	// Commit DKG result to main chain（带 33B 压缩 pubkey），并等到**链上**出现同一把群公钥。
-	// 载荷与核对逻辑见 tss_commit.go：成功判据是链上状态，不是"提交没报错"。
-	t.commitDKGToChain(t.buildCommitDKGPayload(rtypes.BTCSymbol))
-	// RGB20 补 CommitDKG（H6）：对每个注册的 RGB20 合约提交带 pubkey 的 CommitDKG，
-	// 否则 checkDeposit/Exec_Deposit 的 RGB20 分支拿不到 CrossChainInfo.Pubkey，无法验 thresholdSig。
-	if t.client.rgb20 != nil {
-		for _, symbol := range t.client.rgb20.Registry().Symbols() {
-			rgbCommitDKG := &rtypes.CommitDKG{
-				AssetSymbol: symbol,
-				DkgAddress:  t.tssAddress.EncodeAddress(),
-				PkScript:    t.pkScript,
-				Pubkey:      t.tssPublicKey.SerializeCompressed(),
-			}
-			t.client.submitMainChainTxUntilSuccess(rtypes.RgbxX, rtypes.NameCommitDKGAction, rgbCommitDKG)
-			log.Info("init tssService rgb20 commitDKG", "symbol", symbol, "tssAddress", t.tssAddress.EncodeAddress())
-		}
-	}
+	t.ensureDKGOnChain()
 	t.dkgCompleted.Store(true)
+	t.waitSelfPeerId()
+}
+
+// ensureDKGOnChain 让链上每个 symbol 的 CrossChainInfo 达到"存在、且群公钥 == 本地群公钥"，阻塞到达成。
+//
+// 首次 DKG 之后与"从 DB 载入 DKG"之后都要走这一遍，且两处**不能只做一次**：本节点可能
+// 之前提交过但被拒（nodegroup 未 approve / 钱包未解锁），重启后才轮得到成功提交。
+//
+// 成功判据是**链上状态**而不是"提交没报错"，载荷与核对逻辑见 tss_commit.go。
+func (t *tssService) ensureDKGOnChain() {
+	t.ensureDKGOnChainWith(t.client.ctx, t.client.shareCheckSymbols(),
+		t.client.queryCrossChainInfoBounded, t.submitDKGToMainChain)
+}
+
+// ensureDKGOnChainWith 是 ensureDKGOnChain 的实现，symbol 集合与两个依赖显式传入（便于单测）。
+//
+// symbols 用 shareCheckSymbols()：BTC + 配置里的每个 RGB20 合约，去重且跳过空 symbol ——
+// 与自检（checkTssShareAgainstChain）覆盖**同一集合**，两处不能各说各话。
+func (t *tssService) ensureDKGOnChainWith(ctx context.Context, symbols []string,
+	query func(symbol string) (*rtypes.CrossChainInfo, error),
+	submit func(exec, action string, payload *rtypes.CommitDKG) (string, error)) {
+
+	for _, symbol := range symbols {
+		// 与 BTC 同一套判据（提交后核对链上 pubkey）：4 个 guardian 都会提交，先到者创建记录，
+		// 其余节点拿到 ErrDuplicateDKGCommit —— 但"被拒为重复"本身不是成功的判据，链上那把钥
+		// 必须逐字节等于本地群公钥，否则该 symbol 的充值/提现（RGB20 的 thresholdSig 校验）
+		// 或 BTC 充值地址（P2WSH = f(userID, tssPub)）会静默失灵。
+		t.commitDKGToChainWith(ctx, t.buildCommitDKGPayload(symbol), query, submit)
+		log.Info("ensureDKGOnChain commitDKG", "symbol", symbol)
+	}
+}
+
+// waitSelfPeerId 等待 P2P 自节点 peer id 就绪（GG18 签名时 handleSignNotify 的 isSigner 检查依赖它）。
+func (t *tssService) waitSelfPeerId() {
 	for {
 		peers, err := tss.FetchConnectedPeers(t.client.qclient, time.Second*3)
 		if err == nil && len(peers) > 0 && peers[len(peers)-1].Self {
@@ -211,7 +254,6 @@ func (t *tssService) init() {
 		log.Debug("init tssService waitForSelfPeerId FetchConnectedPeers retry", "err", err)
 		time.Sleep(time.Second * 3)
 	}
-
 }
 
 func (t *tssService) loadDKGFromDB() error {
