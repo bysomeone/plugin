@@ -508,7 +508,19 @@ function mine_btcd_blocks() {
     ${BTC_CTL} --"${BTC_NETWORK}" generate "${count}" >/dev/null
 }
 
+# btcd regtest 的 coinbase 每 150 块减半（chaincfg.RegressionNetParams.SubsidyHalvingInterval），
+# 故"往回退一档"= 面额翻倍，见 build_mature_coinbase_utxo。
+BTCD_REGTEST_HALVING_INTERVAL="${BTCD_REGTEST_HALVING_INTERVAL:-150}"
+
+# build_mature_coinbase_utxo [min_amount_sats]：挑一个成熟、**未被花费**且面额足够（默认不限）的
+# coinbase 输出给挖矿地址，输出 "txid:vout:amountSats:pkScriptHex"。
+#
+# 为什么不能只取"最新成熟块"：链被反复复用时（见 start_env：btcd 的 regtest 链不能重建，重跑只能
+# 原地续跑）高度会一路涨，而 coinbase 面额每 150 块减半 —— 实测 h≈1400 时最新成熟 coinbase 只剩
+# 9765625 sats，不够一笔 0.2 BTC 的充值额，充值场景无论桥是否正常都必失败。故按 halving 档位往回
+# 退（每退一档面额翻倍），直到找到面额 >= min_amount 且仍未被花费的那个。
 function build_mature_coinbase_utxo() {
+    local min_amount="${1:-0}"
     assert_non_empty "${BTCD_MINING_ADDR}" "BTCD_MINING_ADDR empty"
     local best_height
     best_height=$(${BTC_CTL} --"${BTC_NETWORK}" getblockcount)
@@ -517,22 +529,52 @@ function build_mature_coinbase_utxo() {
         fail "no mature coinbase yet: bestHeight=${best_height}"
     fi
 
+    local height="${mature_height}"
+    local tries=0
+    while [ "${height}" -ge 1 ] && [ "${tries}" -lt 20 ]; do
+        local utxo
+        if utxo=$(coinbase_utxo_at_height "${height}" "${min_amount}"); then
+            echo "${utxo}"
+            return 0
+        fi
+        height=$((height - BTCD_REGTEST_HALVING_INTERVAL))
+        tries=$((tries + 1))
+    done
+    fail "no mature unspent coinbase >= ${min_amount} sats (bestHeight=${best_height})"
+}
+
+# coinbase_utxo_at_height <height> <min_amount_sats>：该高度 coinbase 里付给挖矿地址、面额达标且
+# 尚未被花费的输出；任一条件不满足返回非 0（让调用方继续往回找）。
+function coinbase_utxo_at_height() {
+    local height="$1"
+    local min_amount="$2"
+
     local block_hash
-    block_hash=$(${BTC_CTL} --"${BTC_NETWORK}" getblockhash "${mature_height}")
+    block_hash=$(${BTC_CTL} --"${BTC_NETWORK}" getblockhash "${height}")
     local coinbase_tx
     coinbase_tx=$(${BTC_CTL} --"${BTC_NETWORK}" getblock "${block_hash}" 1 | jq -r '.tx[0] // empty')
-    assert_non_empty "${coinbase_tx}" "coinbase tx empty at height=${mature_height}"
+    assert_non_empty "${coinbase_tx}" "coinbase tx empty at height=${height}"
     local tx_json
     tx_json=$(${BTC_CTL} --"${BTC_NETWORK}" getrawtransaction "${coinbase_tx}" 1)
     local vout
     vout=$(echo "${tx_json}" | jq -r --arg a "${BTCD_MINING_ADDR}" '.vout[] | select(.scriptPubKey.addresses[]? == $a) | .n' | head -1)
-    assert_non_empty "${vout}" "coinbase vout not found for mining address"
+    if [ -z "${vout}" ]; then
+        return 1
+    fi
     local amount_sats
     amount_sats=$(echo "${tx_json}" | jq -r --argjson v "${vout}" '.vout[] | select(.n == $v) | (.value * 100000000 | floor)')
     local pk_script
     pk_script=$(echo "${tx_json}" | jq -r --argjson v "${vout}" '.vout[] | select(.n == $v) | .scriptPubKey.hex')
-    assert_non_empty "${amount_sats}" "coinbase amount sats empty"
-    assert_non_empty "${pk_script}" "coinbase pkScript empty"
+    if [ -z "${amount_sats}" ] || [ -z "${pk_script}" ]; then
+        return 1
+    fi
+    if [ "${amount_sats}" -lt "${min_amount}" ]; then
+        return 1
+    fi
+    # 已被花掉的输出不能当输入（btcd 没有钱包视图，用 gettxout 判：null = 已花费或不存在）。
+    if ! ${BTC_CTL} --"${BTC_NETWORK}" gettxout "${coinbase_tx}" "${vout}" 2>/dev/null | jq -e '. != null' >/dev/null; then
+        return 1
+    fi
     echo "${coinbase_tx}:${vout}:${amount_sats}:${pk_script}"
 }
 
