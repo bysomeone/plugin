@@ -386,6 +386,9 @@ func (n *neutrinoClient) loadDepositScripts() {
 	}
 	log.Info("loadDepositScripts done", "loaded", n.deposits.size(), "skipped", skipped,
 		"walletWatching", n.depositImporter != nil)
+	// 标记载入完成（只在真的跑完这一轮时置位）：轮询那边据此避免重复导入（见 depositScriptSyncWorker）。
+	// 中途失败（读库/导入出错，上面已 return）不置位 —— 下一轮轮询会再试一次。
+	n.depositsLoaded.Store(true)
 	// 启动即下发一次：本节点可能不是发放地址的那个（重启前在别处发过），下发顺带把侧车持有的
 	// 并集拉回来（见 syncDepositScriptsWithSidecar）。
 	n.syncDepositScriptsWithSidecar()
@@ -444,9 +447,12 @@ func (n *neutrinoClient) depositScriptSyncWorker() {
 				continue
 			}
 			// 官方节点在钱包起来时已经载入过（见 waitAndImportTSSAddress）；其余节点在这里补一次
-			// （载入是幂等的，且它顺带把本地 neutrino.db 里的登记恢复出来）。
+			// （它顺带把本地 neutrino.db 里的登记恢复出来）。**只在没人载入过时才补**：重复载入
+			// 虽然幂等，但会多触发一次 NotifyReceived ⇒ 一次 rescan（主网代价大）。
 			if !loaded {
-				n.loadDepositScripts()
+				if !n.depositsLoaded.Load() {
+					n.loadDepositScripts()
+				}
 				loaded = true
 			}
 			n.syncDepositScriptsWithSidecar()

@@ -573,8 +573,8 @@ func (t *tssService) sweepSignFeeRate() uint32 {
 	return uint32(t.client.cfg.UserDepositSweep.FeeRate)
 }
 
-// signSweepPsbt 协调者侧发起扫集签名：发布 btc-sweep 签名通知让其它签名节点独立核对后入场，
-// 再本地参与 GG18。与提现一样，本节点自己也要过同一套核对（signPsbtInternal 之前先验一遍）。
+// signSweepPsbt 协调者侧发起扫集签名：先在自己这里过一遍 ValidateSweepPsbt，再发布 btc-sweep
+// 签名通知让其它签名节点独立核对后入场，最后本地参与 GG18。
 func (t *tssService) signSweepPsbt(psbtBytes []byte) ([]byte, error) {
 	if len(psbtBytes) == 0 {
 		return nil, fmt.Errorf("invalid sweep sign request: empty psbt")
@@ -582,6 +582,17 @@ func (t *tssService) signSweepPsbt(psbtBytes []byte) ([]byte, error) {
 	p, err := psbt.NewFromRawBytes(bytes.NewReader(psbtBytes), false)
 	if err != nil {
 		return nil, fmt.Errorf("decode psbt: %w", err)
+	}
+	// 协调者自己也要过同一套核对（签名节点入场时各跑一遍，但协调者没有理由把自己排除在外：
+	// 它一旦发布通知就已经在"要求别人核对"，先自检能让不合规的构建在本地就停下）。
+	if t.client.rgb20 == nil {
+		return nil, fmt.Errorf("rgb20 adapter not configured")
+	}
+	if err := t.client.rgb20.ValidateSweepPsbt(&rgb20.ValidateSweepRequest{
+		Psbt:    psbtBytes,
+		FeeRate: t.sweepSignFeeRate(),
+	}); err != nil {
+		return nil, fmt.Errorf("validate btc sweep before signing: %w", err)
 	}
 	signers := t.waitForSufficientSigners()
 	if len(signers) > 0 {
@@ -929,8 +940,14 @@ func finalizeP2WSHInput(in *psbt.PInput, witnessScript []byte) error {
 	in.FinalScriptWitness = buf.Bytes()
 	// 与上游 Finalize 的收尾一致：final witness 落定后清掉中间态（partial sig / sighash type），
 	// 避免同一份 PSBT 里"已 finalize"与"待 finalize"两种状态并存被下游误读。
-	// witnessScript 与 witness_utxo 保留：前者是审计线索（脚本原文），后者广播/侧车提取仍要用，
-	// 且 psbt.MaybeFinalizeAll 对已 finalized 的输入直接跳过，不会因为 witnessScript 在场而重跑。
+	// witnessScript 与 witness_utxo 在**内存结构**里保留（MaybeFinalizeAll 对已 finalized 的输入
+	// 直接跳过，不会因为 witnessScript 在场而重跑）。
+	//
+	// 注意：**线格式里它们不会一起传出去** —— btcd 的 PSBT 序列化器只在输入未 finalize 时写
+	// partial_sigs/sighash_type/redeem_script/witness_script（见 btcutil/psbt 的
+	// `partial_input.go`），已 finalize 的输入只留 final_script_witness。所以任何**拿到已签
+	// PSBT 后**还需要那段脚本的下游，只能从 final witness 的栈顶取（侧车的 `finalize_sweep`
+	// 就是这么做的），别指望 `witness_script` 还在。
 	in.PartialSigs = nil
 	in.SighashType = 0
 	return nil

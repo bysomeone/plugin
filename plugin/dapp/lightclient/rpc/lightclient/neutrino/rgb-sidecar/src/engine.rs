@@ -454,17 +454,56 @@ impl RgbEngine {
                 .ok_or_else(|| anyhow!("sweep input {i} has no witness utxo"))?
                 .script_pubkey
                 .clone();
-            if self.wallet.witness_script_for(&prev).is_none() {
-                return Err(anyhow!(
+            let registered = self.wallet.witness_script_for(&prev).ok_or_else(|| {
+                anyhow!(
                     "sweep input {i} pays {} which is not a registered user deposit script",
                     hex_encode(prev.as_bytes())
-                ));
-            }
-            if input.witness_script.is_none() {
-                return Err(anyhow!(
-                    "sweep input {i} carries no witness script (its BIP143 scriptCode), the input \
-                     cannot be signed"
-                ));
+                )
+            })?;
+            // 这一步判的是"**真正会被执行的那个脚本**就是登记的那份"。两种承载形态都要认：
+            //
+            //   - 未 finalize 的 PSBT：脚本在 `PSBT_IN_WITNESS_SCRIPT` 里（TSS 签名器拿它当
+            //     BIP143 scriptCode）；
+            //   - 已 finalize 的 PSBT：**线格式里没有 witness_script 了** —— btcd 的 PSBT
+            //     序列化器（`partial_input.go`：`if FinalScriptSig == nil && FinalScriptWitness
+            //     == nil { ... 写 partial_sigs/sighash/redeem/witness_script }`）在输入 finalize
+            //     之后就不再写这些字段，脚本只活在 final witness 的栈顶。C3 的注释说"witnessScript
+            //     保留"只对内存结构成立，序列化后并不成立（E2E 实测：签名节点交回来的已签 PSBT
+            //     在这里被判成"没有 witness script"）。
+            //
+            // 判据取栈顶而不是重新从 (userID, tssPub) 派生：栈顶就是实际执行的那份脚本，
+            // 与登记逐字节相等即"这笔 UTXO 花的正是我们登记过的充值脚本"。
+            match input.final_script_witness.as_ref() {
+                Some(witness) => {
+                    let top = witness
+                        .last()
+                        .ok_or_else(|| anyhow!("sweep input {i}: empty final witness"))?;
+                    if top != registered.as_bytes() {
+                        return Err(anyhow!(
+                            "sweep input {i}: the script the witness actually runs ({}) is not the \
+                             registered deposit script ({})",
+                            hex_encode(top),
+                            hex_encode(registered.as_bytes())
+                        ));
+                    }
+                }
+                None => match input.witness_script.as_ref() {
+                    Some(ws) if ws.as_bytes() == registered.as_bytes() => {}
+                    Some(ws) => {
+                        return Err(anyhow!(
+                            "sweep input {i}: psbt witness script ({}) is not the registered deposit \
+                             script ({})",
+                            hex_encode(ws.as_bytes()),
+                            hex_encode(registered.as_bytes())
+                        ))
+                    }
+                    None => {
+                        return Err(anyhow!(
+                            "sweep input {i} carries neither a final witness nor a witness script \
+                             (its BIP143 scriptCode), the input cannot be signed"
+                        ))
+                    }
+                },
             }
         }
         Ok((tx.compute_txid(), tx))
@@ -1728,6 +1767,63 @@ mod sweep_tests {
         // 同一笔交易，只要输出回到主池就通过 —— 证明上面拒的是"付给用户脚本"这件事本身，
         // 不是别的偶发原因。
         assert!(engine.finalize_sweep(&build.psbt).is_ok());
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
+
+    /// 模拟 Go 签名器交回来的**已签** PSBT：每个输入填上 final witness，并且**抹掉
+    /// `witness_script`** —— 这正是它在线上格式里的样子（btcd 的 PSBT 序列化器只在输入
+    /// 未 finalize 时写 witness_script/sighash/redeem 那几个字段，见 `finalize_sweep` 的注释）。
+    fn as_signed_like_the_go_signer(psbt: &Psbt) -> Psbt {
+        let mut signed = psbt.clone();
+        for input in signed.inputs.iter_mut() {
+            let ws = input.witness_script.clone().expect("测试夹具里每个输入都带 witnessScript");
+            input.witness_script = None;
+            input.final_script_witness = Some(Witness::from_slice(&[vec![0x30; 71], ws.to_bytes()]));
+        }
+        signed
+    }
+
+    #[test]
+    fn finalize_sweep_accepts_the_signed_wire_form() {
+        // E2E 实测踩过的坑：签名节点交回来的是**已 finalize** 的 PSBT，线格式里没有
+        // witness_script，于是"必须带 witness script"这条判据把一笔完全合法的扫集判成了非法
+        // （sweepOnce ... "carries no witness script"），钱永远归集不回来。
+        // 现在判据落在"final witness 栈顶 = 登记的那份脚本"，两形态都认。
+        let mut engine = test_engine();
+        let (a, b) = two_users(&mut engine);
+        let build = engine
+            .build_sweep_from_utxos(vec![utxo(0, 20_000, a), utxo(1, 30_000, b)], 1, 1)
+            .unwrap()
+            .unwrap();
+        let signed = as_signed_like_the_go_signer(&build.psbt);
+        let (txid, tx) = engine.finalize_sweep(&signed).expect("已签形态必须能定稿");
+        assert_eq!(txid, build.txid);
+        assert_eq!(tx.output[0].script_pubkey, *engine.tss_script());
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
+
+    #[test]
+    fn finalize_sweep_refuses_a_witness_running_another_script() {
+        // 反向验证：final witness 的栈顶换成**别的脚本**（= 真正会被执行的不是登记的那份），
+        // 必须拒 —— 否则"这笔 UTXO 花的是我们登记过的充值脚本"这句话就没有依据了。
+        let mut engine = test_engine();
+        let (a, b) = two_users(&mut engine);
+        let build = engine
+            .build_sweep_from_utxos(vec![utxo(0, 20_000, a.clone()), utxo(1, 30_000, b.clone())], 1, 1)
+            .unwrap()
+            .unwrap();
+        let mut bad = as_signed_like_the_go_signer(&build.psbt);
+        // 把 0 号输入的栈顶换成 1 号用户的脚本（形态完全一致、只是不是这个 prevout 的那份）。
+        let other = engine.wallet.witness_script_for(&b).unwrap();
+        bad.inputs[0].final_script_witness = Some(Witness::from_slice(&[vec![0x30; 71], other.to_bytes()]));
+        let err = engine.finalize_sweep(&bad).unwrap_err();
+        assert!(
+            format!("{err}").contains("is not the registered deposit script"),
+            "unexpected error: {err}"
+        );
+
+        // 同一笔交易、只要栈顶是对的就能过（证明上面拒的是"脚本不对"这件事本身）。
+        assert!(engine.finalize_sweep(&as_signed_like_the_go_signer(&build.psbt)).is_ok());
         let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
     }
 
