@@ -39,6 +39,12 @@ impl Config {
         self.data_dir.join("ledger.json")
     }
 
+    /// 提现构建的冷层归档目录（O3）：`builds/<sha256(seal 集合)>.json`，每笔提现一个文件。
+    /// 与热账本分开，好让热账本的每次全量重写不再拖着全部提现历史。
+    pub fn builds_dir(&self) -> PathBuf {
+        self.data_dir.join("builds")
+    }
+
     /// 用户 P2WSH 充值脚本注册表（program → witnessScript + userID）。必须持久化：重启后
     /// watch 集一丢，已经打进用户充值地址的 BTC 就没有 witnessScript 可签（花不掉）。
     pub fn user_scripts_path(&self) -> PathBuf {

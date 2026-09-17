@@ -462,7 +462,19 @@ Two stores in `data_dir`:
    - `seals`: `outpoint → {asset, amount, btc_value, maturity_height, status, secret_seal}`.
    - `receives`: `receive_id → {invoice, asset, amount, status, settled txid:vout}` plus a
      reverse `settled_by_outpoint` map for attribution.
-   - Saved atomically (write-tmp + rename).
+   - `finalized_withdrawals`: `txid → {recipient, change}` — the idempotency record that keeps a
+     retried `FinalizeWithdrawal` from re-merging the transition.
+   - Saved atomically (write-tmp + fsync + rename).
+3. **`builds/`** — the withdrawal-build archive (O3): one JSON file per build, named
+   `sha256(seal set).json`, holding the recorded PSBT/consignment/fascia that a retried
+   withdrawal must be replayed with (E9-A). Written once per build (fsync'd before the build RPC
+   returns), read only on a replay.
+   It used to be a field of `ledger.json`, which made **every** state change rewrite the whole
+   withdrawal history inside the global engine lock (10k withdrawals ⇒ 204 MB / 337 ms per save,
+   ~3 state changes/s). The payload is stored as `deflate(base64)` — hex → raw → one deflate
+   frame takes 19.5 KB → ~6 KB — and is pruned to a txid tombstone once the build is finalized
+   *and* its carrier tx has `RGB_SIDECAR_BUILD_RETAIN_CONFIRMATIONS` (default 144) confirmations.
+   A pruned or corrupt archive makes the replay **fail loudly**; it is never silently rebuilt.
 
 **Seal state machine** (`SealStatus`):
 ```
