@@ -546,8 +546,22 @@ func (t *tssService) takeSignRejection(chain33Hash []byte) error {
 
 // recordSignRejection 记录拒签回执。只接受来自**本轮签名节点**的回执：回执走 P2P 广播，
 // 任何人都能发，否则伪造一份回执就能让一笔合法提现被永久判为不可恢复（DoS）。
+//
+// 两道核对（缺一不可）：
+//   - Rejector 必须是本节点为这笔提现选定的签名节点之一；
+//   - Rejector 必须与 P2P 报文的来源（TopicData.From，libp2p 记录的发布者）一致，
+//     否则任何节点都能冒名顶替某个签名节点发回执。
+//
+// 仍然无法区分"签名节点真的拒签"与"该签名节点谎称拒签"——但后者本来就能靠不参与签名达到
+// 同样的阻断效果（组签名超时），所以这里不引入新的信任假设。
 func (t *tssService) recordSignRejection(reject *rgb20.WithdrawSignReject, from string) {
 	if reject == nil || len(reject.Chain33TxHash) == 0 {
+		return
+	}
+	if from != "" && from != reject.Rejector {
+		log.Error("recordSignRejection rejector does not match the publisher",
+			"rejector", reject.Rejector, "from", from,
+			"chain33Hash", hex.EncodeToString(reject.Chain33TxHash))
 		return
 	}
 	signers := t.expectedSigners(reject.Chain33TxHash)
