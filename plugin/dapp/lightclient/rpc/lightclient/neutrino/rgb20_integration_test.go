@@ -412,6 +412,23 @@ func Test_SignRejectionRelay(t *testing.T) {
 		require.Contains(t, err.Error(), "peer-2")
 	})
 
+	t.Run("ignored when the claimed rejector is not the message publisher", func(t *testing.T) {
+		ts := newService()
+		notice, err := json.Marshal(&rgb20.WithdrawSignReject{
+			Chain33TxHash: hash,
+			Class:         "sticky-seal-mismatch",
+			Reason:        "stolen identity",
+			Rejector:      "peer-2", // 本轮签名节点，但报文不是它发的
+		})
+		require.NoError(t, err)
+		ts.handleSignNotify(&types.TopicData{
+			Topic: tssSignNotifyTopic,
+			From:  "peer-9",
+			Data:  types.Encode(&ltypes.TssSignNotify{TxType: transactionTypeRgb20WithdrawReject, Payload: notice}),
+		})
+		require.NoError(t, ts.takeSignRejection(hash), "冒名回执必须被忽略")
+	})
+
 	t.Run("ignored from a node that is not a signer of this round", func(t *testing.T) {
 		ts := newService()
 		notice, err := json.Marshal(&rgb20.WithdrawSignReject{
@@ -423,6 +440,7 @@ func Test_SignRejectionRelay(t *testing.T) {
 		require.NoError(t, err)
 		ts.handleSignNotify(&types.TopicData{
 			Topic: tssSignNotifyTopic,
+			From:  "peer-9", // 与 Rejector 一致，但 peer-9 不是本轮签名节点
 			Data:  types.Encode(&ltypes.TssSignNotify{TxType: transactionTypeRgb20WithdrawReject, Payload: notice}),
 		})
 		require.NoError(t, ts.takeSignRejection(hash), "非本轮签名节点的回执必须被忽略")
