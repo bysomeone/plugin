@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/33cn/chain33/client"
@@ -79,6 +80,10 @@ type neutrinoClient struct {
 	// depositImporter 把充值脚本导入**本节点钱包**并订阅（只有真的在 watch 的官方节点才装）。
 	// nil = 本节点不 watch（不跑交易监听），只维护登记本身。
 	depositImporter func(witnessScripts [][]byte) error
+	// depositsLoaded loadDepositScripts 是否已经跑完一轮（官方节点在钱包起来时跑，见
+	// waitAndImportTSSAddress）。重复载入本身幂等，但会多触发一次 NotifyReceived ⇒ 一次 rescan，
+	// 所以轮询那边只在没人载入过时才补一次。
+	depositsLoaded atomic.Bool
 }
 
 // Init init client context
