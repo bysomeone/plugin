@@ -172,7 +172,7 @@ func TestLightclientCheckBtcHeadersBootstrap(t *testing.T) {
 
 	regtest := &chaincfg.RegressionNetParams
 	ts := types.Now().Add(-time.Hour)
-	// 现有 CI 链就是从 btcHeaderStartHeight=1（即 regtest 创世之后第一个块）长起来的：
+	// 现有 CI 链就是从推导出的起点 1（regtest 无内置锚点 ⇒ 中继起点 = 1，即创世之后第一个块）长起来的：
 	// 首个头的 previousHash 必须等于创世 hash，新增的锚点校验必须仍然放行。
 	h1 := mineBtcHeaderFrom(t, regtest.GenesisHash.String(), 1, regtest.PowLimitBits, ts)
 	h2 := mineBtcHeader(t, h1, 2, regtest.PowLimitBits, ts.Add(time.Minute))

@@ -50,10 +50,18 @@ var btcCheckpointNetNames = []string{"mainnet", "testnet3", "testnet4", "regtest
 //  2. 只允许新增**严格高于** chaincfg 最高锚点的高度；
 //  3. chaincfg 没有锚点的网络（regtest/testnet4/signet/simnet）不允许扩展。
 //
-// 用它做什么：主网需要"比 btcd 内置的最后一个锚点更新鲜"的起点时，**首选升级 btcd**（那样中继侧
-// 的锚点会一起前进，两边天然一致）；只有在不能马上升级 btcd、又必须把 mainnet 起点往前挪时才手加
-// 一条，此时中继侧仍锚在更老的 checkpoint 上（那头链更安全，不会更不安全），运维必须自己保证
-// btcHeaderStartHeight 与这张表（而不是与 chaincfg）配套。
+// 用它做什么：主网需要"比 btcd 内置的最后一个锚点更新鲜"的起点时，**首选升级 btcd**（那样中继侧的
+// 锚点集合会一起前进，两边天然同源）；只有在不能马上升级 btcd、又必须把 mainnet 起点往前挪时才手加
+// 一条。
+//
+// **启用它 ⇒ 中继与执行器必然不同源，头链会 fail-closed 停住（设计如此，不是 bug）**：中继的
+// bootstrap 起点只从 chaincfg 推导（neutrino 的 btcHeaderStartHeight），看不到本扩展层，于是本执行器
+// 给出的最高锚点会比中继推出的起点高出一条（见 Query_GetBtcCheckpoint）；中继启动期的 bootstrap 起点
+// 断言（neutrino 的 btcBootstrapAnchorGuard，比较的正是"本地推出的起点"与"链上这个锚点 + 1"）因此
+// 判定两边不同源，**拒发任何 bootstrap 批**——链上头链停在空链状态，这是刻意的 fail-closed（宁可停住
+// 也不让头链从一个中继没认可的起点长起来）。即：本扩展层只能与"中继侧同步获得同一个锚点"的改造配套
+// 使用，单独加会让中继停止推进头链。运维遇到中继报"起点与链上锚点不配套"时，正确动作是**同步升级
+// 两边的 btcd**（或去掉这里的额外锚点），而不是去找一个已经不存在的高度配置项。
 //
 // 当前为空：所有网络的锚点都来自 chaincfg，不需要扩展。
 var extraBtcCheckpoints = map[wire.BitcoinNet]map[uint64]string{
@@ -315,15 +323,17 @@ const maxAnchorTraceDepth = 1 << 20
 //	③ localDB 可回溯：沿 prevHash 逐级回查已存的头，最终到达创世或某个锚点。
 //
 // 三条都不满足即拒绝。mainnet/testnet3 的锚点来自 btcd chaincfg（见 btcCheckpointTable），
-// 因此中继的 btcHeaderStartHeight 必须是"本网络最高锚点 + 1"（中继启动期会自己做同样的断言，
-// 见 neutrino 的 btcBootstrapAnchorGuard）。
+// 因此中继的提交起点必须正好是"本网络最高锚点 + 1"；这个起点**不是配置项**，而是中继从**同一份**
+// chaincfg 自己推出来的（neutrino 的 btcHeaderStartHeight；中继启动期还会拿本执行器给出的锚点做一次
+// 同样的断言，见 neutrino 的 btcBootstrapAnchorGuard）。两边推不出同一个值只可能是两边 btcd 的
+// checkpoint 表不同源（含本执行器启用了 extraBtcCheckpoints，见那里写的 fail-closed 后果）。
 func checkBootstrapAnchor(first *ltypes.BtcHeader, params *chaincfg.Params, ldb dbm.KV) error {
 	height := first.GetHeight()
 	genesisHash := params.GenesisHash.String()
 	checkpoints := btcCheckpointTable[params.Net]
 
 	// reject 拒绝时把"照做就能过"的信息一并给出（L1）：原来的 ErrBtcHeaderNoAnchor 只说被拒了，
-	// 运维既看不到本网络有哪些锚点，也不知道 btcHeaderStartHeight 该填多少 —— 只能猜。
+	// 运维既看不到本网络有哪些锚点，也不知道中继本该从哪个高度起 —— 只能猜。
 	reject := func() error {
 		detail := anchorRejectDetail(first, params, checkpoints)
 		elog.Error("checkBootstrapAnchor first btc header cannot be anchored to the real chain "+
@@ -354,7 +364,12 @@ func checkBootstrapAnchor(first *ltypes.BtcHeader, params *chaincfg.Params, ldb 
 }
 
 // anchorRejectDetail 组装 bootstrap 锚点被拒时的可操作信息（错误信息与日志同源）：
-// 本网络已知锚点高度列表、首个头的高度、以及"照做就能过"的期望 btcHeaderStartHeight（= 最高锚点 + 1）。
+// 本网络已知锚点高度列表、首个头的高度、以及中继本该推出的提交起点（= 最高锚点 + 1）。
+//
+// 起点那一项（expectedRelayStartHeight）是**诊断值、不是配置项**：中继自己从同一份 chaincfg 推出它
+// （neutrino 的 btcHeaderStartHeight），没有任何可改的键。给出它是为了在"两边对不上"时能直接看出根因
+// 是两边 btcd 的 checkpoint 表不同源（典型成因：两边 build 用了不同版本的 btcd，或本执行器用
+// extraBtcCheckpoints 加了中继没有的锚点），对应动作是同步升级两边的 btcd / 去掉额外锚点。
 func anchorRejectDetail(first *ltypes.BtcHeader, params *chaincfg.Params, checkpoints map[uint64]string) string {
 	heights := make([]uint64, 0, len(checkpoints))
 	for h := range checkpoints {
@@ -365,12 +380,18 @@ func anchorRejectDetail(first *ltypes.BtcHeader, params *chaincfg.Params, checkp
 	detail := fmt.Sprintf("net=%s firstHeight=%d firstPrevHash=%s genesisHash=%s knownCheckpointHeights=%v",
 		params.Name, first.GetHeight(), first.GetPreviousHash(), params.GenesisHash.String(), heights)
 	if top, topHash, ok := highestCheckpoint(checkpoints); ok {
-		detail += fmt.Sprintf(" highestCheckpoint=%d:%s expectedBtcHeaderStartHeight=%d", top, topHash, top+1)
+		detail += fmt.Sprintf(" highestCheckpoint=%d:%s expectedRelayStartHeight=%d", top, topHash, top+1)
 	} else {
-		detail += " highestCheckpoint=none (this net has no anchor: bootstrap only works from genesis, btcHeaderStartHeight=1)"
+		detail += " highestCheckpoint=none (this net has no anchor: bootstrap only works from genesis, expectedRelayStartHeight=1)"
 	}
-	return detail
+	return detail + anchorMismatchHint
 }
+
+// anchorMismatchHint 拒绝信息末尾的成因说明（错误信息与日志同源）：提交起点不是可配置项，两边对不上
+// 时没有键可改，唯一成因是两边 btcd 的 checkpoint 表不同源（见 extraBtcCheckpoints 与
+// anchorRejectDetail 的说明）。
+const anchorMismatchHint = " (start height is derived by the relay from the same btcd chaincfg, it is not a config item: " +
+	"sync-upgrade btcd on both sides, or drop the extra compile-time anchors added via extraBtcCheckpoints)"
 
 // traceHeaderToAnchor 判断"高度 height、hash 为 hash 的头"是否能沿 prevHash 回溯到锚点
 // （创世或 btcCheckpointTable 中的记录）。依赖 localDB 里按高度存的历史头。

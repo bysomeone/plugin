@@ -75,10 +75,13 @@ func (l *lightclient) Query_GetBtcNetName(req *types.ReqNil) (types.Message, err
 // Query_GetBtcCheckpoint 返回本网络最高的有效锚点（= bootstrap 的信任根），复用 ltypes.BtcHeader，
 // 不新增 proto。
 //
-// 用途（L2）：中继在链上头链还是空（tip==0）时用它断言 cfg.BtcHeaderStartHeight == 锚点高度 + 1。
+// 用途（L2）：中继在链上头链还是空（tip==0）时用它断言"本地推出的起点 == 本查询给出的锚点高度 + 1"。
+// 那个起点不是配置项，而是中继自己从同一份 chaincfg 推出的（neutrino 的 btcHeaderStartHeight）；
 // 起点与锚点不配套的话，bootstrap 的每个批都会被执行器以 ErrBtcHeaderNoAnchor 拒收（见
 // checkBootstrapAnchor），而中继自己不会退（同一个批重发多少次都一样）—— 中继启动期就把它变成一条
-// 显式的 ERROR，而不是让人从运行期的报错里反推配置。
+// 显式的 ERROR，而不是让人从运行期的报错里反推。两边对不上时**没有键可改**：唯一成因是两边 btcd 的
+// checkpoint 表不同源（两边 build 的 btcd 版本不同，或本执行器启用了 extraBtcCheckpoints），修法是
+// 同步升级两边的 btcd / 去掉额外锚点。
 //
 // 本网络没有锚点（regtest/testnet4/signet/simnet）时返回高度 0 的空头：调用方据此跳过断言，
 // 不做硬依赖。

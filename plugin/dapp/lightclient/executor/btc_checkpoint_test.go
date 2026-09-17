@@ -40,7 +40,8 @@ func restateChaincfg(p *chaincfg.Params) map[uint64]string {
 //
 // 这是**升级 btcd 的红灯**：锚点集合被依赖地改变了（新增/移除/换 hash），这个用例必须变红——
 // 它意味着执行器与中继（neutrino 把自己的头链硬锚在 btcd 的 checkpoint 上）的锚点集合一起变了，
-// 需要显式确认"所有节点同 build、btcHeaderStartHeight 是否要跟着调"（见 CONFIG.md 2.1.1）。
+// 需要显式确认"所有节点同 build"（中继的 bootstrap 起点由同一份 chaincfg 推出，会随锚点集合一起变，
+// 没有需要人工跟调的配置项；见 CONFIG.md 2.1.1）。
 // 变更这张表时请同步更新本用例里的常量，并说明理由。
 func TestBtcCheckpointTableGolden(t *testing.T) {
 	tests := []struct {
@@ -237,7 +238,8 @@ func TestQueryGetBtcCheckpoint(t *testing.T) {
 }
 
 // TestCheckBootstrapAnchorRejectDetail 覆盖 L1：bootstrap 锚点被拒时，错误（与日志同源）必须带上
-// "照做就能过"的信息 —— 本网络已知锚点高度列表、首个头高度、期望的 btcHeaderStartHeight。
+// "照做就能过"的信息 —— 本网络已知锚点高度列表、首个头高度、中继本该推出的提交起点
+// （expectedRelayStartHeight，诊断值不是配置项），以及成因提示（两边 btcd 不同源）。
 func TestCheckBootstrapAnchorRejectDetail(t *testing.T) {
 	regtest := &chaincfg.RegressionNetParams
 	ts := types.Now().Add(-time.Hour)
@@ -255,7 +257,10 @@ func TestCheckBootstrapAnchorRejectDetail(t *testing.T) {
 		require.Contains(t, msg, "genesisHash="+regtest.GenesisHash.String())
 		require.Contains(t, msg, "knownCheckpointHeights=[]")
 		require.Contains(t, msg, "highestCheckpoint=none")
-		require.Contains(t, msg, "btcHeaderStartHeight=1")
+		require.Contains(t, msg, "expectedRelayStartHeight=1")
+		// 提示必须把人引向"两边 btcd 同源"，而不是一个已经不存在的高度配置项。
+		require.Contains(t, msg, "not a config item")
+		require.Contains(t, msg, "sync-upgrade btcd on both sides")
 	})
 
 	t.Run("net with anchors tells the operator the expected start height", func(t *testing.T) {
@@ -271,7 +276,8 @@ func TestCheckBootstrapAnchorRejectDetail(t *testing.T) {
 		msg := err.Error()
 		require.Contains(t, msg, "knownCheckpointHeights=[100 200]")
 		require.Contains(t, msg, "highestCheckpoint=200:"+cp200.Hash)
-		require.Contains(t, msg, "expectedBtcHeaderStartHeight=201")
+		require.Contains(t, msg, "expectedRelayStartHeight=201")
+		require.Contains(t, msg, "not a config item")
 		require.Contains(t, msg, "firstHeight=5")
 	})
 
