@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/33cn/chain33/types"
+	"github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 )
@@ -35,9 +36,16 @@ func (n *neutrinoClient) SubmitConfirm(confirm *rtypes.ConfirmTx) error {
 	return err
 }
 
-// SignPsbt 通过 TSS 对 PSBT 签名，返回已签 PSBT 字节。
-func (n *neutrinoClient) SignPsbt(psbtBytes []byte) ([]byte, error) {
-	return n.tss.signPsbt(psbtBytes)
+// SignPsbt 通过 TSS 组对 RGB20 提现 PSBT 签名：把提现上下文（chain33 提现哈希、金额、费率、
+// 同步高度门槛、收款 invoice、consignment）一并下发，签名节点据此独立核对后参与 GG18（E11）。
+func (n *neutrinoClient) SignPsbt(req *rgb20.WithdrawSignRequest) ([]byte, error) {
+	return n.tss.signPsbt(req)
+}
+
+// SignPsbtTestOnly 仅供 E2E 的 sign-psbt 测试端点：无提现上下文，签名节点不做任何提现核对。
+// 由本地配置 rgb20.testSignPsbt 显式开启；生产路径不经过这里。
+func (n *neutrinoClient) SignPsbtTestOnly(psbtBytes []byte) ([]byte, error) {
+	return n.tss.signPsbtTestOnly(psbtBytes)
 }
 
 // BroadcastTx 从已签 PSBT 提取交易并广播，同时登记到 btcwallet pending 缓存用于确认跟踪

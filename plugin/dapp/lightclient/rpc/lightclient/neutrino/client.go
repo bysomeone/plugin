@@ -139,6 +139,8 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 		Precision:         n.cfg.Rgb20.Precision,
 		ChangeAddress:     n.cfg.Rgb20.ChangeAddress,
 		MinConfirmations:  n.cfg.BlockConfirmations,
+		// 无上下文的测试签名（E2E 的 sign-psbt 端点）：按配置透传，默认关闭。
+		TestSignPsbt: n.cfg.Rgb20.TestSignPsbt,
 		// 头链保留深度 B：头链只提交到 best - B，充值提交前的本地深度门控据此把链上判据换算成本地判据。
 		// 与头链提交（bitcoin.go 的 btcConfirmedHeight）取同一个配置项，不允许各自取值。
 		HeaderRelayConfirmations: n.cfg.BlockConfirmations,

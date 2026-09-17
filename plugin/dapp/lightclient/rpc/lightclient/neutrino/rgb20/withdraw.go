@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -42,6 +43,40 @@ type WithdrawResult struct {
 	ChangeSeal    string
 }
 
+// WithdrawSignPayload 是 RGB20 提现签名轮次下发给 TSS 组的提现上下文（**协调者的声称值**）。
+//
+// 签名节点不能只信这些字段：金额/费率/高度门槛/收款 invoice 都必须与链上 pending（按
+// Chain33TxHash 查得的真值）逐项比对，不一致即拒签（见 neutrino.handleRgb20WithdrawSign）。
+// 之所以还要带上它们，是为了让"协调者声称什么"与"链上说什么"的偏离本身成为一个可判定的
+// 拒绝理由，而不是默默按链上真值签（那会让签名节点对一笔自己没核对过的提现背书）。
+type WithdrawSignPayload struct {
+	Chain33TxHash    []byte `json:"chain33TxHash"`    // chain33 提现交易哈希
+	Amount           int64  `json:"amount"`           // 资产金额（最小单位）
+	FeeRate          int64  `json:"feeRate"`          // sat/vB
+	TxBlockHeight    int64  `json:"txBlockHeight"`    // chain33 提现交易高度（同步高度门槛基准）
+	RecipientInvoice string `json:"recipientInvoice"` // 用户 RGB 钱包 invoice
+}
+
+// WithdrawSignRequest RGB20 提现签名请求（协调者 → TSS 组）：
+// 提现上下文 + 待签 PSBT + consignment（签名节点独立校验所需的全部材料）。
+type WithdrawSignRequest struct {
+	WithdrawSignPayload
+	Psbt        []byte
+	Consignment []byte
+}
+
+// WithdrawSignReject 签名节点拒签回执（经 TSS 通知链回传协调者）。
+//
+// 只在**确定性拒签**（UnrecoverableWithdrawError）时发出：否则本节点拒签只表现为"组签名
+// 超时"，协调者会把该笔当可重试、每秒重试刷屏。Class/Reason 由协调者还原成
+// UnrecoverableWithdrawError 后走 retryRgb20Withdraw 的"停止重试"路径。
+type WithdrawSignReject struct {
+	Chain33TxHash []byte `json:"chain33TxHash"`
+	Class         string `json:"class"`
+	Reason        string `json:"reason"`
+	Rejector      string `json:"rejector"` // 拒签节点的 peer id（协调者据此核对来源）
+}
+
 // ValidateWithdrawRequest RGB20 提现交叉核对请求（BL-4/HR-3，签名节点用）。
 type ValidateWithdrawRequest struct {
 	Psbt                  []byte
@@ -52,6 +87,14 @@ type ValidateWithdrawRequest struct {
 	MinSyncedHeight       uint64
 	// FeeRate sat/vB：签名节点据此核对提现交易手续费在合理范围（防桥自有费输入被超收）。
 	FeeRate int64
+	// CheckSpentSeals 选填回调：在**全部交叉核对通过之后**、用同一份已验证事实同步调用，
+	// 参数是本笔实际花掉且被 consignment 关闭的 RGB seal 集合（详见 spentSealsOf）。
+	// 签名节点用它做 sticky seal 核对（E9-B）；协调者用它取回同一集合去记账。
+	// 回调返回错误即整次校验失败（拒签），错误原样上抛。
+	//
+	// 之所以做成回调而不是让调用方再算一次：sticky 核对必须落在**这一份**已验证的
+	// consignment 上，否则两次 ValidateConsignment 之间侧车状态可能变化（TOCTOU）。
+	CheckSpentSeals func(spentSeals []string) error
 }
 
 // rgb20RecipientDustCap 提现交易中允许离开桥控制（非 TSS 脚本）的输出金额上限（sats）。
@@ -61,8 +104,9 @@ const rgb20RecipientDustCap int64 = 100_000
 
 // UnrecoverableWithdrawError 标记"重试永远不可能成功"的 RGB20 提现失败：链上 pending 指向的
 // 状态在侧车已不存在（最典型的是账本被重建后资产被重新发行 → pending 的 invoice 编码的是老
-// asset_id，而 asset id 由 genesis seal 派生，重试不可能"变回来"）。调用方据此停止重试并落盘
-// 状态，而不是每秒重试、无限刷屏。
+// asset_id，而 asset id 由 genesis seal 派生，重试不可能"变回来"）；或者签名侧 sticky seal
+// 与本笔实际花掉的 seal 不一致（见 unrecoverableClassStickySealMismatch）。调用方据此停止
+// 重试并落盘状态，而不是每秒重试、无限刷屏。
 //
 // 注意：这不改变任何资金处置 —— 该 pending 会留在链上（用户已锁仓的资产如何处置属产品决策，
 // 桥不做自动退款）。
@@ -88,6 +132,18 @@ func IsUnrecoverableWithdraw(err error) (string, bool) {
 	return "", false
 }
 
+// NewUnrecoverableWithdrawError 按分类名重建不可恢复错误。
+//
+// 用途是跨进程传回：签名节点的拒签原因经 TSS 通知链回到协调者时只剩 JSON（class + reason
+// 文本），类型信息已丢失，协调者据此把它还原成同一套 UnrecoverableWithdrawError，走
+// retryRgb20Withdraw 的"停止重试"路径。
+func NewUnrecoverableWithdrawError(class string, reason error) *UnrecoverableWithdrawError {
+	if class == "" {
+		class = "permanent"
+	}
+	return &UnrecoverableWithdrawError{Class: class, Reason: reason}
+}
+
 // 判定"不可恢复"的两条依据（fail-closed，只收窄不放宽）：
 //  1. 侧车 gRPC 状态码 FailedPrecondition —— 侧车用它显式标记"重试无法成功"（engine
 //     PermanentError，见 rgb-sidecar service.rs）；
@@ -98,10 +154,26 @@ func IsUnrecoverableWithdraw(err error) (string, bool) {
 const (
 	unrecoverableClassAssetMismatch = "asset-contract-mismatch"
 	unrecoverableClassAssetGone     = "asset-not-issued"
+	// unrecoverableClassStickySealMismatch 本笔 chain33 burn 绑定的 RGB seal 集合与既有记录
+	// 不一致（E9）：要么签名节点算不出本笔花了哪个 seal，要么与"上一次为同一笔 burn 签名时"
+	// 绑定的 seal 不同。重试改变不了这个绑定关系（正确做法是维持原 seal 重放同一笔交易），
+	// 继续重试只会把同一笔 burn 换成另一组 seal 再付一次。
+	unrecoverableClassStickySealMismatch = "sticky-seal-mismatch"
 
 	unrecoverableMarkerContractMismatch = "!= asset contract "
 	unrecoverableMarkerAssetNotIssued   = "not issued"
+	// unrecoverableMarkerStickySealMismatch 是分类名本身：UnrecoverableWithdrawError.Error()
+	// 会把 class 打进文本（"unrecoverable rgb20 withdrawal (sticky-seal-mismatch): ..."），
+	// 因此签名节点的拒签原因即使经 TSS 通知链/日志跨进程回来、类型信息已丢失，也能按这段
+	// 措辞被认出来（见 classifyWithdrawSignError）。
+	unrecoverableMarkerStickySealMismatch = unrecoverableClassStickySealMismatch
 )
+
+// NewStickySealMismatchError 构造 sticky-seal-mismatch 分类的不可恢复错误。
+// 签名节点据此把"拒签原因"回传给协调者（经 TSS 通知链），协调者按 class 归类、停止重试。
+func NewStickySealMismatchError(reason error) *UnrecoverableWithdrawError {
+	return &UnrecoverableWithdrawError{Class: unrecoverableClassStickySealMismatch, Reason: reason}
+}
 
 // classifyWithdrawSidecarError 把侧车 BuildWithdrawal 的失败分为"可重试"与"不可恢复"。
 func classifyWithdrawSidecarError(err error) error {
@@ -123,6 +195,25 @@ func classifyWithdrawSidecarError(err error) error {
 		return &UnrecoverableWithdrawError{Class: unrecoverableClassAssetMismatch, Reason: err}
 	case strings.Contains(msg, unrecoverableMarkerAssetNotIssued):
 		return &UnrecoverableWithdrawError{Class: unrecoverableClassAssetGone, Reason: err}
+	}
+	return err
+}
+
+// classifyWithdrawSignError 把 TSS 签名失败按同样的口径分类：
+//   - 已经是 UnrecoverableWithdrawError（本地签名节点自己的拒绝，或协调者已还原过）→ 原样返回；
+//   - 否则按固定措辞识别（错误经 TSS 通知链/日志跨进程回来时只剩文本）。
+//
+// 与侧车错误的分类刻意分开：签名失败里绝大多数是超时等暂时性原因，不能误判为永久失败。
+func classifyWithdrawSignError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var u *UnrecoverableWithdrawError
+	if errors.As(err, &u) {
+		return err
+	}
+	if strings.Contains(err.Error(), unrecoverableMarkerStickySealMismatch) {
+		return &UnrecoverableWithdrawError{Class: unrecoverableClassStickySealMismatch, Reason: err}
 	}
 	return err
 }
@@ -189,28 +280,48 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 	}
 
 	// 构造签名节点交叉核对所需参数，先由主节点做一遍相同校验。
+	// stickySeals 必须由**同一份已验证事实**推出（PSBT 输入 ∩ consignment 关闭的 seal）：
+	// 协调者与签名节点用同一口径，否则同一笔提现在两侧记出不同的值、签名节点会把协调者
+	// 自己的合法提现也拒掉（见 CheckSpentSeals 的注释）。
+	var stickySeals []string
 	valReq := &ValidateWithdrawRequest{
 		Psbt:            rsp.Psbt,
 		Consignment:     rsp.Consignment,
 		ExpectedAmount:  req.Amount,
 		MinSyncedHeight: uint64(req.TxBlockHeight),
 		FeeRate:         req.FeeRate,
+		CheckSpentSeals: func(spentSeals []string) error {
+			stickySeals = spentSeals
+			return nil
+		},
 	}
 	if err := a.ValidateWithdrawPsbt(valReq); err != nil {
 		return nil, fmt.Errorf("validate withdrawal: %w", err)
 	}
-	// sticky-seal：持久化该笔提现绑定的 seal（重试时不可改选）。
-	if err := a.persistStickySeal(req.Chain33TxHash, rsp.Psbt); err != nil {
+	// sticky-seal：持久化该笔提现绑定的 seal（重试时不可改选；已有记录必须一致，绝不覆盖）。
+	if err := a.persistStickySeal(req.Chain33TxHash, stickySeals); err != nil {
 		return nil, err
 	}
 
-	// TSS 签名（主节点下发 PSBT+consignment，签名节点独立校验后 signPsbt）。
+	// TSS 签名（主节点下发 PSBT+consignment+提现上下文，签名节点独立核对后 signPsbt）。
 	if a.bridge == nil {
 		return nil, fmt.Errorf("chain33 bridge not set")
 	}
-	signedPsbt, err := a.bridge.SignPsbt(rsp.Psbt)
+	signedPsbt, err := a.bridge.SignPsbt(&WithdrawSignRequest{
+		WithdrawSignPayload: WithdrawSignPayload{
+			Chain33TxHash:    req.Chain33TxHash,
+			Amount:           req.Amount,
+			FeeRate:          req.FeeRate,
+			TxBlockHeight:    req.TxBlockHeight,
+			RecipientInvoice: req.RecipientInvoice,
+		},
+		Psbt:        rsp.Psbt,
+		Consignment: rsp.Consignment,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("sign psbt: %w", err)
+		// 签名失败的错误经 TSS 通知链回来（可能是签名节点的确定性拒签回执），按同一套口径
+		// 分类：确定性拒签 ⇒ 不可恢复（停止重试），其余保持可重试。
+		return nil, fmt.Errorf("sign psbt: %w", classifyWithdrawSignError(err))
 	}
 
 	// Finalize（send_end）。
@@ -418,6 +529,13 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 	if v.SyncedHeight < req.MinSyncedHeight {
 		return fmt.Errorf("sidecar synced height too low: %d < %d", v.SyncedHeight, req.MinSyncedHeight)
 	}
+	// 全部交叉核对已通过：把「本笔实际花掉且被 consignment 关闭的 RGB seal 集合」交给调用方
+	// （签名节点据此做 sticky 核对 E9-B；协调者据此记账）。用同一份已验证事实，避免 TOCTOU。
+	if req.CheckSpentSeals != nil {
+		if err := req.CheckSpentSeals(spentSealsOf(psbtInputs, v.GetClosedSeals())); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -530,20 +648,117 @@ func psbtInputOutpoints(p *psbt.Packet) []string {
 	return out
 }
 
-// persistStickySeal 从 PSBT 输入提取 seals，持久化绑定到 chain33 提现哈希。
-func (a *Adapter) persistStickySeal(chain33Hash []byte, psbtBytes []byte) error {
-	p, err := psbt.NewFromRawBytes(bytes.NewReader(psbtBytes), false)
-	if err != nil {
-		return fmt.Errorf("decode psbt: %w", err)
+// spentSealsOf 求「本笔实际花掉且被 consignment 关闭的 RGB seal 集合」：
+// PSBT 输入 ∩ consignment 的 closed_seals。
+//
+// 口径说明（协调者记账与签名节点核对必须完全一致）：
+//   - closed_seals 是侧车按**自己的账本**解析出的、本笔状态转移真正关闭的 seal（含历史
+//     bundle 里更早关闭的 seal），故要与本笔 PSBT 的输入取交集才是"本笔花掉的"；
+//   - 交集为空意味着这份 consignment 没有把任何 seal 绑到这笔 burn 上——E9 的漏洞形态本身
+//     就是"一笔 chain33 burn ↔ 一组 RGB seal"的绑定缺失，因此调用方（CheckStickySeal /
+//     persistStickySeal）对空集一律 fail-closed 拒绝，而不是当成"没有记录"放行。
+func spentSealsOf(psbtInputs []string, closedSeals []string) []string {
+	inPSBT := make(map[string]struct{}, len(psbtInputs))
+	for _, op := range psbtInputs {
+		inPSBT[op] = struct{}{}
 	}
-	inputs := psbtInputOutpoints(p)
-	if len(inputs) == 0 {
-		return fmt.Errorf("no inputs in psbt")
+	out := make([]string, 0, len(closedSeals))
+	for _, cs := range closedSeals {
+		if _, ok := inPSBT[cs]; ok {
+			out = append(out, cs)
+		}
 	}
-	// 取第一个输入作为 sticky seal：RGB seal 输入恒排在 PSBT 输入最前（build_transfer 先列
-	// RGB seal、后追加桥自有费输入），最后一个输入可能是纯 BTC 费输入而非 RGB seal。
-	seal := inputs[0]
-	return a.store.Put(withdrawStickySealBucket, chain33Hash, []byte(seal))
+	return out
+}
+
+// encodeStickySeals 把 seal 集合编码成可落盘、可逐字节比较的规范形式：
+// 去空、去重、按 outpoint 字典序升序、逗号分隔。用集合而非单个 outpoint 是因为侧车一次
+// 提现可能花掉多个 seal（build_transfer 按面额拼凑）。
+func encodeStickySeals(seals []string) string {
+	seen := make(map[string]struct{}, len(seals))
+	uniq := make([]string, 0, len(seals))
+	for _, s := range seals {
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		uniq = append(uniq, s)
+	}
+	sort.Strings(uniq)
+	return strings.Join(uniq, ",")
+}
+
+// CheckStickySeal 签名节点侧 sticky seal 核对（E9-B）：一笔 chain33 burn 只能绑定一组 RGB seal。
+//
+//   - 本地无记录（本笔首次签名）⇒ 放行。记录必须由签名成功之后的 SetStickySeal 写入，否则
+//     一次失败签名会把该笔提现的合法重试永久锁死；
+//   - 有记录 ⇒ 必须与本笔实际花掉的 seal 集合完全一致，否则拒签（sticky-seal-mismatch）。
+//
+// 空集合一律拒签：本核对的全部意义就是把 burn 绑到 seal 上，放行空集等于本核对不存在。
+func (a *Adapter) CheckStickySeal(chain33Hash []byte, spentSeals []string) error {
+	if len(chain33Hash) == 0 {
+		return NewStickySealMismatchError(fmt.Errorf("empty chain33 withdraw hash"))
+	}
+	want := encodeStickySeals(spentSeals)
+	if want == "" {
+		return NewStickySealMismatchError(fmt.Errorf("no rgb seal is spent by this withdrawal"))
+	}
+	recorded := a.GetStickySeal(chain33Hash)
+	if recorded == "" {
+		return nil // 首次：放行（见函数注释）
+	}
+	if recorded != want {
+		return NewStickySealMismatchError(fmt.Errorf("sticky seal changed: recorded=%s spending=%s", recorded, want))
+	}
+	return nil
+}
+
+// SetStickySeal 落盘该笔提现绑定的 seal 集合。**只能在签名成功之后调用**（镜像 BTC 侧
+// handleSignNotify → setWithdrawStickyUTXO）：签名前写会让一次失败签名锁死合法重试。
+//
+// 已存在且不一致时拒绝写入并报错：签名已经发生，此时能做的只是不再让记录被冲掉，
+// 由调用方记录 ERROR 暴露异常。
+func (a *Adapter) SetStickySeal(chain33Hash []byte, spentSeals []string) error {
+	want := encodeStickySeals(spentSeals)
+	if want == "" {
+		return fmt.Errorf("no rgb seal to bind")
+	}
+	a.stickySealMu.Lock()
+	defer a.stickySealMu.Unlock()
+	if recorded := a.GetStickySeal(chain33Hash); recorded != "" && recorded != want {
+		return NewStickySealMismatchError(fmt.Errorf("refuse to overwrite sticky seal: recorded=%s signed=%s", recorded, want))
+	}
+	return a.store.Put(withdrawStickySealBucket, chain33Hash, []byte(want))
+}
+
+// persistStickySeal 把该笔提现绑定的 RGB seal 集合落盘（键 = chain33 提现哈希）。
+//
+// **绝不覆盖**：已有记录时要求与本次构建出的集合完全一致，不一致即判为不可恢复失败。
+// 这条是 E9 的提交侧防线——`Withdraw()` 每次重试都会重新构建（可能因账本推进选到另一组
+// seal），覆盖写会把"上一份已签名/已发出"的绑定抹掉，让同一笔 burn 换一组 seal 再付一次
+// （用户得两份资产、链上只结算一次，缺口由桥的 RGB 储备承担）。
+func (a *Adapter) persistStickySeal(chain33Hash []byte, spentSeals []string) error {
+	if len(chain33Hash) == 0 {
+		return fmt.Errorf("empty chain33 withdraw hash")
+	}
+	want := encodeStickySeals(spentSeals)
+	if want == "" {
+		// fail-closed：算不出本笔绑定的 seal 就不提现（否则本记录与签名侧的核对都形同虚设）。
+		return NewStickySealMismatchError(fmt.Errorf("no rgb seal is spent by this withdrawal"))
+	}
+	a.stickySealMu.Lock()
+	defer a.stickySealMu.Unlock()
+	recorded := a.GetStickySeal(chain33Hash)
+	switch {
+	case recorded == want:
+		return nil // 重试构建出同一组 seal：幂等重放，合法
+	case recorded != "":
+		return NewStickySealMismatchError(fmt.Errorf("sticky seal changed: recorded=%s spending=%s", recorded, want))
+	}
+	return a.store.Put(withdrawStickySealBucket, chain33Hash, []byte(want))
 }
 
 // GetStickySeal 读取该笔提现绑定的 sticky seal。

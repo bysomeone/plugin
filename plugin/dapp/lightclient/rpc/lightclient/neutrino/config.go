@@ -75,6 +75,10 @@ type rgb20Config struct {
 	Precision uint32 `json:"precision"`
 	// ChangeAddress 提现找零地址（TSS P2WPKH 地址）；留空则由 TSS 地址自动填充。
 	ChangeAddress string `json:"changeAddress"`
+	// TestSignPsbt 是否允许"无提现上下文的 PSBT 签名"（E2E 的 sign-psbt 测试端点用）。
+	// 该能力等价于"用 TSS 组私钥签任意 PSBT"（签名节点无从核对被签内容），**生产必须为 false**
+	// （默认 false），只有 E2E/regtest 部署显式打开。
+	TestSignPsbt bool `json:"testSignPsbt"`
 }
 
 // rgb20Contract RGB20 资产合约注册项。
