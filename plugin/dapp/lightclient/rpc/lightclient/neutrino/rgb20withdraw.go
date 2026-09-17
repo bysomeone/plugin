@@ -35,7 +35,7 @@ func (n *neutrinoClient) TSSPkScript() []byte {
 
 // IsUserDepositScript 判断某个输入脚本是否为桥已登记（发放过地址 + 在 watch 集里）的用户
 // P2WSH 充值脚本，返回其 userID。签名节点交叉核对提现 PSBT 输入归属时用（C3）：
-// 这类脚本的 program 也是 TSS 群钥的脚本，只有 GG18 签名才能花，因此必须被认作"受桥控制"。
+// 这类脚本的 program 也是 TSS 群钥的脚本，只有 CGGMP 组签名才能花，因此必须被认作"受桥控制"。
 func (n *neutrinoClient) IsUserDepositScript(pkScript []byte) (string, bool) {
 	if n == nil {
 		return "", false
@@ -50,7 +50,7 @@ func (n *neutrinoClient) SubmitConfirm(confirm *rtypes.ConfirmTx) error {
 }
 
 // SignPsbt 通过 TSS 组对 RGB20 提现 PSBT 签名：把提现上下文（chain33 提现哈希、金额、费率、
-// 同步高度门槛、收款 invoice、consignment）一并下发，签名节点据此独立核对后参与 GG18（E11）。
+// 同步高度门槛、收款 invoice、consignment）一并下发，签名节点据此独立核对后参与 CGGMP 组签名（E11）。
 func (n *neutrinoClient) SignPsbt(req *rgb20.WithdrawSignRequest) ([]byte, error) {
 	return n.tss.signPsbt(req)
 }

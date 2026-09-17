@@ -356,11 +356,17 @@ P2WSH 充值地址上线后，用户的充值**不再进主池**（钱停在各�
   - 含义：TSS 参与节点地址列表
   - 要求：所有参与节点配置一致
 - `threshold` (uint32)
-  - 含义：阈值签名门限（t-of-n 中的 t）
-  - 建议：按容错策略设置，且不大于节点总数
+  - 含义：阈值签名门限（t-of-n 中的 t），且不大于节点总数
+  - **同时是签名者个数**：CGGMP 的 `ProcessSign` 要求 `len(peers) == threshold`，每轮签名只挑
+    `threshold` 个节点参与（挑法见 4.3.2）。4 节点取 3 即 3-of-4。
 - `rank` (uint32)
-  - 含义：节点角色标识（用于区分官方/验证角色）
-  - 要求：同一节点在全网配置必须稳定一致
+  - 含义：本节点的 **Birkhoff rank**（alice CGGMP 的导数阶，**不是**节点序号），必须满足
+    **`rank + 1 < threshold`**（即 `rank <= threshold - 2`）。
+  - 建议取值：**4 节点 + `threshold=3` ⇒ `{0,1,1,1}`**（官方节点 `0`，其余三个第三方节点都是 `1`）。
+    **多个节点共用同一个 rank 是正常的**——alice 用各自的 x 坐标区分同 rank 的参与者；
+    照抄"`0,1,2,3`"这种索引式分配会被 alice 的 `EnsureRank` 直接拒，DKG 永远跑不起来。
+  - 要求：同一节点在全网配置必须稳定一致；不合规时**启动自检直接拒绝启动**（见 4.3.2），
+    不会退化成"每 60s 重试一次 DKG"。
 - `allowShareMismatch` (bool)
   - 含义：**逃生阀**，默认 `false`（不写即关闭）。见 4.3.1：启动自检发现本地 share 与链上组公钥
     不一致时，关闭（默认）即**拒绝启动**；打开后只打 ERROR 日志、照常启动。
@@ -369,7 +375,7 @@ P2WSH 充值地址上线后，用户的充值**不再进主池**（钱停在各�
 #### 4.3.1 启动自检：share ↔ 链上组公钥一致性（无配置项，逃生阀见 4.3）
 
 - 含义：中继启动时（`client.Start()` 最开始，早于 TSS/RGBX 任何后台流程）读本地持久化的 DKG 结果
-  （`neutrino.db` 的 bucket `rgbx-tss` / key `dkg-result`，即该节点的 share 对应的组公钥），
+  （`neutrino.db` 的 bucket `rgbx-tss` / key `cggmp-dkg-result`，即该节点的 share 对应的组公钥），
   对每个已知 symbol（`BTC` + `[rpc.sub.light.neutrino.rgb20]` 里注册的每个 `contracts.symbol`）
   查链上 `CrossChainInfo`，不一致即 **ERROR + 拒绝启动**（panic，节点退出）。
 - 为什么 fail-closed：链上 `CrossChainInfo` **每个 symbol 只有一份、且写死不可改**（re-DKG 换出的
@@ -384,7 +390,7 @@ P2WSH 充值地址上线后，用户的充值**不再进主池**（钱停在各�
   - 链上两者都没有 → 没有判据，不判定。
 - **三种情形不判定**（不把正常的当异常）：① 链上还没有该 symbol 的 `CrossChainInfo`（DKG 尚未
   commit，或主链查询不可用/不支持）；② 本地还没有 DKG 结果（首次启动、DKG 还没跑）；③ 本地 DKG
-  记录读出来解不开（损坏；那条路径的既有处置是重新 DKG，不在这里改它的行为）。
+  记录读出来解不开（损坏）。
 - 查询有界：自检在主链 grpc 上带 8s 超时 + 最多 2 次尝试（只对传输层错误重试），**不会因为主链
   `QueryChain` hang 而卡住启动**；查不到按"不判定"处理。
 - 逃生阀：`tss.allowShareMismatch=true`（见 4.3）。打开后不一致只打一条 ERROR 日志、照常启动——
@@ -392,6 +398,37 @@ P2WSH 充值地址上线后，用户的充值**不再进主池**（钱停在各�
 - 恢复办法（真出现不一致时）：把**与链上同一代**的 `neutrino.db` 还原回去（备份里有就还原），
   或重建整组（清链重跑 DKG）。**重新 DKG 不能修**：新组公钥上不了链（同 symbol 的
   `CrossChainInfo` 已被占死）。
+
+#### 4.3.2 CGGMP 密钥材料的落盘、备份与"只许 refresh、不许 re-DKG"
+
+签名协议是 **CGGMP**（不再是 GG18），因此每个节点要持久化**两份**材料，都在
+`neutrino.db` 的 bucket `rgbx-tss` 里（同一份数据库文件，按"整个数据目录"备份即可覆盖）：
+
+| key | 内容 | 敏感度 |
+|---|---|---|
+| `cggmp-dkg-result` | 群公钥、本节点 share、各节点 Birkhoff 参数、DKG rid、各节点 partial pubkey | **等同私钥 share** |
+| `cggmp-refresh-result` | refresh 后的 share、**本节点 Paillier 私钥素数**（`paillierP/Q`）、`ySecret`、各节点 Pedersen/ppk/y 参数 | **等同私钥 share**（Paillier 素数 + share 即可参与组签名） |
+
+- **备份范围必须同时包含两者**：只备份 `cggmp-dkg-result` 是不完整的。两条记录都是**明文 JSON**
+  （与本地其它 TSS 材料一样不做额外加密），备份介质的机密性要求与私钥一致。
+- **refresh 是必经阶段，不是可选优化**：DKG 之后每把钥必须跑一次 refresh 才能签名（Paillier /
+  Pedersen 材料由它一次性 provision），产物落盘后**每次签名复用**，不是每签一次跑一次。
+  启动时若发现本地没有与当前 DKG（按 `rid` 比对）配套的 refresh 记录，会自动补跑一轮
+  （会话名由 `rid` 派生，因此**缺记录的节点必须一起重启**才会落在同一轮；正常路径不会出现
+  部分节点缺记录——两条记录是同一条启动路径上先后两步写入的）。
+- **超时按阶段给**：DKG/PPK/签名沿用包装器默认 30s，**refresh 给 5 分钟**——它要在每个节点上
+  现生成 2048-bit Paillier 安全素数（本机 4 节点实测 ≈23s），30s 在真实网络下必炸。
+- **rank 自检**：启动时按 4.3 的规则校验 `rank + 1 < threshold`，不合规即拒绝启动
+  （`validateCggmpRank`）。
+- **链上已有该 symbol 的 `CrossChainInfo` 时，禁止自动重跑 DKG**（资金安全闸门）：此时本节点没有
+  DKG 结果（容器重建 / 数据目录被清）就**拒绝启动**（panic，见 `errRedkgRefusedOnChainWithoutLocalShare`），
+  因为 re-DKG 会换出新的群公钥，而链上那把钥每个 symbol 只有一份、写死不可改 ⇒ 已发放的 P2WSH
+  充值地址收到的 BTC 永远花不出去、RGB20 的 `threshold_sig` 永远验不过，**资金永久锁死**。
+  正确处置：① 从**同一代**备份还原 `neutrino.db`；② 整组重建（那就要连链一起重建：全新链上没有
+  旧记录）；③ **只换密钥材料、不换群公钥**的诉求走 refresh（删掉所有签名节点的
+  `cggmp-refresh-result` 后一起重启，即补跑一节所述）。
+- 同类闸门：链上记录存在但群公钥**是另一把**时，`ensureDKGOnChain` 不再"报 stall 无限等"，而是
+  直接拒绝启动（不可自愈，且不能靠重跑 DKG 修）。
 
 ### 4.4 `[rpc.sub.light.neutrino.rgb20]`
 
