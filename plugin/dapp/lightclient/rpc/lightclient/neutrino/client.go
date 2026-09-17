@@ -22,7 +22,7 @@ import (
 	"github.com/33cn/chain33/queue"
 	"github.com/33cn/chain33/rpc/grpcclient"
 	"github.com/33cn/chain33/system/crypto/secp256k1"
-	"github.com/33cn/chain33/system/crypto/tss"
+	"github.com/33cn/chain33/system/crypto/tss/cggmp"
 	"github.com/33cn/chain33/types"
 	"github.com/lightninglabs/neutrino/headerfs"
 
@@ -121,7 +121,7 @@ func (n *neutrinoClient) Init(ctx context.Context, q queue.Queue, cfg *lightclie
 	// RGB20 适配器：所有节点都需要（签名节点只读校验 ValidateConsignment/交叉核对）。
 	// 不能放在 IsOfficialNode 分支里，否则 para2-4（validator）不创建 adapter，
 	// handleRgb20DepositSign/handleRgb20WithdrawSign 报 "rgb20 adapter not configured"，
-	// 不参与 deposit/withdraw 的 GG18 组签名（组签名超时）。
+	// 不参与 deposit/withdraw 的 CGGMP 组签名（组签名超时）。
 	if err := n.initRgb20Adapter(); err != nil {
 		log.Error("Init", "initRgb20Adapter error", err)
 		return err
@@ -210,7 +210,7 @@ func (n *neutrinoClient) Start() {
 	go n.subMsg()
 	go n.cleanUp()
 	// RGB20 侧车连接：所有节点都需要（签名节点只读校验 ValidateConsignment/交叉核对）。
-	// 侧车可能晚于本节点启动（需先拿到 GG18 公钥再起侧车），这里后台重试。
+	// 侧车可能晚于本节点启动（需先拿到 TSS 群公钥再起侧车），这里后台重试。
 	if n.rgb20 != nil {
 		go func() {
 			n.waitUntilDone("rgb20 connect", func() bool {
@@ -470,8 +470,8 @@ func (n *neutrinoClient) shareCheckSymbols() []string {
 	return symbols
 }
 
-// loadTssGroupPubKeyFromDB 从中继自己的 neutrino.db 读 DKG 结果（bucket rgbx-tss / key dkg-result，
-// 与 tss.go 的 loadDKGFromDB 同一份数据）并解出组公钥。
+// loadTssGroupPubKeyFromDB 从中继自己的 neutrino.db 读 CGGMP DKG 结果（bucket rgbx-tss /
+// key cggmp-dkg-result，与 tss.go 的 loadDKGFromDB 同一份数据）并解出组公钥。
 //
 // 读不到（bucket/key 不存在 = 首次启动、DKG 还没跑、数据目录被清）返回 (nil, nil) —— 情形②；
 // 读得到但解不开（记录损坏）返回 error —— 情形③，由调用方按"不判定"处理。
@@ -500,11 +500,11 @@ func (n *neutrinoClient) loadTssGroupPubKeyFromDB() (*btcec.PublicKey, error) {
 		}
 		return nil, err
 	}
-	var dkgResult tss.DKGResult
-	if err := types.Decode(dkgData, &dkgResult); err != nil {
-		return nil, fmt.Errorf("decode local dkg result: %w", err)
+	var dkgResult cggmp.DKGResult
+	if err := json.Unmarshal(dkgData, &dkgResult); err != nil {
+		return nil, fmt.Errorf("decode local cggmp dkg result: %w", err)
 	}
-	pub, err := tss.ParseBtcecPublicKey(&dkgResult)
+	pub, err := groupPubKeyFromDKG(&dkgResult)
 	if err != nil {
 		return nil, fmt.Errorf("parse local dkg group pubkey: %w", err)
 	}

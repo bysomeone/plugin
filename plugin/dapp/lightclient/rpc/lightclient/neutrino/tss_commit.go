@@ -71,8 +71,8 @@ func (t *tssService) buildCommitDKGPayload(symbol string) *rtypes.CommitDKG {
 // 状态未达成时按原因分类报告（首次/原因变化/每 commitDKGStallRepeatLogs 次各报一条），
 // 持续超过 commitDKGStallErrorAfter 升级为 ERROR —— 需要运维介入的形态（链上是另一把钥、
 // guardian 未凑齐、本节点不是合法提交者）必须能一眼看见，且不该靠"多试几次"自愈。
-func (t *tssService) commitDKGToChain(payload *rtypes.CommitDKG) {
-	t.commitDKGToChainWith(t.client.ctx, payload, t.client.queryCrossChainInfoBounded, t.submitDKGToMainChain)
+func (t *tssService) commitDKGToChain(payload *rtypes.CommitDKG) error {
+	return t.commitDKGToChainWith(t.client.ctx, payload, t.client.queryCrossChainInfoBounded, t.submitDKGToMainChain)
 }
 
 // submitDKGToMainChain 生产路径的提交依赖（单测用替身注入，见 commitDKGToChainWith）。
@@ -82,12 +82,16 @@ func (t *tssService) submitDKGToMainChain(exec, action string, payload *rtypes.C
 
 // commitDKGToChainWith 是 commitDKGToChain 的实现，两个外部依赖（查链上状态、提交）显式传入，
 // 便于单测覆盖三种判据（链上无记录 ⇒ 提交、链上另一把钥 ⇒ 不提交、链上同一把钥 ⇒ 不重复提交）。
+//
+// 返回值只有一种情况非 nil：**链上已有该 symbol 且是另一把群公钥**（不可自愈，调用方据此拒绝启动）。
+// "链上还没出现 / 查询暂时不可用"都是等待，不是错误——它们会自愈（出块、grpc 恢复），
+// 所以这个循环不设放弃、也不上抛。
 func (t *tssService) commitDKGToChainWith(ctx context.Context, payload *rtypes.CommitDKG,
 	query func(symbol string) (*rtypes.CrossChainInfo, error),
-	submit func(exec, action string, payload *rtypes.CommitDKG) (string, error)) {
+	submit func(exec, action string, payload *rtypes.CommitDKG) (string, error)) error {
 
 	if payload == nil {
-		return
+		return nil
 	}
 	symbol := payload.GetAssetSymbol()
 	localPub := payload.GetPubkey()
@@ -104,7 +108,7 @@ func (t *tssService) commitDKGToChainWith(ctx context.Context, payload *rtypes.C
 		case <-ctx.Done():
 			log.Warn("commitDKGToChain client shutting down, stop waiting for the on-chain state",
 				"symbol", symbol)
-			return
+			return nil
 		default:
 		}
 		info, err := query(symbol)
@@ -119,15 +123,20 @@ func (t *tssService) commitDKGToChainWith(ctx context.Context, payload *rtypes.C
 		case err == nil && bytes.Equal(info.GetPubkey(), localPub):
 			log.Info("commitDKG confirmed on chain", "symbol", symbol, "attempt", attempt,
 				"elapsed", time.Since(start).String(), "tssAddress", info.GetTssAddress())
-			return
+			return nil
 
 		case err == nil:
-			// 链上已有该 symbol，但群公钥不是本地这把：不可自愈（同一 symbol 只能提交一次，
+			// 链上已有该 symbol，但群公钥不是本地这把：**不可自愈**（同一 symbol 只能提交一次，
 			// 换钥被 ErrDuplicateDKGCommit 挡住），桥发的充值地址执行器永远不认。
-			reportCommitDKGStall(&reported, &lastReportAt, attempt, start,
-				"on-chain cross chain info carries a different tss pubkey",
+			//
+			// 以前这里只是"报 stall 然后无限等"：日志刷得再多，节点也仍然活着、仍然参与签名，
+			// 于是静态失灵被拖成"能跑但产出无人认"。现在直接上抛 —— 调用方 fail-closed
+			// 拒绝启动（见 ensureDKGOnChainWith），把不可逆的后果挡在启动阶段。
+			log.Error("commitDKG on-chain cross chain info carries a different tss pubkey",
 				"symbol", symbol, "localPubkey", hexOrEmpty(localPub), "chainPubkey", hexOrEmpty(info.GetPubkey()),
 				"chainTssAddress", info.GetTssAddress())
+			return fmt.Errorf("%w: symbol=%s localPubkey=%s chainPubkey=%s",
+				errChainGroupKeyMismatch, symbol, hexOrEmpty(localPub), hexOrEmpty(info.GetPubkey()))
 
 		case errors.Is(err, errCrossChainInfoNotOnChain):
 			if submitted {
