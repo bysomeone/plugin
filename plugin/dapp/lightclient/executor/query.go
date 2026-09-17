@@ -14,21 +14,58 @@ func (l *lightclient) Query_GetBtcLastHeader(req *types.ReqNil) (types.Message, 
 	return header, err
 }
 
+// Query_GetBtcHeader 按高度返回 canonical 链上的 BTC 头。
+//
+// 读的是 localdb（节点私有），而读方是 rgbx 的共识判定 → 必须先做两道交叉校验（见 btc_index_guard.go）：
+//  1. localdb 在共识 tip 高度上的头要与 statedb 的 btc-lastheader 一致（丢库/落后/停在别的链上直接拒）；
+//  2. 请求高度落在 statedb 的 canonical 窗口里时，头必须与窗口节点的 hash 一致（hash 已承诺 merkleRoot，
+//     所以这一步等价于校验 merkleRoot）；窗口里没有这条则维持原行为。
 func (l *lightclient) Query_GetBtcHeader(req *ltypes.ReqGetBtcHeader) (types.Message, error) {
-
+	allow := lightCfg.AllowBtcIndexMismatch
+	if err := checkBtcLocalIndexTip(l.GetStateDB(), l.GetLocalDB(), allow); err != nil {
+		return nil, err
+	}
 	header, err := getBtcHeader(l.GetLocalDB(), req.GetHeight())
-	return header, err
+	if err != nil {
+		return nil, err
+	}
+	state, err := getBtcChainState(l.GetStateDB())
+	if err != nil {
+		elog.Error("Query_GetBtcHeader getBtcChainState", "height", req.GetHeight(), "err", err)
+		return nil, err
+	}
+	if err := checkBtcHeaderCanonical(state, header, allow); err != nil {
+		return nil, err
+	}
+	return header, nil
 }
 
+// Query_GetBtcHeaderByHash 按 hash 返回 canonical 链上的 BTC 头（先经 localdb 的 hash → height 索引）。
+// 交叉校验与 Query_GetBtcHeader 相同：索引越旧/错位时，取到的头与窗口节点对不上就会被拒，
+// 而不是返回一个"查得到但不是它"的头。
 func (l *lightclient) Query_GetBtcHeaderByHash(req *types.ReqString) (types.Message, error) {
-
+	allow := lightCfg.AllowBtcIndexMismatch
+	if err := checkBtcLocalIndexTip(l.GetStateDB(), l.GetLocalDB(), allow); err != nil {
+		return nil, err
+	}
 	height, err := getBtcHeight(l.GetLocalDB(), req.GetData())
 	if err != nil {
 		elog.Error("Query_GetBtcHeaderByHash", "hash", req.GetData(), "err", err)
 		return nil, err
 	}
 	header, err := getBtcHeader(l.GetLocalDB(), uint64(height.GetData()))
-	return header, err
+	if err != nil {
+		return nil, err
+	}
+	state, err := getBtcChainState(l.GetStateDB())
+	if err != nil {
+		elog.Error("Query_GetBtcHeaderByHash getBtcChainState", "hash", req.GetData(), "err", err)
+		return nil, err
+	}
+	if err := checkBtcHeaderCanonical(state, header, allow); err != nil {
+		return nil, err
+	}
+	return header, nil
 }
 
 func (l *lightclient) Query_GetBtcNetName(req *types.ReqNil) (types.Message, error) {
