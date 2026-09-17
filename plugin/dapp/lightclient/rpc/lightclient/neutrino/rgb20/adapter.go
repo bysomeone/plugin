@@ -36,10 +36,6 @@ type Config struct {
 	//
 	// 0 = 未配置（等价于"头链不保留深度"，只影响门控的保守程度，不影响链上校验）。
 	HeaderRelayConfirmations uint32
-	// SignedDepositTTL 签名侧"已签集合"的保留期（TTL），单位 = BTC 区块数。
-	// <= 0（默认 0）= 只增不删（永久保留）；正数 = 已签记录保留 N 个 BTC 块，到期后可被清理、
-	// 同一 txid 允许再次签名。语义与重启行为见 CONFIG.md 4.4 与 signedset.go。
-	SignedDepositTTL int64
 }
 
 // Contract 一个 RGB20 资产的合约注册项。
@@ -141,10 +137,6 @@ type Chain33Bridge interface {
 	SignDepositMessage(payload *DepositSignPayload) ([]byte, error)
 	// SignPsbt 通过 TSS 对 PSBT 签名，返回已签 PSBT 字节。
 	SignPsbt(psbtBytes []byte) ([]byte, error)
-	// BtcTipHeight 返回链上 lightclient 头链的 canonical tip 高度（BTC 高度）。
-	// 已签集合的 TTL 判定用它当"当前高度"：所有节点（含没有本地 neutrino 头库的 validator 节点）
-	// 都查主链，结果一致、单调，且不受本机时钟漂移影响；链上还没有任何头时返回 0。
-	BtcTipHeight() (uint64, error)
 	// BtcBestHeight 返回本节点 BTC 视图的 best height（中继自己的头链视图，与头链提交同源）。
 	// 充值提交前的本地深度门控用它算"提交那一刻链上可见 tip 到哪"；取不到时返回错误（门控 fail-closed）。
 	BtcBestHeight() (uint64, error)
@@ -187,12 +179,6 @@ type RGB20Adapter interface {
 	SetBridge(b Chain33Bridge)
 	// ValidateDepositConsignment 签名节点对 rgb20-deposit 消息做独立校验。
 	ValidateDepositConsignment(payload *DepositSignPayload) error
-	// CheckDepositSigned 签名侧去重（A3 后半）：payload 的付款交易已签过则返回错误。
-	CheckDepositSigned(payload *DepositSignPayload) error
-	// MarkDepositSigned 登记 payload 的付款交易为已签（幂等，须在签名成功之后调用）。
-	MarkDepositSigned(payload *DepositSignPayload) error
-	// PruneSignedDeposits 按当前 TTL 清理过期的已签记录（启动/改配置重启后立即执行一次）。
-	PruneSignedDeposits() error
 	// ValidateWithdrawPsbt 签名节点对 rgb20 提现 PSBT+consignment 做交叉核对（BL-4/HR-3）。
 	ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error
 	// BuildDepositSignMessage 构造 rgb20-deposit 签名消息（主节点侧）。
@@ -211,9 +197,7 @@ type Adapter struct {
 	reg      *Registry
 	cfg      Config
 	bridge   Chain33Bridge
-	// signed 已签集合（签名侧去重，A3 后半）。
-	signed *SignedDepositSet
-	// depositSigs 已签充值的落盘产物（签名轮次的产出，提交失败/深度不够时只重发，见 deposit.go 与
+	// depositSigs 已签充值的落盘产物（签名轮次的产出：提交失败/深度不够时只重发，见 deposit.go 与
 	// depositsig.go）。
 	depositSigs *DepositSignatureStore
 	// depositNotes 充值重试路径的日志限流（30s 轮询会把同一个状态反复带回来，同一个 key 只报一次）。
@@ -243,20 +227,9 @@ func NewAdapter(cfg Config, store KVStore) (*Adapter, error) {
 		cancel:       cancel,
 		depositNotes: newDepositNoteOnce(),
 	}
-	// 已签集合：TTL 判定的"当前高度"经 btcTipHeight 走桥接查链上 tip（SetBridge 之后才可用；
-	// TTL <= 0 时根本不会调用它）。
-	a.signed = newSignedDepositSet(store, cfg.SignedDepositTTL, a.btcTipHeight)
-	// 已签充值的落盘产物：与 receive/seal/已签集合共用同一个 KVStore（不引入新存储引擎）。
+	// 已签充值的落盘产物：与 receive/seal 共用同一个 KVStore（不引入新存储引擎）。
 	a.depositSigs = newDepositSignatureStore(store)
 	return a, nil
-}
-
-// btcTipHeight 取链上 BTC canonical tip 高度（已签集合 TTL 判定用，见 signedset.go）。
-func (a *Adapter) btcTipHeight() (uint64, error) {
-	if a.bridge == nil {
-		return 0, fmt.Errorf("chain33 bridge not set")
-	}
-	return a.bridge.BtcTipHeight()
 }
 
 // Connect 建立侧车 gRPC 连接（unix socket 优先）。所有节点都需要（签名节点只读校验）。

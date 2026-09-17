@@ -142,7 +142,6 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 		// 头链保留深度 B：头链只提交到 best - B，充值提交前的本地深度门控据此把链上判据换算成本地判据。
 		// 与头链提交（bitcoin.go 的 btcConfirmedHeight）取同一个配置项，不允许各自取值。
 		HeaderRelayConfirmations: n.cfg.BlockConfirmations,
-		SignedDepositTTL:         n.cfg.Rgb20.SignedDepositTTL,
 	}
 	for _, c := range n.cfg.Rgb20.Contracts {
 		rgbCfg.Contracts = append(rgbCfg.Contracts, rgb20.Contract{
@@ -185,16 +184,6 @@ func (n *neutrinoClient) Start() {
 			}, time.Second*3)
 			log.Info("Start rgb20 sidecar connected")
 		}()
-		// 已签集合 TTL 生效（A3）：按当前配置立即清理一次过期记录——包括之前 TTL=0（只增不删）
-		// 期间攒下的旧记录，改配置重启后不需要等下一笔充值/下一个周期。后台执行 + 重试：
-		// 取链上高度在启动竞态下可能失败，且绝不能阻塞 Start。
-		go n.waitUntilDone("rgb20 prune expired signed deposits", func() bool {
-			if err := n.rgb20.PruneSignedDeposits(); err != nil {
-				log.Debug("Start rgb20 prune signed deposits retry", "err", err)
-				return false
-			}
-			return true
-		}, time.Second*3)
 	}
 	if !n.cfg.IsOfficialNode {
 		return

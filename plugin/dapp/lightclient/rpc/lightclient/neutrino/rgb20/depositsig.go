@@ -9,29 +9,25 @@ import (
 )
 
 /*
- * 已签充值的落盘产物（签名落盘、重试只重发）。
+ * 已签充值的落盘产物（签名落盘、重试优先重发）。
  *
- * 背景：submitDeposit 原本每次重试都走"组 DepositAsset → TSS 签 → 提交"整条链路。这带来三个问题：
+ * 背景：submitDeposit 原本每次重试都走"组 DepositAsset → TSS 签 → 提交"整条链路。这带来两个问题：
  *
  *  1. 链上深度不够时（B8：链上要求 canonical tip >= H + N - 1，而中继上链的头链只到 best - B），
  *     首笔提交注定被拒，而每次 30s 重试都会**空跑一整轮 GG18 签名**；
- *  2. 签名侧"已签集合"（signedset.go）在签名成功后即登记该 txid：重试再驱动签名会被其它签名节点
- *     直接拒绝，本节点每轮白等 GG18 超时（30s 起），记录**永不 minted**；TTL <= 0（默认）时永久卡死；
- *  3. 签名产物只存在于内存里，进程重启即丢，哪怕是"签名成功、提交瞬间失败"这种最该自愈的情况。
+ *  2. 签名产物只存在于内存里，进程重启即丢，哪怕是"签名成功、提交瞬间失败"这种最该直接续上的情况。
  *
- * 因此把签名轮次的产出落盘：**先落盘、再提交**；重试时若已有落盘产物就只重发（不再驱动签名轮次）。
+ * 因此把签名轮次的产出落盘：**先落盘、再提交**；重试时若已有落盘产物就只重发，省掉一轮 GG18。
+ *
+ * 注意这只是**性能缓存**，不是重试的唯一依据：产物丢了（落盘失败后重启、数据目录被清、从旧快照
+ * 恢复）就再签一轮 —— 充值重签是逐字节幂等的（签的是 C = sha256(Encode(DepositAsset{thresholdSig:nil}))，
+ * 只有金额/地址/符号 + SPV 证明，没有 nonce、时间戳或 UTXO 选择），链上还按 txid 去重兜底。
  *
  * 粒度选"完整 DepositAsset"而不是只存 thresholdSig 字节：链上验签的消息是
  * C = sha256(types.Encode(DepositAsset{thresholdSig:nil}))（与 tss.computeRgb20DepositMsg、
  * rgbx 执行器 computeDepositSignMessage 同口径）—— 金额、目标地址、资产符号、SPV 证明都在这个编码里。
  * 重发时若重新构造 DepositAsset（例如重新取一次 SPV，merkle 分支/高度与签名时不同），签名就对不上了；
  * 存整份对象则"签的是什么就重发什么"，不存在这个风险。
- *
- * 与已签集合的关系（两个集合各管一件事，互不冲突）：
- *   - 已签集合（signedset.go）：签名节点侧的**去重**，防协调者反复索要签名；
- *   - 本存储：**本节点自己的签名产物**，让重试不必再去问签名节点。
- * 落盘产物存在 → 走重发，根本不问签名节点，与已签集合无交集；
- * 落盘产物缺失但已签集合里有该 txid → 异常（见 deposit.go 的 checkSignedArtifactMissing）。
  */
 
 // depositSigBucket 已签充值产物的顶层 bucket：key = 付款交易 txid，value = JSON(SignedDepositArtifact)。
@@ -96,9 +92,10 @@ func (s *DepositSignatureStore) Get(txid string) (*SignedDepositArtifact, error)
 
 // Put 写入产物：先放内存缓存，再尽力落盘。
 //
-// 落盘失败时**缓存里仍然有这份产物**（返回错误给调用方）：签名已经产出、不可能重来一次（重来会被
-// 已签集合拒绝），所以不能因为一次写盘失败就丢掉它；调用方下次调用 Put 即可重试落盘。
-// 契约：调用方在产物 durable 之前**不得提交**（见 submitDeposit 的"先落盘、再提交"）。
+// 落盘失败时**缓存里仍然有这份产物**（返回错误给调用方）：签名已经产出，不能因为一次写盘失败就
+// 丢掉它；调用方下次调用 Put 即可重试落盘。契约：调用方在产物 durable 之前**不得提交**
+// （见 submitDeposit 的"先落盘、再提交"）—— 进程若在落盘成功前重启，产物随之丢失，下一轮重签一份
+// 完全相同的对象即可（重签幂等，只是白花一轮 GG18）。
 func (s *DepositSignatureStore) Put(art *SignedDepositArtifact) error {
 	if art == nil || art.Txid == "" || art.Deposit == nil {
 		return fmt.Errorf("invalid signed deposit artifact")
