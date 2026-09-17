@@ -7,22 +7,23 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use bitcoin::absolute::LockTime;
 use bitcoin::{
     Address, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
 };
-use electrum_client::ElectrumApi;
 use psrgbt::{RgbOutExt, RgbPsbtExt};
 use rand::Rng;
 use bitcoin::Network;
 use rgbinvoice::Precision;
-use rgbcore::validation::{ResolveWitness, ValidationConfig, WitnessResolverError, WitnessStatus};
+use rgbcore::validation::{
+    ResolveWitness, ValidationConfig, WitnessOrdProvider, WitnessResolverError, WitnessStatus,
+};
 use rgbcore::vm::WitnessOrd;
 use rgbcore::{ChainNet, ContractId, Opout, TxoSeal, Txid};
-use rgbstd::containers::{Consignment, ConsignmentExt};
+use rgbstd::containers::{Consignment, ConsignmentExt, Fascia};
 use rgbstd::contract::{AllocatedState, ContractBuilder, IssuerWrapper, TransitionBuilder};
 use rgbstd::invoice::Amount;
 use rgbstd::persistence::fs::FsBinStore;
@@ -37,20 +38,32 @@ use crate::invoice::{
     consignment_from_bytes, consignment_to_bytes, network_to_chainnet, parse_invoice,
 };
 use crate::ledger::{AssetRec, Ledger, ReceiveRec};
+use crate::rpc::BtcdRpc;
 use crate::types::{recv_status, SealStatus, SealTxOut};
 use crate::wallet::{BtcWallet, WalletUtxo};
 
-/// A `ResolveWitness` that resolves witness transactions from the Electrum indexer.
-struct ElectrumResolver {
-    electrum: Arc<electrum_client::Client>,
+/// A `ResolveWitness` that resolves witness transactions from the btcd node.
+///
+/// Withdrawal consignments are validated *before* their anchor tx is broadcast (the signers need
+/// to agree before the tx is sent), so the anchor is not yet on btcd. Such anchors are resolved
+/// from `local_anchors` — a shared cache of the txs this engine just built — before falling back
+/// to the node. Deposit/user-pay anchors are broadcast & mined first, so they resolve from btcd.
+struct BtcdResolver {
+    rpc: Arc<BtcdRpc>,
     chain_net: ChainNet,
+    local_anchors: Arc<Mutex<HashMap<Txid, Transaction>>>,
 }
 
-impl ResolveWitness for ElectrumResolver {
+impl ResolveWitness for BtcdResolver {
     fn resolve_witness(&self, witness_id: Txid) -> Result<WitnessStatus, WitnessResolverError> {
-        match self.electrum.transaction_get(&witness_id) {
-            Ok(tx) => Ok(WitnessStatus::Resolved(tx, WitnessOrd::Tentative)),
-            Err(_) => Ok(WitnessStatus::Unresolved),
+        if let Ok(guard) = self.local_anchors.lock() {
+            if let Some(tx) = guard.get(&witness_id) {
+                return Ok(WitnessStatus::Resolved(tx.clone(), WitnessOrd::Tentative));
+            }
+        }
+        match self.rpc.get_transaction(&witness_id) {
+            Ok(Some(tx)) => Ok(WitnessStatus::Resolved(tx, WitnessOrd::Tentative)),
+            _ => Ok(WitnessStatus::Unresolved),
         }
     }
     fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
@@ -61,6 +74,30 @@ impl ResolveWitness for ElectrumResolver {
         }
     }
 }
+
+impl WitnessOrdProvider for BtcdResolver {
+    /// Witness ordering view of the same resolver: used when merging a locally built fascia
+    /// (`Stock::consume_fascia`), where the anchor tx is typically not yet mined and resolves
+    /// from the `local_anchors` cache as [`WitnessOrd::Tentative`].
+    fn witness_ord(&self, witness_id: Txid) -> Result<WitnessOrd, WitnessResolverError> {
+        Ok(self.resolve_witness(witness_id)?.witness_ord())
+    }
+}
+
+/// An error that retrying can never turn into a success, because the request targets state this
+/// sidecar does not hold any more (an asset that was re-issued, an invoice written for a contract
+/// that no longer exists, ...). The gRPC layer reports it as `FAILED_PRECONDITION` so the bridge
+/// stops retrying and surfaces it, instead of hammering the sidecar once per second forever.
+#[derive(Debug)]
+pub struct PermanentError(pub String);
+
+impl std::fmt::Display for PermanentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for PermanentError {}
 
 /// Result of a consignment inspection.
 #[derive(Clone, Debug)]
@@ -91,6 +128,9 @@ pub struct BuildTransferOutcome {
     pub input_amounts: Vec<i64>,
     pub input_btc_values: Vec<u64>,
     pub consignment: Vec<u8>,
+    /// The RGB fascia exported from the PSBT: merging it into the Stock is what registers
+    /// this transfer's output seals (incl. the change seal) as spendable RGB state.
+    pub fascia: Fascia,
     pub txid: Txid,
     /// vout of the recipient output (always 1).
     pub recipient_vout: u32,
@@ -108,6 +148,18 @@ struct PendingWithdrawal {
     pub input_outpoints: Vec<OutPoint>,
     pub change_vout: Option<u32>,
     pub change_amount: i64,
+    /// Kept until `finalize_withdrawal` so the transition can be merged into the Stock once the
+    /// withdrawal is signed (and therefore certain to be broadcast).
+    pub fascia: Fascia,
+}
+
+/// Result of a finalized withdrawal, kept so a repeated `finalize_withdrawal` is a no-op
+/// returning the same values instead of failing with "no pending withdrawal".
+#[derive(Clone, Debug)]
+struct FinalizedWithdrawal {
+    pub txid: Txid,
+    pub recipient_outpoint: String,
+    pub change_outpoint: Option<String>,
 }
 
 pub struct RgbEngine {
@@ -115,12 +167,17 @@ pub struct RgbEngine {
     pub stock: Stock,
     pub ledger: Ledger,
     wallet: BtcWallet,
-    electrum: Arc<electrum_client::Client>,
+    rpc: Arc<BtcdRpc>,
     chain_net: ChainNet,
     tss_script: ScriptBuf,
     tss_address: Address,
-    resolver: ElectrumResolver,
+    resolver: BtcdResolver,
     pending_withdrawals: HashMap<String, PendingWithdrawal>,
+    /// Withdrawals already finalized, by txid: makes a repeated finalize idempotent.
+    finalized_withdrawals: HashMap<String, FinalizedWithdrawal>,
+    /// Txs built by `build_transfer` that are not yet broadcast (withdrawal anchors awaiting TSS
+    /// signature). Shared with `resolver` so pre-broadcast consignment validation can resolve them.
+    local_anchors: Arc<Mutex<HashMap<Txid, Transaction>>>,
 }
 
 impl RgbEngine {
@@ -140,17 +197,22 @@ impl RgbEngine {
         };
 
         let ledger = Ledger::load(&cfg.ledger_path())?;
-        let wallet = BtcWallet::new(&cfg.electrum_url, &cfg.tss_pubkey_hex, cfg.network)?;
+        let rpc = Arc::new(BtcdRpc::connect(
+            &cfg.btc_rpc_host,
+            &cfg.btc_rpc_user,
+            &cfg.btc_rpc_pass,
+            cfg.btc_rpc_cert.as_deref(),
+            cfg.network,
+        )?);
+        let wallet = BtcWallet::new(rpc.clone(), &cfg.tss_pubkey_hex, cfg.network)?;
         let tss_address = wallet.address().clone();
         let tss_script = wallet.script().clone();
         let chain_net = network_to_chainnet(cfg.network);
-        let electrum = Arc::new(
-            electrum_client::Client::new(&cfg.electrum_url)
-                .map_err(|e| anyhow!("electrum connect {}: {}", cfg.electrum_url, e))?,
-        );
-        let resolver = ElectrumResolver {
-            electrum: electrum.clone(),
+        let local_anchors = Arc::new(Mutex::new(HashMap::new()));
+        let resolver = BtcdResolver {
+            rpc: rpc.clone(),
             chain_net,
+            local_anchors: local_anchors.clone(),
         };
 
         Ok(Self {
@@ -158,12 +220,14 @@ impl RgbEngine {
             stock,
             ledger,
             wallet,
-            electrum,
+            rpc,
             chain_net,
             tss_script,
             tss_address,
             resolver,
             pending_withdrawals: HashMap::new(),
+            finalized_withdrawals: HashMap::new(),
+            local_anchors,
         })
     }
 
@@ -188,12 +252,14 @@ impl RgbEngine {
         self.cfg.network
     }
 
-    /// Height of the indexer tip.
+    /// Height of the chain tip (btcd `getblockcount`).
     pub fn synced_height(&self) -> u64 {
-        self.electrum
-            .block_headers_subscribe()
-            .map(|h| h.height as u64)
-            .unwrap_or(0)
+        self.rpc.get_block_count().unwrap_or(0)
+    }
+
+    /// Current BTC UTXO set of the single TSS script (watch-only), from btcd.
+    pub fn list_unspent_btc(&self) -> Result<Vec<WalletUtxo>> {
+        Ok(self.wallet.list_unspent())
     }
 
     // ===================================================================
@@ -251,9 +317,10 @@ impl RgbEngine {
         let contract: rgbstd::containers::Contract =
             valid_contract.clone().into_consignment().into_contract();
         let genesis_bytes = consignment_to_bytes(&contract)?;
-        let resolver = ElectrumResolver {
-            electrum: self.electrum.clone(),
+        let resolver = BtcdResolver {
+            rpc: self.rpc.clone(),
             chain_net,
+            local_anchors: self.local_anchors.clone(),
         };
         self.stock
             .import_contract(valid_contract, resolver)
@@ -385,6 +452,17 @@ impl RgbEngine {
             .validate(&self.resolver, &config)
             .map_err(|e| anyhow!("consignment invalid: {e}"))?;
 
+        // Idempotent re-settle: the Go bridge uploads the consignment AFTER the test-sim already
+        // settled the receive. Return the existing settled record instead of erroring so the bridge
+        // has a consistent view and can proceed to pollTransfers -> submitDeposit.
+        if let Some(h) = receive_id_hint {
+            if let Some(r) = self.ledger.receive(h) {
+                if r.status == recv_status::SETTLED {
+                    return Ok(r.clone());
+                }
+            }
+        }
+
         let mut candidate = receive_id_hint
             .and_then(|h| self.ledger.receive(h))
             .filter(|r| r.status == recv_status::WAITING_COUNTERPARTY)
@@ -431,7 +509,7 @@ impl RgbEngine {
         // BTC value of the receive output, from the witness tx (when available).
         let btc_value = Txid::from_str(&txid)
             .ok()
-            .and_then(|tid| self.electrum.transaction_get(&tid).ok())
+            .and_then(|tid| self.rpc.get_transaction(&tid).ok().flatten())
             .and_then(|tx| tx.output.get(vout as usize).cloned())
             .map(|o| o.value.to_sat() as i64)
             .unwrap_or(0);
@@ -450,7 +528,6 @@ impl RgbEngine {
                 s.status = SealStatus::Consumed;
             }
         }
-
         self.save()?;
         Ok(self.ledger.receive(&rec.receive_id).cloned().expect("just settled"))
     }
@@ -564,15 +641,24 @@ impl RgbEngine {
         fee_rate: u64,
         recipient_btc: u64,
     ) -> Result<BuildTransferOutcome> {
+        // 同步 TSS watch-only 钱包：否则 bdk list_unspent 看不到 TSS 地址的 BTC UTXO，
+        // 构造 PSBT 时 BTC 输入为 0，报 "BTC inputs (0) cannot cover output+fee"。
+        self.wallet.sync()?;
         let asset = self
             .ledger
             .asset(symbol)
-            .ok_or_else(|| anyhow!("asset {symbol} not issued"))?;
+            .ok_or_else(|| PermanentError(format!("asset {symbol} not issued")))?;
         let contract_id = ContractId::from_str(&asset.asset_id)?;
         let invoice = parse_invoice(recipient_invoice)?;
         if let Some(cid) = invoice.contract_id {
             if cid != contract_id {
-                return Err(anyhow!("invoice contract {cid} != asset contract {contract_id}"));
+                // The invoice names the contract the payer must be holding. A mismatch means this
+                // sidecar's asset was re-issued (its ledger was rebuilt), so the invoice can never
+                // be honoured by this sidecar — no amount of retrying changes that.
+                return Err(PermanentError(format!(
+                    "invoice contract {cid} != asset contract {contract_id}"
+                ))
+                .into());
             }
         }
         let recipient_script = invoice
@@ -586,6 +672,7 @@ impl RgbEngine {
             .stock
             .transition_builder(contract_id, "transfer")
             .map_err(|e| anyhow!("transition_builder: {e:?}"))?;
+        let wallet_utxos = self.wallet.list_unspent();
         let mut input_amounts: Vec<i64> = Vec::new();
         let mut input_btc: Vec<u64> = Vec::new();
         for outpoint in input_outpoints {
@@ -606,10 +693,8 @@ impl RgbEngine {
                 _ => return Err(anyhow!("input {outpoint} not fungible")),
             };
             input_amounts.push(amount.value() as i64);
-            let btc = self
-                .wallet
-                .list_unspent()
-                .into_iter()
+            let btc = wallet_utxos
+                .iter()
                 .find(|u| u.outpoint == *outpoint)
                 .map(|u| u.value)
                 .unwrap_or(0);
@@ -637,19 +722,60 @@ impl RgbEngine {
         }
         let transition = builder.complete_transition()?;
 
-        // Build the unsigned PSBT with explicit inputs.
-        let total_btc = input_btc.iter().sum::<u64>();
-        let est_vbytes = 10 + 41 * input_outpoints.len() + 31 * 3 + 68 * input_outpoints.len();
-        let fee = est_vbytes as u64 * fee_rate;
-        if total_btc < recipient_btc + fee {
-            return Err(anyhow!("BTC inputs ({total_btc}) cannot cover output+fee"));
+        // ---- BTC funding ----
+        // RGB receive outputs are dust (546 sats) so a single seal usually cannot cover the
+        // recipient dust output + miner fee. When the seal BTC is insufficient, pull additional
+        // bridge-owned BTC UTXOs (TSS script, e.g. the deposit change output) as pure-BTC fee
+        // inputs. They carry no RGB state and are not part of the transition — they only fund
+        // the carrier transaction, and their excess returns to the TSS change output.
+        let seal_btc_total = input_btc.iter().sum::<u64>();
+        let mut extra_fee_inputs: Vec<(OutPoint, u64)> = Vec::new(); // (outpoint, btc value)
+        let mut total_btc = seal_btc_total;
+        let mut n_inputs = input_outpoints.len();
+        loop {
+            // 与既有字节模型保持一致（3 输出上界，P2WPKH 输入 41+68 计费）。
+            let est_vbytes = (10 + 41 * n_inputs + 31 * 3 + 68 * n_inputs) as u64;
+            let fee = est_vbytes * fee_rate;
+            if total_btc >= recipient_btc + fee {
+                break;
+            }
+            // 选一笔桥自有（TSS 脚本）、未作为 RGB seal / 已选费输入 的 BTC UTXO（取最大额优先）。
+            let next = wallet_utxos
+                .iter()
+                .filter(|u| u.script_pubkey == self.tss_script)
+                .filter(|u| !self.ledger.seals.contains_key(&u.outpoint.to_string()))
+                .filter(|u| !input_outpoints.contains(&u.outpoint))
+                .filter(|u| !extra_fee_inputs.iter().any(|(o, _)| o == &u.outpoint))
+                .max_by_key(|u| u.value)
+                .cloned();
+            match next {
+                Some(u) => {
+                    total_btc += u.value;
+                    extra_fee_inputs.push((u.outpoint, u.value));
+                    n_inputs += 1;
+                }
+                None => {
+                    return Err(anyhow!(
+                        "BTC inputs ({total_btc}) cannot cover output+fee; no bridge-owned BTC fee UTXO available"
+                    ));
+                }
+            }
         }
+        let est_vbytes = (10 + 41 * n_inputs + 31 * 3 + 68 * n_inputs) as u64;
+        let fee = est_vbytes * fee_rate;
         let change_btc = total_btc - recipient_btc - fee;
 
+        // 交易输入 = RGB seal 输入 + 桥自有费输入。
+        let mut all_inputs: Vec<OutPoint> = input_outpoints.to_vec();
+        let mut all_input_btc: Vec<u64> = input_btc.clone();
+        for (o, v) in &extra_fee_inputs {
+            all_inputs.push(*o);
+            all_input_btc.push(*v);
+        }
         let mut tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: LockTime::ZERO,
-            input: input_outpoints
+            input: all_inputs
                 .iter()
                 .map(|o| TxIn {
                     previous_output: *o,
@@ -664,13 +790,21 @@ impl RgbEngine {
                 TxOut { value: bitcoin::Amount::from_sat(change_btc), script_pubkey: change_script.clone() },
             ],
         };
-        if change_amount == 0 {
+        // 无 RGB change、也无 BTC 找零时才去掉 change 输出；只要有多余 BTC（来自费输入）
+        // 就必须保留找零输出回到 TSS，避免把费输入的币烧成手续费。
+        if change_amount == 0 && change_btc == 0 {
             tx.output.truncate(2);
         }
         let mut psbt = Psbt::from_unsigned_tx(tx)?;
         for (i, _outpoint) in input_outpoints.iter().enumerate() {
             psbt.inputs[i].witness_utxo = Some(TxOut {
                 value: bitcoin::Amount::from_sat(input_btc[i]),
+                script_pubkey: self.tss_script.clone(),
+            });
+        }
+        for (j, (_, v)) in extra_fee_inputs.iter().enumerate() {
+            psbt.inputs[input_outpoints.len() + j].witness_utxo = Some(TxOut {
+                value: bitcoin::Amount::from_sat(*v),
                 script_pubkey: self.tss_script.clone(),
             });
         }
@@ -681,6 +815,13 @@ impl RgbEngine {
         psbt.set_rgb_close_method(CloseMethod::OpretFirst);
         let fascia = psbt.rgb_commit()?;
         let txid = psbt.get_txid();
+        // Cache the un-broadcast anchor so the withdrawal consignment can be validated (locally by
+        // the official node AND by signing nodes via the shared sidecar) before the tx is signed &
+        // broadcast. rgb_commit wrote the commitment into unsigned_tx, so its txid == `txid`.
+        self.local_anchors
+            .lock()
+            .unwrap()
+            .insert(txid, psbt.unsigned_tx.clone());
 
         let recipient_out = OutputSeal::with(txid, 1);
         let mut outputs = vec![recipient_out];
@@ -696,8 +837,9 @@ impl RgbEngine {
         Ok(BuildTransferOutcome {
             psbt,
             input_amounts,
-            input_btc_values: input_btc,
+            input_btc_values: all_input_btc,
             consignment,
+            fascia,
             txid,
             recipient_vout: 1,
             change_vout: if change_amount > 0 { Some(2) } else { None },
@@ -706,8 +848,8 @@ impl RgbEngine {
     }
 
     pub fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
-        self.electrum
-            .transaction_broadcast(tx)
+        self.rpc
+            .send_raw_transaction(tx)
             .map_err(|e| anyhow!("broadcast: {e}"))
     }
 
@@ -715,12 +857,12 @@ impl RgbEngine {
     pub fn wait_tx(&self, txid: Txid, timeout: std::time::Duration) -> Result<()> {
         let start = std::time::Instant::now();
         while start.elapsed() < timeout {
-            if self.electrum.transaction_get(&txid).is_ok() {
+            if self.rpc.get_transaction(&txid).map(|o| o.is_some()).unwrap_or(false) {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
-        anyhow::bail!("tx {txid} not visible to indexer within {timeout:?}")
+        anyhow::bail!("tx {txid} not visible to btcd within {timeout:?}")
     }
 
     // ===================================================================
@@ -735,6 +877,11 @@ impl RgbEngine {
         change_address: &str,
         fee_rate: u64,
     ) -> Result<BuildTransferOutcome> {
+        // 先从链上对账 seal 生命周期：上一笔提现的 change seal 只有在其锚定 tx 上链后
+        // （PendingMint -> Minted，sync 依据 TSS UTXO 集合推导）才可花。否则紧接的下一笔
+        // 提现在 select_seals 阶段会报 "0 minted seals"（充值 settle 路径在 test_sim 里
+        // 会显式 sync，提现路径漏了这步）。
+        self.sync()?;
         let (seals, _total) = self.ledger.select_seals(symbol, amount)?;
         let input_outpoints: Vec<OutPoint> = seals
             .iter()
@@ -766,6 +913,7 @@ impl RgbEngine {
                 input_outpoints,
                 change_vout: outcome.change_vout,
                 change_amount: outcome.change_amount,
+                fascia: outcome.fascia.clone(),
             },
         );
         Ok(outcome)
@@ -780,11 +928,43 @@ impl RgbEngine {
         let tx = signed_psbt.clone().extract_tx()?;
         let txid = tx.compute_txid();
 
+        // Idempotent re-finalize (e.g. the bridge retrying after a restart): return the values
+        // recorded by the first call instead of double-applying the transition.
+        if let Some(fin) = self.finalized_withdrawals.get(&txid.to_string()) {
+            return Ok((fin.txid, fin.recipient_outpoint.clone(), fin.change_outpoint.clone()));
+        }
+
+        // Keep the pending entry until the Stock merge succeeded, so a failure here leaves the
+        // withdrawal retryable instead of dropping it.
         let pending = self
             .pending_withdrawals
-            .remove(&txid.to_string())
+            .get(&txid.to_string())
+            .cloned()
             .ok_or_else(|| anyhow!("no pending withdrawal for txid {txid}"))?;
         assert_eq!(pending.txid, txid, "pending withdrawal txid mismatch");
+
+        // Merge our own transfer into the Stock. The bridge builds the withdrawal transition
+        // itself, so - unlike the deposit path, where `provide_consignment` -> `accept_transfer`
+        // records the received seal - nothing else would ever register this transition's output
+        // seals. Without it the RGB state of the change seal is missing and the next withdrawal
+        // fails with "outpoint <txid>:<vout> has no <contract> state".
+        //
+        // Done here (the PSBT is signed, broadcast is imminent) rather than at build time: a
+        // built-but-never-signed withdrawal must not leave a tentative transition in the Stock,
+        // since tentative witnesses take priority over mined ones. The anchor is still in
+        // `local_anchors` (resolved as tentative) because the tx is broadcast only after this
+        // call returns.
+        let resolver = BtcdResolver {
+            rpc: self.rpc.clone(),
+            chain_net: self.chain_net,
+            local_anchors: self.local_anchors.clone(),
+        };
+        self.stock
+            .consume_fascia(pending.fascia.clone(), resolver)
+            .map_err(|e| anyhow!("consume_fascia: {e:?}"))?;
+
+        // Anchor is being broadcast; drop it from the local resolver cache (btcd will own it now).
+        self.local_anchors.lock().unwrap().remove(&txid);
 
         for o in &pending.input_outpoints {
             let key = o.to_string();
@@ -812,6 +992,14 @@ impl RgbEngine {
         self.save()?;
         let recipient_outpoint = format!("{txid}:1");
         let change_outpoint = pending.change_vout.map(|v| format!("{txid}:{v}"));
+        self.finalized_withdrawals.insert(
+            txid.to_string(),
+            FinalizedWithdrawal {
+                txid,
+                recipient_outpoint: recipient_outpoint.clone(),
+                change_outpoint: change_outpoint.clone(),
+            },
+        );
         Ok((txid, recipient_outpoint, change_outpoint))
     }
 
@@ -849,6 +1037,23 @@ impl RgbEngine {
         out
     }
 
+    /// The witness transaction behind `wtxid`: this engine's own un-broadcast anchor first (see
+    /// `local_anchors`), then the node.
+    ///
+    /// Withdrawals are validated *before* their anchor tx is broadcast, so btcd cannot resolve it
+    /// yet — only the tx this engine just built can. The cache is local construction, never an
+    /// external claim: it is filled by `build_transfer` (the anchor whose txid the caller holds as
+    /// the PSBT's own txid), so resolving through it cannot vouch for anything the engine did not
+    /// build itself.
+    fn witness_tx(&self, wtxid: &Txid) -> Option<Transaction> {
+        if let Ok(guard) = self.local_anchors.lock() {
+            if let Some(tx) = guard.get(wtxid) {
+                return Some(tx.clone());
+            }
+        }
+        self.rpc.get_transaction(wtxid).ok().flatten()
+    }
+
     /// Inspect opened seals; find the recipient (opened seal at the TSS script).
     fn inspect_opened_seals(
         &self,
@@ -873,7 +1078,12 @@ impl RgbEngine {
                                 asset_id: asset_id.clone(),
                             });
                             if recipient.is_none() {
-                                if let Ok(tx) = self.electrum.transaction_get(&wtxid) {
+                                // Resolve through the local anchor cache as well: for a withdrawal
+                                // the anchor is still unbroadcast here, and resolving it only from
+                                // btcd left `recipient_amount` at 0 — the bridge then rejected the
+                                // withdrawal with "consignment=0 expected=…" whenever the bridge
+                                // holds nothing but the genesis seal (no earlier mined anchor).
+                                if let Some(tx) = self.witness_tx(&wtxid) {
                                     if let Some(o) = tx.output.get(vout.to_u32() as usize) {
                                         if o.script_pubkey == self.tss_script {
                                             recipient = Some(outpoint);

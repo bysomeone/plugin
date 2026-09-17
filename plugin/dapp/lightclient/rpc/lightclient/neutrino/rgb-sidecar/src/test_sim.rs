@@ -27,46 +27,22 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-fn basic_auth(user: &str, pass: &str) -> String {
-    use base64::Engine;
-    // 修复：必须带 "Basic " scheme，否则 bitcoind RPC 返回 401（issue_usdt.rs 同款实现带前缀）。
-    format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"))
-    )
-}
-
-/// bitcoind JSON-RPC（test-sim 用，不依赖本机 bitcoin-cli）。
-fn rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-    let url = env_or("RGB_BITCOIND_RPC", "http://127.0.0.1:18443");
-    let user = env_or("RGB_BITCOIND_USER", "rgb");
-    let pass = env_or("RGB_BITCOIND_PASS", "rgbpass123");
-    let body = serde_json::json!({"jsonrpc": "1.0", "id": "test-sim", "method": method, "params": params});
-    let resp = ureq::post(&url)
-        .set("Content-Type", "application/json")
-        .set("Authorization", &basic_auth(&user, &pass))
-        .send_string(&body.to_string())
-        .map_err(|e| anyhow!("rpc {method}: {e}"))?;
-    let text = resp.into_string().map_err(|e| anyhow!("rpc {method} read: {e}"))?;
-    let v: serde_json::Value = serde_json::from_str(&text)?;
-    if let Some(err) = v.get("error") {
-        if !err.is_null() {
-            return Err(anyhow!("rpc {method} error: {err}"));
-        }
-    }
-    v.get("result").cloned().ok_or_else(|| anyhow!("rpc {method} no result"))
-}
-
-/// Mine regtest blocks via bitcoind JSON-RPC. Test-only.
+/// Mine regtest blocks on the shared btcd node (test-only). btcd mines to `--miningaddr`
+/// (no wallet), unlike the old per-chain bitcoind + wallet (`getnewaddress`/`generatetoaddress`).
 fn mine_blocks(n: u32) -> Result<()> {
-    // 修复：getnewaddress 不接收参数对象，空参即可（[{}] 会被 bitcoind 判为 label 类型错误 -3，
-    // 导致挖块失败 → deposit settle 卡住）。
-    let addr = rpc("getnewaddress", serde_json::json!([]))?
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    rpc("generatetoaddress", serde_json::json!([n, addr]))?;
-    Ok(())
+    let host = env_or("RGB_BITCOIND_RPC", "127.0.0.1:18443");
+    let user = env_or("RGB_BITCOIND_USER", "root");
+    let pass = env_or("RGB_BITCOIND_PASS", "1314");
+    let cert = env_or("RGB_BITCOIND_CERT", "");
+    let cert_path = (!cert.is_empty()).then(|| std::path::PathBuf::from(cert));
+    let rpc = crate::rpc::BtcdRpc::connect(
+        &host,
+        &user,
+        &pass,
+        cert_path.as_deref(),
+        bitcoin::Network::Regtest,
+    )?;
+    rpc.mine_blocks(n)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -114,9 +90,6 @@ pub struct SimPayResult {
 
 impl SimulateExt for RgbEngine {
     fn simulate_user_pay_begin(&mut self, invoice: &str) -> Result<SimPayOutcome> {
-        // 同步 TSS watch-only 钱包：否则 bdk list_unspent 看不到 TSS 地址的 BTC UTXO，
-        // build_transfer 报 "BTC inputs (0) cannot cover output+fee"。
-        self.wallet.sync()?;
         let parsed = parse_invoice(invoice)?;
         let amount = parsed
             .amount
