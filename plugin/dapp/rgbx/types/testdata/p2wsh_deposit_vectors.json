@@ -1,0 +1,76 @@
+{
+  "spec": "p2wsh-deposit-v1",
+  "note": "P2WSH 每用户 BTC 充值地址派生规格 v1 的冻结测试向量（Go 桥 / Go 合约 / Rust 侧车共用同一组）。witnessScript = push(userID) || OP_DROP || push(tssPub) || OP_CHECKSIG；programSHA256 = sha256(witnessScript)；pkScript = 00 20 || program；address = bech32 v0。tssPrivKey 仅为本向量的可复现花费验证（p2wsh_deposit_spend_test.go）而公开，禁止用于任何真实资产。",
+  "vectors": [
+    {
+      "name": "v1-chain33-address",
+      "note": "主向量：userID = chain33 地址串（来自 seed \"rgbx-p2wsh-vector-user-1\"），tssPub = privkey 1 的压缩公钥（生成元）",
+      "userID": "1AmRYcURfDGxBhiaJAvEGdRkvkoM7ztn1u",
+      "tssPubKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "tssPrivKey": "0000000000000000000000000000000000000000000000000000000000000001",
+      "witnessScript": "2231416d525963555266444778426869614a4176454764526b766b6f4d377a746e317575210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac",
+      "programSHA256": "78d9392c30b67443d288c548adde74e0eff45454048cf3e7cc2f82f43da70465",
+      "pkScript": "002078d9392c30b67443d288c548adde74e0eff45454048cf3e7cc2f82f43da70465",
+      "addresses": {
+        "mainnet": "bc1q0rvnjtpske6y855gc4y2mhn5urhlg4z5qjx08e7v97p0g0d8q3jsepkfqp",
+        "regtest": "bcrt1q0rvnjtpske6y855gc4y2mhn5urhlg4z5qjx08e7v97p0g0d8q3jsrs2q05",
+        "signet": "tb1q0rvnjtpske6y855gc4y2mhn5urhlg4z5qjx08e7v97p0g0d8q3jswfqx6w",
+        "simnet": "sb1q0rvnjtpske6y855gc4y2mhn5urhlg4z5qjx08e7v97p0g0d8q3jsfc2prt",
+        "testnet3": "tb1q0rvnjtpske6y855gc4y2mhn5urhlg4z5qjx08e7v97p0g0d8q3jswfqx6w"
+      },
+      "witnessScriptLen": 71
+    },
+    {
+      "name": "v2-second-chain33-address",
+      "note": "第二组：不同 userID 与不同 tssPub（seed \"rgbx-p2wsh-vector-tss-2\"）",
+      "userID": "1MCurL8dSuJUWQKabUCGYXuM9Ypm5ftN9s",
+      "tssPubKey": "03d1ee32d73a68fe4cef8b5736a0ec96bd4cd3395b3dfee7d6423acc857b286ec2",
+      "tssPrivKey": "bd9d4a73258e58d38113b393aa502db05392eb7d5c0825ebe6a5918f4259c1a5",
+      "witnessScript": "22314d4375724c386453754a5557514b61625543475958754d3959706d3566744e3973752103d1ee32d73a68fe4cef8b5736a0ec96bd4cd3395b3dfee7d6423acc857b286ec2ac",
+      "programSHA256": "9913fa295a756b65bc623851526625df70a6dcdda2380054f5b9f51515f654a5",
+      "pkScript": "00209913fa295a756b65bc623851526625df70a6dcdda2380054f5b9f51515f654a5",
+      "addresses": {
+        "mainnet": "bc1qnyfl5226w44kt0rz8pg4ye39mac2dhxa5guqq484h863290k2jjsc2e0n7",
+        "regtest": "bcrt1qnyfl5226w44kt0rz8pg4ye39mac2dhxa5guqq484h863290k2jjszm9xut",
+        "signet": "tb1qnyfl5226w44kt0rz8pg4ye39mac2dhxa5guqq484h863290k2jjs0z0qf3",
+        "simnet": "sb1qnyfl5226w44kt0rz8pg4ye39mac2dhxa5guqq484h863290k2jjsgn98s5",
+        "testnet3": "tb1qnyfl5226w44kt0rz8pg4ye39mac2dhxa5guqq484h863290k2jjs0z0qf3"
+      },
+      "witnessScriptLen": 71
+    },
+    {
+      "name": "v3-userID-max-len-75",
+      "note": "边界：userID 长度 75 = 最小 push 上限（OP_PUSHBYTES_75）",
+      "userID": "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm",
+      "tssPubKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "witnessScript": "4b6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d75210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac",
+      "programSHA256": "348215d2b012821539974638737c2743c13ccac23cfa22bb3644ea48cf915ad7",
+      "pkScript": "0020348215d2b012821539974638737c2743c13ccac23cfa22bb3644ea48cf915ad7",
+      "addresses": {
+        "mainnet": "bc1qxjppt54sz2pp2wvhgcu8xlp8g0qnejkz8naz9wekgn4y3nu3tttsqtndc7",
+        "regtest": "bcrt1qxjppt54sz2pp2wvhgcu8xlp8g0qnejkz8naz9wekgn4y3nu3ttts660yht",
+        "signet": "tb1qxjppt54sz2pp2wvhgcu8xlp8g0qnejkz8naz9wekgn4y3nu3tttshr9zz3",
+        "simnet": "sb1qxjppt54sz2pp2wvhgcu8xlp8g0qnejkz8naz9wekgn4y3nu3tttssj09m5",
+        "testnet3": "tb1qxjppt54sz2pp2wvhgcu8xlp8g0qnejkz8naz9wekgn4y3nu3tttshr9zz3"
+      },
+      "witnessScriptLen": 112
+    },
+    {
+      "name": "v4-userID-len-1-value-5",
+      "note": "边界：userID 为单字节 0x05 —— 必须编码为 0x01 0x05，不得走 OP_5 特例（Go AddData 与 Rust push_slice 的分歧点）",
+      "userID": "\u0005",
+      "tssPubKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "witnessScript": "010575210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac",
+      "programSHA256": "0a33564a546532ace1bf0974ebd21e0f96e6eb57cccb761d3a0cfaef9c125780",
+      "pkScript": "00200a33564a546532ace1bf0974ebd21e0f96e6eb57cccb761d3a0cfaef9c125780",
+      "addresses": {
+        "mainnet": "bc1qpge4vjj5v5e2ecdlp96wh5s7p7twd66hen9hv8f6pnawl8qj27qql0r752",
+        "regtest": "bcrt1qpge4vjj5v5e2ecdlp96wh5s7p7twd66hen9hv8f6pnawl8qj27qq97lhml",
+        "signet": "tb1qpge4vjj5v5e2ecdlp96wh5s7p7twd66hen9hv8f6pnawl8qj27qqg843w9",
+        "simnet": "sb1qpge4vjj5v5e2ecdlp96wh5s7p7twd66hen9hv8f6pnawl8qj27qq0klkhq",
+        "testnet3": "tb1qpge4vjj5v5e2ecdlp96wh5s7p7twd66hen9hv8f6pnawl8qj27qqg843w9"
+      },
+      "witnessScriptLen": 38
+    }
+  ]
+}
