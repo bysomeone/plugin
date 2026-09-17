@@ -111,7 +111,7 @@ func TestBuildCommitDKGPayload_incompleteDKG(t *testing.T) {
 	svc2 := &tssService{}
 	assert.Nil(t, svc2.buildCommitDKGPayload(rtypes.BTCSymbol))
 	// nil 载荷直接返回（不 panic、不空转）。
-	svc2.commitDKGToChainWith(context.Background(), nil, nil, nil)
+	assert.NoError(t, svc2.commitDKGToChainWith(context.Background(), nil, nil, nil))
 }
 
 /*
@@ -189,7 +189,7 @@ func TestCommitDKGToChain_submitsWhenChainHasNoRecord(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*commitDKGVerifyInterval)
 	defer cancel()
-	svc.commitDKGToChainWith(ctx, svc.buildCommitDKGPayload(rtypes.BTCSymbol), chain.query, chain.submit)
+	require.NoError(t, svc.commitDKGToChainWith(ctx, svc.buildCommitDKGPayload(rtypes.BTCSymbol), chain.query, chain.submit))
 
 	require.Equal(t, 1, chain.submitCount(), "链上无记录时必须真的提交（且只提交一次）")
 	require.Equal(t, svc.tssPublicKey.SerializeCompressed(), chain.pubkey(rtypes.BTCSymbol),
@@ -197,7 +197,10 @@ func TestCommitDKGToChain_submitsWhenChainHasNoRecord(t *testing.T) {
 }
 
 // TestCommitDKGToChain_doesNotSubmitWhenChainHasAnotherKey 链上已有该 symbol、但群公钥是另一把：
-// 提交必然被 ErrDuplicateDKGCommit 拒（同一 symbol 只能提交一次），因此不提交，只报 stall。
+// 提交必然被 ErrDuplicateDKGCommit 拒（同一 symbol 只能提交一次），因此不提交；
+// 且这个形态**不可自愈**，必须以错误上抛（调用方据此拒绝启动），而不是"报 stall 无限等"。
+// 反向：改动前这里只是 reportCommitDKGStall + 继续循环 —— 本用例会因"等不到返回"而挂死
+// （超时兜底见 commitDKGVerifyInterval；改坏后实际表现为 4×interval 后才因 ctx 退出返回 nil）。
 func TestCommitDKGToChain_doesNotSubmitWhenChainHasAnotherKey(t *testing.T) {
 	svc := newTestTssService(t)
 	chain := newFakeChain()
@@ -205,17 +208,14 @@ func TestCommitDKGToChain_doesNotSubmitWhenChainHasAnotherKey(t *testing.T) {
 	chain.put(&rtypes.CrossChainInfo{
 		AssetSymbol: rtypes.BTCSymbol, TssAddress: "bcrt1qchain", Pubkey: otherPub})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// 不取消 ctx：判据必须是"函数自己带着错误返回"，而不是等 ctx 到期。
+	ctx, cancel := context.WithTimeout(context.Background(), 8*commitDKGVerifyInterval)
 	defer cancel()
-	// 第一轮核对就能看出"链上是另一把钥"，取消 ctx 让循环退出（生产上这个形态会一直报 stall，
-	// 由运维介入 —— 不可自愈）。
-	query := func(symbol string) (*rtypes.CrossChainInfo, error) {
-		info, err := chain.query(symbol)
-		cancel()
-		return info, err
-	}
-	svc.commitDKGToChainWith(ctx, svc.buildCommitDKGPayload(rtypes.BTCSymbol), query, chain.submit)
+	err := svc.commitDKGToChainWith(ctx, svc.buildCommitDKGPayload(rtypes.BTCSymbol), chain.query, chain.submit)
 
+	require.ErrorIs(t, err, errChainGroupKeyMismatch,
+		"链上是另一把群公钥时必须上抛（不可自愈的形态），不能只报 stall 然后无限等")
+	require.ErrorContains(t, err, "duplicate")
 	require.Zero(t, chain.submitCount(), "链上是另一把钥时不该空转提交（必被拒为 duplicate）")
 	require.Equal(t, otherPub, chain.pubkey(rtypes.BTCSymbol), "链上记录不该被本地载荷覆盖")
 }
@@ -228,8 +228,8 @@ func TestCommitDKGToChain_skipsSubmitWhenChainAlreadyHasSameKey(t *testing.T) {
 		AssetSymbol: rtypes.BTCSymbol, TssAddress: svc.tssAddress.EncodeAddress(),
 		PkScript: svc.pkScript, Pubkey: svc.tssPublicKey.SerializeCompressed()})
 
-	svc.commitDKGToChainWith(context.Background(), svc.buildCommitDKGPayload(rtypes.BTCSymbol),
-		chain.query, chain.submit)
+	require.NoError(t, svc.commitDKGToChainWith(context.Background(), svc.buildCommitDKGPayload(rtypes.BTCSymbol),
+		chain.query, chain.submit))
 
 	require.Zero(t, chain.submitCount(), "链上已有同一把钥，不该重复提交")
 }
@@ -244,7 +244,7 @@ func TestEnsureDKGOnChain_commitsEverySymbol(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*commitDKGVerifyInterval)
 	defer cancel()
-	svc.ensureDKGOnChainWith(ctx, symbols, chain.query, chain.submit)
+	require.NoError(t, svc.ensureDKGOnChainWith(ctx, symbols, chain.query, chain.submit))
 
 	require.Equal(t, len(symbols), chain.submitCount(), "每个 symbol 都要提交（含 RGB20）")
 	for _, symbol := range symbols {
