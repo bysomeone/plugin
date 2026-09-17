@@ -52,6 +52,18 @@ fn psbt_to_bytes(psbt: &Psbt) -> Vec<u8> {
     psbt.serialize()
 }
 
+/// watch 集登记的可观测性：只打"变了多少"，不打全量（1e4 条会把日志淹掉）。
+fn log_registered(entries: &[(String, Vec<u8>)], accepted: u32, total: usize) {
+    if accepted > 0 || entries.is_empty() {
+        eprintln!(
+            "deposit scripts registered: pushed={} accepted={} total={}",
+            entries.len(),
+            accepted,
+            total
+        );
+    }
+}
+
 fn psbt_from_bytes(bytes: &[u8]) -> Result<Psbt, Status> {
     bitcoin::psbt::Psbt::deserialize(bytes)
         .map_err(|e| Status::invalid_argument(format!("bad PSBT: {e}")))
@@ -247,6 +259,75 @@ impl RgbSidecar for RgbSidecarService {
             txid: txid.to_string(),
             recipient_seal_outpoint: recipient_outpoint,
             change_seal_outpoint: change_outpoint.unwrap_or_default(),
+        }))
+    }
+
+    async fn register_deposit_scripts(
+        &self,
+        request: Request<RegisterDepositScriptsRequest>,
+    ) -> Result<Response<RegisterDepositScriptsResponse>, Status> {
+        let req = request.into_inner();
+        let mut engine = self.engine.lock().await;
+        let entries: Vec<(String, Vec<u8>)> = req
+            .scripts
+            .iter()
+            .map(|e| (e.user_id.clone(), e.pk_script.clone()))
+            .collect();
+        let (accepted, all) = engine.register_deposit_scripts(&entries).map_err(err)?;
+        log_registered(&entries, accepted, all.len());
+        Ok(Response::new(RegisterDepositScriptsResponse {
+            accepted,
+            total: all.len() as u32,
+            scripts: all
+                .into_iter()
+                .map(|(user_id, pk_script)| DepositScriptEntry { user_id, pk_script })
+                .collect(),
+        }))
+    }
+
+    async fn build_sweep(
+        &self,
+        request: Request<BuildSweepRequest>,
+    ) -> Result<Response<BuildSweepResponse>, Status> {
+        let req = request.into_inner();
+        let mut engine = self.engine.lock().await;
+        match engine
+            .build_sweep(req.fee_rate as u64, req.min_utxos, req.min_confirmations)
+            .map_err(err)?
+        {
+            // 没有值得扫的 UTXO **不是错误**：调用方（闲时 ticker）按这个分支静默跳过。
+            None => Ok(Response::new(BuildSweepResponse::default())),
+            Some(b) => {
+                eprintln!(
+                    "sweep built: txid={} inputs={} value={} fee={}",
+                    b.txid, b.input_count, b.input_value, b.fee
+                );
+                Ok(Response::new(BuildSweepResponse {
+                    psbt: psbt_to_bytes(&b.psbt),
+                    input_count: b.input_count,
+                    input_value: b.input_value,
+                    fee: b.fee,
+                    txid: b.txid.to_string(),
+                }))
+            }
+        }
+    }
+
+    async fn finalize_sweep(
+        &self,
+        request: Request<FinalizeSweepRequest>,
+    ) -> Result<Response<FinalizeSweepResponse>, Status> {
+        let req = request.into_inner();
+        let engine = self.engine.lock().await;
+        let psbt = psbt_from_bytes(&req.psbt_signed)?;
+        let (txid, tx) = engine.finalize_sweep(&psbt).map_err(err)?;
+        use bitcoin::consensus::Encodable;
+        let mut raw = Vec::new();
+        tx.consensus_encode(&mut raw)
+            .map_err(|e| Status::internal(format!("encode sweep tx: {e}")))?;
+        Ok(Response::new(FinalizeSweepResponse {
+            txid: txid.to_string(),
+            raw_tx: raw,
         }))
     }
 
