@@ -412,6 +412,8 @@ func (t *tssService) signBtcTx(tx *wire.MsgTx, inputAmounts []int64, signers []s
 }
 
 // normalizeLowS 将高-S 签名归一化为低-S（BIP146 规范），保证广播前签名合法。
+// 注意：下游 Sig.Serialize() 自己也会归一化（decred secp256k1 v4.4.0 ecdsa/signature.go），
+// 此处不是 low-S 不变量的唯一保障——别因此以为它可以删，也别以为摘掉它广播仍一定安全。
 func normalizeLowS(sig *ecdsa.Signature) *ecdsa.Signature {
 	if sig != nil {
 		r := sig.R()
