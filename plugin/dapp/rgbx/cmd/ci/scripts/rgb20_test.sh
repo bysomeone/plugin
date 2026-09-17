@@ -184,7 +184,41 @@ function run_rgb20_env() {
 
     compose_cmd up -d rgb-sidecar
     wait_rgb20_sidecar_grpc
+    wait_bridge_signing_ready
     log_step "RGB20 env done: sidecar up (GG18 pubkey)"
+}
+
+# =====================================================================
+# 桥"可签名"就绪等待（CGGMP 起必需，不是可选的保险）
+# =====================================================================
+
+# 桥的 rgb20 HTTP（充值 CreateReceive / sign-psbt / 扫集协调）是在 **dkgCompleted 之后**才起来的：
+# client.Start → waitDKGCompleted → bw.start → rgb20.Start。
+#
+# GG18 时代 dkgCompleted 紧跟 DKG（亚秒级），所以"链上 CrossChainInfo 出现"（wait_rgb20_dkg_commit）
+# 之后桥基本已可用，无需单独等待。**切到 CGGMP 后不再成立**：DKG 之后每个节点还必须跑一次**必经的
+# refresh 阶段**（现生成 2048-bit Paillier 安全素数，本机实测数十秒；见 CONFIG.md §4.3.2）才会置
+# dkgCompleted。不等它就发充值请求，curl 直接连接失败 ⇒ 断言的 "receive_id empty" 是**假失败**
+# （桥还没开始服务），会把"协议启动更慢"误报成"桥坏了"。
+#
+# 判据必须落在**应用层**的应答上，不能只看"curl 成不成功"：容器端口还没被进程监听时，
+# Docker Desktop 的端口转发会在宿主侧先接住连接并回 **502**（实测），curl 仍然退出 0 —— 只看 curl
+# 的退出码会立刻"就绪"，等于没等（本 harness 第一版就是这么假通过的）。所以取状态码：
+#   - 连接被拒（容器没起/端口没发布）→ 000 → 未就绪；
+#   - 502/503（Docker 转发器：容器在、但里面没人监听）→ 未就绪；
+#   - 应用自己的应答（`/` 走 ServeMux 默认 → 404）→ **就绪**。
+function wait_bridge_signing_ready() {
+    log_step "wait bridge rgb20 HTTP ready (CGGMP: the mandatory refresh phase must finish first)"
+    local i code
+    for ((i = 0; i < 300; i++)); do
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:17000/" 2>/dev/null || echo 000)
+        if [ "${code}" != "000" ] && [ "${code}" -lt 500 ]; then
+            log_step "bridge rgb20 HTTP ready (status=${code}, after ~${i}s)"
+            return 0
+        fi
+        sleep 1
+    done
+    fail "bridge rgb20 HTTP not ready after 300s (CGGMP refresh stuck? check the para1 log for 'ensureRefresh')"
 }
 
 # =====================================================================
