@@ -35,6 +35,9 @@ import (
 const testB8ProofHeight = uint64(100)
 
 // b8Fixture 一个"能通过 checkDeposit 既有全部校验"的 BTC(XBTC) 充值环境 + 可控 tip。
+//
+// 充值绑定形态是 v1 的 P2WSH 派生：充值地址是冻结向量 A 的 chain33 地址串
+// （p2wsh_test.go 的 frozenVectorA），充值交易的输出付给该用户的 P2WSH program。
 type b8Fixture struct {
 	r           *rgbx
 	state       db.DB
@@ -44,7 +47,10 @@ type b8Fixture struct {
 	branch      [][]byte
 	depositAddr string
 	amount      int64
-	pkScript    []byte
+	// pkScript 主池脚本（P2WPKH 形态占位），仅用于填 CrossChainInfo
+	pkScript []byte
+	// user 冻结向量 A 的派生结果（充值地址 + tssPub + P2WSH program）
+	user *p2wshDepositFixture
 	// tip 注册进 mock 的 canonical tip 指针：改 (*tip).Height 即可模拟 tip 前进 / 重组回退。
 	tip *ltypes.BtcHeader
 }
@@ -64,10 +70,14 @@ func newB8Fixture(t *testing.T) *b8Fixture {
 	f.r.SetAPI(f.api)
 	f.r.SetStateDB(state)
 
+	f.user = newP2WSHDepositFixture(t, frozenVectorA)
+	f.depositAddr = f.user.depositAddr
+
 	prevHash := chainhash.DoubleHashH([]byte("b8-prevout"))
 	btcTx := wire.NewMsgTx(wire.TxVersion)
 	btcTx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: prevHash, Index: 0}, nil, nil))
-	btcTx.AddTxOut(wire.NewTxOut(f.amount, f.pkScript))
+	// 充值交易：付给该用户的 P2WSH program（链上看不到任何 OP_RETURN 承诺）
+	btcTx.AddTxOut(wire.NewTxOut(f.amount, f.user.pkScript))
 	var buf bytes.Buffer
 	require.NoError(t, btcTx.SerializeNoWitness(&buf))
 	f.raw = buf.Bytes()
@@ -82,11 +92,7 @@ func newB8Fixture(t *testing.T) *b8Fixture {
 		Hash: "b8-block", Height: testB8ProofHeight, MerkleRoot: rootHash.String(),
 	}, nil)
 
-	require.NoError(t, state.Set(formatCrossChainInfoKey("BTC"), types.Encode(&rtypes.CrossChainInfo{
-		AssetSymbol: "BTC", PkScript: f.pkScript,
-	})))
-	// 充值承诺：fromUtxo 口径 —— 交易的第一笔输入就是该 utxo。
-	f.depositAddr = rtypes.FormatUtxo(prevHash.String(), 0)
+	require.NoError(t, state.Set(formatCrossChainInfoKey("BTC"), types.Encode(f.user.crossChainInfo(f.pkScript))))
 	return f
 }
 
@@ -256,10 +262,15 @@ func Test_checkDeposit_permanentErrorsNotMaskedByConfirmations(t *testing.T) {
 	badMerkle.TxProof.MerkleProof = [][]byte{bytes.Repeat([]byte{1}, 32)}
 	require.Equal(t, ErrInvalidBtcProofMerkle, f.r.checkDeposit("tx", badMerkle))
 
-	// 2) OP_RETURN / fromUtxo 承诺不匹配
+	// 2) 归属不成立：拿另一份 chain33 地址来认领（派生脚本对不上 → 永久性拒绝）
 	badCommit := f.deposit(f.raw)
-	badCommit.DepositAddress = rtypes.FormatUtxo(chainhash.DoubleHashH([]byte("other")).String(), 0)
-	require.Equal(t, ErrInvalidDepositCommitment, f.r.checkDeposit("tx", badCommit))
+	badCommit.DepositAddress = frozenVectorB.userID
+	require.Equal(t, ErrInvalidDepositScript, f.r.checkDeposit("tx", badCommit))
+
+	// 2b) UTXO 形态的"充值地址"不再是合法地址（旧 fromUtxo 承诺路径已硬切删除）
+	badUtxo := f.deposit(f.raw)
+	badUtxo.DepositAddress = rtypes.FormatUtxo(chainhash.DoubleHashH([]byte("other")).String(), 0)
+	require.Equal(t, ErrInvalidDepositAddress, f.r.checkDeposit("tx", badUtxo))
 
 	// 3) 金额不匹配
 	badAmount := f.deposit(f.raw)

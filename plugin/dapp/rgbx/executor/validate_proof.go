@@ -17,7 +17,38 @@ import (
 )
 
 const withdrawCommitmentPrefix = "rgbx:withdraw:"
-const depositCommitmentPrefix = "rgbx:deposit:"
+
+/*
+ * 充值绑定：P2WSH 派生脚本（硬切，v1）
+ *
+ * 非 RGB20（BTC/XBTC）的充值绑定 = "这笔 BTC 交易付给了 (depositAddress, tssPub) 派生出的
+ * P2WSH program，且金额相符"。派生由 rtypes.DeriveDepositPkScript 给出，逐字节遵循冻结规格
+ * （plugin/dapp/rgbx/types/p2wsh_deposit.go，测试向量 testdata/p2wsh_deposit_vectors.json）。
+ *
+ * 为什么"去掉 OP_RETURN 承诺"仍然安全（后来者别以为 OP_RETURN 是可有可无的冗余）：
+ * 派生是确定性的、且 userID（= chain33 充值地址串）是原像的一部分 ——
+ *   - 想领别人那笔付款：得让 program 命中别人的 userID，做不可行（要 sha256 原像）；
+ *   - 想给自己记别人的账：得让对方的地址派生出的 program 命中自己那把钥，同样不可行。
+ * 于是"付给谁的 P2WSH"就等于"记谁的账"，不再需要额外在 tx 里写承诺。
+ * 代价是下面这条不变式必须由桥遵守（链上只能部分兜底）：
+ *
+ *   【不变式·冻结】用户 P2WSH 脚本只允许由**外部充值方**付款；
+ *   桥的任何自有付款（提现放款、扫集找零、手续费补贴、批量归集）都不得落到用户 P2WSH 上。
+ *
+ * 违反它的后果：桥自己付出去的那笔交易，收款用户可以拿着它回头当**充值证明**再铸一次
+ * ——因为链上只能看到"这笔 tx 付了 P2WSH(该用户)"，看不出付款方是谁（链上没有任何标记能
+ * 区分"外部充值"与"桥的付款"，见 TECHNICAL.md 的安全模型）。逐轮记账的净额是：
+ * 供给 ±0（烧多少铸多少）、主池 −X、桥控脚本 +X —— 桥的总资产不变、用户也没多拿，
+ * 所以它不是"资金被偷"，但会让提现额度与主池流动性被反复抽干（主池被抽干后，
+ * 其他用户的提现会因主池不足而失败）。因此活干在两头：
+ *   - 提现侧：checkWithdraw 直接拒绝 native P2WSH 目标地址（链上可判定，见 E15-a）；
+ *   - 扫集/找零/补贴侧：一律回主池 TSS P2WPKH，不许回用户 P2WSH（C4 落地，约束现在立此存照）。
+ *
+ * 其它已冻结的边界：
+ *   - 主托管（TSS 主池）脚本形态不变，仍是 P2WPKH：P2WSH 只作用于"BTC 充值收款"。
+ *   - RGB20 分支不走这条路（金额在 consignment 内，链上只验 TSS 阈值签名，H4）。
+ *   - `withdrawCommitmentPrefix` 保留：提现确认仍要 OP_RETURN 承诺（只有 RGB20 跳过）。
+ */
 
 func btcProof2String(txProof *rtypes.BtcTxProof) string {
 	return fmt.Sprintf("btcBlockHeight: %d, btcBlockHash: %s, btcTxIndex: %d, btcTxData: %s",
@@ -66,25 +97,67 @@ func (r *rgbx) checkWithdrawConfirm(txHash, confirmHash string, confirm *rtypes.
 	return r.checkBtcConfirmations("withdrawConfirm", txHash, confirm.GetBtcTxProof())
 }
 
+// deriveDepositPkScript 按冻结规格确定性重建"该用户在本 symbol 下的 P2WSH program"。
+//
+// 执行器侧不需要 bech32、不需要网络参数：只比 34 字节的 pkScript（少一层编解码歧义，
+// 也避免"地址串与 program 谁才是真身份"的二次约定）。逐字节规格见
+// plugin/dapp/rgbx/types/p2wsh_deposit.go，测试向量为三方共用。
+//
+// tssPub 取自链上 CrossChainInfo.Pubkey（CommitDKG 提交，checkCommitDKG 已强制带且
+// 与 DKG 地址的 P2WPKH 绑定）。取不到 ⇒ ErrInvalidCrossChainInfo（**不留旧状态兼容分支**：
+// 本链尚未上线，没有"没有 pubkey 的历史 CrossChainInfo"需要照顾）。
+func (r *rgbx) deriveDepositPkScript(txHash, symbol, depositAddr string) ([]byte, error) {
+	info, err := r.getCrossChainInfo(symbol)
+	if err != nil {
+		elog.Error("deriveDepositPkScript getCrossChainInfo", "txHash", txHash, "symbol", symbol, "err", err)
+		return nil, ErrGetCrossChainInfo
+	}
+	pkScript, err := rtypes.DeriveDepositPkScript(depositAddr, info.GetPubkey())
+	if err != nil {
+		elog.Error("deriveDepositPkScript derive p2wsh", "txHash", txHash, "symbol", symbol,
+			"depositAddr", depositAddr, "tssPubLen", len(info.GetPubkey()), "err", err)
+		return nil, ErrInvalidCrossChainInfo
+	}
+	return pkScript, nil
+}
+
+// validateDepositTxContent 链上金额校验（非 RGB20）：累加"等于该用户 P2WSH program"的输出，
+// 要求总和**恰好等于**申报金额。
+//
+// 两个错误码分得开，便于运维/桥侧区分"地址不对"与"金额不对"：
+//   - ErrInvalidDepositScript：这笔 tx 里**根本没有**付给该用户 P2WSH 的输出（充值地址错、
+//     tssPub 换代、或用户打到了别的地址）；
+//   - ErrInvalidDepositAmount：有这个输出，但金额与申报不符（多付/少报、想多记别人的付款）。
+//
+// 允许一笔 tx 同时给多个用户的 P2WSH 付款：各用户各自索赔时只累加自己那份（各自
+// deposit.GetAmount() 必须与自己那段相等），互不影响。
 func (r *rgbx) validateDepositTxContent(txHash string, deposit *rtypes.DepositAsset, btcTx *wire.MsgTx) error {
 	// RGB20 分支：全跳过链上金额（RGB 金额在 consignment 内）。
 	if rtypes.IsRgb20Symbol(deposit.GetAssetSymbol()) {
 		return nil
 	}
-	info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
+	expectPkScript, err := r.deriveDepositPkScript(txHash, deposit.GetAssetSymbol(), deposit.GetDepositAddress())
 	if err != nil {
-		elog.Error("validateDepositTxContent getCrossChainInfo", "txHash", txHash, "symbol", deposit.GetAssetSymbol(), "err", err)
-		return ErrGetCrossChainInfo
+		return err
 	}
 	var amount int64
+	matched := 0
 	for _, out := range btcTx.TxOut {
-		if bytes.Equal(out.PkScript, info.GetPkScript()) {
+		if bytes.Equal(out.PkScript, expectPkScript) {
 			amount += out.Value
+			matched++
 		}
+	}
+	if matched == 0 {
+		elog.Error("validateDepositTxContent no p2wsh output for user", "txHash", txHash,
+			"symbol", deposit.GetAssetSymbol(), "depositAddr", deposit.GetDepositAddress(),
+			"expectPkScript", hex.EncodeToString(expectPkScript))
+		return ErrInvalidDepositScript
 	}
 	if amount != deposit.GetAmount() {
 		elog.Error("validateDepositTxContent amount mismatch", "txHash", txHash,
-			"expect", deposit.GetAmount(), "actual", amount)
+			"depositAddr", deposit.GetDepositAddress(),
+			"expect", deposit.GetAmount(), "actual", amount, "matchedOutputs", matched)
 		return ErrInvalidDepositAmount
 	}
 	return nil
@@ -355,20 +428,10 @@ func (r *rgbx) getBtcHeader(height uint64) (*ltypes.BtcHeader, error) {
 	return header, nil
 }
 
+// 提现确认仍要求 OP_RETURN 承诺 rgbx:withdraw:<chain33 burn txHash>（只有 RGB20 跳过，H4）。
+// 充值侧自 v1 起**没有**这一层：绑定改由 P2WSH 派生承担（见文件头的"充值绑定"注释）。
 func hasWithdrawCommitment(tx *wire.MsgTx, chain33TxHash []byte) bool {
 	expectData := append([]byte(withdrawCommitmentPrefix), chain33TxHash...)
-	return hasExpectedOpReturnData(tx, expectData)
-}
-
-func hasDepositCommitment(tx *wire.MsgTx, depositAddress string) bool {
-	if rtypes.IsUtxoAddress(depositAddress) {
-		if len(tx.TxIn) > 0 {
-			firstInputUtxo := tx.TxIn[0].PreviousOutPoint
-			return depositAddress == rtypes.FormatUtxo(firstInputUtxo.Hash.String(), firstInputUtxo.Index)
-		}
-		return false
-	}
-	expectData := append([]byte(depositCommitmentPrefix), []byte(depositAddress)...)
 	return hasExpectedOpReturnData(tx, expectData)
 }
 

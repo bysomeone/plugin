@@ -50,11 +50,15 @@ func newE1DepositFixture(t *testing.T) *e1DepositFixture {
 	f.r.SetAPI(api)
 	f.r.SetStateDB(state)
 
+	// 充值目标 = 冻结向量 A 的 P2WSH program（v1 起充值绑定完全靠派生，不再有 fromUtxo 承诺）
+	user := newP2WSHDepositFixture(t, frozenVectorA)
+	f.depositAddr = user.depositAddr
+
 	prevHash := chainhash.DoubleHashH([]byte("e1-prevout"))
 	var btcTx wire.MsgTx
 	btcTx.Version = 2
 	btcTx.TxIn = append(btcTx.TxIn, wire.NewTxIn(&wire.OutPoint{Hash: prevHash, Index: 0}, nil, nil))
-	btcTx.TxOut = append(btcTx.TxOut, wire.NewTxOut(f.amount, f.pkScript))
+	btcTx.TxOut = append(btcTx.TxOut, wire.NewTxOut(f.amount, user.pkScript))
 	buf := new(bytes.Buffer)
 	require.NoError(t, btcTx.SerializeNoWitness(buf))
 	f.raw = buf.Bytes()
@@ -72,10 +76,7 @@ func newE1DepositFixture(t *testing.T) *e1DepositFixture {
 		Hash: "e1-tip", Height: 100 + uint64(defaultMinBtcConfirmations) - 1,
 	}, nil)
 
-	require.NoError(t, state.Set(formatCrossChainInfoKey("BTC"), types.Encode(&rtypes.CrossChainInfo{
-		AssetSymbol: "BTC", PkScript: f.pkScript,
-	})))
-	f.depositAddr = rtypes.FormatUtxo(prevHash.String(), 0)
+	require.NoError(t, state.Set(formatCrossChainInfoKey("BTC"), types.Encode(user.crossChainInfo(f.pkScript))))
 	return f
 }
 

@@ -305,8 +305,8 @@ func TestRgbx_Exec_Withdraw(t *testing.T) {
 
 func TestRgbx_Exec_CommitDKG(t *testing.T) {
 	r := newRgbx()
-	dkgAddr, pkScript := newTestnetWitnessAddr(t)
-	commit := &rtypes.CommitDKG{AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: pkScript}
+	dkgAddr, pkScript, pubkey := newTestnetWitnessAddrAndPub(t)
+	commit := &rtypes.CommitDKG{AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: pkScript, Pubkey: pubkey}
 
 	dir, state, _ := util.CreateTestDB()
 	defer util.CloseTestDB(dir, state)
