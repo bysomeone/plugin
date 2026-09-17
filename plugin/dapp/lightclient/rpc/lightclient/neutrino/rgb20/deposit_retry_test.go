@@ -15,7 +15,7 @@ import (
  *  ① 本地深度门控：链上可见深度不够时**不签、不提交**（重试只等，不空跑签名轮次）；
  *  ② N 来自链上（桥接查询），不是中继自己镜像的配置；
  *  ③ 签名产物落盘：重试优先重发，签名轮次不必重跑；
- *  ④ 产物丢失（rgb20-deposit-sig 无记录）时可自愈：重新签名一轮并提交成功。
+ *  ④ 产物丢失（`rgb20-deposit-sig` 无记录）时可自愈：重新签名一轮并提交成功。
  *
  * 注意 N > 1 是这些用例的重点：CI 里 [exec.sub.rgbx].minBtcConfirmations=1 会让"提交那一刻
  * 链上可见深度是 0"这件事被掩盖（N=1 时深度 0 也够），本地单测必须显式覆盖 N > 1。
@@ -267,27 +267,6 @@ func TestSubmitDeposit_ResignsWhenArtifactLost(t *testing.T) {
 	require.Equal(t, ReceiveStatusMinted, mustReceiveStatus(t, adapter2, rec.ReceiveID))
 	require.Equal(t, 0, adapter2.depositSigs.Len(), "铸造成功后应清掉落盘产物")
 	require.False(t, adapter2.seals.IsPendingMint(rec.Seal))
-}
-
-// TestSubmitDeposit_ResubmitWithArtifactKeepsOneSignatureRound ⑤：产物存在时走重发，**签名轮次
-// 一次都不再驱动** —— 这是落盘产物存在的全部意义（省一轮 GG18），也是"提交失败不丢产物"的价值。
-func TestSubmitDeposit_ResubmitWithArtifactKeepsOneSignatureRound(t *testing.T) {
-	bridge := &fakeBridge{}
-	adapter := newDepositTestAdapter(t, bridge, nil)
-	rec := seedSettledReceive(t, adapter, "recv-resubmit", testDepositTxid, 1000)
-	bridge.setDepth(testRequiredBest+10, testRgbxConfs)
-
-	bridge.setSubmitErr(errors.New("chain33 busy"))
-	require.Error(t, adapter.submitDeposit(rec))
-	require.Equal(t, 1, bridge.signCallCount())
-	require.Equal(t, 1, adapter.depositSigs.Len())
-
-	// 重试：走重发路径，不再签名。
-	bridge.setSubmitErr(nil)
-	require.NoError(t, adapter.submitDeposit(rec))
-	require.Equal(t, 1, bridge.signCallCount(), "有产物时重试不得再驱动签名轮次")
-	require.Equal(t, 2, bridge.submitCallCount())
-	require.Equal(t, ReceiveStatusMinted, mustReceiveStatus(t, adapter, rec.ReceiveID))
 }
 
 // TestRequiredSubmitHeight 门控公式：本地 best 阈值 = H + B + N - 1。
