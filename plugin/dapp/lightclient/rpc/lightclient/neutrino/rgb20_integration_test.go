@@ -104,8 +104,8 @@ func Test_analyzeTransaction_normalDepositUsesDerivedScript(t *testing.T) {
 	const userID = "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk"
 	depositScript, err := rtypes.DeriveDepositPkScript(userID, pub.SerializeCompressed())
 	require.NoError(t, err)
-	b.depositScripts = newDepositScriptSet()
-	b.depositScripts.add(userID, depositScript)
+	b.client.deposits = newDepositScriptSet()
+	b.client.deposits.add(userID, depositScript)
 
 	tx := wire.NewMsgTx(wire.TxVersion)
 	tx.AddTxOut(wire.NewTxOut(100000, depositScript))
