@@ -552,14 +552,17 @@ func checkShareAgainstChainInfos(localPub *btcec.PublicKey, symbols []string,
 		}
 		switch {
 		case len(info.GetPubkey()) > 0:
-			// RGB20 symbol：链上带 TSS 组公钥（CommitDKG 时上链，RGB20 分支强制非空）。
+			// 链上带 TSS 组公钥，逐字节比对。**这是全部 symbol 的正常路径**：C1 起 checkCommitDKG
+			// 对所有 symbol（含 BTC/XBTC）强制 33 字节压缩公钥（P2WSH 充值地址 = f(userID, tssPub)，
+			// 靠的就是这把钥），桥侧对应的提交见 tss_commit.go 的 buildCommitDKGPayload。
 			if !bytes.Equal(info.GetPubkey(), localPubBytes) {
 				mismatches = append(mismatches, fmt.Sprintf(
 					"symbol=%s localGroupPubkey=%x chainPubkey=%x chainTssAddress=%s",
 					symbol, localPubBytes, info.GetPubkey(), info.GetTssAddress()))
 			}
 		case isP2WPKHScript(info.GetPkScript()):
-			// 不带 pubkey 的 symbol（BTC：CommitDKG 里没有 pubkey 字段）：退化为比对
+			// 链上记录没有 pubkey 时的退化路径（C1 前提交的 BTC CrossChainInfo 属这种形态；
+			// 硬切后新提交的一律带 pubkey，因此这条只剩防御意义）：比对
 			// hash160(组公钥) == pkScript[2:]，与链上 checkCommitDKG 的判定口径一致、与网络无关。
 			if !bytes.Equal(localPubHash, info.GetPkScript()[2:]) {
 				mismatches = append(mismatches, fmt.Sprintf(
