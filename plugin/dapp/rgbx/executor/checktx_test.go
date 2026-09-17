@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -367,14 +368,34 @@ func Test_checkMint_rejectsAliasedSymbol(t *testing.T) {
 
 func newTestnetWitnessAddr(t *testing.T) (addr string, pkScript []byte) {
 	t.Helper()
+	addr, pkScript, _ = newTestnetWitnessAddrAndPub(t)
+	return addr, pkScript
+}
+
+// newTestnetWitnessAddrAndPub 同 newTestnetWitnessAddr，另外返回与 pkScript 绑定的压缩公钥
+// （CommitDKG 现在对所有 symbol 都要求带 pubkey，且校验 hash160(pubkey)==pkScript[2:]）。
+func newTestnetWitnessAddrAndPub(t *testing.T) (addr string, pkScript, pub []byte) {
+	t.Helper()
 	priv, err := btcec.NewPrivateKey()
 	require.NoError(t, err)
-	pub := priv.PubKey().SerializeCompressed()
+	pub = priv.PubKey().SerializeCompressed()
 	waddr, err := btcutil.NewAddressWitnessPubKeyHash(btcutil.Hash160(pub), &chaincfg.TestNet3Params)
 	require.NoError(t, err)
 	pk, err := txscript.PayToAddrScript(waddr)
 	require.NoError(t, err)
-	return waddr.String(), pk
+	return waddr.String(), pk, pub
+}
+
+// newTestnetP2WSHAddr 由给定 witnessScript 造一个 native P2WSH 目标地址（任意脚本，
+// 用于证明"普通 P2WSH 目标不受影响"）。
+func newTestnetP2WSHAddr(t *testing.T, witnessScript []byte) (string, []byte) {
+	t.Helper()
+	sum := sha256.Sum256(witnessScript)
+	addr, err := btcutil.NewAddressWitnessScriptHash(sum[:], &chaincfg.TestNet3Params)
+	require.NoError(t, err)
+	pk, err := txscript.PayToAddrScript(addr)
+	require.NoError(t, err)
+	return addr.String(), pk
 }
 
 func Test_checkWithdraw(t *testing.T) {
@@ -416,7 +437,12 @@ func Test_checkWithdraw(t *testing.T) {
 	api.On("GetConfig").Return(testCfg)
 	api.On("Query", ltypes.LightclientX, "GetBtcNetName", mock.Anything).Return(&types.ReplyString{Data: "testnet3"}, nil)
 	r.SetStateDB(state)
-	require.Nil(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(&rtypes.CrossChainInfo{AssetSymbol: "BTC"})))
+	// E15-a 之后 checkWithdraw 需要 tssPub（判"目标是不是发起人自己的充值脚本"），
+	// 因此 CrossChainInfo 必须带 pubkey（无 pubkey ⇒ ErrInvalidCrossChainInfo，见专用用例）。
+	infoWithPub := func() *rtypes.CrossChainInfo {
+		return &rtypes.CrossChainInfo{AssetSymbol: "BTC", Pubkey: newP2WSHDepositFixture(t, frozenVectorA).tssPub}
+	}
+	require.Nil(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(infoWithPub())))
 	// checkWithdraw 现在使用 newAccount(withdraw.GetAssetSymbol())，即 newAccount("btc")
 	// formatSymbol("btc") -> "BTC"，所以账户 symbol 是 "BTC"
 	acc, err := r.(*rgbx).newAccount("xbtc")
@@ -429,11 +455,100 @@ func Test_checkWithdraw(t *testing.T) {
 			require.Nil(t, state.Delete(formatCrossChainInfoKey("btc")))
 		}
 		if idx == 2 {
-			require.Nil(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(&rtypes.CrossChainInfo{AssetSymbol: "BTC"})))
+			require.Nil(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(infoWithPub())))
 		}
 		value.Withdraw = tc.action.(*rtypes.WithdrawAsset)
 		testCheck(t, r, tx, action, tc.expectErr, idx)
 	}
+}
+
+// Test_checkWithdraw_depositScriptGuard E15-a：**只拒"提现目标 = 发起人自己的充值脚本"**，
+// 不拒一般的 P2WSH / P2TR 目标（交易所、多签钱包、闪电通道大量使用这两类地址）。
+func Test_checkWithdraw_depositScriptGuard(t *testing.T) {
+	r := newRgbx().(*rgbx)
+	tx := &types.Transaction{}
+	tx.Sign(types.SECP256K1, testPriv) // from == testCommitAddr
+	fromAddr := tx.From()
+	require.Equal(t, testCommitAddr, fromAddr)
+
+	dir, state, _ := util.CreateTestDB()
+	defer util.CloseTestDB(dir, state)
+	api := &mocks.QueueProtocolAPI{}
+	r.SetAPI(api)
+	api.On("GetConfig").Return(testCfg)
+	api.On("Query", ltypes.LightclientX, "GetBtcNetName", mock.Anything).Return(&types.ReplyString{Data: "testnet3"}, nil)
+	r.SetStateDB(state)
+
+	params := &chaincfg.TestNet3Params
+	user := newP2WSHDepositFixture(t, frozenVectorA)
+	require.NoError(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(user.crossChainInfo([]byte{0x51}))))
+
+	// 与 checkWithdraw 的 ensureCrossChainSymbol("btc") 口径一致：账户 symbol 是 "XBTC"
+	acc, err := r.newAccount("xbtc")
+	require.NoError(t, err)
+	_, err = acc.Mint(fromAddr, 100000)
+	require.NoError(t, err)
+
+	// 1) 目标 = 发起人自己的充值地址（P2WSH(发起人, tssPub)）→ 拒
+	ownDepositAddr, err := rtypes.DeriveDepositAddress(fromAddr, user.tssPub, params)
+	require.NoError(t, err)
+	ownScript, err := r.decodeBtcAddressScript(ownDepositAddr)
+	require.NoError(t, err)
+	require.True(t, rtypes.IsDepositPkScript(ownScript, fromAddr, user.tssPub), "前提：这个目标就是自己的充值脚本")
+	require.Equal(t, ErrWithdrawToDepositScript, r.checkWithdraw(fromAddr, "tx", &rtypes.WithdrawAsset{
+		AssetSymbol: "btc", Amount: 10000, FeeRate: 10, DestinationAddr: ownDepositAddr,
+	}))
+
+	// 2) 目标 = **普通** P2WSH（2-of-2 多签）→ 放行
+	priv1, _ := btcec.NewPrivateKey()
+	priv2, _ := btcec.NewPrivateKey()
+	multisig, err := txscript.NewScriptBuilder().
+		AddOp(txscript.OP_2).
+		AddData(priv1.PubKey().SerializeCompressed()).
+		AddData(priv2.PubKey().SerializeCompressed()).
+		AddOp(txscript.OP_2).AddOp(txscript.OP_CHECKMULTISIG).Script()
+	require.NoError(t, err)
+	multisigAddr, _ := newTestnetP2WSHAddr(t, multisig)
+	require.NoError(t, r.checkWithdraw(fromAddr, "tx", &rtypes.WithdrawAsset{
+		AssetSymbol: "btc", Amount: 10000, FeeRate: 10, DestinationAddr: multisigAddr,
+	}))
+
+	// 3) 目标 = P2WPKH → 放行
+	wpkhAddr, _ := newTestnetWitnessAddr(t)
+	require.NoError(t, r.checkWithdraw(fromAddr, "tx", &rtypes.WithdrawAsset{
+		AssetSymbol: "btc", Amount: 10000, FeeRate: 10, DestinationAddr: wpkhAddr,
+	}))
+
+	// 4) 目标 = P2TR（witness v1）→ 放行
+	taprootAddr, err := btcutil.NewAddressTaproot(bytes.Repeat([]byte{0x02}, 32), params)
+	require.NoError(t, err)
+	require.NoError(t, r.checkWithdraw(fromAddr, "tx", &rtypes.WithdrawAsset{
+		AssetSymbol: "btc", Amount: 10000, FeeRate: 10, DestinationAddr: taprootAddr.String(),
+	}))
+
+	// 5) 已知覆盖面边界（如实钉住，不假装覆盖）：目标是**另一个** chain33 地址的充值地址时，
+	//    链上无法枚举已发放地址 ⇒ 放行；这一段只能由桥侧 registry 兜底（C2/C4）。
+	otherUser := newP2WSHDepositFixture(t, frozenVectorB)
+	require.NotEqual(t, fromAddr, otherUser.depositAddr)
+	otherDepositAddr, err := rtypes.DeriveDepositAddress(otherUser.depositAddr, user.tssPub, params)
+	require.NoError(t, err)
+	require.True(t, rtypes.IsDepositPkScript(mustDecodeScript(t, r, otherDepositAddr), otherUser.depositAddr, user.tssPub))
+	require.NoError(t, r.checkWithdraw(fromAddr, "tx", &rtypes.WithdrawAsset{
+		AssetSymbol: "btc", Amount: 10000, FeeRate: 10, DestinationAddr: otherDepositAddr,
+	}), "链上挡不住这个变体（边界，需桥侧 registry 兜底）")
+
+	// 6) CrossChainInfo 没有 pubkey ⇒ fail-closed（无法判定"是不是自己的充值脚本"就不放行）
+	require.NoError(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(&rtypes.CrossChainInfo{AssetSymbol: "BTC"})))
+	require.Equal(t, ErrInvalidCrossChainInfo, r.checkWithdraw(fromAddr, "tx", &rtypes.WithdrawAsset{
+		AssetSymbol: "btc", Amount: 10000, FeeRate: 10, DestinationAddr: wpkhAddr,
+	}))
+}
+
+func mustDecodeScript(t *testing.T, r *rgbx, addr string) []byte {
+	t.Helper()
+	script, err := r.decodeBtcAddressScript(addr)
+	require.NoError(t, err)
+	return script
 }
 
 func Test_checkDeposit(t *testing.T) {
@@ -519,23 +634,35 @@ func Test_checkCommitDKG(t *testing.T) {
 	value := &rtypes.RgbxAction_CommitDKG{}
 	action.Value = value
 
-	dkgAddr, validPk := newTestnetWitnessAddr(t)
+	dkgAddr, validPk, validPub := newTestnetWitnessAddrAndPub(t)
 
+	// P2WSH 起，**所有** symbol 的 CommitDKG 都必须带 TSS 群公钥（派生充值脚本要用），
+	// 且 hash160(pubkey) 必须等于 DKG 地址的 pkScript[2:]。
 	tcArr := []*testCase{
 		{expectErr: ErrInvalidDkgAddress, action: &rtypes.CommitDKG{
-			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: []byte{0x01},
+			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: []byte{0x01}, Pubkey: validPub,
+		}},
+		{expectErr: ErrInvalidDkgAddress, action: &rtypes.CommitDKG{
+			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk, // 缺 pubkey → 拒
+		}},
+		{expectErr: ErrInvalidDkgAddress, action: &rtypes.CommitDKG{
+			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk, Pubkey: newP2WSHDepositFixture(t, frozenVectorB).tssPub,
+		}},
+		{expectErr: ErrInvalidDkgAddress, action: &rtypes.CommitDKG{
+			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk,
+			Pubkey: append(append([]byte{}, validPub[:32]...), validPub[32]^0x01), // 改了最后一字节 → 与地址不符
 		}},
 		{expectErr: ErrGetGuardianNodeAddress, action: &rtypes.CommitDKG{
-			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk,
+			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk, Pubkey: validPub,
 		}},
 		{expectErr: ErrInvalidGuardianCommitter, action: &rtypes.CommitDKG{
-			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk,
+			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk, Pubkey: validPub,
 		}},
 		{expectErr: ErrDuplicateDKGCommit, action: &rtypes.CommitDKG{
-			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk,
+			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk, Pubkey: validPub,
 		}},
 		{expectErr: nil, action: &rtypes.CommitDKG{
-			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk,
+			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk, Pubkey: validPub,
 		}},
 	}
 
@@ -549,25 +676,25 @@ func Test_checkCommitDKG(t *testing.T) {
 
 	for idx, tc := range tcArr {
 		switch idx {
-		case 1:
+		case 4:
 			api.ExpectedCalls = nil
 			api.On("GetConfig").Return(testCfg)
 			api.On("Query", ltypes.LightclientX, "GetBtcNetName", mock.Anything).Return(&types.ReplyString{Data: "testnet3"}, nil)
 			api.On("Query", paratypes.ParaX, "GetNodeGroupStatus", mock.Anything).Return(nil, errors.New("query fail"))
-		case 2:
+		case 5:
 			api.ExpectedCalls = nil
 			api.On("GetConfig").Return(testCfg)
 			api.On("Query", ltypes.LightclientX, "GetBtcNetName", mock.Anything).Return(&types.ReplyString{Data: "testnet3"}, nil)
 			api.On("Query", paratypes.ParaX, "GetNodeGroupStatus", mock.Anything).Return(
 				&paratypes.ParaNodeGroupStatus{TargetAddrs: "other1,other2"}, nil)
-		case 3:
+		case 6:
 			api.ExpectedCalls = nil
 			api.On("GetConfig").Return(testCfg)
 			api.On("Query", ltypes.LightclientX, "GetBtcNetName", mock.Anything).Return(&types.ReplyString{Data: "testnet3"}, nil)
 			api.On("Query", paratypes.ParaX, "GetNodeGroupStatus", mock.Anything).Return(
 				&paratypes.ParaNodeGroupStatus{TargetAddrs: testCommitAddr}, nil)
 			require.Nil(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(&rtypes.CrossChainInfo{AssetSymbol: "BTC"})))
-		case 4:
+		case 7:
 			api.ExpectedCalls = nil
 			api.On("GetConfig").Return(testCfg)
 			api.On("Query", ltypes.LightclientX, "GetBtcNetName", mock.Anything).Return(&types.ReplyString{Data: "testnet3"}, nil)

@@ -9,7 +9,6 @@ import (
 	"github.com/33cn/chain33/common/address"
 	"github.com/33cn/chain33/types"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
-	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/txscript"
 )
@@ -37,9 +36,28 @@ var (
 	ErrInvalidWithdrawAmount            = errors.New("invalid withdraw amount")
 	ErrInvalidWithdrawDestination       = errors.New("invalid withdraw destination")
 	ErrInvalidWithdrawDestinationScript = errors.New("invalid withdraw destination script")
-	ErrInvalidDepositAmount             = errors.New("invalid deposit amount")
-	ErrInvalidDepositAddress            = errors.New("invalid deposit address")
-	ErrInvalidDepositCommitment         = errors.New("invalid deposit opreturn commitment")
+	// ErrWithdrawToDepositScript 提现目标**就是提现发起人自己的充值脚本**
+	// （program == P2WSH(tx.From(), 本 symbol 的 tssPub)）。
+	//
+	// E15-a 卫生项（纵深防御）：提现是 receiverPaysFee=true（btcwallet.go buildTransaction），
+	// 收款输出只有 amount−fee；而去掉充值 OP_RETURN 后，链上充值判定取的是"实际付到派生
+	// P2WSH 的输出值"（validateDepositTxContent 累加实际输出，**不是**名义金额）。
+	// 两条前提合起来 ⇒ 把提现目标填成自己的充值地址再拿那笔付款当充值证明，这一圈
+	// **是自我限制的**：用户每轮净亏一次手续费，桥的总资产不变（BTC 落在桥自己控制的
+	// P2WSH 里，用户拿不走），真实后果只是主池流动性被反复抽干（其他用户提现可能因
+	// 主池不足而失败）。所以这是低成本卫生项，不是"资金被偷"级紧急项。
+	// **这两个前提不要被改掉**（提现保持 receiverPaysFee=true；充值金额保持"实际输出值"）。
+	//
+	// 只拒"我们自己的充值脚本"，**不拒一般的 P2WSH**：交易所/多签钱包/闪电通道大量使用
+	// P2WSH 与 P2TR 地址，一刀切会把合法提现也拒了。
+	ErrWithdrawToDepositScript = errors.New("withdraw destination is a bridge deposit script")
+	ErrInvalidDepositAmount    = errors.New("invalid deposit amount")
+	ErrInvalidDepositAddress   = errors.New("invalid deposit address")
+	// ErrInvalidDepositScript 充值交易里没有任何输出付给该用户的 P2WSH 派生脚本
+	// （充值地址错 / tssPub 换代 / 用户打到了别的地址）。与 ErrInvalidDepositAmount 分开，
+	// 便于桥侧把"地址不对"与"金额不对"区分开。旧 OP_RETURN 承诺口径（ErrInvalidDepositCommitment）
+	// 已随硬切删除：v1 的绑定完全由派生承担（见 validate_proof.go 的"充值绑定"注释）。
+	ErrInvalidDepositScript             = errors.New("invalid deposit p2wsh script")
 	ErrInvalidWithdrawFeeRate           = errors.New("invalid withdraw fee rate")
 	ErrInvalidAssetSymbol               = errors.New("invalid asset symbol")
 	ErrInvalidBtcTxProof                = errors.New("invalid btc tx proof")
@@ -264,24 +282,26 @@ func (r *rgbx) checkCommitDKG(txHash, fromAddr string, commitDKG *rtypes.CommitD
 			"pkScript", hex.EncodeToString(commitDKG.GetPkScript()), "expectPkScript", hex.EncodeToString(pkScript), "err", err)
 		return ErrInvalidDkgAddress
 	}
-	// RGB20 分支（BL-1）：校验 hash160(pubkey) == pkScript[2:]，确保 TSS 组公钥与地址一致。
-	if rtypes.IsRgb20Symbol(symbol) {
-		if len(commitDKG.GetPubkey()) == 0 {
-			elog.Error("checkCommitDKG rgb20 empty pubkey", "txHash", txHash, "symbol", symbol)
-			return ErrInvalidDkgAddress
-		}
-		pub, err := btcec.ParsePubKey(commitDKG.GetPubkey())
-		if err != nil {
-			elog.Error("checkCommitDKG rgb20 parse pubkey", "txHash", txHash, "symbol", symbol, "err", err)
-			return ErrInvalidDkgAddress
-		}
-		pubHash := btcutil.Hash160(pub.SerializeCompressed())
-		if len(pkScript) != 22 || pkScript[0] != txscript.OP_0 || pkScript[1] != 0x14 ||
-			!bytes.Equal(pubHash, pkScript[2:]) {
-			elog.Error("checkCommitDKG rgb20 pubkey mismatch", "txHash", txHash, "symbol", symbol,
-				"pubHash", hex.EncodeToString(pubHash), "pkScript", hex.EncodeToString(pkScript))
-			return ErrInvalidDkgAddress
-		}
+	// 所有 symbol（含 BTC/XBTC）都必须提交 TSS 组公钥，并校验 hash160(pubkey) == pkScript[2:]，
+	// 确保群公钥与 DKG 地址一致（原 RGB20 分支 BL-1 提升为全局）。
+	//
+	// 为什么 BTC 符号也必须带：P2WSH 充值地址 = f(userID, tssPub)，执行器/桥都靠这把钥重建脚本
+	// （validate_proof.go 的 deriveDepositPkScript）。缺了它充值根本无法判定；带了别的钥，
+	// 用户打进的 BTC 会落到桥认不出的脚本里。所以"取不到即报错"，**不留无 pubkey 的兼容分支**
+	// （本链未上线，不存在需要照顾的历史 CrossChainInfo）。
+	// 只接受 33 字节压缩公钥（ParseDepositTssPubKey）：非压缩的同一把钥会派生出另一个地址。
+	pub, err := rtypes.ParseDepositTssPubKey(commitDKG.GetPubkey())
+	if err != nil {
+		elog.Error("checkCommitDKG parse tss pubkey", "txHash", txHash, "symbol", symbol,
+			"pubkeyLen", len(commitDKG.GetPubkey()), "err", err)
+		return ErrInvalidDkgAddress
+	}
+	pubHash := btcutil.Hash160(pub)
+	if len(pkScript) != 22 || pkScript[0] != txscript.OP_0 || pkScript[1] != 0x14 ||
+		!bytes.Equal(pubHash, pkScript[2:]) {
+		elog.Error("checkCommitDKG pubkey mismatch", "txHash", txHash, "symbol", symbol,
+			"pubHash", hex.EncodeToString(pubHash), "pkScript", hex.EncodeToString(pkScript))
+		return ErrInvalidDkgAddress
 	}
 	guardianAddrs, err := r.getGuardianNodeAddress(rgbxCfg.GuardianParachainTitle)
 	if err != nil {
@@ -339,13 +359,48 @@ func (r *rgbx) checkWithdraw(fromAddr, txHash string, withdraw *rtypes.WithdrawA
 		return ErrInvalidWithdrawAmount
 	}
 
-	if _, err := r.decodeBtcAddressScript(withdraw.GetDestinationAddr()); err != nil {
+	destScript, err := r.decodeBtcAddressScript(withdraw.GetDestinationAddr())
+	if err != nil {
 		elog.Error("checkWithdraw invalid btc destination", "txHash", txHash, "address", withdraw.GetDestinationAddr(), "err", err)
 		return ErrInvalidWithdrawDestination
 	}
 	if withdraw.GetFeeRate() < 1 || withdraw.GetFeeRate() > maxBtcFeeRate {
 		elog.Error("checkWithdraw feeRate", "txHash", txHash, "feeRate", withdraw.GetFeeRate())
 		return ErrInvalidWithdrawFeeRate
+	}
+	// E15-a：拒"提现目标 = 发起人自己的充值脚本"。理由与两条前提见 ErrWithdrawToDepositScript。
+	//
+	// tssPub 取自链上 CrossChainInfo（fail-closed：读不到 / 没带 pubkey 都拒 —— 同一份信息
+	// 在提现确认（validateWithdrawTxContent）那里也是必需的，早拒比事后卡住好）。
+	// 注意用**原始** symbol 查：CrossChainInfo 的 key 是 formatSymbol(raw)（"btc" → "BTC"），
+	// 而上面的 symbol 已经过 ensureCrossChainSymbol（"btc" → "XBTC"）—— 用后者查不到。
+	info, err := r.getCrossChainInfo(withdraw.GetAssetSymbol())
+	if err != nil {
+		elog.Error("checkWithdraw getCrossChainInfo", "txHash", txHash, "symbol", withdraw.GetAssetSymbol(), "err", err)
+		return ErrGetCrossChainInfo
+	}
+	tssPub, err := rtypes.ParseDepositTssPubKey(info.GetPubkey())
+	if err != nil {
+		elog.Error("checkWithdraw invalid tss pubkey", "txHash", txHash, "symbol", symbol,
+			"pubkeyLen", len(info.GetPubkey()), "err", err)
+		return ErrInvalidCrossChainInfo
+	}
+	// 判定为什么是这个形态（而不是"目标是不是 native P2WSH"）：链上拿到的是目标地址的输出
+	// 脚本，对 native P2WSH 只有 34 字节的 `OP_0 <sha256(witnessScript)>` —— witnessScript
+	// 本身在花费前不可见，所以"看目标脚本是不是 <data> OP_DROP <tssPub> OP_CHECKSIG 形态"
+	// 在链上**不可判定**。可判定的等价形式是"program 是否等于按 (发起人, tssPub) 能确定性
+	// 重建出来的那个充值 program"，而发起人自己的充值地址正是这条自循环唯一能得手的形态
+	// （充值金额必须落在按 depositAddress 派生的脚本上，depositAddress 就是发起人的 chain33
+	// 地址）。一般的 P2WSH（交易所/多签/闪电通道）与 P2TR 目标一律放行。
+	//
+	// 覆盖面边界（如实记）：若用**另一个**自己控制的 chain33 地址 B 的充值地址当提现目标
+	// （再以 B 认领充值），链上无法枚举"已发放地址" ⇒ 挡不住；那一段只能由桥侧用 registry
+	// 兜底（属 C2/C4）。链上这条是无白名单、零成本的兜底。
+	if rtypes.IsDepositPkScript(destScript, fromAddr, tssPub) {
+		elog.Error("checkWithdraw destination is own deposit script", "txHash", txHash,
+			"fromAddr", fromAddr, "symbol", symbol, "address", withdraw.GetDestinationAddr(),
+			"destScript", hex.EncodeToString(destScript))
+		return ErrWithdrawToDepositScript
 	}
 	accDB, err := r.newAccount(symbol)
 	if err != nil {
@@ -385,9 +440,15 @@ func (r *rgbx) checkDeposit(txHash string, deposit *rtypes.DepositAsset) error {
 		elog.Error("checkDeposit amount", "txHash", txHash, "amount", deposit.GetAmount())
 		return ErrInvalidDepositAmount
 	}
+	// 充值地址必须是 chain33 地址串：它同时是 P2WSH 派生里的 userID（原样字节，见
+	// types/p2wsh_deposit.go）。UTXO 形态（<btc txid>:<idx>，旧 fromUtxo 承诺路径的遗留）
+	// 不再是合法充值地址 —— 硬切后没有 OP_RETURN / 首输入承诺可依赖，拒绝而非兼容。
+	// IsUtxoAddress 必须显式排除：address.CheckAddress(addr, -1) 对 "<64hex>:<idx>" 这样的串
+	// 也会返回 nil（任一 driver 通过即算合法），只靠它挡不住 UTXO 形态。
 	addr := deposit.GetDepositAddress()
-	if addr == "" || (!rtypes.IsUtxoAddress(addr) && address.CheckAddress(addr, -1) != nil) {
-		elog.Error("checkDeposit address invalid", "txHash", txHash, "address", addr)
+	if addr == "" || rtypes.IsUtxoAddress(addr) || address.CheckAddress(addr, -1) != nil {
+		elog.Error("checkDeposit address invalid", "txHash", txHash, "address", addr,
+			"utxoForm", rtypes.IsUtxoAddress(addr))
 		return ErrInvalidDepositAddress
 	}
 	if err := r.checkDepositDuplicate(txHash, deposit); err != nil {
@@ -411,10 +472,7 @@ func (r *rgbx) checkDeposit(txHash string, deposit *rtypes.DepositAsset) error {
 			return err
 		}
 	} else {
-		if !hasDepositCommitment(btcTx, addr) {
-			elog.Error("checkDeposit commitment mismatch", "txHash", txHash, "depositAddress", addr)
-			return ErrInvalidDepositCommitment
-		}
+		// 硬切：充值只认 P2WSH 派生脚本（金额 + 归属一次判定），不再有 OP_RETURN 承诺。
 		if err = r.validateDepositTxContent(txHash, deposit, btcTx); err != nil {
 			return err
 		}

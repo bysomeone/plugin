@@ -35,7 +35,8 @@ func Test_btcProof2String_and_merkleProof2String(t *testing.T) {
 	require.Contains(t, merkleProof2String([][]byte{{0xaa}, {0xbb}}), "aa")
 }
 
-func Test_hasExpectedOpReturnData_and_commitments(t *testing.T) {
+// Test_hasWithdrawCommitment 提现侧的 OP_RETURN 承诺仍保留（充值侧已随硬切删除）。
+func Test_hasWithdrawCommitment(t *testing.T) {
 	data := []byte("rgbx:test")
 	script, err := txscript.NullDataScript(data)
 	require.NoError(t, err)
@@ -52,23 +53,19 @@ func Test_hasExpectedOpReturnData_and_commitments(t *testing.T) {
 	txWd.TxOut = append(txWd.TxOut, wire.NewTxOut(0, wdScript))
 	require.True(t, hasWithdrawCommitment(txWd, chain33Hash))
 
-	depAddr, _ := util.Genaddress()
-	depData := append([]byte(depositCommitmentPrefix), []byte(depAddr)...)
+	// 充值承诺前缀已删除：同样形态的 rgbx:deposit: 输出不再被任何人认（只作为历史记录）
+	depData := append([]byte("rgbx:deposit:"), []byte("addr")...)
 	depScript, err := txscript.NullDataScript(depData)
 	require.NoError(t, err)
 	txDep := &wire.MsgTx{}
 	txDep.TxOut = append(txDep.TxOut, wire.NewTxOut(0, depScript))
-	require.True(t, hasDepositCommitment(txDep, depAddr))
-
-	utxo := "74503993e7c8d4280f6fbb99ae5aaa92231a1981a358e40f97e2b4f4dfbea13c:0"
-	out, err := wire.NewOutPointFromString(utxo)
-	require.NoError(t, err)
-	tx2 := &wire.MsgTx{}
-	tx2.TxIn = []*wire.TxIn{{PreviousOutPoint: *out}}
-	require.True(t, hasDepositCommitment(tx2, utxo))
-	require.False(t, hasDepositCommitment(tx2, "0000000000000000000000000000000000000000000000000000000000000000:1"))
+	require.False(t, hasExpectedOpReturnData(txDep, append([]byte(withdrawCommitmentPrefix), []byte("addr")...)))
 }
 
+// Test_rgbx_validateDepositTxContent P2WSH 充值绑定：按 (充值地址, tssPub) 重建 program 再核金额。
+//
+// 用例覆盖 C0 §2.2 的单测要点：派生一致 / 通过 / 金额差 1 sat / 另一个用户 / 另一把 tssPub /
+// 一笔 tx 付两个用户各自只算自己那份 / 非规范（非派生脚本）输出不被计入。
 func Test_rgbx_validateDepositTxContent(t *testing.T) {
 	r := newRgbx()
 	dir, state, _ := util.CreateTestDB()
@@ -78,25 +75,63 @@ func Test_rgbx_validateDepositTxContent(t *testing.T) {
 	api.On("GetConfig").Return(types.NewChain33Config(types.GetDefaultCfgstring()))
 	r.SetStateDB(state)
 
-	tssScript := []byte{0x51, 0x52}
-	deposit := &rtypes.DepositAsset{AssetSymbol: "btc", Amount: 1000}
-	btcTx := &wire.MsgTx{}
-	btcTx.TxOut = append(btcTx.TxOut, wire.NewTxOut(1000, tssScript))
+	userA := newP2WSHDepositFixture(t, frozenVectorA)
+	userB := newP2WSHDepositFixture(t, frozenVectorB)
 
-	err := r.(*rgbx).validateDepositTxContent("h1", deposit, btcTx)
+	btcTx := &wire.MsgTx{}
+	btcTx.TxOut = append(btcTx.TxOut,
+		wire.NewTxOut(600, userA.pkScript),
+		wire.NewTxOut(400, userB.pkScript),
+		wire.NewTxOut(5000, []byte{0x51}), // 与任何用户的 P2WSH 无关的输出
+	)
+
+	// 1) 没有 CrossChainInfo → 取不到 tssPub，直接拒
+	err := r.(*rgbx).validateDepositTxContent("h1", userA.deposit(600), btcTx)
 	require.Equal(t, ErrGetCrossChainInfo, err)
 
+	// 2) CrossChainInfo 存在但没有 pubkey（旧状态/未带 pubkey 的 CommitDKG）→ 拒，且不留兼容分支
 	require.NoError(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(&rtypes.CrossChainInfo{
-		AssetSymbol: "BTC",
-		PkScript:    tssScript,
+		AssetSymbol: "BTC", PkScript: []byte{0x51},
 	})))
+	err = r.(*rgbx).validateDepositTxContent("h1", userA.deposit(600), btcTx)
+	require.Equal(t, ErrInvalidCrossChainInfo, err)
 
-	err = r.(*rgbx).validateDepositTxContent("h1", deposit, btcTx)
-	require.NoError(t, err)
+	// 3) pubkey 合法（= 用户 A 的那把）：各自只算自己那份
+	require.NoError(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(userA.crossChainInfo([]byte{0x51}))))
+	require.NoError(t, r.(*rgbx).validateDepositTxContent("h1", userA.deposit(600), btcTx))
 
-	deposit.Amount = 999
-	err = r.(*rgbx).validateDepositTxContent("h1", deposit, btcTx)
+	// 4) 用户 B 在同一个 symbol 下：另一把 tssPub ⇒ 执行器重建不出 B 的脚本（B 的地址属于另一个 symbol）
+	err = r.(*rgbx).validateDepositTxContent("h1", userB.deposit(400), btcTx)
+	require.Equal(t, ErrInvalidDepositScript, err)
+
+	// 5) 金额多 1 / 少 1 sat → ErrInvalidDepositAmount（分母只含该用户自己的那段）
+	err = r.(*rgbx).validateDepositTxContent("h1", userA.deposit(601), btcTx)
 	require.Equal(t, ErrInvalidDepositAmount, err)
+	err = r.(*rgbx).validateDepositTxContent("h1", userA.deposit(599), btcTx)
+	require.Equal(t, ErrInvalidDepositAmount, err)
+
+	// 6) 把与本次充值无关的输出（付给别的脚本）算进来也没用：金额只看派生脚本那段
+	bigTx := &wire.MsgTx{}
+	bigTx.TxOut = append(bigTx.TxOut,
+		wire.NewTxOut(600, userA.pkScript),
+		wire.NewTxOut(100000, []byte{0x51}),
+	)
+	require.NoError(t, r.(*rgbx).validateDepositTxContent("h1", userA.deposit(600), bigTx))
+	require.Equal(t, ErrInvalidDepositAmount, r.(*rgbx).validateDepositTxContent("h1", userA.deposit(100600), bigTx))
+
+	// 7) 完全没有付给该用户的输出 → ErrInvalidDepositScript（与"金额不对"区分开）
+	noOutput := &wire.MsgTx{}
+	noOutput.TxOut = append(noOutput.TxOut, wire.NewTxOut(600, userB.pkScript))
+	err = r.(*rgbx).validateDepositTxContent("h1", userA.deposit(600), noOutput)
+	require.Equal(t, ErrInvalidDepositScript, err)
+
+	// 8) 同一地址、旧世代的 tssPub（改写 CrossChainInfo 模拟 re-key）→ 重建不出原脚本 → 拒
+	oldGen := newP2WSHDepositFixture(t, frozenVectorB)
+	info := userA.crossChainInfo([]byte{0x51})
+	info.Pubkey = oldGen.tssPub
+	require.NoError(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(info)))
+	err = r.(*rgbx).validateDepositTxContent("h1", userA.deposit(600), noOutput)
+	require.Equal(t, ErrInvalidDepositScript, err)
 }
 
 func Test_rgbx_validateWithdrawTxContent(t *testing.T) {
