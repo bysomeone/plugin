@@ -14,10 +14,45 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use bitcoin::opcodes::all::{OP_CHECKSIG, OP_DROP};
+use bitcoin::script::{Builder, PushBytesBuf};
 use bitcoin::{Address, CompressedPublicKey, Network, OutPoint, ScriptBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::rpc::BtcdRpc;
+
+/// 派生 `witnessScript = <push userID> OP_DROP <push tssPub> OP_CHECKSIG`（规格 §1.2 冻结形态）。
+///
+/// 与 Go 侧 `rgbx/types/p2wsh_deposit.go` 的那份实现必须**逐字节相同**（同一组冻结向量
+/// `types/testdata/p2wsh_deposit_vectors.json` 是两边共同的判据）。push 必须是最小 push：
+/// `Builder::push_slice` 对 ≤75 字节走 `OP_PUSHBYTES_n` —— 手工拼长度前缀一旦拼错，地址会静默
+/// 指向一个没人能签的脚本。
+///
+/// userID 只影响 program（脚本自推后立刻 `OP_DROP`），花费时的 witness 栈只需
+/// `[sig||sighashType, witnessScript]`，不需要花费方提供 userID。
+pub fn deposit_witness_script(user_id: &str, tss_pubkey: &CompressedPublicKey) -> Result<ScriptBuf> {
+    if user_id.is_empty() {
+        return Err(anyhow!("deposit witness script: empty user id"));
+    }
+    // 与 Go 侧 `DeriveDepositWitnessScript` 同界：>75 字节的 push 不再是单字节长度前缀的最小 push，
+    // 两边对"超长 userID"必须同样拒绝（否则一方产出的脚本另一方重建不出来）。
+    if user_id.len() > 75 {
+        return Err(anyhow!(
+            "deposit witness script: user id is {} bytes (max 75)",
+            user_id.len()
+        ));
+    }
+    // push_slice 只接受 ≤75 字节的 PushBytes（正是上面那条界）；它负责最小 push 编码，
+    // 手写长度前缀是被规格明令禁止的（错一个字节 = 地址静默指向无人能签的脚本）。
+    let user_push = PushBytesBuf::try_from(user_id.as_bytes().to_vec())
+        .map_err(|e| anyhow!("deposit witness script: user id push: {e}"))?;
+    Ok(Builder::new()
+        .push_slice(user_push)
+        .push_opcode(OP_DROP)
+        .push_slice(tss_pubkey.to_bytes())
+        .push_opcode(OP_CHECKSIG)
+        .into_script())
+}
 
 /// Test-only: derive the E2E "user" P2WPKH address from a fixed test secret ([0x22;32]).
 /// Used by the test-sim driver to build user-side RGB invoices; the sidecar still holds NO keys.
@@ -71,6 +106,9 @@ pub struct BtcWallet {
     rpc: Arc<BtcdRpc>,
     address: Address,
     script: ScriptBuf,
+    /// 该 symbol 的 TSS 群公钥（33 字节压缩）。用户充值脚本必须由它派生 —— 见
+    /// [`deposit_witness_script`]，登记时用它把桥下发的条目重新推导一遍再比对。
+    tss_pubkey: CompressedPublicKey,
     /// programme(pkScript) → 该用户充值脚本的原文与 userID（主池之外的 watch 集）。
     user_scripts: HashMap<ScriptBuf, UserDepositScript>,
     /// 注册表落盘路径（`None` = 纯内存，测试用）。注册**必须**持久化：重启后 watch 集一丢，
@@ -91,9 +129,20 @@ impl BtcWallet {
             rpc,
             address,
             script,
+            tss_pubkey: pubkey,
             user_scripts: HashMap::new(),
             user_scripts_path: None,
         })
+    }
+
+    /// 该 symbol 的 TSS 群公钥（33 字节压缩）。
+    pub fn tss_pubkey(&self) -> &CompressedPublicKey {
+        &self.tss_pubkey
+    }
+
+    /// 按 `(userID, 本侧车的 tssPub)` 重新派生某个 userID 的充值脚本原文。
+    pub fn derive_user_witness_script(&self, user_id: &str) -> Result<ScriptBuf> {
+        deposit_witness_script(user_id, &self.tss_pubkey)
     }
 
     /// 指定用户充值脚本注册表的落盘路径（`data_dir/user_scripts.json`）。
@@ -149,10 +198,44 @@ impl BtcWallet {
         self.save_user_scripts()
     }
 
+    /// 登记桥下发的用户充值脚本条目：**不采信**下发的 witnessScript（根本没有这个字段），
+    /// 而是按 `(user_id, 本侧车的 tssPub)` 自己重新派生，并要求它的 program 与桥给的
+    /// `pk_script` 逐字节一致。
+    ///
+    /// 为什么必须核对而不是照收：桥与侧车各自持有一份群公钥（桥取运行时 `tssPublicKey`，侧车取
+    /// 配置），两者不一致时桥发的是**另一个群**的地址 —— 侧车把它当"自己的充值脚本"收下，就会
+    /// 对着一笔自己无权花费的 UTXO 出签名（签出来的必然无效），而故障要到提现时才暴露。这里
+    /// 直接对不上就报错，把不一致顶到登记那一刻。
+    ///
+    /// 返回 `true` = 本次新增，`false` = 已在集合里（幂等）。
+    pub fn register_deposit_script(&mut self, user_id: &str, pk_script: &ScriptBuf) -> Result<bool> {
+        let witness_script = self.derive_user_witness_script(user_id)?;
+        let expected = ScriptBuf::new_p2wsh(&witness_script.wscript_hash());
+        if expected != *pk_script {
+            return Err(anyhow!(
+                "deposit script for {user_id}: bridge pkScript {} is not the p2wsh program of the script \
+                 this sidecar derives from (userID, its own tss pubkey {}); the two derivations disagree \
+                 (different group key, or the frozen template drifted on one side)",
+                hex_of(pk_script.as_bytes()),
+                hex_of(&self.tss_pubkey.to_bytes())
+            ));
+        }
+        if self.user_scripts.contains_key(pk_script) {
+            return Ok(false);
+        }
+        self.register_user_script(pk_script.clone(), user_id.to_string(), witness_script)?;
+        Ok(true)
+    }
+
     /// 该脚本的 witnessScript（= BIP143 scriptCode）。非注册的用户脚本返回 `None`
     /// —— 调用方据此 fail-closed，绝不拿 prevout 的 output program 去顶替。
     pub fn witness_script_for(&self, script: &ScriptBuf) -> Option<ScriptBuf> {
         self.user_scripts.get(script).map(|e| e.witness_script.clone())
+    }
+
+    /// 该脚本对应的 userID（充值归因/对账用）。非注册的用户脚本返回 `None`。
+    pub fn user_id_for(&self, script: &ScriptBuf) -> Option<String> {
+        self.user_scripts.get(script).map(|e| e.user_id.clone())
     }
 
     /// 该脚本是否在 watch 集里（主池脚本 或 已登记的用户充值脚本）。
@@ -250,6 +333,18 @@ impl BtcWallet {
         out
     }
 
+    /// **只有用户 P2WSH 充值脚本**的 UTXO 集（扫集器的输入候选）。
+    ///
+    /// 与 `list_unspent_all` 分开：扫集要把这些 UTXO 归集回主池，不能把主池自己的 UTXO 当成
+    /// 待归集对象（那笔交易等于自己花自己，白付手续费）。
+    pub fn list_unspent_user_deposits(&self) -> Vec<WalletUtxo> {
+        let mut out = Vec::new();
+        for script in self.user_scripts.keys() {
+            out.extend(self.list_unspent_for(script));
+        }
+        out
+    }
+
     /// 单个脚本的 UTXO 集，通过 btcd 的地址索引发现。
     pub fn list_unspent_for(&self, script: &ScriptBuf) -> Vec<WalletUtxo> {
         let Ok(txs) = self.rpc.search_txs_for_script(script) else {
@@ -316,19 +411,95 @@ mod tests {
     }
 
     /// 不联网的 BtcWallet（btcd agent 是惰性的；任何 RPC 调用失败时 list_unspent 返回空）。
-    fn test_wallet(user_scripts_path: Option<PathBuf>) -> BtcWallet {
+    fn test_wallet_with(pubkey_hex: &str, user_scripts_path: Option<PathBuf>) -> BtcWallet {
         let rpc = Arc::new(
             BtcdRpc::connect("127.0.0.1:1", "", "", None, Network::Regtest).unwrap(),
         );
-        let hex = bitcoin::hex::DisplayHex::to_hex_string(
-            &[0x02u8; 33],
-            bitcoin::hex::Case::Lower,
-        );
-        let w = BtcWallet::new(rpc, &hex, Network::Regtest).unwrap();
+        let w = BtcWallet::new(rpc, pubkey_hex, Network::Regtest).unwrap();
         match user_scripts_path {
             Some(p) => w.with_user_scripts_path(p),
             None => w,
         }
+    }
+
+    fn test_wallet(user_scripts_path: Option<PathBuf>) -> BtcWallet {
+        let hex = bitcoin::hex::DisplayHex::to_hex_string(
+            &[0x02u8; 33],
+            bitcoin::hex::Case::Lower,
+        );
+        test_wallet_with(&hex, user_scripts_path)
+    }
+
+    /// 冻结向量（`plugin/dapp/rgbx/types/testdata/p2wsh_deposit_vectors.json` 的主向量，
+    /// 由 `rgbx/types/p2wsh_deposit_test.go` 守着 Go 侧那一份）。三份实现（Go 桥 / Go 执行器 /
+    /// Rust 侧车）必须对同一组输入产出同一串字节，这是唯一能防"三份实现漂移"的手段 —— 谁把
+    /// 模板改坏了，这里就红。
+    const VECTOR_USER_ID: &str = "1AmRYcURfDGxBhiaJAvEGdRkvkoM7ztn1u";
+    const VECTOR_TSS_PUB: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    const VECTOR_WITNESS_SCRIPT: &str = "2231416d525963555266444778426869614a4176454764526b766b6f4d377a746e317575210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac";
+    const VECTOR_PK_SCRIPT: &str =
+        "002078d9392c30b67443d288c548adde74e0eff45454048cf3e7cc2f82f43da70465";
+
+    fn vector_pubkey() -> CompressedPublicKey {
+        CompressedPublicKey::from_str(VECTOR_TSS_PUB).unwrap()
+    }
+
+    #[test]
+    fn derivation_matches_the_frozen_vector() {
+        let ws = deposit_witness_script(VECTOR_USER_ID, &vector_pubkey()).unwrap();
+        assert_eq!(hex_of(ws.as_bytes()), VECTOR_WITNESS_SCRIPT, "witnessScript 漂移了");
+        assert_eq!(
+            hex_of(ScriptBuf::new_p2wsh(&ws.wscript_hash()).as_bytes()),
+            VECTOR_PK_SCRIPT,
+            "program(pkScript) 漂移了"
+        );
+        // 形态自证：最小 push 的 34 字节 userID（0x22 = OP_PUSHBYTES_34）+ OP_DROP + 33 字节
+        // 公钥（0x21）+ OP_CHECKSIG（0xac）。手工拼前缀拼错就会在这里露出来。
+        let b = ws.as_bytes();
+        assert_eq!(b[0], 0x22);
+        assert_eq!(b[35], 0x75);
+        assert_eq!(b[36], 0x21);
+        assert_eq!(b[70], 0xac);
+        assert_eq!(b.len(), 71);
+    }
+
+    #[test]
+    fn derivation_rejects_an_empty_or_oversized_user_id() {
+        assert!(deposit_witness_script("", &vector_pubkey()).is_err());
+        // 76 字节：不再是单字节长度前缀的最小 push，与 Go 侧同界拒绝。
+        assert!(deposit_witness_script(&"a".repeat(76), &vector_pubkey()).is_err());
+        assert!(deposit_witness_script(&"a".repeat(75), &vector_pubkey()).is_ok());
+    }
+
+    #[test]
+    fn register_deposit_script_derives_and_verifies() {
+        // 侧车配的就是冻结向量里那把群公钥（真实部署里两边的群公钥必须一致，见下一条测试）。
+        let mut w = test_wallet_with(VECTOR_TSS_PUB, None);
+        let pk_script = ScriptBuf::from_bytes(decode_hex(VECTOR_PK_SCRIPT).unwrap());
+        assert!(w.register_deposit_script(VECTOR_USER_ID, &pk_script).unwrap(), "首次登记 = 新增");
+        assert_eq!(
+            hex_of(w.witness_script_for(&pk_script).unwrap().as_bytes()),
+            VECTOR_WITNESS_SCRIPT,
+            "登记的原文必须是自己派生出来的那一份"
+        );
+        assert_eq!(w.user_id_for(&pk_script).as_deref(), Some(VECTOR_USER_ID));
+        // 幂等：重复登记不新增、不报错。
+        assert!(!w.register_deposit_script(VECTOR_USER_ID, &pk_script).unwrap());
+        assert_eq!(w.user_scripts().len(), 1);
+    }
+
+    #[test]
+    fn register_deposit_script_refuses_a_program_from_another_group_key() {
+        let mut w = test_wallet_with(VECTOR_TSS_PUB, None);
+        // 另一个群公钥派出来的 program（这里直接换一个 userID 派生，效果同"桥与侧车的群公钥不一致"）：
+        let other = ScriptBuf::new_p2wsh(
+            &deposit_witness_script("1AnotherUserAddressForTheSameGroupKey", &vector_pubkey())
+                .unwrap()
+                .wscript_hash(),
+        );
+        let err = w.register_deposit_script(VECTOR_USER_ID, &other).unwrap_err();
+        assert!(format!("{err}").contains("the two derivations disagree"), "{err}");
+        assert!(w.user_scripts().is_empty(), "对不上的条目一律不落地");
     }
 
     #[test]

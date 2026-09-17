@@ -139,6 +139,35 @@ pub struct BuildTransferOutcome {
     pub change_amount: i64,
 }
 
+/// 一笔待签的扫集（未签 PSBT + 它的构成，供调用方判断/记账）。
+#[derive(Clone, Debug)]
+pub struct SweepBuild {
+    pub psbt: Psbt,
+    pub txid: Txid,
+    /// 输入笔数（= 被归集的不同用户充值脚本数）。
+    pub input_count: u32,
+    /// 输入面额合计（sat）。
+    pub input_value: u64,
+    /// 手续费（sat）。
+    pub fee: u64,
+}
+
+/// 费估算常数（扫集）：见 `build_sweep` 的注释。
+const SWEEP_TX_OVERHEAD_VBYTES: u64 = 11;
+const SWEEP_P2WSH_INPUT_VBYTES: u64 = 100;
+const SWEEP_P2WPKH_OUTPUT_VBYTES: u64 = 31;
+/// P2WPKH 输出的 dust 门槛（btcd `txscript` 的 dustLimit 同值口径）：归集额减费后低于它，
+/// 这笔扫集没有意义。
+const SWEEP_DUST_LIMIT: u64 = 294;
+
+/// 某 UTXO 相对链尖的确认数（`None` 高度 = 未确认 = 0）。
+fn confirmations_of(u: &WalletUtxo, best: u32) -> u32 {
+    match u.height {
+        Some(h) if best >= h => best - h + 1,
+        _ => 0,
+    }
+}
+
 /// A built (unsigned) withdrawal awaiting external signature.
 #[derive(Clone, Debug)]
 struct PendingWithdrawal {
@@ -252,6 +281,185 @@ impl RgbEngine {
     /// Height of the chain tip (btcd `getblockcount`).
     pub fn synced_height(&self) -> u64 {
         self.rpc.get_block_count().unwrap_or(0)
+    }
+
+    /// 登记桥下发的用户充值脚本（C4，跨节点 watch 集分发）。
+    ///
+    /// **不采信下发内容**：每条按 `(user_id, 本侧车的 tssPub)` 自己重新派生，program 与桥给的
+    /// `pk_script` 对不上就整批报错（见 `BtcWallet::register_deposit_script`）。返回
+    /// `(本次新增数, 登记后的全部条目)` —— 后者是**并集**，节点据此补齐自己没发放过的那些条目。
+    pub fn register_deposit_scripts(
+        &mut self,
+        entries: &[(String, Vec<u8>)],
+    ) -> Result<(u32, Vec<(String, Vec<u8>)>)> {
+        let mut accepted = 0u32;
+        for (user_id, pk_script) in entries {
+            let pk = ScriptBuf::from_bytes(pk_script.clone());
+            if self.wallet.register_deposit_script(user_id, &pk)? {
+                accepted += 1;
+            }
+        }
+        let all = self
+            .wallet
+            .user_scripts()
+            .into_iter()
+            .map(|(pk, e)| (e.user_id, pk.as_bytes().to_vec()))
+            .collect();
+        Ok((accepted, all))
+    }
+
+    /// 已登记的用户充值脚本（并集，供调用方回显/对账）。
+    pub fn deposit_scripts(&self) -> Vec<(String, Vec<u8>)> {
+        self.wallet
+            .user_scripts()
+            .into_iter()
+            .map(|(pk, e)| (e.user_id, pk.as_bytes().to_vec()))
+            .collect()
+    }
+
+    /// 扫集：把散在**用户 P2WSH** 上的充值 UTXO 归集回主池。
+    ///
+    /// 触发与时序（规格 §6① 选项 A：扫集是纯 UTXO 整理，不影响账，可懒执行/批量/闲时执行）：
+    /// 由调用方（Go 桥的闲时 ticker）决定何时来问；本函数只回答"现在值不值得扫"：
+    ///   - 只取用户充值脚本的 UTXO，且**排除任何承载 RGB 状态的 outpoint**（那是 seal，花它必须
+    ///     走 RGB 转移，不能当普通 BTC 扫走）；
+    ///   - 确认数不足的不要；
+    ///   - 少于 `min_utxos` 笔就返回 `None`（UTXO 太少时扫集的手续费不划算，等它攒够）。
+    ///
+    /// **【不变式·冻结】归集目标只有一个：主池 TSS 脚本**（规格 §2.3(b)：桥的任何自有付款都不得
+    /// 落到用户 P2WSH —— 那笔付款会被该用户回头当成充值证明再认领一次）。因此本交易只有一个输出，
+    /// 且一定是主池脚本：**没有"找零回原用户脚本"这种形态**。
+    pub fn build_sweep(
+        &mut self,
+        fee_rate: u64,
+        min_utxos: u32,
+        min_confirmations: u32,
+    ) -> Result<Option<SweepBuild>> {
+        let best = self.rpc.get_block_count().unwrap_or(0) as u32;
+        let utxos: Vec<WalletUtxo> = self
+            .wallet
+            .list_unspent_user_deposits()
+            .into_iter()
+            .filter(|u| !self.ledger.seals.contains_key(&u.outpoint.to_string()))
+            .filter(|u| confirmations_of(u, best) >= min_confirmations)
+            .collect();
+        self.build_sweep_from_utxos(utxos, fee_rate, min_utxos)
+    }
+
+    /// `build_sweep` 的纯构造部分：给定候选 UTXO，决定值不值得扫并组装交易
+    /// （与钱包/账本的发现过程分开，便于单测直接喂候选集）。
+    fn build_sweep_from_utxos(
+        &self,
+        mut utxos: Vec<WalletUtxo>,
+        fee_rate: u64,
+        min_utxos: u32,
+    ) -> Result<Option<SweepBuild>> {
+        // 确定性顺序（同一批 UTXO ⇒ 同一笔未签交易 ⇒ 同一 txid），便于重试/排障。
+        utxos.sort_by_key(|u| u.outpoint.to_string());
+        if (utxos.len() as u32) < min_utxos {
+            return Ok(None);
+        }
+
+        let n = utxos.len() as u64;
+        // 费估算：P2WSH(CHECKSIG, 71 字节 witnessScript) 输入 ≈ 79 vbytes（41 非见证字节 +
+        // 147 字节见证），按 100 取上界（宁可略多付，也不让交易因低估费而永远不上链）；
+        // 输出是一个 P2WPKH（8 + 1 + 22）。
+        let est_vbytes = SWEEP_TX_OVERHEAD_VBYTES + SWEEP_P2WSH_INPUT_VBYTES * n + SWEEP_P2WPKH_OUTPUT_VBYTES;
+        let fee = est_vbytes * fee_rate;
+        let input_value: u64 = utxos.iter().map(|u| u.value).sum();
+        if input_value <= fee + SWEEP_DUST_LIMIT {
+            // 有可扫的 UTXO 却扫不动：费率高到把归集额吃光。响亮失败（调用方按 tick 重试），
+            // 不静默地什么都不做 —— 否则"扫集一直没发生"没有任何线索。
+            return Err(anyhow!(
+                "sweep of {n} user deposit utxo(s) ({input_value} sat) cannot cover fee {fee} sat \
+                 plus dust; fee_rate {fee_rate} sat/vB is too high for the amount being swept"
+            ));
+        }
+
+        let all_inputs: Vec<OutPoint> = utxos.iter().map(|u| u.outpoint).collect();
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: all_inputs
+                .iter()
+                .map(|o| TxIn {
+                    previous_output: *o,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            // 只有一个输出：主池。没有 OP_RETURN（本交易不带任何 RGB 承诺），也没有找零输出
+            // （归集额减费后全部进主池）—— 输出集合小到不可能把币付给用户脚本。
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(input_value - fee),
+                script_pubkey: self.tss_script.clone(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx)?;
+        fill_psbt_inputs(
+            &mut psbt,
+            &all_inputs,
+            &utxos,
+            &self.tss_script,
+            &|script| self.wallet.witness_script_for(script),
+        )?;
+        let txid = psbt.get_txid();
+        Ok(Some(SweepBuild {
+            psbt,
+            txid,
+            input_count: all_inputs.len() as u32,
+            input_value,
+            fee,
+        }))
+    }
+
+    /// 定稿一笔扫集：解出交易并**重新核对不变式**，再交给调用方广播。
+    ///
+    /// 这里再核一遍不是多余的：签名方与构建方可能是不同的节点（签名节点只看得到 PSBT 字节），
+    /// 而"桥的自有付款不得落到用户 P2WSH"是资金安全级的约束 —— 广播前的最后一道必须自己算，
+    /// 不依赖构建方自称。
+    ///   - **每个输出脚本都必须是主池脚本**（归集目标只有主池）；
+    ///   - 每个输入都必须是**已登记的用户充值脚本**，且 PSBT 里带了它自己的 witnessScript
+    ///     （否则那笔 UTXO 花不掉，等于签了一笔必然无效的交易）。
+    pub fn finalize_sweep(&self, signed_psbt: &Psbt) -> Result<(Txid, Transaction)> {
+        let tx = signed_psbt.clone().extract_tx()?;
+        for (i, out) in tx.output.iter().enumerate() {
+            if out.script_pubkey != self.tss_script {
+                return Err(anyhow!(
+                    "sweep output {i} pays {} which is not the main pool script: bridge-owned payments \
+                     must never land on a user P2WSH deposit script",
+                    hex_encode(out.script_pubkey.as_bytes())
+                ));
+            }
+        }
+        if tx.output.is_empty() {
+            return Err(anyhow!("sweep tx has no output"));
+        }
+        if signed_psbt.inputs.len() != tx.input.len() {
+            return Err(anyhow!("sweep psbt input count mismatch"));
+        }
+        for (i, input) in signed_psbt.inputs.iter().enumerate() {
+            let prev = input
+                .witness_utxo
+                .as_ref()
+                .ok_or_else(|| anyhow!("sweep input {i} has no witness utxo"))?
+                .script_pubkey
+                .clone();
+            if self.wallet.witness_script_for(&prev).is_none() {
+                return Err(anyhow!(
+                    "sweep input {i} pays {} which is not a registered user deposit script",
+                    hex_encode(prev.as_bytes())
+                ));
+            }
+            if input.witness_script.is_none() {
+                return Err(anyhow!(
+                    "sweep input {i} carries no witness script (its BIP143 scriptCode), the input \
+                     cannot be signed"
+                ));
+            }
+        }
+        Ok((tx.compute_txid(), tx))
     }
 
     /// Current BTC UTXO set of the single TSS script (watch-only), from btcd.
@@ -806,7 +1014,6 @@ impl RgbEngine {
             &mut psbt,
             &all_inputs,
             &wallet_utxos,
-            &all_input_btc,
             &self.tss_script,
             &|script| self.wallet.witness_script_for(script),
         )?;
@@ -1328,35 +1535,48 @@ fn rand_hex(n: usize) -> String {
 /// 脚本来源是钱包的 watch 集（主池 ∪ 已登记的用户充值脚本）：用户 P2WSH 的 witnessScript 链上
 /// 不可见，只能由 `(userID, tssPub)` 重派生后登记到钱包里。**解析不出 witnessScript 的非主池
 /// 输入一律失败** —— 猜一个脚本去签等于让 TSS 对不属于这笔 UTXO 的脚本出签名。
+///
+/// **钱包里查不到该 outpoint 也一律失败（C4 收紧，fail-closed）**：改动前的退化路径是"退回
+/// (主池脚本, 调用方给的 fallback 面额)"，而 BIP143 的 sighash **把 prevout 面额算进被签的消息**
+/// —— 面额猜错（或调用方根本给不出来、按 0 填）签出来的签名对这笔 UTXO 无效，交易广播后被全网
+/// 拒收。失败形态还是最坏的一种：交易看起来构造成功、PSBT 也能过签名流程，直到广播才发现。
+/// 查不到就是查不到（btcd 索引滞后、UTXO 已花、脚本不属于本钱包），报错让调用方重试。
 fn fill_psbt_inputs(
     psbt: &mut Psbt,
     inputs: &[OutPoint],
     wallet_utxos: &[WalletUtxo],
-    fallback_btc: &[u64],
     tss_script: &ScriptBuf,
     witness_script_for: &dyn Fn(&ScriptBuf) -> Option<ScriptBuf>,
 ) -> Result<()> {
-    for (i, outpoint) in inputs.iter().enumerate() {
-        let utxo = wallet_utxos.iter().find(|u| u.outpoint == *outpoint);
-        // prevout 脚本：优先钱包的 watch 集（它带真实脚本），取不到时退回主池脚本 —— 后者与
-        // 改动前的行为一致（seal 的 BTC 面额本来也取自钱包，取不到时按 0 计）。
-        let script = utxo
-            .map(|u| u.script_pubkey.clone())
-            .unwrap_or_else(|| tss_script.clone());
-        let value = utxo
-            .map(|u| u.value)
-            .unwrap_or_else(|| fallback_btc.get(i).copied().unwrap_or(0));
-        if script != *tss_script {
-            let witness_script = witness_script_for(&script).ok_or_else(|| {
+    // 先把每个输入解析完再写 PSBT：中途失败不留半份填好的 PSBT（调用方拿到错误就该整体放弃）。
+    let mut resolved: Vec<(ScriptBuf, u64, Option<ScriptBuf>)> = Vec::with_capacity(inputs.len());
+    for outpoint in inputs {
+        let utxo = wallet_utxos.iter().find(|u| u.outpoint == *outpoint).ok_or_else(|| {
+            anyhow!(
+                "input {outpoint} is not in the wallet's watch set (unknown utxo, or btcd has not \
+                 seen it yet): its script and value are unknown, and BIP143 commits to the value, so \
+                 guessing either would produce an input that cannot be signed"
+            )
+        })?;
+        let script = utxo.script_pubkey.clone();
+        let witness_script = if script != *tss_script {
+            Some(witness_script_for(&script).ok_or_else(|| {
                 anyhow!(
                     "input {outpoint} pays script {} which is neither the main pool script nor a \
                      registered user deposit script: its witnessScript (the BIP143 scriptCode) is \
                      unknown, refusing to build an input that cannot be signed",
                     hex_encode(script.as_bytes())
                 )
-            })?;
-            psbt.inputs[i].witness_script = Some(witness_script);
-        }
+            })?)
+        } else {
+            None
+        };
+        resolved.push((script, utxo.value, witness_script));
+    }
+    for (i, (script, value, witness_script)) in resolved.into_iter().enumerate() {
+        // 原生 P2WSH 输入带自己的 witnessScript（BIP143 scriptCode）；主池 P2WPKH 输入不带
+        // （带上会被上游 finalizer 判为不可 finalize，主池输入会因此签不出来）。
+        psbt.inputs[i].witness_script = witness_script;
         psbt.inputs[i].witness_utxo = Some(TxOut {
             value: bitcoin::Amount::from_sat(value),
             script_pubkey: script,
@@ -1367,6 +1587,193 @@ fn fill_psbt_inputs(
 
 fn hex_encode(bytes: &[u8]) -> String {
     bitcoin::hex::DisplayHex::to_hex_string(bytes, bitcoin::hex::Case::Lower)
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use crate::wallet::deposit_witness_script;
+    use bitcoin::CompressedPublicKey;
+
+    /// 冻结向量里的那把群公钥（`types/testdata/p2wsh_deposit_vectors.json`）。
+    const VECTOR_TSS_PUB: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+
+    /// 不联网的引擎（btcd RPC 指向一个必然连不上的地址；`list_unspent*` 失败即返回空集）。
+    fn test_engine() -> RgbEngine {
+        let dir = std::env::temp_dir().join(format!(
+            "rgb-sidecar-sweep-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        RgbEngine::open(Config {
+            data_dir: dir.clone(),
+            btc_rpc_host: "127.0.0.1:1".into(),
+            btc_rpc_user: String::new(),
+            btc_rpc_pass: String::new(),
+            btc_rpc_cert: None,
+            network: Network::Regtest,
+            tss_pubkey_hex: VECTOR_TSS_PUB.into(),
+            grpc_listen: "0.0.0.0:0".into(),
+        })
+        .unwrap()
+    }
+
+    /// 登记一个用户并返回 (userID, 该用户的 P2WSH program)。
+    fn register(engine: &mut RgbEngine, user_id: &str) -> (String, ScriptBuf) {
+        let pubkey = CompressedPublicKey::from_str(VECTOR_TSS_PUB).unwrap();
+        let ws = deposit_witness_script(user_id, &pubkey).unwrap();
+        let pk = ScriptBuf::new_p2wsh(&ws.wscript_hash());
+        let (accepted, all) = engine
+            .register_deposit_scripts(&[(user_id.to_string(), pk.as_bytes().to_vec())])
+            .unwrap();
+        assert_eq!(accepted, 1);
+        assert_eq!(all.len(), engine.deposit_scripts().len());
+        (user_id.to_string(), pk)
+    }
+
+    fn utxo(n: u32, value: u64, script: ScriptBuf) -> WalletUtxo {
+        use bitcoin::hashes::Hash;
+        WalletUtxo {
+            outpoint: OutPoint {
+                txid: Txid::from_byte_array([n as u8; 32]),
+                vout: n,
+            },
+            value,
+            script_pubkey: script,
+            height: Some(10),
+        }
+    }
+
+    /// 一个 userID 必须能被桥、执行器、侧车三方派生到同一个 program；两个不同用户 ⇒ 两个不同的
+    /// 脚本 ⇒ 一笔扫集里**多条不同 witnessScript 的输入**（C3 的能力，这里复用）。
+    fn two_users(engine: &mut RgbEngine) -> (ScriptBuf, ScriptBuf) {
+        let (_, a) = register(engine, "1AmRYcURfDGxBhiaJAvEGdRkvkoM7ztn1u");
+        let (_, b) = register(engine, "1KSBd17H7ZK8iT37aJztFB22XGwsPTdwE4");
+        assert_ne!(a, b, "不同 userID 必须派生到不同脚本");
+        (a, b)
+    }
+
+    #[test]
+    fn sweep_spends_several_user_scripts_into_the_main_pool() {
+        let mut engine = test_engine();
+        let (a, b) = two_users(&mut engine);
+        let tss = engine.tss_script().clone();
+        let utxos = vec![utxo(0, 20_000, a.clone()), utxo(1, 30_000, b.clone())];
+
+        let build = engine.build_sweep_from_utxos(utxos, 2, 2).unwrap().expect("应该可扫");
+        assert_eq!(build.input_count, 2);
+        assert_eq!(build.input_value, 50_000);
+        // 只有一个输出，且**必须是主池脚本**（不变式：桥的自有付款不得落到用户 P2WSH）。
+        let tx = &build.psbt.unsigned_tx;
+        assert_eq!(tx.output.len(), 1);
+        assert_eq!(tx.output[0].script_pubkey, tss);
+        assert_ne!(tx.output[0].script_pubkey, a);
+        assert_ne!(tx.output[0].script_pubkey, b);
+        assert_eq!(tx.output[0].value.to_sat(), 50_000 - build.fee);
+
+        // 每个输入带**自己的** witnessScript（BIP143 scriptCode 逐输入定义），且真的编进线格式。
+        let back = Psbt::deserialize(&build.psbt.serialize()).unwrap();
+        let ws_of = |engine: &RgbEngine, s: &ScriptBuf| engine.wallet.witness_script_for(s).unwrap();
+        assert_eq!(back.inputs[0].witness_script, Some(ws_of(&engine, &a)));
+        assert_eq!(back.inputs[1].witness_script, Some(ws_of(&engine, &b)));
+        assert_ne!(back.inputs[0].witness_script, back.inputs[1].witness_script);
+        assert_eq!(
+            back.inputs[0].witness_utxo.as_ref().unwrap().script_pubkey,
+            a
+        );
+
+        // 定稿：不变式复核通过，txid 与构建时一致。
+        let (txid, _raw) = engine.finalize_sweep(&build.psbt).unwrap();
+        assert_eq!(txid, build.txid);
+
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
+
+    #[test]
+    fn sweep_below_the_threshold_does_nothing() {
+        let mut engine = test_engine();
+        let (a, _b) = two_users(&mut engine);
+        // 只有 1 笔、阈值 2 ⇒ 不构建（闲时攒够再扫），且**不是错误**。
+        let one = engine.build_sweep_from_utxos(vec![utxo(0, 20_000, a)], 2, 2).unwrap();
+        assert!(one.is_none());
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
+
+    #[test]
+    fn sweep_refuses_to_pay_a_user_script() {
+        // 反向验证：把那一笔扫集的输出改成用户充值脚本（= 桥的自有付款落到用户 P2WSH，
+        // 规格 §2.3(b) 明令禁止：那笔付款会被该用户回头当充值证明再认领一次），
+        // finalize_sweep 必须拒。
+        let mut engine = test_engine();
+        let (a, b) = two_users(&mut engine);
+        let build = engine
+            .build_sweep_from_utxos(vec![utxo(0, 20_000, a.clone()), utxo(1, 30_000, b)], 1, 1)
+            .unwrap()
+            .unwrap();
+        let mut bad = build.psbt.clone();
+        bad.unsigned_tx.output[0].script_pubkey = a.clone();
+        let err = engine.finalize_sweep(&bad).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("must never land on a user P2WSH"), "unexpected error: {msg}");
+
+        // 同一笔交易，只要输出回到主池就通过 —— 证明上面拒的是"付给用户脚本"这件事本身，
+        // 不是别的偶发原因。
+        assert!(engine.finalize_sweep(&build.psbt).is_ok());
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
+
+    #[test]
+    fn sweep_refuses_an_input_that_is_not_a_registered_deposit_script() {
+        let mut engine = test_engine();
+        let (a, b) = two_users(&mut engine);
+        let build = engine
+            .build_sweep_from_utxos(vec![utxo(0, 20_000, a.clone()), utxo(1, 30_000, b)], 1, 1)
+            .unwrap()
+            .unwrap();
+        // 把一个输入的 prevout 换成"没登记过的脚本"（比如主池自己）：那不是待归集的充值，
+        // 而且它的 witnessScript 也解析不出来 ⇒ 拒。
+        let mut bad = build.psbt.clone();
+        let tss = engine.tss_script().clone();
+        bad.inputs[0].witness_utxo.as_mut().unwrap().script_pubkey = tss;
+        let err = engine.finalize_sweep(&bad).unwrap_err();
+        assert!(
+            format!("{err}").contains("not a registered user deposit script"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
+
+    #[test]
+    fn register_deposit_scripts_returns_the_union() {
+        // 跨节点分发的核心契约：节点推上自己那份，拿回**并集** —— 于是没发放过某地址的节点也能
+        // 收敛到同一份登记（响应里的条目可能不是自己推的）。
+        let mut engine = test_engine();
+        let (_, a) = register(&mut engine, "1AmRYcURfDGxBhiaJAvEGdRkvkoM7ztn1u");
+        // 模拟"另一个节点推来的"条目：引擎侧同样自己派生核对，不采信推送内容。
+        let user_b = "1NLHPEcbTWWxxU3dGUZBhayjrCHD3psX7k";
+        let pubkey = CompressedPublicKey::from_str(VECTOR_TSS_PUB).unwrap();
+        let ws_b = deposit_witness_script(user_b, &pubkey).unwrap();
+        let pk_b = ScriptBuf::new_p2wsh(&ws_b.wscript_hash());
+
+        let (accepted, all) = engine
+            .register_deposit_scripts(&[(user_b.to_string(), pk_b.as_bytes().to_vec())])
+            .unwrap();
+        assert_eq!(accepted, 1);
+        assert_eq!(all.len(), 2, "并集里既有自己先登记的，也有本次推来的");
+        assert!(all.iter().any(|(u, _)| u == "1AmRYcURfDGxBhiaJAvEGdRkvkoM7ztn1u"));
+        assert_eq!(engine.deposit_scripts().len(), 2);
+        assert!(all.iter().any(|(u, _)| u == user_b));
+        assert!(all.iter().any(|(_, s)| s.as_slice() == a.as_bytes()));
+        // 重复推同一条：accepted=0，集合不变（幂等，重试安全）。
+        let (accepted, all) = engine
+            .register_deposit_scripts(&[(user_b.to_string(), pk_b.as_bytes().to_vec())])
+            .unwrap();
+        assert_eq!(accepted, 0);
+        assert_eq!(all.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
 }
 
 #[cfg(test)]
@@ -1449,10 +1856,7 @@ mod fill_psbt_inputs_tests {
 
         let known: HashMap<ScriptBuf, ScriptBuf> =
             [(user_pk_script.clone(), user_ws.clone())].into_iter().collect();
-        fill_psbt_inputs(&mut psbt, &[o0, o1], &utxos, &[5000, 7000], &tss, &|s| {
-            known.get(s).cloned()
-        })
-        .unwrap();
+        fill_psbt_inputs(&mut psbt, &[o0, o1], &utxos, &tss, &|s| known.get(s).cloned()).unwrap();
 
         // 每个输入带**自己的**脚本与面额（不再统一填主池脚本）。
         let in0 = psbt.inputs[0].witness_utxo.as_ref().unwrap();
@@ -1487,22 +1891,26 @@ mod fill_psbt_inputs_tests {
 
         // 既不是主池脚本、也没有登记过 witnessScript ⇒ 必须失败：
         // 绝不拿 output program（或任何猜的脚本）去顶替 scriptCode。
-        let err = fill_psbt_inputs(&mut psbt, &[o0], &utxos, &[5000], &tss, &|_| None).unwrap_err();
+        let err = fill_psbt_inputs(&mut psbt, &[o0], &utxos, &tss, &|_| None).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("cannot be signed"), "unexpected error: {msg}");
     }
 
     #[test]
-    fn unknown_utxo_falls_back_to_the_main_pool_script() {
-        // 既有行为：钱包里查不到该 outpoint 时按 (fallback 面额, 主池脚本) 填。
+    fn unknown_utxo_is_refused_instead_of_guessed() {
+        // C4 收紧后的 fail-closed：钱包里查不到该 outpoint 就报错。
+        //
+        // 退化路径（改前：按"主池脚本 + 调用方给的面额"填）产出的输入**签名必然无效**：
+        // BIP143 的 sighash 把 prevout 面额算进被签的消息，面额猜错（或按 0 填）签出来的签名
+        // 广播后会被全网拒收 —— 而失败形态是最坏的一种：交易看起来构造成功、PSBT 也能过签名
+        // 流程，直到广播才发现。这里连同反向验证一起钉住：只要还"猜"，本用例就红。
         let tss = pool_script(1);
         let o0 = op(0);
         let mut psbt = unsigned_psbt(&[o0]);
-        fill_psbt_inputs(&mut psbt, &[o0], &[], &[4242], &tss, &|_| None).unwrap();
-        let inp = psbt.inputs[0].witness_utxo.as_ref().unwrap();
-        assert_eq!(inp.value.to_sat(), 4242);
-        assert_eq!(inp.script_pubkey, tss);
-        assert!(psbt.inputs[0].witness_script.is_none());
+        let err = fill_psbt_inputs(&mut psbt, &[o0], &[], &tss, &|_| None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not in the wallet's watch set"), "unexpected error: {msg}");
+        assert!(psbt.inputs[0].witness_utxo.is_none(), "不得留下任何猜出来的 prevout");
     }
 }
 

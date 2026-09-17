@@ -456,27 +456,6 @@ fn failed_broadcast_is_replayed_not_rebuilt() -> Result<()> {
         "a repeated finalize must not re-apply the transition or add a second change seal"
     );
 
-    // ---- 6. without the record, "the same seals" is NOT the same transaction ------
-    // The build is not a pure function of its inputs: every run draws fresh random blinding
-    // factors for the recipient/change seals (and picks fee inputs from the live wallet), so
-    // re-building from the same seals yields a different RGB commitment — and therefore a
-    // different txid. This is why the replay has to re-issue the recorded PSBT, and why the
-    // fallback below is a degraded path (same seals, different transaction).
-    engine.ledger.withdrawal_builds.clear();
-    let rebuilt = engine.build_withdrawal(
-        SYMBOL,
-        WITHDRAW,
-        &user_invoice,
-        &tss_addr,
-        FEE_RATE,
-        &[seal_outpoint.to_string()],
-    )?;
-    assert_ne!(
-        rebuilt.txid.to_string(),
-        first_txid,
-        "a rebuild of the same seals is a different transaction ⇒ the record is what makes a replay a replay"
-    );
-
     // ---- 7. the seals are verified, not trusted ----------------------------------
     let err = engine
         .build_withdrawal(SYMBOL, WITHDRAW, &user_invoice, &tss_addr, FEE_RATE, &[fee_outpoint.to_string()])
@@ -511,6 +490,31 @@ fn failed_broadcast_is_replayed_not_rebuilt() -> Result<()> {
         .expect_err("a recorded build must not be re-issued for a different recipient");
     assert!(
         format!("{err:#}").contains("differs from the request"),
+        "unexpected error: {err:#}"
+    );
+
+    // ---- 6. without the record there is no second transaction at all --------------
+    // The build is not a pure function of its inputs: every run draws fresh random blinding
+    // factors for the recipient/change seals (and picks fee inputs from the live wallet), so
+    // rebuilding from the same seals used to yield a *different* transaction — a second,
+    // independently valid payment for one on-chain burn, i.e. the E9 hazard this record exists to
+    // close. C4 把它彻底堵死（fail-closed）：重放要花的那个 seal 早在第一笔上链时就被花掉了，
+    // 钱包里查不到它的脚本与面额，而 BIP143 把 prevout 面额算进被签的消息 —— 猜一个值只会签出
+    // 一笔必然无效的交易（改前那条"退化路径"产出的正是这种东西）。所以记录丢了不再退化成
+    // "另造一笔"，而是直接报错，由调用方按不可恢复处理。
+    engine.ledger.withdrawal_builds.clear();
+    let err = engine
+        .build_withdrawal(
+            SYMBOL,
+            WITHDRAW,
+            &user_invoice,
+            &tss_addr,
+            FEE_RATE,
+            &[seal_outpoint.to_string()],
+        )
+        .expect_err("without the record the retry must fail closed, not build a second payment");
+    assert!(
+        format!("{err:#}").contains("not in the wallet's watch set"),
         "unexpected error: {err:#}"
     );
 

@@ -22,6 +22,11 @@ service RgbSidecar {
   // ---- 提现 ----
   rpc BuildWithdrawal(BuildWithdrawalRequest) returns (BuildWithdrawalResponse);
   rpc FinalizeWithdrawal(FinalizeWithdrawalRequest) returns (FinalizeWithdrawalResponse);
+  // ---- 用户充值脚本 watch 集（C4）----
+  rpc RegisterDepositScripts(RegisterDepositScriptsRequest) returns (RegisterDepositScriptsResponse);
+  // ---- 扫集（C4）----
+  rpc BuildSweep(BuildSweepRequest) returns (BuildSweepResponse);
+  rpc FinalizeSweep(FinalizeSweepRequest) returns (FinalizeSweepResponse);
   // ---- 辅助 ----
   rpc ParseBtcTx(ParseBtcTxRequest) returns (ParseBtcTxResponse);
 }
@@ -161,6 +166,67 @@ message FinalizeWithdrawalResponse {
   string txid = 1;                     // 广播用 txid；Go 侧据此做 txid↔pending 关联
   string recipient_seal_outpoint = 2;  // 新打开的收款 seal
   string change_seal_outpoint = 3;     // change seal（可能为空）
+}
+
+// ================= 用户充值脚本 watch 集（C4）=================
+//
+// 为什么需要这条通道：原生 P2WSH 的 witnessScript 在花费之前**链上不可见**（链上只有 34 字节的
+// `OP_0 <sha256(witnessScript)>` program），而它是 BIP143 的 scriptCode —— 没有它就无法为这笔
+// UTXO 出签名。原文只能由 (userID, tssPub) 重新派生，而 userID 集合是**桥的运维状态**（谁要过
+// 地址），侧车无从自行得知，因此必须由桥下发。
+//
+// 为什么不复用既有 RPC：这是"状态写入 + 集合读取"两件事，塞进 Sync/ListSeals/ParseBtcTx 任何一个
+// 都会把一次**会改变侧车能否花钱的状态变更**藏在语义无关的只读 RPC 后面（评审时看不见）。本契约
+// 的改动是纯增量的：新增方法 + 新增消息，不动任何既有字段编号与语义 —— 单侧旧的实现只会在调用时
+// 拿到 UNIMPLEMENTED，不会静默地按旧语义跑。
+//
+// 跨节点：桥在**每个**节点上都跑一份（各自的 watch 集只在发放过地址的那个节点上增长），所以
+//   1) 每个节点把自己那份下发到**本地侧车**；2) 响应回带侧车登记的**并集**，节点据此补齐自己没有
+//   的条目。于是任何节点只要与"发放过地址的那个节点"共用同一个侧车（当前部署形态），就能收敛到
+//   同一份登记 —— 这正是签名节点"各自必须持有登记"的落地方式。
+message DepositScriptEntry {
+  string user_id = 1;   // chain33 地址串 = 派生里的 userID（脚本里的 OP_DROP 标签）
+  bytes pk_script = 2;  // 34 字节 = 0x00 0x20 || sha256(witnessScript)，桥侧派生结果
+}
+message RegisterDepositScriptsRequest {
+  // 幂等：已在集合里的条目重复下发不报错。
+  repeated DepositScriptEntry scripts = 1;
+}
+message RegisterDepositScriptsResponse {
+  // 侧车**不采信**下发内容：逐条按自己的 tssPub 重新派生 witnessScript 并要求 program 与
+  // pk_script 逐字节一致。任一条对不上就整批拒绝（桥与侧车的群公钥不一致必须响亮地失败 ——
+  // 收下一份花不掉的脚本，故障会拖到"提现时才炸"）。
+  uint32 accepted = 1;                     // 本次新增条目数（已存在的计入 total，不计入 accepted）
+  uint32 total = 2;                        // 登记后集合规模
+  repeated DepositScriptEntry scripts = 3; // 侧车登记的**全部**条目（并集，供节点补齐）
+}
+
+// ================= 扫集（C4）=================
+//
+// 扫集 = 把散在用户 P2WSH 地址上的充值 UTXO 归集回**主池**（TSS P2WPKH），让提现重新有 BTC 可花。
+// 它**不改变任何 RGB 账**（入账在铸币那一刻已经完成），纯粹是 UTXO 整理（规格 §6① 选项 A）。
+//
+// 【不变式·冻结】归集目标只有一个：主池 TSS 脚本。桥的任何自有付款都不得落到用户 P2WSH
+// （规格 §2.3(b)）—— 否则那笔付款会被该用户回头当成充值证明再认领一次（同一笔 BTC 两边入账）。
+// 因此本交易**没有**"找零回用户脚本"这种形态：所有输出都是主池脚本。
+message BuildSweepRequest {
+  uint32 fee_rate = 1;          // sat/vB
+  uint32 min_utxos = 2;         // 低于这个数就不值得扫（返回 input_count=0，不是错误）
+  uint32 min_confirmations = 3; // 只归集达到该确认数的充值 UTXO（0 = 含未确认）
+}
+message BuildSweepResponse {
+  bytes psbt = 1;               // 未签 PSBT（每条输入自带自己的 witnessScript）
+  uint32 input_count = 2;       // 0 = 没有可扫的（未达阈值/未达确认数），此时 psbt 为空
+  uint64 input_value = 3;       // 输入面额合计（sat）
+  uint64 fee = 4;               // 手续费（sat）
+  string txid = 5;              // 未签交易的 txid（PSBT 提取后一致）
+}
+message FinalizeSweepRequest {
+  bytes psbt_signed = 1;        // TSS 签名后的 PSBT
+}
+message FinalizeSweepResponse {
+  string txid = 1;
+  bytes raw_tx = 2;             // 已定稿的交易字节（调用方广播；侧车不替调用方广播）
 }
 
 // ================= 辅助 =================
