@@ -102,13 +102,6 @@ type btcWallet struct {
 	tssPubKey   *btcec.PublicKey
 	tssPkScript []byte // 预计算的TSS地址脚本
 
-	// depositScripts 用户 P2WSH 充值脚本的 watch 集（program ↔ userID 双向索引，
-	// 按需增长，见 deposit_address.go）。
-	depositScripts *depositScriptSet
-	// watchingDeposits 本节点是否真的在 watch 充值脚本（= wallet.start() 已跑）。非官方节点
-	// 不跑交易监听，只需要"知道某个脚本是充值脚本"来给签名做归属核对，不需要（也不能）导入钱包
-	// —— 它的链客户端没启动，NotifyReceived 会失败。
-	watchingDeposits bool
 	// notifyFn 可选：注入"订阅地址"的实现（默认走 chainClient.NotifyReceived），仅测试用。
 	notifyFn func([]btcutil.Address) error
 
@@ -153,7 +146,6 @@ func newBtcWallet(n *neutrinoClient) (*btcWallet, error) {
 		removePendingChan: make(chan chainhash.Hash, 100),
 		requiredConfs:     int32(n.cfg.BlockConfirmations),
 		pendingTxs:        make(map[chainhash.Hash]*btcPendingTx),
-		depositScripts:    newDepositScriptSet(),
 	}
 
 	if n.cfg.BtcRPC.Host != "" {
@@ -206,8 +198,12 @@ func (b *btcWallet) start() error {
 	}
 
 	b.Wallet.Start()
-	// 从这里起钱包才真的在 watch（下方 monitorTransactions 会导入 TSS 地址与充值脚本）。
-	b.watchingDeposits = true
+	// 从这里起钱包才真的在 watch：把"导入 + 订阅"装上，watch 集的载入/补齐（见 deposit_address.go）
+	// 会通过它把脚本真正导进钱包。非官方节点不装（它没有可 watch 的钱包）。
+	b.client.depositImporter = func(witnessScripts [][]byte) error {
+		_, err := b.importDepositWitnessScripts(witnessScripts)
+		return err
+	}
 
 	// 启动交易监听
 	go b.monitorTransactions()
@@ -249,7 +245,7 @@ func (b *btcWallet) waitAndImportTSSAddress() {
 	log.Info("waitAndImportTSSAddress success", "address", b.tssAddress.String())
 	// 用户充值脚本的 watch 集（P2WSH 每用户地址）：从 neutrino.db 载入并重新导入钱包，
 	// 见 deposit_address.go。必须在钱包打开之后（这里）、HTTP 发放地址之前完成。
-	b.loadDepositScripts()
+	b.client.loadDepositScripts()
 }
 
 func (b *btcWallet) importTSSPublicKey() error {
@@ -596,7 +592,7 @@ func (b *btcWallet) analyzeTransaction(hash *chainhash.Hash, tx *wire.MsgTx) *bt
 
 		// 充值归因：**只看脚本**。program 是按 (userID, tssPub) 派生的，链上执行器用同一份派生
 		// 认定归属，所以"能反解出 userID"就等于"链上会把这笔算给该 userID"。
-		if userID, ok := b.depositScripts.lookupUser(output.PkScript); ok {
+		if userID, ok := b.client.deposits.lookupUser(output.PkScript); ok {
 			deposits[userID] += btcutil.Amount(output.Value)
 			log.Debug("analyzeTransaction user deposit script found", "txHash", hash.String(),
 				"outputIndex", i, "userID", userID, "amount", btcutil.Amount(output.Value))
@@ -710,7 +706,7 @@ func (b *btcWallet) buildWithdrawTx(req *withdrawRequest) (*wire.MsgTx, []int64,
 	// 充值地址"（checkWithdraw 的 E15-a），用**另一个自己控制的 chain33 地址**当提现目标那一段
 	// 只能由桥侧兜底 —— 就是这里：watch 集里的脚本都是已发放的充值地址，命中即拒。
 	// 只拒"我们自己发放过的脚本"，普通 P2WSH（交易所/多签/闪电通道）不受影响。
-	if userID, ok := b.isWatchedDepositScript(pkScript); ok {
+	if userID, ok := b.client.isWatchedDepositScript(pkScript); ok {
 		log.Error("buildWithdrawTx refuse to pay a user deposit script (bridge self-payment invariant)",
 			"toAddress", req.toAddress, "depositUserID", userID)
 		return nil, nil, nil, fmt.Errorf("withdraw target %s is a user deposit script (userID %s): "+

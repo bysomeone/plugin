@@ -37,10 +37,10 @@ func (n *neutrinoClient) TSSPkScript() []byte {
 // P2WSH 充值脚本，返回其 userID。签名节点交叉核对提现 PSBT 输入归属时用（C3）：
 // 这类脚本的 program 也是 TSS 群钥的脚本，只有 GG18 签名才能花，因此必须被认作"受桥控制"。
 func (n *neutrinoClient) IsUserDepositScript(pkScript []byte) (string, bool) {
-	if n == nil || n.bw == nil {
+	if n == nil {
 		return "", false
 	}
-	return n.bw.isWatchedDepositScript(pkScript)
+	return n.isWatchedDepositScript(pkScript)
 }
 
 // SubmitConfirm 提交 rgbx Confirm 交易（RGB20 提现确认销毁；合约 RGB20 分支跳过 commitment）。

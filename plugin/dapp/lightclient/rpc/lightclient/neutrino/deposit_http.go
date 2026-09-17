@@ -98,7 +98,7 @@ func (n *neutrinoClient) handleDepositAddressRequest(w http.ResponseWriter, r *h
 		writeDepositHTTP(w, http.StatusBadRequest, err.Error(), nil)
 		return
 	}
-	pkScript, err := rtypes.DeriveDepositPkScript(chain33Addr, n.bw.depositTssPubKey())
+	pkScript, err := rtypes.DeriveDepositPkScript(chain33Addr, n.depositTssPubKey())
 	if err != nil {
 		writeDepositHTTP(w, http.StatusInternalServerError, "derive pkScript: "+err.Error(), nil)
 		return
@@ -108,7 +108,7 @@ func (n *neutrinoClient) handleDepositAddressRequest(w http.ResponseWriter, r *h
 		Address:   addr,
 		PkScript:  hex.EncodeToString(pkScript),
 		Spec:      rtypes.P2WSHDepositSpecV1,
-		WatchSize: n.bw.depositScripts.size(),
+		WatchSize: n.deposits.size(),
 	})
 }
 

@@ -90,13 +90,13 @@ func newTestWallet(t *testing.T, pub *btcec.PublicKey, cfg config) (*btcWallet, 
 	t.Cleanup(func() { _ = neutrinoDB.Close() })
 
 	b := &btcWallet{
-		Wallet:         w,
-		db:             walletDB,
-		chainParams:    params,
-		depositScripts: newDepositScriptSet(),
+		Wallet:      w,
+		db:          walletDB,
+		chainParams: params,
 		client: &neutrinoClient{
 			tss:         &tssService{tssPublicKey: pub},
 			cfg:         cfg,
+			deposits:    newDepositScriptSet(),
 			neutrinoCfg: neutrino.Config{Database: neutrinoDB},
 		},
 	}
@@ -136,7 +136,7 @@ func TestEnsureUserDepositScript_matchesFrozenVector(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, addr, addrAgain)
 	assert.Len(t, notified, 1, "重复请求不得重复订阅")
-	assert.Equal(t, 1, b.depositScripts.size())
+	assert.Equal(t, 1, b.client.deposits.size())
 }
 
 // TestEnsureUserDepositScript_persistsAndReloads 重启后 watch 集从 neutrino.db 载入并重新导入。
@@ -159,35 +159,40 @@ func TestEnsureUserDepositScript_persistsAndReloads(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, want2, addr2)
 	require.NotEqual(t, addr1, addr2, "不同 userID 必须得到不同地址")
-	require.Equal(t, 2, b.depositScripts.size())
+	require.Equal(t, 2, b.client.deposits.size())
 
 	// 模拟重启：同一批 DB 上新建一个 btcWallet，载入 watch 集。
 	w, err := wallet.Open(walletDB, []byte("hello"), nil, &params, 0)
 	require.NoError(t, err)
 	reloaded := &btcWallet{
-		Wallet:         w,
-		db:             walletDB,
-		chainParams:    params,
-		depositScripts: newDepositScriptSet(),
+		Wallet:      w,
+		db:          walletDB,
+		chainParams: params,
 		client: &neutrinoClient{
 			tss:         &tssService{tssPublicKey: pub},
 			cfg:         config{},
+			deposits:    newDepositScriptSet(),
 			neutrinoCfg: neutrino.Config{Database: neutrinoDB},
 		},
 	}
+	// 模拟官方节点：载入时要把脚本重新导入钱包（测试里链客户端没起，订阅用注入的 notifyFn）。
+	reloaded.client.depositImporter = func(ws [][]byte) error {
+		_, err := reloaded.importDepositWitnessScripts(ws)
+		return err
+	}
 	reloaded.notifyFn = func([]btcutil.Address) error { return nil }
-	reloaded.loadDepositScripts()
-	assert.Equal(t, 2, reloaded.depositScripts.size(), "重启后 watch 集必须从 neutrino.db 恢复")
-	userID, ok := reloaded.depositScripts.lookupUser(mustPkScriptHex(t, addr1, &params))
+	reloaded.client.loadDepositScripts()
+	assert.Equal(t, 2, reloaded.client.deposits.size(), "重启后 watch 集必须从 neutrino.db 恢复")
+	userID, ok := reloaded.client.deposits.lookupUser(mustPkScriptHex(t, addr1, &params))
 	assert.True(t, ok)
 	assert.Equal(t, v1.UserID, userID)
 
 	// 换成另一把群公钥（re-DKG 后）：旧条目全部作废，载入时必须跳过而不是继续 watch。
 	otherPriv, _ := btcec.PrivKeyFromBytes([]byte{0x77})
 	reloaded.client.tss.tssPublicKey = otherPriv.PubKey()
-	reloaded.depositScripts = newDepositScriptSet()
-	reloaded.loadDepositScripts()
-	assert.Equal(t, 0, reloaded.depositScripts.size(), "旧世代的 watch 条目必须被跳过（地址已作废）")
+	reloaded.client.deposits = newDepositScriptSet()
+	reloaded.client.loadDepositScripts()
+	assert.Equal(t, 0, reloaded.client.deposits.size(), "旧世代的 watch 条目必须被跳过（地址已作废）")
 }
 
 // TestEnsureUserDepositScript_rejectsBadRequests 输入校验与上限：拿不到地址就必须报错，
@@ -234,14 +239,13 @@ func newAttributionWallet(t *testing.T, vectors []depositVector) (*btcWallet, []
 	require.NoError(t, err)
 	params := chaincfg.RegressionNetParams
 	b := &btcWallet{
-		chainParams:    params,
-		depositScripts: newDepositScriptSet(),
-		client:         &neutrinoClient{},
+		chainParams: params,
+		client:      &neutrinoClient{deposits: newDepositScriptSet()},
 	}
 	for _, v := range vectors[:2] {
 		script, derr := rtypes.DeriveDepositPkScript(v.UserID, pub.SerializeCompressed())
 		require.NoError(t, derr)
-		b.depositScripts.add(v.UserID, script)
+		b.client.deposits.add(v.UserID, script)
 	}
 	return b, pub.SerializeCompressed(), pub.SerializeUncompressed()
 }
@@ -469,7 +473,11 @@ func TestHandleDepositAddressRequest(t *testing.T) {
 	require.NoError(t, err)
 	b, _, _ := newTestWallet(t, pub, config{})
 	b.notifyFn = func([]btcutil.Address) error { return nil }
-	n := &neutrinoClient{bw: b, cfg: config{}}
+	// HTTP handler 是官方节点路径：钱包 + watch 集都在。生产里 bw.client 就是节点本身
+	// （同一个对象），测试按同样的形状接线，避免出现"钱包的 client"与"节点的 client"两份状态。
+	n := b.client
+	n.bw = b
+	n.cfg = config{}
 
 	decode := func(t *testing.T, rec *httptest.ResponseRecorder) depositAddressHTTPResponse {
 		t.Helper()
@@ -499,7 +507,7 @@ func TestHandleDepositAddressRequest(t *testing.T) {
 		"/rgbx/v1/btc-deposit-address", strings.NewReader(body)))
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.Equal(t, v.Addresses["regtest"], decode(t, rec).Data.(map[string]interface{})["address"])
-	assert.Equal(t, 1, b.depositScripts.size(), "重复请求不得让 watch 集增长")
+	assert.Equal(t, 1, b.client.deposits.size(), "重复请求不得让 watch 集增长")
 
 	// 缺参数 / 非法地址 / 方法不对：都必须是明确失败，绝不返回一个没被 watch 的地址。
 	rec = httptest.NewRecorder()
@@ -514,7 +522,7 @@ func TestHandleDepositAddressRequest(t *testing.T) {
 	rec = httptest.NewRecorder()
 	n.handleDepositAddressRequest(rec, httptest.NewRequest(http.MethodDelete, "/rgbx/v1/btc-deposit-address", nil))
 	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
-	assert.Equal(t, 1, b.depositScripts.size(), "失败请求不得改变 watch 集")
+	assert.Equal(t, 1, b.client.deposits.size(), "失败请求不得改变 watch 集")
 }
 
 // ---- 阶段 C4：跨节点 watch 集分发 ----
@@ -529,32 +537,32 @@ func TestMergeRemoteDepositScripts_learnsAnotherNodesEntry(t *testing.T) {
 	require.NoError(t, err)
 
 	b, _, _ := newTestWallet(t, pub, config{})
-	b.watchingDeposits = true // 官方节点：合并进来的脚本也要导入钱包（它才看得见充值）
+	b.client.depositImporter = func(ws [][]byte) error { _, err := b.importDepositWitnessScripts(ws); return err }
 	var notified []btcutil.Address
 	b.notifyFn = func(addrs []btcutil.Address) error {
 		notified = append(notified, addrs...)
 		return nil
 	}
-	require.Equal(t, 0, b.depositScripts.size())
+	require.Equal(t, 0, b.client.deposits.size())
 
 	pkScript, err := hex.DecodeString(v2.PkScript)
 	require.NoError(t, err)
-	b.mergeRemoteDepositScripts([]*pb.DepositScriptEntry{
+	b.client.mergeRemoteDepositScripts([]*pb.DepositScriptEntry{
 		{UserId: v2.UserID, PkScript: pkScript},
 	})
 
-	require.Equal(t, 1, b.depositScripts.size(), "别的节点发放过的条目必须被收下")
-	userID, ok := b.depositScripts.lookupUser(pkScript)
+	require.Equal(t, 1, b.client.deposits.size(), "别的节点发放过的条目必须被收下")
+	userID, ok := b.client.deposits.lookupUser(pkScript)
 	assert.True(t, ok, "收下之后，反解归属必须能命中（充值归因/签名归属核对都靠它）")
 	assert.Equal(t, v2.UserID, userID)
 	require.Len(t, notified, 1, "官方节点必须把新脚本导入钱包并订阅")
 	assert.Equal(t, v2.Addresses["regtest"], notified[0].String())
 
 	// 幂等：同一条重复推来不会重复 import/订阅/watch 增长。
-	b.mergeRemoteDepositScripts([]*pb.DepositScriptEntry{
+	b.client.mergeRemoteDepositScripts([]*pb.DepositScriptEntry{
 		{UserId: v2.UserID, PkScript: pkScript},
 	})
-	assert.Equal(t, 1, b.depositScripts.size())
+	assert.Equal(t, 1, b.client.deposits.size())
 	assert.Len(t, notified, 1)
 }
 
@@ -576,12 +584,12 @@ func TestMergeRemoteDepositScripts_skipsMismatchedEntries(t *testing.T) {
 	// v2 的 program 是用 v1 的公钥派生不出来的（向量 1 的 userID 配向量 0 的公钥）。
 	pkScriptV2, err := hex.DecodeString(v2.PkScript)
 	require.NoError(t, err)
-	b.mergeRemoteDepositScripts([]*pb.DepositScriptEntry{
+	b.client.mergeRemoteDepositScripts([]*pb.DepositScriptEntry{
 		{UserId: v2.UserID, PkScript: pkScriptV2},
 		{}, // 空条目
 		{UserId: "not-an-address", PkScript: pkScriptV2},
 	})
-	assert.Equal(t, 0, b.depositScripts.size(), "对不上的条目一条都不能落地")
+	assert.Equal(t, 0, b.client.deposits.size(), "对不上的条目一条都不能落地")
 	assert.Empty(t, notified, "被丢弃的条目不得触发钱包导入")
 }
 
@@ -599,4 +607,48 @@ func TestDepositScriptSetEntriesRoundTrip(t *testing.T) {
 	require.Len(t, entries, 1)
 	assert.Equal(t, v.UserID, entries[0].userID)
 	assert.Equal(t, pkScript, entries[0].pkScript, "导出的 pkScript 必须与入库的逐字节一致")
+}
+
+// TestMergeRemoteDepositScripts_learnsWithoutAWallet 验证节点（非官方节点）**没有 btcWallet**：
+// 它不跑交易监听、看不见充值，但它必须持有同一份登记 —— 它是签名节点，"这个输入脚本是不是用户
+// 充值脚本"正是它决定签不签的依据（IsUserDepositScript）。
+//
+// 这条用例对应一个真实踩过的坑：登记此前挂在 btcWallet 上，而 btcWallet 只在官方节点创建，
+// 于是跨节点分发形同虚设 —— 扫集/提现的 PSBT 到了验证节点全被拒签（"not a registered user
+// deposit script"），GG18 超时，钱出不来。
+func TestMergeRemoteDepositScripts_learnsWithoutAWallet(t *testing.T) {
+	vectors := loadDepositVectors(t)
+	v := vectors[0]
+	pub, err := btcec.ParsePubKey(vectorPub(t, v))
+	require.NoError(t, err)
+
+	n := &neutrinoClient{
+		tss:      &tssService{tssPublicKey: pub},
+		cfg:      config{},
+		deposits: newDepositScriptSet(),
+	}
+	pkScript, err := hex.DecodeString(v.PkScript)
+	require.NoError(t, err)
+
+	// 没有 depositImporter（= 没有钱包在 watch）：登记照样要落地。
+	n.mergeRemoteDepositScripts([]*pb.DepositScriptEntry{{UserId: v.UserID, PkScript: pkScript}})
+	assert.Equal(t, 1, n.deposits.size(), "没有钱包的验证节点也必须持有登记")
+	userID, ok := n.IsUserDepositScript(pkScript)
+	assert.True(t, ok, "签名节点认不出用户充值脚本 ⇒ 花这笔 UTXO 的交易会被它拒签")
+	assert.Equal(t, v.UserID, userID)
+
+	// 同一份登记在**官方节点**上则还要真的导入钱包（它得看得见那笔充值）。
+	b, _, _ := newTestWallet(t, pub, config{})
+	var notified []btcutil.Address
+	b.notifyFn = func(addrs []btcutil.Address) error {
+		notified = append(notified, addrs...)
+		return nil
+	}
+	b.client.depositImporter = func(ws [][]byte) error {
+		_, err := b.importDepositWitnessScripts(ws)
+		return err
+	}
+	b.client.mergeRemoteDepositScripts([]*pb.DepositScriptEntry{{UserId: v.UserID, PkScript: pkScript}})
+	require.Len(t, notified, 1, "官方节点必须把登记里的脚本导入钱包并订阅")
+	assert.Equal(t, v.Addresses["regtest"], notified[0].String())
 }

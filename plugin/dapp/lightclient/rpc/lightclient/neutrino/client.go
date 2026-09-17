@@ -71,6 +71,14 @@ type neutrinoClient struct {
 	lock              sync.RWMutex
 	chain33FeeRate    int64
 	withdrawReqChan   chan *rtypes.PendingTx
+
+	// deposits 用户 P2WSH 充值脚本的 watch 集（program ↔ userID，见 deposit_address.go）。
+	// **所有节点都要有**：签名节点凭它认定"这个输入脚本是用户充值脚本"（IsUserDepositScript），
+	// 没有它，任何签名节点都会拒签花这笔 UTXO 的交易（C4 的跨节点分发要解决的就是这件事）。
+	deposits *depositScriptSet
+	// depositImporter 把充值脚本导入**本节点钱包**并订阅（只有真的在 watch 的官方节点才装）。
+	// nil = 本节点不 watch（不跑交易监听），只维护登记本身。
+	depositImporter func(witnessScripts [][]byte) error
 }
 
 // Init init client context
@@ -113,6 +121,9 @@ func (n *neutrinoClient) Init(ctx context.Context, q queue.Queue, cfg *lightclie
 		log.Error("Init", "initRgb20Adapter error", err)
 		return err
 	}
+	// watch 集必须在**所有**节点上存在（含不跑钱包的验证节点）：它是签名节点判断"这个输入脚本
+	// 是不是用户充值脚本"的依据，见 IsUserDepositScript。
+	n.deposits = newDepositScriptSet()
 	if !n.cfg.IsOfficialNode {
 		return nil
 	}
@@ -210,7 +221,7 @@ func (n *neutrinoClient) Start() {
 	// 跨节点 watch 集补齐（C4）：**每个节点**都下发自己那份登记并接收侧车持有的并集 ——
 	// 签名节点必须各自持有"哪些脚本是用户充值脚本"的登记，才能为花费它的交易出签名
 	// （IsUserDepositScript）。见 deposit_address.go 的 syncDepositScriptsWithSidecar。
-	if n.rgb20 != nil {
+	if n.deposits != nil {
 		go n.depositScriptSyncWorker()
 	}
 	if !n.cfg.IsOfficialNode {
