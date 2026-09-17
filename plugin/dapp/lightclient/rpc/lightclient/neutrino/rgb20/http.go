@@ -128,9 +128,18 @@ func (a *Adapter) handleDepositRequest(w http.ResponseWriter, r *http.Request) {
 
 // handleSignPsbt 测试专用：用 TSS 组对 PSBT 签名（E2E 驱动用，非生产 RPC）。
 // POST /rgbx/v1/sign-psbt  body: {"psbt":"<hex>"}  →  {"psbt":"<hex signed>"}
+//
+// 该端点签的是**任意** PSBT（没有 chain33 提现上下文，签名节点无从核对），等于"用 TSS 组私钥
+// 签任意内容"，所以必须由 [rpc.sub.light.neutrino.rgb20].testSignPsbt 显式打开（默认关闭），
+// 生产环境调用一律 403。
 func (a *Adapter) handleSignPsbt(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeHTTP(w, httpResponse{Code: http.StatusMethodNotAllowed, Message: "method not allowed"})
+		return
+	}
+	if !a.TestSignEnabled() {
+		writeHTTP(w, httpResponse{Code: http.StatusForbidden,
+			Message: "test sign-psbt disabled: set rgb20.testSignPsbt to enable it in test environments"})
 		return
 	}
 	if a.bridge == nil {
@@ -154,7 +163,7 @@ func (a *Adapter) handleSignPsbt(w http.ResponseWriter, r *http.Request) {
 		writeHTTP(w, httpResponse{Code: http.StatusBadRequest, Message: "invalid psbt hex: " + err.Error()})
 		return
 	}
-	signed, err := a.bridge.SignPsbt(psbtBytes)
+	signed, err := a.bridge.SignPsbtTestOnly(psbtBytes)
 	if err != nil {
 		writeHTTP(w, httpResponse{Code: http.StatusInternalServerError, Message: "sign psbt: " + err.Error()})
 		return

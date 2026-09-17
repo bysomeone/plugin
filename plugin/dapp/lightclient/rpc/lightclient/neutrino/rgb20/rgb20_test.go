@@ -63,6 +63,10 @@ type fakeBridge struct {
 	spvProof   *SpvProof
 	sig        []byte
 	signedPSBT []byte
+	// signErr 非空则提现签名失败（驱动"签名节点拒签"的协调者侧归类）。
+	signErr error
+	// signPSBTReq 最近一次提现签名请求（协调者下发的提现上下文）。
+	signPSBTReq *WithdrawSignRequest
 	// bestHeight/err 本地 BTC best height（深度门控用）；minConfs 链上 rgbx 最小确认数 N。
 	bestHeight  uint64
 	bestErr     error
@@ -163,11 +167,32 @@ func (f *fakeBridge) signCallCount() int {
 	return f.signCalls
 }
 
-func (f *fakeBridge) SignPsbt(psbtBytes []byte) ([]byte, error) {
+func (f *fakeBridge) SignPsbt(req *WithdrawSignRequest) ([]byte, error) {
+	f.mu.Lock()
+	f.signPSBTReq = req
+	signErr := f.signErr
+	f.mu.Unlock()
+	if signErr != nil {
+		return nil, signErr
+	}
+	if f.signedPSBT != nil {
+		return f.signedPSBT, nil
+	}
+	return req.Psbt, nil
+}
+
+func (f *fakeBridge) SignPsbtTestOnly(psbtBytes []byte) ([]byte, error) {
 	if f.signedPSBT != nil {
 		return f.signedPSBT, nil
 	}
 	return psbtBytes, nil
+}
+
+// signRequest 取最近一次提现签名请求（断言协调者下发的上下文是否正确）。
+func (f *fakeBridge) signRequest() *WithdrawSignRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.signPSBTReq
 }
 
 // BtcBestHeight 本地 best height（深度门控用）。
@@ -620,8 +645,28 @@ func Test_WithdrawStickySealAndTxidMap(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, chain33Hash, got)
 
-	require.NoError(t, adapter.persistStickySeal(chain33Hash, buildTestPSBT(t)))
-	require.NotEmpty(t, adapter.GetStickySeal(chain33Hash))
+	const sealA = "1111111111111111111111111111111111111111111111111111111111111111:0"
+	const sealB = "2222222222222222222222222222222222222222222222222222222222222222:1"
+	require.NoError(t, adapter.persistStickySeal(chain33Hash, []string{sealA, sealB}))
+	// 集合按 outpoint 字典序规范化（与输入顺序无关），便于逐字节比较。
+	require.Equal(t, sealA+","+sealB, adapter.GetStickySeal(chain33Hash))
+	require.NoError(t, adapter.persistStickySeal(chain33Hash, []string{sealB, sealA}))
+	require.Equal(t, sealA+","+sealB, adapter.GetStickySeal(chain33Hash))
+
+	// 已存在则绝不覆盖：换一组 seal 重试必须失败（E9：否则同一笔 burn 会被换成另一组 seal 再付一次）。
+	err = adapter.persistStickySeal(chain33Hash, []string{sealA})
+	require.Error(t, err)
+	class, unrecoverable := IsUnrecoverableWithdraw(err)
+	require.True(t, unrecoverable, "err=%v", err)
+	require.Equal(t, unrecoverableClassStickySealMismatch, class)
+	require.Equal(t, sealA+","+sealB, adapter.GetStickySeal(chain33Hash), "记录不得被覆盖")
+
+	// 算不出绑定的 seal（空集）一律拒绝：否则本记录与签名侧核对都形同虚设。
+	err = adapter.persistStickySeal([]byte("another-hash"), nil)
+	require.Error(t, err)
+	_, unrecoverable = IsUnrecoverableWithdraw(err)
+	require.True(t, unrecoverable, "err=%v", err)
+	require.Empty(t, adapter.GetStickySeal([]byte("another-hash")))
 }
 
 // Test_Withdraw_UnrecoverableClassification 锁住"该提现永远不可能成功"的判定（A1 生产侧）：

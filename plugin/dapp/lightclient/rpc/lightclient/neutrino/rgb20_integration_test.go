@@ -2,11 +2,16 @@ package neutrino
 
 import (
 	"bytes"
+	"context"
 	"encoding/asn1"
+	"encoding/json"
 	"math/big"
 	"testing"
 
+	"github.com/33cn/chain33/types"
+	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
 	"github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20"
+	rgb20pb "github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20/pb"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
@@ -291,4 +296,301 @@ func Test_VerifyDepositSpv_rejectsNonCanonicalTxData(t *testing.T) {
 		err := n.VerifyDepositSpv(&rtypes.BtcTxProof{TxData: appended})
 		require.ErrorContainsf(t, err, "non-canonical", "尾部 %d 字节的 TxData 必须被签名节点拒绝", extra)
 	}
+}
+
+// ---- E11：RGB20 提现签名通知必须携带提现上下文（签名节点才可能执行交叉核对）----
+
+// Test_handleRgb20WithdrawSign_RequiresWithdrawContext 锁住 E11：签名节点收到**不带上下文**
+// 的提现签名通知时必须直接拒签，而不是"跳过校验、只参与签名"。
+//
+// 之前 tssService 里有一条 len(notify.Payload)==0 ⇒ 跳过全部提现核对直接 GG18 签名的旁路
+// （本为 E2E 的 sign-psbt 端点所加），它同时也是生产路径 ⇒ ValidateWithdrawPsbt 整段不执行
+// （金额覆盖核对 S1、BL-4 交叉核对、费用区间、dust cap、同步高度、closed-seal 非 pending-mint
+// 全部失效）。这个旁路已改为独立的、需显式开关的测试签名类型（transactionTypeTestSign）。
+//
+// 断言方式：tssService 的 client 为 nil —— 一旦真的往下走到签名就会 panic，因此"返回错误而
+// 不是 panic"本身即证明没有进入签名路径。
+func Test_handleRgb20WithdrawSign_RequiresWithdrawContext(t *testing.T) {
+	ts := &tssService{}
+	err := ts.handleRgb20WithdrawSign(&ltypes.TssSignNotify{Psbt: []byte{0x01}})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "without payload")
+
+	payload, err := json.Marshal(&rgb20.WithdrawSignPayload{Chain33TxHash: []byte{0xaa}})
+	require.NoError(t, err)
+	err = ts.handleRgb20WithdrawSign(&ltypes.TssSignNotify{Psbt: []byte{0x01}, Payload: payload})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "without consignment")
+}
+
+// Test_handleTestSignNotify_RequiresOptIn 无上下文的测试签名必须由本地配置显式打开
+// （默认关闭）：打开它就等于"用 TSS 组私钥签任意 PSBT"，生产环境不得可达。
+func Test_handleTestSignNotify_RequiresOptIn(t *testing.T) {
+	ts := &tssService{client: &neutrinoClient{}}
+	require.False(t, ts.testSignEnabled())
+	err := ts.handleTestSignNotify(&ltypes.TssSignNotify{Psbt: []byte{0x01}})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "testSignPsbt")
+
+	ts.client.cfg.Rgb20.TestSignPsbt = true
+	require.True(t, ts.testSignEnabled())
+}
+
+// Test_checkWithdrawClaims 签名节点对协调者声称值的核对（信任边界）：金额/费率/高度/收款
+// invoice 任一项与链上 pending（真值）不一致即拒签。
+func Test_checkWithdrawClaims(t *testing.T) {
+	pending := &rtypes.PendingTx{
+		Amount:        500000,
+		FeeRate:       2,
+		TxBlockHeight: 120,
+		TargetAddress: "rgb:invoice",
+	}
+	claim := &rgb20.WithdrawSignPayload{
+		Chain33TxHash:    []byte{0x01},
+		Amount:           500000,
+		FeeRate:          2,
+		TxBlockHeight:    120,
+		RecipientInvoice: "rgb:invoice",
+	}
+	require.NoError(t, checkWithdrawClaims(claim, pending))
+
+	cases := []struct {
+		name    string
+		mutate  func(*rgb20.WithdrawSignPayload)
+		wantErr string
+	}{
+		{"amount", func(p *rgb20.WithdrawSignPayload) { p.Amount = 499999 }, "amount mismatch"},
+		{"fee rate", func(p *rgb20.WithdrawSignPayload) { p.FeeRate = 3 }, "fee rate mismatch"},
+		{"block height", func(p *rgb20.WithdrawSignPayload) { p.TxBlockHeight = 121 }, "block height mismatch"},
+		{"recipient invoice", func(p *rgb20.WithdrawSignPayload) { p.RecipientInvoice = "rgb:other" }, "recipient invoice mismatch"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := *claim
+			tc.mutate(&c)
+			err := checkWithdrawClaims(&c, pending)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// Test_SignRejectionRelay 拒签回执的回传与采纳：
+//   - 协调者只采纳**本轮签名节点**发来的回执（回执走 P2P 广播，任何人都能发，否则伪造一份
+//     回执就能让一笔合法提现被永久判为不可恢复）；
+//   - 回执还原成不可恢复错误（协调者据此停止重试，不再每秒刷屏）；
+//   - 回执在 isSigner 门槛之前处理：它是广播事实，Signers 为空，过不了签名者检查。
+func Test_SignRejectionRelay(t *testing.T) {
+	hash := []byte("chain33-withdraw-hash")
+	newService := func() *tssService {
+		ts := newTssService(&neutrinoClient{})
+		ts.dkgCompleted.Store(true) // 通知处理的前置条件（真实运行时由 init 置位）
+		ts.setSignRoundSigners(hash, []string{"peer-1", "peer-2"})
+		return ts
+	}
+
+	t.Run("accepted from a signer of this round and classified", func(t *testing.T) {
+		ts := newService()
+		require.NoError(t, ts.takeSignRejection(hash), "尚无回执时不得拒绝")
+		notice, err := json.Marshal(&rgb20.WithdrawSignReject{
+			Chain33TxHash: hash,
+			Class:         "sticky-seal-mismatch",
+			Reason:        "sticky seal changed: recorded=a spending=b",
+			Rejector:      "peer-2",
+		})
+		require.NoError(t, err)
+		ts.handleSignNotify(&types.TopicData{
+			Topic: tssSignNotifyTopic,
+			From:  "peer-2",
+			Data:  types.Encode(&ltypes.TssSignNotify{TxType: transactionTypeRgb20WithdrawReject, Payload: notice}),
+		})
+		err = ts.takeSignRejection(hash)
+		require.Error(t, err)
+		class, unrecoverable := rgb20.IsUnrecoverableWithdraw(err)
+		require.True(t, unrecoverable, "err=%v", err)
+		require.Equal(t, "sticky-seal-mismatch", class)
+		require.Contains(t, err.Error(), "peer-2")
+	})
+
+	t.Run("ignored from a node that is not a signer of this round", func(t *testing.T) {
+		ts := newService()
+		notice, err := json.Marshal(&rgb20.WithdrawSignReject{
+			Chain33TxHash: hash,
+			Class:         "sticky-seal-mismatch",
+			Reason:        "forged",
+			Rejector:      "peer-9",
+		})
+		require.NoError(t, err)
+		ts.handleSignNotify(&types.TopicData{
+			Topic: tssSignNotifyTopic,
+			Data:  types.Encode(&ltypes.TssSignNotify{TxType: transactionTypeRgb20WithdrawReject, Payload: notice}),
+		})
+		require.NoError(t, ts.takeSignRejection(hash), "非本轮签名节点的回执必须被忽略")
+	})
+
+	t.Run("non-signer withdraw notify is dropped", func(t *testing.T) {
+		ts := newService()
+		ts.handleSignNotify(&types.TopicData{
+			Topic: tssSignNotifyTopic,
+			Data: types.Encode(&ltypes.TssSignNotify{
+				TxType:  transactionTypeRgb20Withdraw,
+				Signers: []string{"peer-1"},
+				Psbt:    []byte{0x01},
+			}),
+		})
+		require.Empty(t, ts.signRejections)
+	})
+}
+
+// ---- E9-B / E11 处理器级用例：真实适配器 + 假侧车，验证判定的**组合**（而非单个函数）----
+
+// stubRgb20Bridge 只提供 TSS 脚本（交叉核对用），其余 Chain33Bridge 方法本用例不会调用。
+// 嵌入 nil 接口：一旦调用到未实现的方法会立刻 panic（而不是静默返回零值）。
+type stubRgb20Bridge struct{ rgb20.Chain33Bridge }
+
+func (s *stubRgb20Bridge) TSSPkScript() []byte { return testRgb20TssScript }
+
+func (s *stubRgb20Bridge) TSSAddress() string { return "bcrt1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh" }
+
+// testRgb20TssScript 与 rgb20 包单测同形的 P2WPKH 脚本（OP_0 <20B>）。
+var testRgb20TssScript = []byte{0x00, 0x14, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+	0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13}
+
+const testRgb20SealOutpoint = "1111111111111111111111111111111111111111111111111111111111111111:0"
+
+// buildTestRgb20WithdrawPSBT 构造真机布局的提现 PSBT：vout0 = OP_RETURN（RGB 承诺）、
+// vout1 = 收款 dust（非 TSS，离开桥控制）、vout2 = 找零回 TSS。
+func buildTestRgb20WithdrawPSBT(t *testing.T, sealOutpoint string) []byte {
+	t.Helper()
+	op, err := wire.NewOutPointFromString(sealOutpoint)
+	require.NoError(t, err)
+	tx := wire.NewMsgTx(wire.TxVersion)
+	tx.AddTxIn(wire.NewTxIn(op, nil, nil))
+	tx.AddTxOut(wire.NewTxOut(0, []byte{txscript.OP_RETURN, 0x01}))
+	tx.AddTxOut(wire.NewTxOut(546, []byte{0x51}))
+	tx.AddTxOut(wire.NewTxOut(4000, testRgb20TssScript))
+	p, err := psbt.NewFromUnsignedTx(tx)
+	require.NoError(t, err)
+	p.Inputs[0].WitnessUtxo = &wire.TxOut{Value: 5000, PkScript: testRgb20TssScript}
+	var buf bytes.Buffer
+	require.NoError(t, p.Serialize(&buf))
+	return buf.Bytes()
+}
+
+// rgb20Consignment 构造锚定在该 PSBT 交易上的侧车校验结果：关闭 sealOutpoint、打开
+// vout1（收款，离开桥控制）。
+func rgb20Consignment(t *testing.T, psbtBytes []byte, sealOutpoint string, amount int64) *rgb20pb.ConsignmentValidation {
+	t.Helper()
+	p, err := psbt.NewFromRawBytes(bytes.NewReader(psbtBytes), false)
+	require.NoError(t, err)
+	anchor := p.UnsignedTx.TxHash().String()
+	return &rgb20pb.ConsignmentValidation{
+		Valid:        true,
+		Amount:       amount,
+		SyncedHeight: 200,
+		ClosedSeals:  []string{sealOutpoint},
+		OpenedSeals: []*rgb20pb.OpenedSeal{
+			{Outpoint: anchor + ":1", Amount: amount},
+		},
+	}
+}
+
+// newTestSignerService 构造一个真实的 rgb20 适配器（连假侧车）+ 签名节点服务。
+func newTestSignerService(t *testing.T) (*tssService, *rgb20.MockSidecar, *rgb20.Adapter) {
+	t.Helper()
+	mock := rgb20.NewMockSidecar()
+	sock, cleanup := rgb20.StartTestSidecar(t, mock)
+	t.Cleanup(cleanup)
+	adapter, err := rgb20.NewAdapter(rgb20.Config{
+		SidecarAddr: sock,
+		Precision:   6,
+		Contracts: []rgb20.Contract{
+			{Symbol: "RGB20_USDT", Precision: 6, MinDeposit: 100, MinWithdraw: 100},
+		},
+		ChangeAddress: "bcrt1qxxxx",
+	}, rgb20.NewMemStore())
+	require.NoError(t, err)
+	adapter.SetBridge(&stubRgb20Bridge{})
+	require.NoError(t, adapter.Connect(context.Background()))
+	require.NoError(t, adapter.Start(context.Background()))
+	t.Cleanup(adapter.Stop)
+
+	ts := &tssService{client: &neutrinoClient{rgb20: adapter}}
+	return ts, mock, adapter
+}
+
+// Test_validateRgb20WithdrawSign 处理器级组合：声称值核对 → 交叉核对 → sticky 核对都在
+// **签名之前**，任一步失败即拒签；全部通过时返回本笔花掉的 seal 集合（供签名成功后落盘）。
+func Test_validateRgb20WithdrawSign(t *testing.T) {
+	chain33Hash := []byte("chain33-withdraw-hash")
+	pending := &rtypes.PendingTx{
+		Amount:        500000,
+		FeeRate:       1,
+		TxBlockHeight: 100,
+		TargetAddress: "rgb:invoice",
+	}
+	claim := &rgb20.WithdrawSignPayload{
+		Chain33TxHash:    chain33Hash,
+		Amount:           500000,
+		FeeRate:          1,
+		TxBlockHeight:    100,
+		RecipientInvoice: "rgb:invoice",
+	}
+	psbtBytes := buildTestRgb20WithdrawPSBT(t, testRgb20SealOutpoint)
+	consignment := []byte("consignment")
+
+	t.Run("claims tampered by the coordinator are refused before any rgb check", func(t *testing.T) {
+		ts, mock, _ := newTestSignerService(t)
+		mock.ValidateResp = []*rgb20pb.ConsignmentValidation{
+			rgb20Consignment(t, psbtBytes, testRgb20SealOutpoint, 500000),
+		}
+		bad := *claim
+		bad.Amount = 600000
+		_, err := ts.validateRgb20WithdrawSign(&bad, psbtBytes, consignment, pending)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "amount mismatch")
+		// 声称值就没过，侧车那一步不该被触及（假侧车每响应一次就消费一条 ValidateResp）。
+		require.Len(t, mock.ValidateResp, 1, "声称值核对失败时不得去问侧车")
+	})
+
+	t.Run("valid request returns the spent seal set", func(t *testing.T) {
+		ts, mock, adapter := newTestSignerService(t)
+		mock.ValidateResp = []*rgb20pb.ConsignmentValidation{
+			rgb20Consignment(t, psbtBytes, testRgb20SealOutpoint, 500000),
+		}
+		seals, err := ts.validateRgb20WithdrawSign(claim, psbtBytes, consignment, pending)
+		require.NoError(t, err)
+		require.Equal(t, []string{testRgb20SealOutpoint}, seals)
+		// 判定阶段**不得**落盘 sticky 记录：记录必须等签名成功之后才写，否则一次签名失败
+		// （GG18 超时、广播失败前的任何一步）就会把该笔提现的合法重试永久锁死。
+		require.Empty(t, adapter.GetStickySeal(chain33Hash), "校验阶段不得写 sticky 记录")
+	})
+
+	t.Run("sticky seal switched by a retry is refused (E9)", func(t *testing.T) {
+		const otherSeal = "2222222222222222222222222222222222222222222222222222222222222222:1"
+		ts, mock, adapter := newTestSignerService(t)
+		// 本笔提现此前已按 seal A 成功签名并落盘（签名成功之后才写，见 handleRgb20WithdrawSign）。
+		require.NoError(t, adapter.SetStickySeal(chain33Hash, []string{testRgb20SealOutpoint}))
+
+		// 重试时侧车换了一组 seal：consignment 关闭的是 seal B（不是既有记录里的 seal A）。
+		mock.ValidateResp = []*rgb20pb.ConsignmentValidation{
+			rgb20Consignment(t, psbtBytes, otherSeal, 500000),
+		}
+		_, err := ts.validateRgb20WithdrawSign(claim, psbtBytes, consignment, pending)
+		require.Error(t, err)
+		class, unrecoverable := rgb20.IsUnrecoverableWithdraw(err)
+		require.True(t, unrecoverable, "err=%v", err)
+		require.Equal(t, "sticky-seal-mismatch", class)
+	})
+
+	t.Run("consignment that closes nothing in this tx is refused (fail-closed)", func(t *testing.T) {
+		ts, mock, _ := newTestSignerService(t)
+		v := rgb20Consignment(t, psbtBytes, testRgb20SealOutpoint, 500000)
+		v.ClosedSeals = nil // 本笔 burn 没有绑定任何 seal
+		mock.ValidateResp = []*rgb20pb.ConsignmentValidation{v}
+		_, err := ts.validateRgb20WithdrawSign(claim, psbtBytes, consignment, pending)
+		require.Error(t, err)
+		_, unrecoverable := rgb20.IsUnrecoverableWithdraw(err)
+		require.True(t, unrecoverable, "err=%v", err)
+	})
 }

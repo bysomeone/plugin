@@ -244,7 +244,9 @@ best >= H + B + N - 1          （等价于：提交后链上可见深度 >= N�
 ### 4.4 `[rpc.sub.light.neutrino.rgb20]`
 
 RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentListen` / `contracts` / `precision` /
-`changeAddress`）见 `RGB_USDT_INTEGRATION.md`；本节只描述充值重试相关的行为，**没有额外配置项**。
+`changeAddress`）见 `RGB_USDT_INTEGRATION.md`；本节只描述充值重试相关的行为。唯一的额外配置项是
+`testSignPsbt`（默认 `false`）：打开后允许 E2E 的 `sign-psbt` 测试端点用 TSS 组签名**任意** PSBT
+（签名节点无从核对被签内容），**生产环境必须保持关闭**；`sign-psbt` 仅用于 E2E 模拟用户付款。
 本节的行为都**不需要**与主链 `[exec.sub.rgbx]` 人肉对齐：链上最小确认数 N 由中继直接查链上
 （见 2.2）。
 

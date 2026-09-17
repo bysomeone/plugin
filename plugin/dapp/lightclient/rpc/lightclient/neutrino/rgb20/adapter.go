@@ -36,6 +36,12 @@ type Config struct {
 	//
 	// 0 = 未配置（等价于"头链不保留深度"，只影响门控的保守程度，不影响链上校验）。
 	HeaderRelayConfirmations uint32
+	// TestSignPsbt 是否允许"无提现上下文的 PSBT 签名"（E2E 的 sign-psbt 测试端点用）。
+	//
+	// 该能力等于"用 TSS 组私钥签任意 PSBT"：签名节点无法对被签内容做任何提现核对，因此
+	// **生产环境必须为 false**（默认 false），只有 E2E/regtest 部署显式打开。打开时协调者侧
+	// 的 HTTP 端点与签名节点侧的通知处理都会放行，并在此路径上打 WARN 日志。
+	TestSignPsbt bool
 }
 
 // Contract 一个 RGB20 资产的合约注册项。
@@ -135,8 +141,13 @@ type Chain33Bridge interface {
 	SubmitConfirm(confirm *rtypes.ConfirmTx) error
 	// SignDepositMessage 执行 rgb20-deposit TSS 签名轮次，返回阈值签名（DER）。
 	SignDepositMessage(payload *DepositSignPayload) ([]byte, error)
-	// SignPsbt 通过 TSS 对 PSBT 签名，返回已签 PSBT 字节。
-	SignPsbt(psbtBytes []byte) ([]byte, error)
+	// SignPsbt 通过 TSS 组对 RGB20 提现 PSBT 签名，并把提现上下文（chain33 提现哈希、金额、
+	// 费率、同步高度门槛、收款 invoice、consignment）一并下发给 TSS 组，供签名节点独立核对
+	// （E11：签名节点必须拿到上下文才可能执行 ValidateWithdrawPsbt；缺上下文的签名一律拒签）。
+	SignPsbt(req *WithdrawSignRequest) ([]byte, error)
+	// SignPsbtTestOnly 仅 E2E 的 sign-psbt 测试端点使用：**无提现上下文**，签名节点不做任何
+	// 提现核对就直接参与 GG18。生产提现路径永远不走这里（见 Config.TestSignPsbt）。
+	SignPsbtTestOnly(psbtBytes []byte) ([]byte, error)
 	// BtcBestHeight 返回本节点 BTC 视图的 best height（中继自己的头链视图，与头链提交同源）。
 	// 充值提交前的本地深度门控用它算"提交那一刻链上可见 tip 到哪"；取不到时返回错误（门控 fail-closed）。
 	BtcBestHeight() (uint64, error)
@@ -209,6 +220,9 @@ type Adapter struct {
 
 	// withdrawMu 提现串行（一次只处理一笔，避免并发花同一 seal）。
 	withdrawMu sync.Mutex
+	// stickySealMu 串行 sticky seal 记录的「读-比对-写」（两个调用方各自都在提现串行区内，
+	// 这层锁只保证记录本身不会被交叉读改写）。**不可跨签名/构建调用持有**：它只保护记录。
+	stickySealMu sync.Mutex
 }
 
 // NewAdapter 构造适配器。
@@ -315,6 +329,9 @@ func (a *Adapter) Registry() *Registry         { return a.reg }
 
 func (a *Adapter) Bridge() Chain33Bridge     { return a.bridge }
 func (a *Adapter) SetBridge(b Chain33Bridge) { a.bridge = b }
+
+// TestSignEnabled 是否允许无上下文的 PSBT 签名（E2E 的 sign-psbt 测试端点）。默认关闭。
+func (a *Adapter) TestSignEnabled() bool { return a.cfg.TestSignPsbt }
 
 // FormatOutpoint 将 txid 与 vout 格式化为 "txid:vout"。
 func FormatOutpoint(txid string, vout uint32) string {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,6 +31,19 @@ const (
 	moduleName = "dapp-lightclient-neutrino"
 	// TSS pubsub topic - notification only
 	tssSignNotifyTopic = "rgbx/tssSignNotify/1.0"
+
+	// transactionTypeRgb20Withdraw RGB20 提现 PSBT 的签名通知类型：Payload = 提现上下文
+	// （rgb20.WithdrawSignPayload JSON）、Psbt + Consignment。与 BTC 提现的
+	// transactionTypeWithdraw（Payload = chain33 提现哈希、无 PSBT）分开是刻意的：
+	// 通知类型决定签名节点跑哪一套校验，靠"PSBT 是否为空"之类的旁证来分派正是 E11
+	// （空 Payload 旁路成了生产路径）的成因。
+	transactionTypeRgb20Withdraw = "rgb20-withdraw"
+	// transactionTypeTestSign 只给 E2E 的 sign-psbt 测试端点（见 signPsbtTestOnly）：不带任何
+	// 提现上下文、签名节点不做提现核对。必须由本地配置 rgb20.testSignPsbt 显式打开，
+	// 生产提现路径永远发不出这个类型。
+	transactionTypeTestSign = "test-sign"
+	// transactionTypeRgb20WithdrawReject 签名节点拒签回执（确定性拒签时回传协调者）。
+	transactionTypeRgb20WithdrawReject = "rgb20-withdraw-reject"
 
 	// Database bucket and keys
 	tssBucketName  = "rgbx-tss"
@@ -65,13 +79,25 @@ type tssService struct {
 	subChan    chan *types.TopicData
 	selfPeerId string
 	signTaskCh chan *signTask
+
+	// signMu 保护下面两张表（协调者侧的签名轮次状态）。
+	signMu sync.Mutex
+	// signRoundSigners 本节点作为协调者时，每笔 RGB20 提现（chain33 哈希 hex）所选定的签名
+	// 节点集合。拒签回执是 P2P 广播、任何人都能发，用它核对回执来源确实是本轮签名节点。
+	signRoundSigners map[string][]string
+	// signRejections 其它签名节点对本节点发起的提现签名轮次的**确定性拒签**
+	// （chain33 哈希 hex → 拒签回执）。拒签是终态（重试不会变好），因此记录保留到进程结束：
+	// 后续重试据此立刻短路并归类为不可恢复，不再等 GG18 超时、也不再每秒重试刷屏。
+	signRejections map[string]rgb20.WithdrawSignReject
 }
 
 func newTssService(n *neutrinoClient) *tssService {
 	t := &tssService{
-		client:     n,
-		subChan:    make(chan *types.TopicData, 100),
-		signTaskCh: make(chan *signTask, 1024),
+		client:           n,
+		subChan:          make(chan *types.TopicData, 100),
+		signTaskCh:       make(chan *signTask, 1024),
+		signRoundSigners: make(map[string][]string),
+		signRejections:   make(map[string]rgb20.WithdrawSignReject),
 	}
 	t.cfg = n.cfg.Tss
 	return t
@@ -412,7 +438,177 @@ func computeRgb20DepositMsg(dep *rtypes.DepositAsset) []byte {
 // psbtSignFunc 对单个输入的 sigHash 进行签名，返回 GG18 阈值签名（DER）。
 type psbtSignFunc func(sigHash []byte, sessionName string) *signResult
 
-func (t *tssService) signPsbt(psbtBytes []byte) ([]byte, error) {
+// signPsbt 协调者侧发起 RGB20 提现签名：发布 rgb20-withdraw 签名通知（**带完整提现上下文**，
+// E11）让其它签名节点独立核对后入场，再本地参与 GG18。
+//
+// 上下文（chain33 提现哈希 + 金额/费率/高度门槛/收款 invoice + consignment）是签名节点唯一
+// 的核对依据：不带上下文的签名通知一律被拒签（签名节点无从执行 ValidateWithdrawPsbt），
+// 测试用的无上下文签名走 signPsbtTestOnly 那条独立路径。
+func (t *tssService) signPsbt(req *rgb20.WithdrawSignRequest) ([]byte, error) {
+	if req == nil || len(req.Psbt) == 0 || len(req.Chain33TxHash) == 0 || len(req.Consignment) == 0 {
+		return nil, fmt.Errorf("invalid rgb20 withdraw sign request: psbt/hash/consignment required")
+	}
+	// 本笔已收到确定性拒签回执 ⇒ 直接按不可恢复返回：不再发通知、不再等 GG18 超时，
+	// 也不再被协调者的重试循环每秒重复一遍（见 handleRgb20WithdrawReject）。
+	if err := t.takeSignRejection(req.Chain33TxHash); err != nil {
+		return nil, err
+	}
+	p, err := psbt.NewFromRawBytes(bytes.NewReader(req.Psbt), false)
+	if err != nil {
+		return nil, fmt.Errorf("decode psbt: %w", err)
+	}
+	payload, err := json.Marshal(&req.WithdrawSignPayload)
+	if err != nil {
+		return nil, fmt.Errorf("marshal withdraw sign payload: %w", err)
+	}
+	signers := t.waitForSufficientSigners()
+	if len(signers) > 0 {
+		t.setSignRoundSigners(req.Chain33TxHash, signers)
+		notify := &ltypes.TssSignNotify{
+			TxType:      transactionTypeRgb20Withdraw,
+			Payload:     payload,
+			Psbt:        req.Psbt,
+			Consignment: req.Consignment,
+			Signers:     signers,
+		}
+		t.pubMsg(tssSignNotifyTopic, types.Encode(notify))
+	}
+	signed, err := t.signPsbtWithSigners(p, signers, func(sigHash []byte, sessionName string) *signResult {
+		return t.signMsg(sigHash, sessionName, signers)
+	})
+	if err != nil {
+		// 组签名失败：若期间收到了确定性拒签回执，按拒签原因归类（不可恢复），而不是把
+		// "缺签名"当成可重试失败——否则协调者会每秒重试、无限刷屏。
+		if rerr := t.takeSignRejection(req.Chain33TxHash); rerr != nil {
+			return nil, rerr
+		}
+		return nil, err
+	}
+	return signed, nil
+}
+
+// signPsbtTestOnly 仅 E2E 的 sign-psbt 测试端点：无提现上下文 ⇒ 签名节点无法做任何提现核对，
+// 因此必须由本地配置 rgb20.testSignPsbt 显式打开（默认关闭），且走独立的通知类型
+// （transactionTypeTestSign）——生产提现路径永远发不出这个类型。
+func (t *tssService) signPsbtTestOnly(psbtBytes []byte) ([]byte, error) {
+	if !t.testSignEnabled() {
+		return nil, fmt.Errorf("test sign-psbt disabled: set rgb20.testSignPsbt to enable it in test environments")
+	}
+	p, err := psbt.NewFromRawBytes(bytes.NewReader(psbtBytes), false)
+	if err != nil {
+		return nil, fmt.Errorf("decode psbt: %w", err)
+	}
+	signers := t.waitForSufficientSigners()
+	if len(signers) > 0 {
+		notify := &ltypes.TssSignNotify{
+			TxType:  transactionTypeTestSign,
+			Psbt:    psbtBytes,
+			Signers: signers,
+		}
+		t.pubMsg(tssSignNotifyTopic, types.Encode(notify))
+	}
+	log.Warn("signPsbtTestOnly signing psbt WITHOUT any withdrawal validation (test-only)", "psbtLen", len(psbtBytes))
+	return t.signPsbtWithSigners(p, signers, func(sigHash []byte, sessionName string) *signResult {
+		return t.signMsg(sigHash, sessionName, signers)
+	})
+}
+
+// testSignEnabled 本地是否允许无上下文的测试签名（rgb20.testSignPsbt，默认关闭）。
+func (t *tssService) testSignEnabled() bool {
+	return t.client != nil && t.client.cfg.Rgb20.TestSignPsbt
+}
+
+// setSignRoundSigners 记录本节点为某笔提现选定的签名节点（拒签回执的来源核对用）。
+func (t *tssService) setSignRoundSigners(chain33Hash []byte, signers []string) {
+	t.signMu.Lock()
+	defer t.signMu.Unlock()
+	t.signRoundSigners[hex.EncodeToString(chain33Hash)] = signers
+}
+
+// expectedSigners 取本节点为某笔提现选定的签名节点集合。
+func (t *tssService) expectedSigners(chain33Hash []byte) []string {
+	t.signMu.Lock()
+	defer t.signMu.Unlock()
+	return t.signRoundSigners[hex.EncodeToString(chain33Hash)]
+}
+
+// takeSignRejection 取出某笔提现已记录的确定性拒签回执并还原成不可恢复错误；无记录返回 nil。
+func (t *tssService) takeSignRejection(chain33Hash []byte) error {
+	t.signMu.Lock()
+	r, ok := t.signRejections[hex.EncodeToString(chain33Hash)]
+	t.signMu.Unlock()
+	if !ok {
+		return nil
+	}
+	return rgb20.NewUnrecoverableWithdrawError(r.Class,
+		fmt.Errorf("signer %s rejected the withdrawal: %s", r.Rejector, r.Reason))
+}
+
+// recordSignRejection 记录拒签回执。只接受来自**本轮签名节点**的回执：回执走 P2P 广播，
+// 任何人都能发，否则伪造一份回执就能让一笔合法提现被永久判为不可恢复（DoS）。
+func (t *tssService) recordSignRejection(reject *rgb20.WithdrawSignReject, from string) {
+	if reject == nil || len(reject.Chain33TxHash) == 0 {
+		return
+	}
+	signers := t.expectedSigners(reject.Chain33TxHash)
+	isSigner := false
+	for _, s := range signers {
+		if s == reject.Rejector {
+			isSigner = true
+			break
+		}
+	}
+	if !isSigner {
+		log.Error("recordSignRejection not from a signer of this round",
+			"rejector", reject.Rejector, "from", from, "signers", signers,
+			"chain33Hash", hex.EncodeToString(reject.Chain33TxHash))
+		return
+	}
+	t.signMu.Lock()
+	defer t.signMu.Unlock()
+	if _, ok := t.signRejections[hex.EncodeToString(reject.Chain33TxHash)]; ok {
+		return // 已有记录（本笔是终态），不覆盖
+	}
+	t.signRejections[hex.EncodeToString(reject.Chain33TxHash)] = *reject
+	log.Error("recordSignRejection stop retrying this withdraw",
+		"chain33Hash", hex.EncodeToString(reject.Chain33TxHash),
+		"class", reject.Class, "reason", reject.Reason)
+}
+
+// publishSignRejection 签名节点把**确定性拒签**回传协调者。
+//
+// 不这样做的话，本节点拒签只表现为"组签名少了一个 signer ⇒ 超时"，协调者会把这笔当可重试、
+// 每秒重试刷屏（rgb20.UnrecoverableWithdrawError 的设计目的正是让这类失败被识别为终态）。
+// 只回传可分类的拒签：其余失败（pending 查不到、consignment 校验暂时失败等）是可重试的，
+// 回传会把"暂时失败"误判成终态。
+func (t *tssService) publishSignRejection(payloadBytes []byte, err error) {
+	class, unrecoverable := rgb20.IsUnrecoverableWithdraw(err)
+	if !unrecoverable {
+		return
+	}
+	payload := &rgb20.WithdrawSignPayload{}
+	if jsonErr := json.Unmarshal(payloadBytes, payload); jsonErr != nil || len(payload.Chain33TxHash) == 0 {
+		return
+	}
+	reject := &rgb20.WithdrawSignReject{
+		Chain33TxHash: payload.Chain33TxHash,
+		Class:         class,
+		Reason:        err.Error(),
+		Rejector:      t.selfPeerId,
+	}
+	body, jsonErr := json.Marshal(reject)
+	if jsonErr != nil {
+		log.Error("publishSignRejection marshal", "err", jsonErr)
+		return
+	}
+	t.pubMsg(tssSignNotifyTopic, types.Encode(&ltypes.TssSignNotify{
+		TxType:  transactionTypeRgb20WithdrawReject,
+		Payload: body,
+	}))
+}
+
+// signPsbtInternal 签名节点参与 GG18 PSBT 签名（不发布通知，避免递归）。
+func (t *tssService) signPsbtInternal(psbtBytes []byte) ([]byte, error) {
 	p, err := psbt.NewFromRawBytes(bytes.NewReader(psbtBytes), false)
 	if err != nil {
 		return nil, fmt.Errorf("decode psbt: %w", err)
@@ -656,7 +852,7 @@ func (t *tssService) checkStickyInput(chain33WithdrawHash []byte, tx *wire.MsgTx
 
 // handleSignNotify handles incoming TSS sign notifications
 // All nodes (including main node) receive this and participate in signing
-func (t *tssService) handleSignNotify(msg []byte) {
+func (t *tssService) handleSignNotify(data *types.TopicData) {
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -669,11 +865,24 @@ func (t *tssService) handleSignNotify(msg []byte) {
 	}
 
 	notify := &ltypes.TssSignNotify{}
-	err := types.Decode(msg, notify)
+	err := types.Decode(data.GetData(), notify)
 	if err != nil {
 		log.Error("handleSignNotify Decode", "err", err)
 		return
 	}
+
+	// 拒签回执是广播事实（不属于任何签名轮次的"参与"），必须在下面的 isSigner 门槛之前处理：
+	// 回执的 Signers 为空，过不了 isSigner 检查。
+	if notify.TxType == transactionTypeRgb20WithdrawReject {
+		reject := &rgb20.WithdrawSignReject{}
+		if err := json.Unmarshal(notify.Payload, reject); err != nil {
+			log.Error("handleSignNotify decode sign reject", "err", err)
+			return
+		}
+		t.recordSignRejection(reject, data.GetFrom())
+		return
+	}
+
 	isSigner := false
 	for _, signer := range notify.Signers {
 		if signer == t.selfPeerId {
@@ -686,20 +895,26 @@ func (t *tssService) handleSignNotify(msg []byte) {
 		return
 	}
 
-	// RGB20 分支：rgb20-deposit 签名轮次 / RGB20 提现 PSBT 签名。
+	// RGB20 分支：rgb20-deposit 签名轮次 / RGB20 提现 PSBT 签名 / 无上下文的测试签名。
+	// 分派只看 TxType：生产提现必须走 transactionTypeRgb20Withdraw 并携带完整上下文。
 	switch notify.TxType {
 	case transactionTypeRgb20Deposit:
 		if err := t.handleRgb20DepositSign(notify); err != nil {
 			log.Error("handleSignNotify handleRgb20DepositSign", "err", err)
 		}
 		return
-	case transactionTypeWithdraw:
-		if len(notify.Psbt) > 0 {
-			if err := t.handleRgb20WithdrawSign(notify); err != nil {
-				log.Error("handleSignNotify handleRgb20WithdrawSign", "err", err)
-			}
-			return
+	case transactionTypeRgb20Withdraw:
+		if err := t.handleRgb20WithdrawSign(notify); err != nil {
+			log.Error("handleSignNotify handleRgb20WithdrawSign", "err", err)
+			// 确定性拒签回传协调者（否则只表现为组签名超时 ⇒ 协调者每秒重试刷屏）。
+			t.publishSignRejection(notify.Payload, err)
 		}
+		return
+	case transactionTypeTestSign:
+		if err := t.handleTestSignNotify(notify); err != nil {
+			log.Error("handleSignNotify handleTestSignNotify", "err", err)
+		}
+		return
 	}
 
 	tx, inputAmounts, err := t.parseTxFromNotify(notify)
@@ -774,28 +989,137 @@ func (t *tssService) handleRgb20DepositSign(notify *ltypes.TssSignNotify) error 
 	return nil
 }
 
-// handleRgb20WithdrawSign 签名节点处理 RGB20 提现 PSBT：交叉核对（BL-4/HR-3）后 signPsbt。
+// handleRgb20WithdrawSign 签名节点处理 RGB20 提现 PSBT：
+//  1. 解出协调者下发的提现上下文（**声称值**）；
+//  2. 按 chain33 提现哈希取链上 pending（**真值**）并逐项比对声称值（payload 是协调者给的，
+//     不能只信它）；
+//  3. ValidateWithdrawPsbt 独立交叉核对（BL-4/HR-3：金额覆盖 S1、费用区间、dust cap、同步
+//     高度、closed-seal 非 pending-mint），并在**同一份已验证事实**上做 sticky seal 核对（E9-B）；
+//  4. 全部通过才参与 GG18 签名；sticky 记录只在签名成功之后写（一次失败签名不得锁死合法重试）。
+//
+// 注意这里**没有**"Payload 为空就跳过校验"的旁路：无上下文的签名走 transactionTypeTestSign
+// 那条独立路径，且必须由本地配置显式开启。
 func (t *tssService) handleRgb20WithdrawSign(notify *ltypes.TssSignNotify) error {
-	if t.client.rgb20 == nil {
-		return fmt.Errorf("rgb20 adapter not configured")
-	}
-	pendingTx, err := t.checkNonOfficialWithdrawSign(notify.Payload)
+	payload, psbtBytes, consignment, err := parseRgb20WithdrawNotify(notify)
 	if err != nil {
 		return err
 	}
-	valReq := &rgb20.ValidateWithdrawRequest{
-		Psbt:            notify.Psbt,
-		Consignment:     notify.Consignment,
-		ExpectedAmount:  pendingTx.GetAmount(),
-		MinSyncedHeight: uint64(pendingTx.GetTxBlockHeight()),
+	if t.client.rgb20 == nil {
+		return fmt.Errorf("rgb20 adapter not configured")
 	}
-	if err := t.client.rgb20.ValidateWithdrawPsbt(valReq); err != nil {
-		return fmt.Errorf("validate rgb20 withdrawal: %w", err)
+	pendingTx, err := t.checkNonOfficialWithdrawSign(payload.Chain33TxHash)
+	if err != nil {
+		return err
 	}
-	if _, err := t.signPsbt(notify.Psbt); err != nil {
+	spentSeals, err := t.validateRgb20WithdrawSign(payload, psbtBytes, consignment, pendingTx)
+	if err != nil {
+		return err
+	}
+	if _, err := t.signPsbtInternal(psbtBytes); err != nil {
 		return fmt.Errorf("sign rgb20 withdrawal psbt: %w", err)
 	}
-	log.Debug("handleRgb20WithdrawSign signed psbt", "chain33Hash", hex.EncodeToString(notify.Payload))
+	// sticky 记录只在签名成功之后写（镜像 BTC 侧 handleSignNotify → setWithdrawStickyUTXO）：
+	// 签名前写会把一次失败签名变成对该笔提现的永久拒绝。
+	if err := t.client.rgb20.SetStickySeal(payload.Chain33TxHash, spentSeals); err != nil {
+		log.Error("handleRgb20WithdrawSign SetStickySeal", "err", err,
+			"chain33Hash", hex.EncodeToString(payload.Chain33TxHash))
+	}
+	log.Debug("handleRgb20WithdrawSign signed psbt", "chain33Hash", hex.EncodeToString(payload.Chain33TxHash))
+	return nil
+}
+
+// parseRgb20WithdrawNotify 解出提现签名通知里的提现上下文与材料，并强制三样东西都在：
+// 上下文（payload）、PSBT、consignment。缺任何一项都拒签——没有上下文就没有可核对的东西，
+// 签名节点不可能"只签名不核对"（那正是 E11 的漏洞形态）。
+func parseRgb20WithdrawNotify(notify *ltypes.TssSignNotify) (*rgb20.WithdrawSignPayload, []byte, []byte, error) {
+	if notify == nil || len(notify.Psbt) == 0 {
+		return nil, nil, nil, fmt.Errorf("rgb20 withdraw sign notify without psbt")
+	}
+	if len(notify.Payload) == 0 {
+		return nil, nil, nil, fmt.Errorf("rgb20 withdraw sign notify without payload")
+	}
+	if len(notify.Consignment) == 0 {
+		return nil, nil, nil, fmt.Errorf("rgb20 withdraw sign notify without consignment")
+	}
+	payload := &rgb20.WithdrawSignPayload{}
+	if err := json.Unmarshal(notify.Payload, payload); err != nil {
+		return nil, nil, nil, fmt.Errorf("decode rgb20-withdraw payload: %w", err)
+	}
+	if len(payload.Chain33TxHash) == 0 {
+		return nil, nil, nil, fmt.Errorf("invalid rgb20-withdraw payload: empty chain33 withdraw hash")
+	}
+	return payload, notify.Psbt, notify.Consignment, nil
+}
+
+// validateRgb20WithdrawSign 是签名节点对一笔提现签名请求的**全部判定**（不签名、不发布、不落盘）：
+//
+//	payload（协调者声称值） vs pendingTx（链上真值）→ ValidateWithdrawPsbt（BL-4/HR-3 交叉核对
+//	+ S1 金额覆盖 + 费用区间 + dust cap + 同步高度 + closed-seal 非 pending-mint）
+//	→ 同一份已验证事实上的 sticky seal 核对（E9-B）
+//
+// 返回本笔实际花掉且被 consignment 关闭的 RGB seal 集合（签名成功后由调用方落盘）。
+// 任一环节失败都返回错误 ⇒ 拒签。
+func (t *tssService) validateRgb20WithdrawSign(payload *rgb20.WithdrawSignPayload, psbtBytes, consignment []byte,
+	pendingTx *rtypes.PendingTx) ([]string, error) {
+	// 信任边界：payload 只是协调者的声称值，必须与链上 pending（真值）逐项一致才继续。
+	if err := checkWithdrawClaims(payload, pendingTx); err != nil {
+		return nil, err
+	}
+	var spentSeals []string
+	valReq := &rgb20.ValidateWithdrawRequest{
+		Psbt:        psbtBytes,
+		Consignment: consignment,
+		// 金额/费率/高度门槛一律取链上 pending（真值），不取 payload 的声称值。
+		ExpectedAmount:  pendingTx.GetAmount(),
+		MinSyncedHeight: uint64(pendingTx.GetTxBlockHeight()),
+		FeeRate:         pendingTx.GetFeeRate(),
+		// sticky seal 核对（E9-B）：一笔 chain33 burn 只能绑定一组 RGB seal。核对失败
+		// （含"算不出绑定的 seal"）会作为本次校验的错误上抛 ⇒ 拒签 + 回执。
+		CheckSpentSeals: func(seals []string) error {
+			spentSeals = seals
+			return t.client.rgb20.CheckStickySeal(payload.Chain33TxHash, seals)
+		},
+	}
+	if err := t.client.rgb20.ValidateWithdrawPsbt(valReq); err != nil {
+		return nil, fmt.Errorf("validate rgb20 withdrawal: %w", err)
+	}
+	return spentSeals, nil
+}
+
+// checkWithdrawClaims 核对协调者声称的提现上下文与链上 pending（真值）是否一致。
+// 任何一项不一致都拒签：签名节点签的是"链上这笔提现"，而它只能通过自己的链上视图确认这一点。
+func checkWithdrawClaims(payload *rgb20.WithdrawSignPayload, pendingTx *rtypes.PendingTx) error {
+	if payload.Amount != pendingTx.GetAmount() {
+		return fmt.Errorf("withdraw amount mismatch: claim=%d chain=%d", payload.Amount, pendingTx.GetAmount())
+	}
+	if payload.FeeRate != pendingTx.GetFeeRate() {
+		return fmt.Errorf("withdraw fee rate mismatch: claim=%d chain=%d", payload.FeeRate, pendingTx.GetFeeRate())
+	}
+	if payload.TxBlockHeight != pendingTx.GetTxBlockHeight() {
+		return fmt.Errorf("withdraw block height mismatch: claim=%d chain=%d",
+			payload.TxBlockHeight, pendingTx.GetTxBlockHeight())
+	}
+	if payload.RecipientInvoice != pendingTx.GetTargetAddress() {
+		return fmt.Errorf("withdraw recipient invoice mismatch: claim=%q chain=%q",
+			payload.RecipientInvoice, pendingTx.GetTargetAddress())
+	}
+	return nil
+}
+
+// handleTestSignNotify 仅 E2E 的 sign-psbt 测试端点使用：不带提现上下文 ⇒ 不做任何提现核对，
+// 只参与 GG18 组签名。必须由本地配置 rgb20.testSignPsbt 显式开启（默认关闭），否则拒签。
+func (t *tssService) handleTestSignNotify(notify *ltypes.TssSignNotify) error {
+	if !t.testSignEnabled() {
+		return fmt.Errorf("test sign notify refused: rgb20.testSignPsbt is not enabled on this node")
+	}
+	if len(notify.Psbt) == 0 {
+		return fmt.Errorf("test sign notify without psbt")
+	}
+	log.Warn("handleTestSignNotify signing psbt WITHOUT any withdrawal validation (test-only)",
+		"psbtLen", len(notify.Psbt))
+	if _, err := t.signPsbtInternal(notify.Psbt); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -863,7 +1187,7 @@ func (t *tssService) handleSubMsg() {
 
 		case data := <-t.subChan:
 			if data.Topic == tssSignNotifyTopic {
-				t.handleSignNotify(data.GetData())
+				t.handleSignNotify(data)
 			}
 		}
 	}

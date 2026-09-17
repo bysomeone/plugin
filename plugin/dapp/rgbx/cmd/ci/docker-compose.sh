@@ -242,6 +242,10 @@ rank=${rank}
 sidecarAddr="${RGB20_SIDECAR_ADDR}"
 consignmentListen="0.0.0.0:17000"
 precision=${RGB20_PRECISION}
+# testSignPsbt 打开 E2E 的 sign-psbt 测试端点（用 TSS 组签任意 PSBT，模拟用户付款）。
+# 该能力等于"用组私钥签任意内容"，签名节点无从核对 ⇒ 生产环境必须为 false（默认关闭），
+# 这里只为 E2E/regtest 打开。
+testSignPsbt=true
 
 [[rpc.sub.light.neutrino.rgb20.contracts]]
 symbol="${RGB20_SYMBOL}"
