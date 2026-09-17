@@ -39,6 +39,12 @@ impl Config {
         self.data_dir.join("ledger.json")
     }
 
+    /// 用户 P2WSH 充值脚本注册表（program → witnessScript + userID）。必须持久化：重启后
+    /// watch 集一丢，已经打进用户充值地址的 BTC 就没有 witnessScript 可签（花不掉）。
+    pub fn user_scripts_path(&self) -> PathBuf {
+        self.data_dir.join("user_scripts.json")
+    }
+
     pub fn stock_dir(&self) -> PathBuf {
         self.data_dir.join("stock")
     }
