@@ -293,6 +293,37 @@ best >= H + B + N - 1          （等价于：提交后链上可见深度 >= N�
 - `rank` (uint32)
   - 含义：节点角色标识（用于区分官方/验证角色）
   - 要求：同一节点在全网配置必须稳定一致
+- `allowShareMismatch` (bool)
+  - 含义：**逃生阀**，默认 `false`（不写即关闭）。见 4.3.1：启动自检发现本地 share 与链上组公钥
+    不一致时，关闭（默认）即**拒绝启动**；打开后只打 ERROR 日志、照常启动。
+  - 只在为了临时把节点拉起来做冷修时打开，修好必须改回 `false`。
+
+#### 4.3.1 启动自检：share ↔ 链上组公钥一致性（无配置项，逃生阀见 4.3）
+
+- 含义：中继启动时（`client.Start()` 最开始，早于 TSS/RGBX 任何后台流程）读本地持久化的 DKG 结果
+  （`neutrino.db` 的 bucket `rgbx-tss` / key `dkg-result`，即该节点的 share 对应的组公钥），
+  对每个已知 symbol（`BTC` + `[rpc.sub.light.neutrino.rgb20]` 里注册的每个 `contracts.symbol`）
+  查链上 `CrossChainInfo`，不一致即 **ERROR + 拒绝启动**（panic，节点退出）。
+- 为什么 fail-closed：链上 `CrossChainInfo` **每个 symbol 只有一份、且写死不可改**（re-DKG 换出的
+  新组公钥提交上去会被 `checkCommitDKG` 按 `duplicate` 拒掉，而中继把 `duplicate` 当作"已提交"放过，
+  见 `submitMainChainTxUntilSuccess`）。于是 share 与链上不一致的节点仍能"参与签名"，但产出的签名
+  链上/其他节点不认——**表现是静默失灵而不是报错**（提现卡住、充值签名无效），所以默认拒绝启动。
+- 典型成因：share 丢失后自动 re-DKG、换过钥、或从别的环境恢复过数据（`neutrino.db` 与链不是同一代）。
+- 比对口径（两边字段形态不同，按可得判据退化）：
+  - 链上 `CrossChainInfo.pubkey` 非空（RGB20 symbol 走这条）→ 比对压缩公钥逐字节相等；
+  - 链上没有 pubkey（BTC：`CommitDKG` 不带该字段）→ 退化为比对
+    `hash160(本地组公钥) == pkScript[2:]`（与链上 `checkCommitDKG` 同一口径，与网络无关）；
+  - 链上两者都没有 → 没有判据，不判定。
+- **三种情形不判定**（不把正常的当异常）：① 链上还没有该 symbol 的 `CrossChainInfo`（DKG 尚未
+  commit，或主链查询不可用/不支持）；② 本地还没有 DKG 结果（首次启动、DKG 还没跑）；③ 本地 DKG
+  记录读出来解不开（损坏；那条路径的既有处置是重新 DKG，不在这里改它的行为）。
+- 查询有界：自检在主链 grpc 上带 8s 超时 + 最多 2 次尝试（只对传输层错误重试），**不会因为主链
+  `QueryChain` hang 而卡住启动**；查不到按"不判定"处理。
+- 逃生阀：`tss.allowShareMismatch=true`（见 4.3）。打开后不一致只打一条 ERROR 日志、照常启动——
+  **打开期间该节点"参与签名但不被认"，只是把静默失灵换成了可运行的静默失灵**，仅用于临时拉起来冷修。
+- 恢复办法（真出现不一致时）：把**与链上同一代**的 `neutrino.db` 还原回去（备份里有就还原），
+  或重建整组（清链重跑 DKG）。**重新 DKG 不能修**：新组公钥上不了链（同 symbol 的
+  `CrossChainInfo` 已被占死）。
 
 ### 4.4 `[rpc.sub.light.neutrino.rgb20]`
 
@@ -416,6 +447,8 @@ peerblockfilters=1
   （≈ N 个 BTC 块）与重组风险的那个旋钮；中继**不需要**配任何镜像值，它直接查链上（见 2.2）
 - `btcRPC.host/user/pass/TLS` 与 BTC 节点一致
 - 全部 TSS 节点的 `peers/threshold` 一致，且 `rank` 分配无冲突
+- 每个节点的 `neutrino.db` 是**与当前链同一代**的那份（启动自检会拒掉与链上组公钥不一致的节点，
+  见 4.3.1）；`tss.allowShareMismatch` 保持默认关闭
 
 ## 8. 最小示例（仅配置片段）
 
@@ -519,3 +552,8 @@ rank=0 # 官方节点；第三方节点配置为 rank=1，且 isOfficialNode=fal
 - E2E/CI 里看不出"提交那一刻链上深度是 0"的坑：CI 把 `blockConfirmations=1` 与
   `minBtcConfirmations=1` 一起配（见 2.2 与 4.1），N=1 时深度 0 也够，等于把这条交互掩盖了。本地验证
   必须显式用 N > 1（单测已覆盖，见 `rgb20/deposit_retry_test.go`）
+- 启动即退出、ERROR "local tss share does not match the on-chain cross chain info"：该节点的 share
+  与链上组公钥不是同一代（share 丢失后 re-DKG / 换过钥 / 从别的环境恢复过数据），按 fail-closed
+  **拒绝启动**（见 4.3.1）。恢复办法是还原与链同一代的 `neutrino.db`，或重建整组；**重新 DKG 修不了**
+  （同 symbol 的 `CrossChainInfo` 已被占死，新组公钥提交会被按 duplicate 放过）。
+  `tss.allowShareMismatch=true` 只是临时把它拉起来（带病运行），不是修复

@@ -136,6 +136,11 @@ type tssConfig struct {
 	Threshold uint32 `json:"threshold"`
 	// Rank peer rank
 	Rank uint32 `json:"rank"`
+	// AllowShareMismatch 逃生阀，默认 false（不写即关闭）：启动自检（见 client.go
+	// checkTssShareAgainstChain）发现本地 share 与链上 CrossChainInfo 不一致时，是否仍允许启动。
+	// 关闭时 fail-closed 拒绝启动（panic）—— 不一致的节点能"参与签名"但产出链上不认，是静默失灵。
+	// 只在为了临时把节点拉起来做冷修时打开，修好必须改回 false。
+	AllowShareMismatch bool `json:"allowShareMismatch"`
 }
 
 func (c config) getChainParams() chaincfg.Params {
