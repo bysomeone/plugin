@@ -5,7 +5,9 @@ function scenario_user_deposit_via_btc_tx() {
     # make sure segwit is activated
     mine_btcd_blocks 450
     local utxo
-    utxo=$(build_mature_coinbase_utxo)
+    # 必须同时满足"面额 >= amount+fee"（下面的 --amount/--fee）：链被复用到 coinbase 已减半多轮时，
+    # 最新成熟块的面额可能不够，取到就会在 CLI 里以 "insufficient utxo amount" 失败。
+    utxo=$(build_mature_coinbase_utxo "$((BTC_DEPOSIT_AMOUNT_SATS + 500))")
     assert_non_empty "${utxo}" "funding utxo empty"
 
     # 充值地址 = P2WSH(chain33 地址, TSS 群公钥) 派生，链上按同一份派生认定归属（无 OP_RETURN）。
