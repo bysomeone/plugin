@@ -64,27 +64,37 @@ func (r *rgbx) start(cli *neutrinoClient) {
 	r.commitTxKey = cli.getCommitKey()
 	r.requiredConfs = int64(cli.cfg.BlockConfirmations)
 
-	log.Debug("wait getRgbxConfirmedHeight")
-	cli.waitUntilDone("wait getRgbxConfirmedHeight", func() bool {
-		if height := cli.getRgbxConfirmedHeight(); height != nil {
-			r.pendingTxConfirmedHeight = height.GetData()
-			if r.pendingTxConfirmedHeight > 0 {
-				r.pendingTxPullHeight = height.GetData() + 1
+	// 获取 rgbx 确认高度。RGB20 场景下主链 grpc GetConfirmedHeight（QueryChain）在并发/时序下
+	// 可能 hang（与 getCrossChainInfo 同因），跳过不影响 RGB20 充值/提现主流程
+	// （pending 起始高度为 0 仅导致重复拉取，无害）。BTC 场景保持原行为。
+	if cli.cfg.Rgb20.SidecarAddr == "" {
+		log.Debug("wait getRgbxConfirmedHeight")
+		cli.waitUntilDone("wait getRgbxConfirmedHeight", func() bool {
+			if height := cli.getRgbxConfirmedHeight(); height != nil {
+				r.pendingTxConfirmedHeight = height.GetData()
+				if r.pendingTxConfirmedHeight > 0 {
+					r.pendingTxPullHeight = height.GetData() + 1
+				}
+				return true
 			}
-			return true
-		}
-		return false
-	}, 0)
+			return false
+		}, 0)
+	}
 
-	// 等待轻节点同步
-	log.Debug("wait neutrino sync", "currHeight", cli.getBestBlock().Height)
-	cli.waitUntilDone("wait neutrino sync", func() bool {
-		return cli.neutrinoCS.IsCurrent()
-	}, 0)
-	log.Debug("wait neutrino best block")
-	cli.waitUntilDone("wait neutrino best block", func() bool {
-		return cli.getBestBlock() != nil
-	}, 0)
+	// 等待轻节点同步。RGB20 场景的链同步由 RGB 侧车/electrs 完成，neutrino（BTC 轻客户端）
+	// 的同步等待在 CI 时序下会拖住启动（阻塞 rgb20.Start/serveHTTP，17000 充值 HTTP 起不来），
+	// 而（C3/C4 未做之前）RGB20 流程并不依赖 neutrino 的同步结果。
+	// 故仅 BTC 场景（无 sidecar 配置）等待 neutrino 同步。
+	if cli.cfg.Rgb20.SidecarAddr == "" {
+		log.Debug("wait neutrino sync", "currHeight", cli.getBestBlock().Height)
+		cli.waitUntilDone("wait neutrino sync", func() bool {
+			return cli.neutrinoCS.IsCurrent()
+		}, 0)
+		log.Debug("wait neutrino best block")
+		cli.waitUntilDone("wait neutrino best block", func() bool {
+			return cli.getBestBlock() != nil
+		}, 0)
+	}
 
 	go r.pullPendingTx()
 	go r.handleCommitPendingTx()

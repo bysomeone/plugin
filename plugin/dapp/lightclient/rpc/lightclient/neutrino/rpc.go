@@ -4,15 +4,18 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/33cn/chain33/system/crypto/secp256k1"
 	"github.com/33cn/chain33/types"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 )
 
-func (n *neutrinoClient) getCrossChainInfo() *rtypes.CrossChainInfo {
-
-	req := &types.ReqString{Data: "btc"}
+func (n *neutrinoClient) getCrossChainInfo(symbol string) *rtypes.CrossChainInfo {
+	if symbol == "" {
+		symbol = rtypes.BTCSymbol
+	}
+	req := &types.ReqString{Data: symbol}
 	reply, err := n.mainChainGrpc.QueryChain(n.ctx, &types.ChainExecutor{
 		Driver:   rtypes.RgbxX,
 		FuncName: "GetCrossChainInfo",
@@ -198,7 +201,20 @@ func (n *neutrinoClient) submitMainChainTxUntilSuccess(exec string, action strin
 
 	n.waitUntilDone("submitMainChainTxUntilSuccess", func() bool {
 		_, err := n.submitMainChainTx(exec, action, payload)
-		return err == nil
+		if err == nil {
+			return true
+		}
+		// 幂等动作（充值等）：链上已有同一条记录时被拒为 duplicate，等价于"已在链上"，按已受理处理。
+		//
+		// 注意：**CommitDKG 不走这个口径**（旧实现曾在这里按 "duplicate" 子串判成功，会把"链上是
+		// 另一把钥"的错开也当成成功，见 tss_commit.go 的文件头注释）。CommitDKG 的成功判据是
+		// 链上状态（CrossChainInfo 存在且 pubkey 逐字节等于本地群公钥），见 commitDKGToChain。
+		if strings.Contains(err.Error(), "duplicate") {
+			log.Info("submitMainChainTxUntilSuccess already on chain, treat as accepted",
+				"action", action, "err", err)
+			return true
+		}
+		return false
 	}, 0)
 }
 
