@@ -197,7 +197,12 @@ impl RgbEngine {
             cfg.btc_rpc_cert.as_deref(),
             cfg.network,
         )?);
-        let wallet = BtcWallet::new(rpc.clone(), &cfg.tss_pubkey_hex, cfg.network)?;
+        // 载入用户 P2WSH 充值脚本注册表（不存在 = 空集，不报错）。载入失败必须**中止启动**：
+        // 带着半份 watch 集跑起来，那些用户的充值会变成"看得见但花不掉"，而故障要等到提现
+        // 时才暴露。
+        let mut wallet = BtcWallet::new(rpc.clone(), &cfg.tss_pubkey_hex, cfg.network)?
+            .with_user_scripts_path(cfg.user_scripts_path());
+        wallet.load_user_scripts()?;
         let tss_address = wallet.address().clone();
         let tss_script = wallet.script().clone();
         let chain_net = network_to_chainnet(cfg.network);
@@ -664,7 +669,10 @@ impl RgbEngine {
             .stock
             .transition_builder(contract_id, "transfer")
             .map_err(|e| anyhow!("transition_builder: {e:?}"))?;
-        let wallet_utxos = self.wallet.list_unspent();
+        // watch 集全集（主池 ∪ 已登记的用户充值脚本）：既要按 outpoint 解析**每个输入自己的
+        // 脚本与面额**（用户 P2WSH 的 seal 输入不再是主池脚本），也不能把用户充值 UTXO 的
+        // BTC 当成不存在。注意下面的费输入选择仍然只从主池取（见那里的注释）。
+        let wallet_utxos = self.wallet.list_unspent_all();
         let mut input_amounts: Vec<i64> = Vec::new();
         let mut input_btc: Vec<u64> = Vec::new();
         for outpoint in input_outpoints {
@@ -732,6 +740,12 @@ impl RgbEngine {
                 break;
             }
             // 选一笔桥自有（TSS 脚本）、未作为 RGB seal / 已选费输入 的 BTC UTXO（取最大额优先）。
+            //
+            // 这里**只从主池取**，用户 P2WSH 的充值 UTXO 不参与费输入选择 —— 这是 C3 刻意的
+            // 边界，不是遗漏：签名节点核对输入归属时只认"主池脚本 或 **本节点已登记**的用户
+            // 充值脚本"，而 watch 集目前只在发放过地址的那个节点上存在（跨节点分发属 C4）。
+            // 现在就允许选它们，会让没有该地址的签名节点拒签（拒签理由正当：它无法核实归属）。
+            // 把扫集/选入做出来之后（C4），这里的过滤器与跨节点 watch 集要一起放开。
             let next = wallet_utxos
                 .iter()
                 .filter(|u| u.script_pubkey == self.tss_script)
@@ -788,18 +802,14 @@ impl RgbEngine {
             tx.output.truncate(2);
         }
         let mut psbt = Psbt::from_unsigned_tx(tx)?;
-        for (i, _outpoint) in input_outpoints.iter().enumerate() {
-            psbt.inputs[i].witness_utxo = Some(TxOut {
-                value: bitcoin::Amount::from_sat(input_btc[i]),
-                script_pubkey: self.tss_script.clone(),
-            });
-        }
-        for (j, (_, v)) in extra_fee_inputs.iter().enumerate() {
-            psbt.inputs[input_outpoints.len() + j].witness_utxo = Some(TxOut {
-                value: bitcoin::Amount::from_sat(*v),
-                script_pubkey: self.tss_script.clone(),
-            });
-        }
+        fill_psbt_inputs(
+            &mut psbt,
+            &all_inputs,
+            &wallet_utxos,
+            &all_input_btc,
+            &self.tss_script,
+            &|script| self.wallet.witness_script_for(script),
+        )?;
 
         psbt.push_rgb_transition(transition.clone())?;
         psbt.outputs[0].set_opret_host();
@@ -1303,8 +1313,197 @@ fn rand_hex(n: usize) -> String {
     bitcoin::hex::DisplayHex::to_hex_string(&buf, bitcoin::hex::Case::Lower)
 }
 
+/// 逐输入写 PSBT 的 prevout 与 **scriptCode 载体**（BIP143 是逐输入定义的：一笔交易可以同时
+/// 花主池 P2WPKH 与用户 P2WSH 的 UTXO，每个输入有自己的 scriptCode 与自己的一条签名轮次）。
+///
+///   - `witness_utxo.script_pubkey` 必须是**该输入自己的脚本**，不能再统一填主池脚本
+///     （统一填的后果：签名者按主池脚本算 sighash，签出来的签名对这笔 UTXO 无效）；
+///   - 原生 P2WSH 输入必须带 `PSBT_IN_WITNESS_SCRIPT` = 该输入的 witnessScript，Go 侧 TSS
+///     签名器拿它当 BIP143 scriptCode。**不是** output program：34 字节的
+///     `OP_0 <sha256(witnessScript)>` 会算出另一个 sighash（见 C1 的可复现证明
+///     `rgbx/types/p2wsh_deposit_spend_test.go`）；
+///   - P2WPKH 输入**不得**带 witness_script：上游 finalizer 对"带 witness_script 的 P2WPKH"
+///     判为不可 finalize（`isFinalizableWitnessInput`），主池输入会因此签不出来。
+///
+/// 脚本来源是钱包的 watch 集（主池 ∪ 已登记的用户充值脚本）：用户 P2WSH 的 witnessScript 链上
+/// 不可见，只能由 `(userID, tssPub)` 重派生后登记到钱包里。**解析不出 witnessScript 的非主池
+/// 输入一律失败** —— 猜一个脚本去签等于让 TSS 对不属于这笔 UTXO 的脚本出签名。
+fn fill_psbt_inputs(
+    psbt: &mut Psbt,
+    inputs: &[OutPoint],
+    wallet_utxos: &[WalletUtxo],
+    fallback_btc: &[u64],
+    tss_script: &ScriptBuf,
+    witness_script_for: &dyn Fn(&ScriptBuf) -> Option<ScriptBuf>,
+) -> Result<()> {
+    for (i, outpoint) in inputs.iter().enumerate() {
+        let utxo = wallet_utxos.iter().find(|u| u.outpoint == *outpoint);
+        // prevout 脚本：优先钱包的 watch 集（它带真实脚本），取不到时退回主池脚本 —— 后者与
+        // 改动前的行为一致（seal 的 BTC 面额本来也取自钱包，取不到时按 0 计）。
+        let script = utxo
+            .map(|u| u.script_pubkey.clone())
+            .unwrap_or_else(|| tss_script.clone());
+        let value = utxo
+            .map(|u| u.value)
+            .unwrap_or_else(|| fallback_btc.get(i).copied().unwrap_or(0));
+        if script != *tss_script {
+            let witness_script = witness_script_for(&script).ok_or_else(|| {
+                anyhow!(
+                    "input {outpoint} pays script {} which is neither the main pool script nor a \
+                     registered user deposit script: its witnessScript (the BIP143 scriptCode) is \
+                     unknown, refusing to build an input that cannot be signed",
+                    hex_encode(script.as_bytes())
+                )
+            })?;
+            psbt.inputs[i].witness_script = Some(witness_script);
+        }
+        psbt.inputs[i].witness_utxo = Some(TxOut {
+            value: bitcoin::Amount::from_sat(value),
+            script_pubkey: script,
+        });
+    }
+    Ok(())
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bitcoin::hex::DisplayHex::to_hex_string(bytes, bitcoin::hex::Case::Lower)
+}
+
+#[cfg(test)]
+mod fill_psbt_inputs_tests {
+    use super::*;
+
+    const USER_ID: &str = "1AmRYcURfDGxBhiaJAvEGdRkvkoM7ztn1u";
+
+    /// 与真实充值脚本同构：`<push userID> OP_DROP <push tssPub> OP_CHECKSIG`，
+    /// program = sha256(witnessScript)（`rgbx/types/p2wsh_deposit.go` 的形态）。
+    fn deposit_scripts(seed: u8) -> (ScriptBuf, ScriptBuf) {
+        let mut ws = vec![0x22u8];
+        ws.extend(USER_ID.as_bytes());
+        ws.push(0x75); // OP_DROP
+        let mut pk = vec![0x02u8];
+        pk.extend(vec![seed; 32]);
+        ws.push(pk.len() as u8);
+        ws.extend(&pk);
+        ws.push(0xac); // OP_CHECKSIG
+        let witness_script = ScriptBuf::from_bytes(ws);
+        let pk_script = ScriptBuf::new_p2wsh(&witness_script.wscript_hash());
+        (pk_script, witness_script)
+    }
+
+    /// 主池 P2WPKH 形态的脚本（`OP_0 <20 字节>`）。这里只按字节比较脚本，不要求它是真实哈希。
+    fn pool_script(seed: u8) -> ScriptBuf {
+        let mut b = vec![0x00u8, 0x14];
+        b.extend(vec![seed; 20]);
+        ScriptBuf::from_bytes(b)
+    }
+
+    fn utxo(outpoint: OutPoint, value: u64, script: ScriptBuf) -> WalletUtxo {
+        WalletUtxo {
+            outpoint,
+            value,
+            script_pubkey: script,
+            height: Some(1),
+        }
+    }
+
+    fn op(n: u32) -> OutPoint {
+        use bitcoin::hashes::Hash;
+        OutPoint {
+            txid: bitcoin::Txid::from_byte_array([n as u8; 32]),
+            vout: n,
+        }
+    }
+
+    fn unsigned_psbt(inputs: &[OutPoint]) -> Psbt {
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: inputs
+                .iter()
+                .map(|o| TxIn {
+                    previous_output: *o,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(1000),
+                script_pubkey: ScriptBuf::new_op_return([]),
+            }],
+        };
+        Psbt::from_unsigned_tx(tx).unwrap()
+    }
+
+    #[test]
+    fn p2wsh_input_carries_its_own_witness_script() {
+        let tss = pool_script(1);
+        let (user_pk_script, user_ws) = deposit_scripts(2);
+        let (o0, o1) = (op(0), op(1));
+        let utxos = vec![
+            utxo(o0, 5000, user_pk_script.clone()),
+            utxo(o1, 7000, tss.clone()),
+        ];
+        let mut psbt = unsigned_psbt(&[o0, o1]);
+
+        let known: HashMap<ScriptBuf, ScriptBuf> =
+            [(user_pk_script.clone(), user_ws.clone())].into_iter().collect();
+        fill_psbt_inputs(&mut psbt, &[o0, o1], &utxos, &[5000, 7000], &tss, &|s| {
+            known.get(s).cloned()
+        })
+        .unwrap();
+
+        // 每个输入带**自己的**脚本与面额（不再统一填主池脚本）。
+        let in0 = psbt.inputs[0].witness_utxo.as_ref().unwrap();
+        assert_eq!(in0.value.to_sat(), 5000);
+        assert_eq!(in0.script_pubkey, user_pk_script);
+        assert_eq!(
+            psbt.inputs[0].witness_script.as_deref(),
+            Some(user_ws.as_script())
+        );
+        let in1 = psbt.inputs[1].witness_utxo.as_ref().unwrap();
+        assert_eq!(in1.value.to_sat(), 7000);
+        assert_eq!(in1.script_pubkey, tss);
+        // 主池输入不得带 witness_script（带了上游 finalizer 会把 P2WPKH 判为不可 finalize）。
+        assert!(psbt.inputs[1].witness_script.is_none());
+
+        // 线格式往返：witness_script 必须真的编码进 PSBT（签名节点拿到的是字节）。
+        let back = Psbt::deserialize(&psbt.serialize()).unwrap();
+        assert_eq!(
+            back.inputs[0].witness_script.as_deref(),
+            Some(user_ws.as_script())
+        );
+        assert!(back.inputs[1].witness_script.is_none());
+    }
+
+    #[test]
+    fn unknown_non_pool_script_is_refused() {
+        let tss = pool_script(1);
+        let unknown = pool_script(9);
+        let o0 = op(0);
+        let utxos = vec![utxo(o0, 5000, unknown)];
+        let mut psbt = unsigned_psbt(&[o0]);
+
+        // 既不是主池脚本、也没有登记过 witnessScript ⇒ 必须失败：
+        // 绝不拿 output program（或任何猜的脚本）去顶替 scriptCode。
+        let err = fill_psbt_inputs(&mut psbt, &[o0], &utxos, &[5000], &tss, &|_| None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("cannot be signed"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn unknown_utxo_falls_back_to_the_main_pool_script() {
+        // 既有行为：钱包里查不到该 outpoint 时按 (fallback 面额, 主池脚本) 填。
+        let tss = pool_script(1);
+        let o0 = op(0);
+        let mut psbt = unsigned_psbt(&[o0]);
+        fill_psbt_inputs(&mut psbt, &[o0], &[], &[4242], &tss, &|_| None).unwrap();
+        let inp = psbt.inputs[0].witness_utxo.as_ref().unwrap();
+        assert_eq!(inp.value.to_sat(), 4242);
+        assert_eq!(inp.script_pubkey, tss);
+        assert!(psbt.inputs[0].witness_script.is_none());
+    }
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>> {

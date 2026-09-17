@@ -39,6 +39,15 @@ fn err(e: anyhow::Error) -> Status {
     }
 }
 
+/// Wire form of a PSBT (C3).
+///
+/// The per-input **scriptCode rides inside these bytes**: `build_transfer` writes each input's own
+/// `witness_utxo.script_pubkey` plus, for native P2WSH inputs, `PSBT_IN_WITNESS_SCRIPT` with that
+/// input's witnessScript. That is why the gRPC contract needs no per-input script field — the
+/// sidecar hands the TSS signers one opaque PSBT and the signers read each input's scriptCode from
+/// it (BIP143 is defined per input, so a tx may mix main-pool P2WPKH and user P2WSH inputs).
+/// The same holds in reverse: `finalize_withdrawal` consumes the signed PSBT unchanged and only
+/// calls `extract_tx()` on it.
 fn psbt_to_bytes(psbt: &Psbt) -> Vec<u8> {
     psbt.serialize()
 }
