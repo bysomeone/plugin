@@ -33,6 +33,7 @@ use rgbstd::txout::{BlindSeal, CloseMethod, TxPtr};
 use rgbstd::{Identity, OutputSeal};
 use schemata::InflatableFungibleAsset;
 
+use crate::build_store::{key_digest, BuildStore, Pruned};
 use crate::config::Config;
 use crate::invoice::{
     consignment_from_bytes, consignment_to_bytes, network_to_chainnet, parse_invoice,
@@ -193,6 +194,13 @@ pub struct RgbEngine {
     cfg: Config,
     pub stock: Stock,
     pub ledger: Ledger,
+    /// 冷层：提现构建的重放存档（O3）。热账本里只留 `finalized_withdrawals`，
+    /// 构建正文每笔一个文件，只在重放/裁剪时碰。
+    pub builds: BuildStore,
+    /// 构建归档的保留窗口（确认数）：`finalized × N 确认`之前**绝不**裁剪。
+    build_retain_confirmations: u32,
+    /// 上一次跑归档裁剪的时间（节流：裁剪要列目录，不该跟着 `sync()` 每次都跑）。
+    last_prune: Option<std::time::Instant>,
     wallet: BtcWallet,
     rpc: Arc<BtcdRpc>,
     chain_net: ChainNet,
@@ -221,7 +229,27 @@ impl RgbEngine {
             }
         };
 
-        let ledger = Ledger::load(&cfg.ledger_path())?;
+        let mut ledger = Ledger::load(&cfg.ledger_path())?;
+        // O3 迁移：pre-O3 的账本把提现构建存在热账本里（每次变更全量重写，W=1e4 时 204 MB/
+        // 337 ms）。把存档搬到冷层，热账本随即瘦下来。顺序是"先把归档全部落盘（fsync），再保存
+        // 瘦身后的热账本"——中途崩了下次启动会重跑（写同名文件是幂等的覆盖）。
+        //
+        // 顺手把 `finalized_withdrawals` 指向归档（pre-O3 的记录没有这个指针）——否则老部署升级
+        // 后那些归档永远不会被裁剪。指针只是"去哪儿找"，裁剪仍要另有两道确认判据（见
+        // `prune_build_archives`），给错也裁不掉东西。
+        let builds = BuildStore::new(cfg.builds_dir());
+        let legacy = ledger.take_legacy_builds();
+        if !legacy.is_empty() {
+            for (key, rec) in &legacy {
+                builds.put(key, rec)?;
+                if let Some(fin) = ledger.finalized_withdrawals.get_mut(&rec.txid) {
+                    if fin.seal_set_digest.is_none() {
+                        fin.seal_set_digest = Some(key_digest(key));
+                    }
+                }
+            }
+            ledger.save(&cfg.ledger_path())?;
+        }
         let rpc = Arc::new(BtcdRpc::connect(
             &cfg.btc_rpc_host,
             &cfg.btc_rpc_user,
@@ -249,6 +277,9 @@ impl RgbEngine {
             cfg,
             stock,
             ledger,
+            builds,
+            build_retain_confirmations: build_retain_confirmations_from_env(),
+            last_prune: None,
             wallet,
             rpc,
             chain_net,
@@ -266,6 +297,78 @@ impl RgbEngine {
             .map_err(|e| anyhow!("stock store: {e:?}"))?;
         self.ledger.save(&self.cfg.ledger_path())?;
         Ok(())
+    }
+
+    /// 归档保留窗口（确认数）：构建在"已 finalize **且**锚定交易确认满 N 块"之后才可以裁剪。
+    pub fn build_retain_confirmations(&self) -> u32 {
+        self.build_retain_confirmations
+    }
+
+    /// 覆盖归档保留窗口（部署用 env，测试直接用这个）。
+    pub fn set_build_retain_confirmations(&mut self, n: u32) {
+        self.build_retain_confirmations = n;
+    }
+
+    /// 裁剪可以裁剪的提现构建归档（见 [`crate::build_store`] 的"归档窗口"）。
+    ///
+    /// 判据全部来自**本地已持久化的证据**，不做额外 RPC、不猜：
+    /// 1. `finalized_withdrawals` 里有该 txid ⇒ 转账已并入 Stock、seal 状态已落盘；
+    /// 2. 有 change outpoint，且它的 seal `maturity_height > 0` ⇒ 钱包见过其确认高度；
+    /// 3. `tip - maturity_height >= build_retain_confirmations`。
+    ///
+    /// 三条缺一不可，缺了就**不裁**（宁可留着归档，也不让重放取不回）。裁剪是"瘦身"不是"删除"：
+    /// 留下墓碑，重放会撞上指名道姓的错误（见 `BuildStore::prune`）。
+    pub fn prune_build_archives(&mut self) -> Result<u32> {
+        if self.build_retain_confirmations == u32::MAX {
+            return Ok(0); // 显式关掉（运维用）
+        }
+        let tip = self.rpc.get_block_count().unwrap_or(0) as u32;
+        if tip == 0 {
+            return Ok(0); // 没有链视图，不裁
+        }
+        let mut candidates: Vec<(String, u32)> = Vec::new();
+        for fin in self.ledger.finalized_withdrawals.values() {
+            let Some(digest) = fin.seal_set_digest.as_deref() else {
+                continue; // pre-O3 记录：没有指向归档的指针，保守留着
+            };
+            let Some(change_outpoint) = fin.change_outpoint.as_deref() else {
+                continue; // 没有 change seal ⇒ 拿不到确认高度的证明
+            };
+            let Some(seal) = self.ledger.seal(change_outpoint) else {
+                continue;
+            };
+            if seal.maturity_height == 0 {
+                continue; // 未确认（或钱包还没见过确认高度）
+            }
+            if tip.saturating_sub(seal.maturity_height) < self.build_retain_confirmations {
+                continue;
+            }
+            candidates.push((digest.to_string(), seal.maturity_height));
+        }
+        let mut pruned = 0u32;
+        for (digest, confirm_height) in candidates {
+            // 单次上限：升级到 O3 后第一次 `sync()` 时，"历史上一整天以前的提现"全都成了候选，
+            // 一万笔就是一万次文件重写 —— 那会是一次几十秒级的全局锁停顿。分多次跑完即可，
+            // 裁剪本来就不急。
+            if pruned >= MAX_PRUNES_PER_PASS {
+                break;
+            }
+            if self.builds.prune_by_digest(
+                &digest,
+                Pruned {
+                    btc_height: tip,
+                    confirm_height,
+                    reason: format!(
+                        "finalized and confirmed {} blocks ago (retain window {} blocks)",
+                        tip - confirm_height,
+                        self.build_retain_confirmations
+                    ),
+                },
+            )? {
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
     }
 
     pub fn tss_address(&self) -> &Address {
@@ -854,6 +957,22 @@ impl RgbEngine {
         if changed {
             self.save()?;
         }
+        // O3：顺手裁剪已定稿且早已确认的提现构建归档。节流到 `PRUNE_INTERVAL`，因为它要列
+        // `builds/` 目录（上万个文件时是几十毫秒量级），不能跟着每次 `sync()` 跑。裁剪失败不该
+        // 让 `sync()` 失败——归档只是重放旁路，裁不掉顶多是多占点盘。
+        if self
+            .last_prune
+            .map(|t| t.elapsed() >= PRUNE_INTERVAL)
+            .unwrap_or(true)
+        {
+            self.last_prune = Some(std::time::Instant::now());
+            if let Err(e) = self.prune_build_archives() {
+                eprintln!(
+                    "rgb-sidecar: pruning withdrawal build archives failed (archive keeps growing, \
+                     replay still works): {e:#}"
+                );
+            }
+        }
         Ok((changed, new_seals))
     }
 
@@ -1173,10 +1292,15 @@ impl RgbEngine {
         // recipient/change seals on every run, so even identical inputs give a different RGB
         // commitment (and txid), i.e. a second, conflicting spend of the same seal rather than a
         // replay. Only a recorded PSBT can be replayed byte for byte.
+        //
+        // O3：记录在冷层归档里（`builds/<digest>.json`）。取不回来时**一律报错**，绝不静默重建
+        // ——`BuildStore::get` 对"归档损坏/已裁剪"返回 Err，对"从没建过"才返回 Ok(None)，后者落到
+        // 下面 fail-closed 的重建路径（C4：重放要花的 seal 早被花掉，钱包里查不到它的脚本与面额，
+        // 重建必然报错而不是造出第二笔支付）。
         if !input_seals.is_empty() {
-            if let Some(rec) = self.ledger.withdrawal_builds.get(&seal_set_key(&input_outpoints)) {
+            if let Some(rec) = self.builds.get(&seal_set_key(&input_outpoints))? {
                 return self.replay_recorded_withdrawal(
-                    rec.clone(),
+                    rec,
                     symbol,
                     recipient_invoice,
                     change_address,
@@ -1197,9 +1321,13 @@ impl RgbEngine {
             .map(|a| a.asset_id.clone())
             .unwrap_or_default();
         // Record the build so a retry of this withdrawal (same seals) can replay it verbatim.
-        self.ledger.withdrawal_builds.insert(
-            seal_set_key(&input_outpoints),
-            RecordedWithdrawal {
+        //
+        // O3：写进**冷层归档**（一次写、永不重写），**先于** `save()` 并且对 IO 错误硬失败 ——
+        // 归档的契约是"返回给调用方之前已在盘上"，否则桥拿着这份 PSBT 重试时会取不回来。
+        let seal_key = seal_set_key(&input_outpoints);
+        self.builds.put(
+            &seal_key,
+            &RecordedWithdrawal {
                 txid: outcome.txid.to_string(),
                 asset_id: asset_id.clone(),
                 asset_symbol: symbol.to_string(),
@@ -1211,7 +1339,7 @@ impl RgbEngine {
                 input_amounts: outcome.input_amounts.clone(),
                 fascia_hex: hex_encode(&fascia_to_bytes(&outcome.fascia)?),
             },
-        );
+        )?;
         self.save()?;
         self.pending_withdrawals.insert(
             outcome.txid.to_string(),
@@ -1438,6 +1566,9 @@ impl RgbEngine {
         }
         let recipient_outpoint = format!("{txid}:1");
         let change_outpoint = pending.change_vout.map(|v| format!("{txid}:{v}"));
+        // O3：把冷层归档的指针一并记下（摘要 = seal 集合的 sha256）。裁剪归档时只凭这条记录就能
+        // 直接定位文件，不必扫描 `builds/`（目录里可能有上万个文件）。
+        let seal_set_digest = Some(key_digest(&seal_set_key(&pending.input_outpoints)));
         // Recorded before `save()` so the "already finalized" marker is persisted in the same
         // write as the seal statuses it stands for — a crash in between must not leave the
         // transition applied in the Stock without the record that makes the retry a no-op.
@@ -1447,6 +1578,7 @@ impl RgbEngine {
                 txid: txid.to_string(),
                 recipient_outpoint: recipient_outpoint.clone(),
                 change_outpoint: change_outpoint.clone(),
+                seal_set_digest,
             },
         );
         self.save()?;
@@ -2075,12 +2207,50 @@ fn split_outpoint(s: &str) -> Result<(String, u32)> {
     Ok((txid.to_string(), vout.parse::<u32>()?))
 }
 
-/// Canonical key of a set of RGB seals: sorted by outpoint, comma-joined. Matches the bridge's
-/// own encoding of its sticky-seal record (`rgb20.encodeStickySeals`), so a replay request and the
-/// build it replays resolve to the same key.
-fn seal_set_key(seals: &[OutPoint]) -> String {
+/// Canonical key of a set of RGB seals: stringified, **sorted as strings**, comma-joined. Matches
+/// the bridge's own encoding of its sticky-seal record (`rgb20.encodeStickySeals`), so a replay
+/// request and the build it replays resolve to the same key.
+///
+/// 公开给 [`crate::build_store`] 交叉校验：归档的键必须与它逐字节一致（字符串序，**不是**
+/// `OutPoint` 的数值序 —— vout 10 与 2 在两种序下相反）。
+pub fn seal_set_key(seals: &[OutPoint]) -> String {
     let mut v: Vec<String> = seals.iter().map(|o| o.to_string()).collect();
     v.sort();
     v.dedup();
     v.join(",")
+}
+
+/// [`seal_set_key`] over already-stringified outpoints (the form the build archive stores).
+///
+/// Public because [`crate::build_store`] re-derives the key from a file's contents to check that the
+/// archive it just read really belongs to the seal set it was looked up by.
+///
+/// **必须与 [`seal_set_key`] 逐字节一致**，所以这里复刻的是它的**字符串序**（`seal_set_key` 先
+/// `to_string()` 再 `sort()`），而不是 `OutPoint` 的数值序：同一笔 tx 的多个 seal（vout 2 与
+/// vout 10）下两者顺序相反（字符串序 `:10` 在前），写成归档的键与读回重算的键就会对不上。
+pub fn seal_set_key_of_strs(seals: &[String]) -> String {
+    let mut v: Vec<&str> = seals.iter().map(String::as_str).collect();
+    v.sort_unstable();
+    v.dedup();
+    v.join(",")
+}
+
+/// 归档裁剪的节流间隔：`sync()` 里最多每 5 分钟扫一次 `builds/`。
+const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// 单次裁剪最多重写多少个归档文件：升级后的第一次裁剪可能一口气攒下全部历史提现，给个上限
+/// 免得在全局锁里卡几十秒（剩下的下一轮继续）。
+const MAX_PRUNES_PER_PASS: u32 = 200;
+
+/// 默认归档保留窗口（确认数）：144 ≈ 1 天。见 [`crate::build_store`] 的"归档窗口"——
+/// 已 finalize + 已确认 ⇒ 广播没失败 ⇒ 不需要重放；一天确认深度远超任何合理的重试窗口。
+/// 保守取的代价只是归档多留一天（~6 KB/笔，写一次不再重写）。
+/// `RGB_SIDECAR_BUILD_RETAIN_CONFIRMATIONS=0` 表示"确认即可裁"；`=4294967295` 表示永不裁。
+const DEFAULT_BUILD_RETAIN_CONFIRMATIONS: u32 = 144;
+
+fn build_retain_confirmations_from_env() -> u32 {
+    std::env::var("RGB_SIDECAR_BUILD_RETAIN_CONFIRMATIONS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(DEFAULT_BUILD_RETAIN_CONFIRMATIONS)
 }

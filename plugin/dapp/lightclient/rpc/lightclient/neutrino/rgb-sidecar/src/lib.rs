@@ -9,6 +9,7 @@ pub mod pb {
     tonic::include_proto!("rgb_sidecar");
 }
 
+pub mod build_store;
 pub mod config;
 pub mod engine;
 pub mod invoice;

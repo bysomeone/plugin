@@ -68,6 +68,8 @@ const NEW_UTXO_BTC: u64 = 300_000;
 #[derive(Default)]
 struct MockChain {
     height: u64,
+    /// `gettxout` 报的确认数（0 = 还没确认；决定钱包认到的 `height`/`maturity_height`）。
+    confirmations: u64,
     /// txid -> serialized tx (hex served by `getrawtransaction`).
     txs: HashMap<String, Transaction>,
     /// live (unspent) UTXOs.
@@ -113,12 +115,16 @@ fn handle_request(chain: &Arc<Mutex<MockChain>>, req: &Value) -> Value {
             let txid = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
             let vout = params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let op = bitcoin::Txid::from_str(txid).ok().map(|txid| OutPoint { txid, vout });
-            match op.and_then(|op| chain.lock().unwrap().utxos.get(&op).cloned()) {
+            // NOTE: the guard from `lock()` lives until the end of the enclosing statement (the whole
+            // `match`), so read `confirmations` *before* it — locking twice would deadlock.
+            let confirmations = chain.lock().unwrap().confirmations;
+            let live = op.and_then(|op| chain.lock().unwrap().utxos.get(&op).cloned());
+            match live {
                 Some((value, script)) => (
                     json!({
                         "value": value as f64 / 100_000_000.0,
                         "scriptPubKey": {"hex": to_hex(script.as_bytes())},
-                        "confirmations": 100,
+                        "confirmations": confirmations,
                     }),
                     Value::Null,
                 ),
@@ -211,7 +217,11 @@ fn handle_conn(mut stream: TcpStream, chain: Arc<Mutex<MockChain>>) {
 fn start_mock_btcd() -> (String, Arc<Mutex<MockChain>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock btcd");
     let host = listener.local_addr().expect("local addr").to_string();
-    let chain = Arc::new(Mutex::new(MockChain { height: 200, ..Default::default() }));
+    let chain = Arc::new(Mutex::new(MockChain {
+        height: 200,
+        confirmations: 100,
+        ..Default::default()
+    }));
     let chain_for_thread = chain.clone();
     std::thread::spawn(move || {
         for stream in listener.incoming() {
@@ -502,7 +512,9 @@ fn failed_broadcast_is_replayed_not_rebuilt() -> Result<()> {
     // 钱包里查不到它的脚本与面额，而 BIP143 把 prevout 面额算进被签的消息 —— 猜一个值只会签出
     // 一笔必然无效的交易（改前那条"退化路径"产出的正是这种东西）。所以记录丢了不再退化成
     // "另造一笔"，而是直接报错，由调用方按不可恢复处理。
-    engine.ledger.withdrawal_builds.clear();
+    // 记录没了（等同归档被外部删掉）：重放必须 fail-closed。O3 之后记录住在 `<data>/builds/`，
+    // 整个目录就是"重放存档"，删掉它等价于改前的 `withdrawal_builds.clear()`。
+    std::fs::remove_dir_all(dir.join("builds")).unwrap();
     let err = engine
         .build_withdrawal(
             SYMBOL,
@@ -522,8 +534,188 @@ fn failed_broadcast_is_replayed_not_rebuilt() -> Result<()> {
     Ok(())
 }
 
-/// The replay path must also be reachable through the exact wire shape the bridge uses
-/// (`rgb20/pb`: `input_seals` is field 7 of `BuildWithdrawalRequest`), and unknown fields must not
+/// O3：提现构建的重放存档（`<data>/builds/`）的生命周期。
+///
+/// 归档窗口是"**已 finalize 且锚定交易确认满 N 块**"，缺一不可：
+///   - 未 finalize ⇒ 不裁（哪怕链上已经有那笔交易——那正是最需要重放的情形）；
+///   - 未确认 / 没有 change seal ⇒ 不裁（拿不到确认高度的证明）；
+///   - 满足条件 ⇒ 裁成墓碑（丢掉 PSBT 载荷，留下 txid），此后重放**响亮失败**，绝不静默重建。
+///
+/// 反面（"取回同一份 PSBT"的能力被改坏）：把 `BuildStore::get` 的裁剪/损坏分支改成返回
+/// `Ok(None)`，下面第 4 步就会去走重建路径；把 `put` 改成空操作，`failed_broadcast_is_replayed_
+/// not_rebuilt` 会红。
+#[test]
+fn build_archive_is_pruned_only_after_finalize_and_confirmation() -> Result<()> {
+    let (rpc, chain) = start_mock_btcd();
+    let tss_pubkey = pubkey_hex(&TSS_SECRET);
+    let (_tss_addr, tss_script) = p2wpkh(&TSS_SECRET);
+
+    let (seal_funding, seal_outpoint) = funding_tx(&tss_script, SEAL_BTC, 11);
+    let (fee_funding, fee_outpoint) = funding_tx(&tss_script, FEE_UTXO_BTC, 12);
+    {
+        let mut c = chain.lock().unwrap();
+        c.add_tx(seal_funding);
+        c.add_tx(fee_funding);
+    }
+
+    let dir = data_dir("archive");
+    let mut engine = open_engine(&dir, &rpc, &tss_pubkey)?;
+    let asset = engine.issue_asset_at(SYMBOL, "Tether USD", 8, ISSUED as u64, seal_outpoint)?;
+    let user_invoice = build_address_invoice(
+        Network::Regtest,
+        &p2wpkh(&USER_SECRET).1,
+        asset.asset_id.parse()?,
+        InflatableFungibleAsset::schema().schema_id(),
+        WITHDRAW as u64,
+    )?;
+    let tss_addr = engine.tss_address().to_string();
+    // 保留窗口设成 0：确认即可裁 —— 让测试不必造 144 个块。
+    engine.set_build_retain_confirmations(0);
+    let archive_dir = dir.join("builds");
+
+    // ---- 1. 构建：归档落盘，且**不是**在热账本里 ----
+    let first = engine.build_withdrawal(SYMBOL, WITHDRAW, &user_invoice, &tss_addr, FEE_RATE, &[])?;
+    let first_txid = first.txid.to_string();
+    let seal_key = seal_outpoint.to_string();
+    let files: Vec<_> = std::fs::read_dir(&archive_dir)?.map(|e| e.unwrap().path()).collect();
+    assert_eq!(files.len(), 1, "one build ⇒ exactly one archive file: {files:?}");
+    let full_len = std::fs::metadata(&files[0])?.len();
+    let hot: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("ledger.json"))?)?;
+    assert!(
+        hot.get("withdrawal_builds").is_none() && !hot.to_string().contains("psbt_hex"),
+        "the hot ledger must not carry the build payload any more: {}",
+        hot.to_string().chars().take(200).collect::<String>()
+    );
+
+    // ---- 2. 未 finalize ⇒ 不裁（哪怕链上已经有它的交易） ----
+    let broadcast = {
+        let signed = sign_psbt(&first.psbt, &TSS_SECRET)?;
+        chain.lock().unwrap().add_tx(signed.clone().extract_tx()?);
+        signed
+    };
+    engine.sync()?;
+    assert_eq!(engine.prune_build_archives()?, 0, "an unfinalized build must never be pruned");
+
+    // ---- 3. finalize 但**未确认** ⇒ 仍然不裁 ----
+    engine.finalize_withdrawal(&broadcast)?;
+    {
+        let mut c = chain.lock().unwrap();
+        c.confirmations = 0; // 交易还在内存池里
+        c.spend(seal_outpoint);
+        c.spend(fee_outpoint);
+    }
+    engine.sync()?;
+    assert_eq!(
+        engine.prune_build_archives()?,
+        0,
+        "an unprovable confirmation height must block pruning"
+    );
+
+    // ---- 4. 已 finalize + 已确认 ⇒ 裁成墓碑；重放响亮失败 ----
+    chain.lock().unwrap().confirmations = 100;
+    engine.sync()?;
+    assert_eq!(engine.prune_build_archives()?, 1, "a confirmed, finalized build must be pruned");
+    let tomb = std::fs::metadata(&files[0])?.len();
+    assert!(tomb * 4 < full_len, "tombstone should be far smaller: {tomb} vs {full_len}");
+    // 幂等：再裁一次什么都不做。
+    assert_eq!(engine.prune_build_archives()?, 0);
+
+    let err = engine
+        .build_withdrawal(
+            SYMBOL,
+            WITHDRAW,
+            &user_invoice,
+            &tss_addr,
+            FEE_RATE,
+            &[seal_key],
+        )
+        .expect_err("a pruned build must fail loudly, never silently rebuild");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("was pruned"), "unexpected error: {msg}");
+    assert!(msg.contains(&first_txid), "the error must name the txid: {msg}");
+
+    // ---- 5. 重启后墓碑仍在：裁剪结果活得比进程久 ----
+    drop(engine);
+    let mut engine = open_engine(&dir, &rpc, &tss_pubkey)?;
+    engine.set_build_retain_confirmations(0);
+    let err = engine
+        .build_withdrawal(SYMBOL, WITHDRAW, &user_invoice, &tss_addr, FEE_RATE, &[format!("{}", seal_outpoint)])
+        .expect_err("the tombstone must survive a restart");
+    assert!(format!("{err:#}").contains("was pruned"), "unexpected: {err:#}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// O3 迁移：pre-O3 的 `ledger.json` 把构建存档存在热账本里。启动时必须**搬到冷层**（否则那台
+/// 机器的重放能力会静默消失），且迁移只做一次。
+#[test]
+fn legacy_ledger_builds_are_migrated_to_the_archive() -> Result<()> {
+    let (rpc, chain) = start_mock_btcd();
+    let tss_pubkey = pubkey_hex(&TSS_SECRET);
+    let (_tss_addr, tss_script) = p2wpkh(&TSS_SECRET);
+    let (seal_funding, seal_outpoint) = funding_tx(&tss_script, SEAL_BTC, 21);
+    let (fee_funding, _fee_outpoint) = funding_tx(&tss_script, FEE_UTXO_BTC, 22);
+    {
+        let mut c = chain.lock().unwrap();
+        c.add_tx(seal_funding);
+        c.add_tx(fee_funding);
+    }
+
+    let dir = data_dir("legacy-migrate");
+    let mut engine = open_engine(&dir, &rpc, &tss_pubkey)?;
+    let asset = engine.issue_asset_at(SYMBOL, "Tether USD", 8, ISSUED as u64, seal_outpoint)?;
+    let user_invoice = build_address_invoice(
+        Network::Regtest,
+        &p2wpkh(&USER_SECRET).1,
+        asset.asset_id.parse()?,
+        InflatableFungibleAsset::schema().schema_id(),
+        WITHDRAW as u64,
+    )?;
+    let tss_addr = engine.tss_address().to_string();
+    let first = engine.build_withdrawal(SYMBOL, WITHDRAW, &user_invoice, &tss_addr, FEE_RATE, &[])?;
+    let seal_key = seal_outpoint.to_string();
+    drop(engine);
+    // 模拟一台 **pre-O3** 的机器：还没有 `builds/`，构建存档躺在热账本里。
+    std::fs::remove_dir_all(dir.join("builds")).unwrap();
+
+    let legacy_rec = serde_json::json!({
+        "txid": first.txid.to_string(),
+        "asset_id": asset.asset_id,
+        "asset_symbol": SYMBOL,
+        "input_outpoints": [seal_outpoint.to_string()],
+        "change_vout": 2,
+        "change_amount": 100_000,
+        "psbt_hex": "abcd",          // 内容不是本测试的重点：只验证"旧记录被搬进冷层"
+        "consignment_hex": "abcd",
+        "input_amounts": [SEAL_BTC as i64],
+        "fascia_hex": "abcd",
+    });
+    let ledger_path = dir.join("ledger.json");
+    let mut hot: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&ledger_path)?)?;
+    hot["withdrawal_builds"] = serde_json::json!({ seal_key.clone(): legacy_rec });
+    std::fs::write(&ledger_path, serde_json::to_vec_pretty(&hot)?)?;
+
+    // 启动即迁移：不是报错，而是把旧记录搬进冷层。
+    let _engine = open_engine(&dir, &rpc, &tss_pubkey)?;
+    let hot_after = std::fs::read_to_string(&ledger_path)?;
+    assert!(
+        !hot_after.contains("withdrawal_builds"),
+        "the hot ledger must be rewritten without the build archive"
+    );
+    let files: Vec<_> = std::fs::read_dir(dir.join("builds"))?.map(|e| e.unwrap().path()).collect();
+    assert_eq!(files.len(), 1, "the legacy record must land in the archive: {files:?}");
+    let rec: serde_json::Value = serde_json::from_slice(&std::fs::read(&files[0])?)?;
+    assert_eq!(rec["txid"].as_str().unwrap(), first.txid.to_string());
+    assert_eq!(rec["seal_set_key"].as_str().unwrap(), seal_key);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// The replay path must also be reachable through the exact wire shape the bridge uses/// (`rgb20/pb`: `input_seals` is field 7 of `BuildWithdrawalRequest`), and unknown fields must not
 /// break the server. This guards the Go↔Rust contract shared by the two generated stubs.
 #[test]
 fn proto_carries_input_seals() -> Result<()> {

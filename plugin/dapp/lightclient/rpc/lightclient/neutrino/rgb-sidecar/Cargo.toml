@@ -22,6 +22,11 @@ bitcoin = "0.32"
 anyhow = "1"
 amplify = "=4.8.1"
 
+# O3: deflate for the archived withdrawal builds. `rust_backend` = miniz_oxide (pure Rust): the
+# sidecar already builds C via ring/rustls, so this is about not adding *more* native build chain
+# for a codec whose ratio, measured on a real consignment, is within 7% of zstd/lz4/xz.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
 # gRPC server
 tonic = "0.14"
 tonic-prost = "0.14"
