@@ -69,9 +69,9 @@ func btcDepositTxCMD() *cobra.Command {
 	cmd.Flags().Bool("disableTLS", true, "disable rpc tls")
 	cmd.Flags().String("rpcCertFile", "", "bitcoin rpc cert file path (optional, required when TLS enabled)")
 	cmd.Flags().String("wif", "", "sender private key in WIF format")
-	cmd.Flags().String("utxo", "", "single input utxo, format: txid:vout:amountSats:pkScriptHex")
+	cmd.Flags().String("utxo", "", "single input utxo, format: txid:vout:amountSats:pkScriptHex (hex fields accept an optional 0x prefix)")
 	cmd.Flags().String("depositAddress", "", "chain33 deposit address (= userID of the p2wsh derivation)")
-	cmd.Flags().String("tssPubkey", "", "tss group pubkey, 33-byte compressed hex (from rgbx getCrossChainInfo)")
+	cmd.Flags().String("tssPubkey", "", "tss group pubkey, 33-byte compressed hex (from rgbx getCrossChainInfo); an optional 0x prefix is accepted")
 	cmd.Flags().Int64("amount", 0, "deposit amount in satoshis")
 	cmd.Flags().Int64("fee", 0, "tx fee in satoshis")
 	cmd.Flags().String("changeAddress", "", "optional change address, default from private key")
@@ -94,7 +94,7 @@ func btcDepositAddressCMD() *cobra.Command {
 	}
 	cmd.Flags().String("net", "regtest", "bitcoin network: mainnet|testnet|regtest|simnet")
 	cmd.Flags().StringP("depositAddress", "d", "", "chain33 deposit address (= userID of the derivation)")
-	cmd.Flags().StringP("tssPubkey", "k", "", "tss group pubkey, 33-byte compressed hex")
+	cmd.Flags().StringP("tssPubkey", "k", "", "tss group pubkey, 33-byte compressed hex (from rgbx getCrossChainInfo); an optional 0x prefix is accepted")
 	markRequired(cmd, "depositAddress", "tssPubkey")
 	return cmd
 }
@@ -109,7 +109,7 @@ func btcDepositAddress(cmd *cobra.Command, _ []string) {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid net: %s, err: %v\n", netName, err)
 		return
 	}
-	pubkey, err := hex.DecodeString(strings.TrimSpace(pubkeyHex))
+	pubkey, err := decodeHexAuto(pubkeyHex)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid tssPubkey: %s, decode err: %v\n", pubkeyHex, err)
 		return
@@ -148,7 +148,8 @@ func parseDepositUTXO(raw string) (*depositUTXO, error) {
 	if len(parts) != 4 {
 		return nil, fmt.Errorf("invalid utxo format: %s", raw)
 	}
-	hash, err := chainhash.NewHashFromStr(strings.TrimSpace(parts[0]))
+	// txid 同样容忍 0x 前缀（chainhash.NewHashFromStr 内部不做这个处理）。
+	hash, err := chainhash.NewHashFromStr(stripHexPrefix(parts[0]))
 	if err != nil {
 		return nil, fmt.Errorf("invalid utxo txid: %w", err)
 	}
@@ -160,7 +161,7 @@ func parseDepositUTXO(raw string) (*depositUTXO, error) {
 	if err != nil || amount <= 0 {
 		return nil, fmt.Errorf("invalid utxo amount: %s", parts[2])
 	}
-	pkScript, err := hex.DecodeString(strings.TrimSpace(parts[3]))
+	pkScript, err := decodeHexAuto(parts[3])
 	if err != nil {
 		return nil, fmt.Errorf("invalid utxo pkScript: %w", err)
 	}
@@ -216,7 +217,7 @@ func btcDepositTx(cmd *cobra.Command, _ []string) {
 	// 重建 program 并核金额；带 OP_RETURN 的旧形态现在必被 checkDeposit 拒（它只看派生脚本）。
 	// tssPubkey 只能来自该 symbol 的 CrossChainInfo（rgbx getCrossChainInfo -s BTC），
 	// 用错世代（re-DKG 后）的钥会让钱落到桥认不出的脚本里。
-	tssPub, err := hex.DecodeString(strings.TrimSpace(tssPubkeyHex))
+	tssPub, err := decodeHexAuto(tssPubkeyHex)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid tssPubkey: %v\n", err)
 		return
@@ -337,7 +338,7 @@ func btcKeyInfo(cmd *cobra.Command, _ []string) {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid net: %s, err: %v\n", netName, err)
 		return
 	}
-	keyBytes, err := hex.DecodeString(strings.TrimSpace(privHex))
+	keyBytes, err := decodeHexAuto(privHex)
 	if err != nil || len(keyBytes) != 32 {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid privHex, require 32-byte hex\n")
 		return
@@ -395,12 +396,12 @@ func commitDKGCMD() *cobra.Command {
 func commitDKGFlags(cmd *cobra.Command) {
 	cmd.Flags().StringP("assetSymbol", "s", rtypes.BTCSymbol, "cross-chain asset symbol")
 	cmd.Flags().StringP("dkgAddress", "d", "", "dkg/tss bitcoin address")
-	cmd.Flags().StringP("pkScript", "p", "", "dkg address pkScript hex")
+	cmd.Flags().StringP("pkScript", "p", "", "dkg address pkScript hex (from rgbx getCrossChainInfo); an optional 0x prefix is accepted")
 	// pubkey 必填：checkCommitDKG 对所有 symbol（含 BTC/XBTC）都要求 33 字节压缩 TSS 群公钥，
 	// 并校验 hash160(pubkey)==pkScript[2:]。缺了它链上必以 ErrInvalidDkgAddress 拒收
 	// （P2WSH 充值地址 = f(userID, pubkey)，执行器要靠它重建充值脚本），所以这里直接
 	// 在 CLI 侧挡住，别让用户提交一份注定被拒的交易。
-	cmd.Flags().StringP("pubkey", "k", "", "tss group pubkey, 33-byte compressed hex")
+	cmd.Flags().StringP("pubkey", "k", "", "tss group pubkey, 33-byte compressed hex (from rgbx getCrossChainInfo); an optional 0x prefix is accepted")
 	markRequired(cmd, "dkgAddress", "pkScript", "pubkey")
 }
 
@@ -410,12 +411,12 @@ func commitDKG(cmd *cobra.Command, _ []string) {
 	pkScriptHex, _ := cmd.Flags().GetString("pkScript")
 	pubkeyHex, _ := cmd.Flags().GetString("pubkey")
 
-	pkScript, err := hex.DecodeString(pkScriptHex)
+	pkScript, err := decodeHexAuto(pkScriptHex)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid pkScript: %s, decode err: %v\n", pkScriptHex, err)
 		return
 	}
-	pubkey, err := hex.DecodeString(strings.TrimSpace(pubkeyHex))
+	pubkey, err := decodeHexAuto(pubkeyHex)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid pubkey: %s, decode err: %v\n", pubkeyHex, err)
 		return
@@ -477,7 +478,7 @@ func depositAsset(cmd *cobra.Command, _ []string) {
 	txDataHex, _ := cmd.Flags().GetString("txData")
 	merkleProofStr, _ := cmd.Flags().GetString("merkleProof")
 
-	txData, err := hex.DecodeString(txDataHex)
+	txData, err := decodeHexAuto(txDataHex)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid txData: %s, decode err: %v\n", txDataHex, err)
 		return
@@ -601,7 +602,7 @@ func confirmTx(cmd *cobra.Command, _ []string) {
 	btcTxDataHex, _ := cmd.Flags().GetString("btcTxData")
 	btcMerkleProofStr, _ := cmd.Flags().GetString("btcMerkleProof")
 
-	txHash, err := hex.DecodeString(txHashHex)
+	txHash, err := decodeHexAuto(txHashHex)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid txHash: %s, decode err: %v\n", txHashHex, err)
 		return
@@ -651,11 +652,37 @@ func confirmTx(cmd *cobra.Command, _ []string) {
 	})
 }
 
+// stripHexPrefix 去掉首尾空白与可选的 "0x"/"0X" 前缀（大小写不敏感）。
+func stripHexPrefix(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		return s[2:]
+	}
+	return s
+}
+
+// decodeHexAuto 解码用户提供的 hex 串：容忍可选的 0x/0X 前缀、首尾空白与大小写。
+//
+// 为什么需要它：本包多处 flag 的帮助文本就指向 `rgbx getCrossChainInfo` 的输出，而该输出
+// 的 pubkey/pkScript 带 0x 前缀（如 "0x03ecaf..."）。旧实现直接把原串丢给 hex.DecodeString，
+// 遇到 0x 会以 "encoding/hex: invalid byte: U+0078 'x'" 失败 —— P2WSH 充值场景因此连交易都
+// 构造不出来（btcDepositTx --tssPubkey 取的就是这个字段）。容错放在 CLI 侧治本，脚本里 sed
+// 掉前缀只是治标。
+//
+// 奇数长度单独报错：hex 的 "odd length hex string" 不带长度，定位时不够直白。
+func decodeHexAuto(raw string) ([]byte, error) {
+	s := stripHexPrefix(raw)
+	if len(s)%2 != 0 {
+		return nil, fmt.Errorf("odd-length hex string: %d chars", len(s))
+	}
+	return hex.DecodeString(s)
+}
+
 func decodeHexOptional(s string) ([]byte, error) {
 	if strings.TrimSpace(s) == "" {
 		return nil, nil
 	}
-	return hex.DecodeString(s)
+	return decodeHexAuto(s)
 }
 
 func decodeHexList(raw string) ([][]byte, error) {
@@ -670,7 +697,7 @@ func decodeHexList(raw string) ([][]byte, error) {
 		if part == "" {
 			continue
 		}
-		b, err := hex.DecodeString(part)
+		b, err := decodeHexAuto(part)
 		if err != nil {
 			return nil, err
 		}
