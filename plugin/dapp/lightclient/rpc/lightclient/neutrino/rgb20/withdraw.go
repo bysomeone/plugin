@@ -241,6 +241,15 @@ func (a *Adapter) resolveTssScript() []byte {
 	return nil
 }
 
+// resolveUserDepositScript 判断某个输入脚本是否为已登记的用户 P2WSH 充值脚本。
+// 无桥（测试 mock）/未登记一律返回 false（fail-closed）。
+func (a *Adapter) resolveUserDepositScript(pkScript []byte) (string, bool) {
+	if a.bridge == nil || len(pkScript) == 0 {
+		return "", false
+	}
+	return a.bridge.IsUserDepositScript(pkScript)
+}
+
 // Withdraw 提现编排：invoice → 侧车 BuildWithdrawal(PSBT) → 交叉核对 → TSS 签 → Finalize → txid↔pending → 广播。
 // 全程持 withdrawMu 串行，避免并发花同一 seal。
 func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*WithdrawResult, error) {
@@ -462,9 +471,25 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 			op := p.UnsignedTx.TxIn[i].PreviousOutPoint
 			prevScript = p.Inputs[i].NonWitnessUtxo.TxOut[op.Index].PkScript
 		}
-		if !bytes.Equal(prevScript, tssScript) {
-			return fmt.Errorf("input %s is not a TSS-controlled utxo", key)
+		if bytes.Equal(prevScript, tssScript) {
+			continue // 主池 TSS P2WPKH：桥直接控制
 		}
+		// C3：用户 P2WSH 充值脚本（`<push userID> OP_DROP <push tssPub> OP_CHECKSIG`）的
+		// program 收进来的 BTC 同样只有 GG18 群签名才能花掉 —— 花费它的 PSBT 输入必须带
+		// witness_script 作 scriptCode，签名节点在这里核对"这个脚本是不是我们发放过的"。
+		//
+		// **只认已登记的**：登记只发生在桥按需发放充值地址时（bitcoin.go 的
+		// depositScripts watch 集，见 deposit_address.go）。一份自称"是用户充值脚本"的
+		// 输入，凡不在本节点 watch 集里就拒 —— 否则任何人都能把任意脚本塞进 PSBT 让
+		// 签名节点为它背书。注意这与"是不是 P2WSH 形态"无关：判别依据是**登记**，不是形态，
+		// 因为 witnessScript 在花费前不可见、形态判别在链上根本不可判定。
+		if userID, ok := a.resolveUserDepositScript(prevScript); ok {
+			if len(p.Inputs[i].WitnessScript) == 0 {
+				return fmt.Errorf("input %s is a user deposit script (userID %s) but the psbt carries no witness script", key, userID)
+			}
+			continue
+		}
+		return fmt.Errorf("input %s is not a TSS-controlled utxo", key)
 	}
 	// 用侧车的 seal 状态双向对齐本地 SealIndex（提升 pending-mint→minted；退休 consumed），
 	// 再判定 pending-mint。提现产生的 change seal 在侧车侧由 sync() 在其上链后提升为 minted，

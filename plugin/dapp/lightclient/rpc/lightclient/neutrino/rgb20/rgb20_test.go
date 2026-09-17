@@ -3,6 +3,7 @@ package rgb20
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,6 +88,26 @@ type fakeBridge struct {
 	broadcastCalls int
 	// withdrawState 该笔提现落盘的本地状态（E9-A 的状态门；空 = 从未处理到广播）。
 	withdrawState []byte
+	// depositScripts 已登记的用户 P2WSH 充值脚本（pkScript hex → userID，C3 输入归属核对用）。
+	depositScripts map[string]string
+}
+
+// registerDepositScript 登记一个用户充值脚本（模拟桥发放地址时写 watch 集）。
+func (f *fakeBridge) registerDepositScript(pkScript []byte, userID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.depositScripts == nil {
+		f.depositScripts = make(map[string]string)
+	}
+	f.depositScripts[hex.EncodeToString(pkScript)] = userID
+}
+
+// IsUserDepositScript 已登记的用户 P2WSH 充值脚本（见 Chain33Bridge 注释）。
+func (f *fakeBridge) IsUserDepositScript(pkScript []byte) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	userID, ok := f.depositScripts[hex.EncodeToString(pkScript)]
+	return userID, ok
 }
 
 // 深度门控的测试默认值：未显式配置时"永远够深"，不让门控干扰与它无关的用例。

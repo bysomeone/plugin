@@ -167,6 +167,13 @@ type Chain33Bridge interface {
 	// TSSPkScript 返回桥 TSS P2WPKH 输出的 pkScript（16 进制? 不，raw bytes）。
 	// 签名节点交叉核对提现 PSBT 时，用它判断额外输入/找零输出是否受桥（TSS）控制。
 	TSSPkScript() []byte
+	// IsUserDepositScript 判断某个输出脚本是否为**已登记**的用户 P2WSH 充值脚本
+	// （桥发放过地址、且已纳入 watch 集），返回其 userID（= chain33 充值地址串）。
+	//
+	// 这类脚本同样受桥（TSS 群钥）控制 —— 脚本里的 `<tssPub>` 就是群公钥，花费需要 GG18 签名
+	// —— 因此签名节点交叉核对输入归属时必须接受它们；反过来，**未登记**的 P2WSH 一律不接受
+	// （登记与否是签名节点自己的判断，不采信协调者下发的 PSBT 自称）。
+	IsUserDepositScript(pkScript []byte) (string, bool)
 }
 
 // RGB20Adapter 是 neutrino 主包使用的适配器接口。
