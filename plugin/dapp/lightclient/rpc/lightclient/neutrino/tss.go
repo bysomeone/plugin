@@ -1158,6 +1158,15 @@ func (t *tssService) signPsbtWithSigners(p *psbt.Packet, signers []string, signF
 			return nil, fmt.Errorf("calc sig hash for input %d: %w", i, err)
 		}
 		sigHashes[i] = sigHash
+		// 会话名由被签内容派生（不是随机的）：**各参与节点必须算出同一个名**，否则收不到彼此的
+		// 消息（见 cggmp README 的 ssid 说明）。
+		//
+		// 代价是重试同一笔时会复用同一个会话名，于是上一轮迟到/残留的消息可能被 chain33 的会话
+		// 注册表（未注册会话的消息按会话名缓存、注册时回灌，上限 32 条）灌进重试轮 ⇒ 该轮以
+		// register session failed / state Init -> Failed 结束。影响有界且可自愈：回灌后缓存即被
+		// 清空，下一轮不再受污染（E2E 实测出现过一次，下一轮自愈）。彻底修法在 chain33 的 tss
+		// 包装器侧（removeSession 时一并清掉该会话的 pending 缓存），或把轮次标识随通知下发、
+		// 让会话名每轮变化 —— 两者都需要改包装器/通知格式，见 CONFIG.md §4.3.3。
 		sessions[i] = fmt.Sprintf("psbt-%s-%d", txHash, i)
 	}
 	for i := range p.Inputs {
