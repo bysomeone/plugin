@@ -485,11 +485,31 @@ func (n *neutrinoClient) loadTssGroupPubKeyFromDB() (*btcec.PublicKey, error) {
 // 后者才是故障（WARN、可重试）。
 var errCrossChainInfoNotOnChain = errors.New("cross chain info not found on chain")
 
+// crossChainInfoAbsentOnChain 判断链上是否**没有**该 symbol 的 CrossChainInfo。
+//
+// 判据必须落在**记录内容**上，不能只看查询有没有报错：执行器的 Query_GetCrossChainInfo
+// （plugin/dapp/rgbx/executor/query.go）在 symbol 不存在时返回**空结构体 + nil error**
+// （既有契约，被 executor/query_test.go 钉住），于是"查得到"与"链上有"是两件事。
+//
+// 为什么这条判据曾经缺失、以及为什么它必须存在（踩过一次，别再踩）：
+//   - 缺了它，空记录会以 err == nil 流进 commitDKGToChain 的"链上是另一把钥"分支（那是
+//     **不可自愈**的形态：同一 symbol 只能提交一次，换钥会被 ErrDuplicateDKGCommit 挡住），
+//     于是该节点永远不会去提交，链上永远没有记录 —— 表现是 DKG 阶段**死锁**，不是慢。
+//   - 以前没暴露是因为旧环境是**原地续跑**的：链上早已有旧代码提交的 CrossChainInfo，
+//     commitDKGToChain 走"确认分支"就过了，压根没进过提交分支。只有全新 reset
+//     （链上没有任何 CrossChainInfo）才必须真的走提交分支，那时才会撞上这个误判。
+func crossChainInfoAbsentOnChain(info *rtypes.CrossChainInfo) bool {
+	return info.GetTssAddress() == "" && len(info.GetPubkey()) == 0
+}
+
 // queryCrossChainInfoBounded 查询链上 CrossChainInfo，带超时与有限重试。
 //
 // 不复用 rpc.go 的 getCrossChainInfo：那个函数把 n.ctx（进程级、不超时）直接传给 QueryChain，
 // 而自检在启动路径上，不能被主链 grpc 的 hang 拖住启动（该 hang 在本仓库有据可查）。
 // 重试只针对传输层错误（不可达 / 超时）：执行器明确回"没有"是业务结果，重试不会变好。
+//
+// 空记录在这里就翻译成 errCrossChainInfoNotOnChain（见 crossChainInfoAbsentOnChain），
+// 让**两个调用方**（commitDKGToChain 的提交/核对、自检的比对）都拿到"链上还没有"这个正确判据。
 func (n *neutrinoClient) queryCrossChainInfoBounded(symbol string) (*rtypes.CrossChainInfo, error) {
 	var lastErr error
 	for i := 0; i < shareCheckQueryAttempts; i++ {
@@ -514,6 +534,10 @@ func (n *neutrinoClient) queryCrossChainInfoBounded(symbol string) (*rtypes.Cros
 		if err := types.Decode(reply.GetMsg(), info); err != nil {
 			lastErr = err
 			continue
+		}
+		if crossChainInfoAbsentOnChain(info) {
+			// 查得到，但链上没有这条记录（执行器对不存在的 symbol 就是回空记录 + nil error）。
+			return nil, fmt.Errorf("%w: symbol=%s msg=%s", errCrossChainInfoNotOnChain, symbol, string(reply.GetMsg()))
 		}
 		return info, nil
 	}

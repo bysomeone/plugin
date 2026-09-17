@@ -46,6 +46,12 @@ func dkgResultForPubkey(pub *btcec.PublicKey) *tss.DKGResult {
 }
 
 // newChainInfoMock 返回一个主链 grpc 替身：按 symbol 查 CrossChainInfo，未登记即"链上还没有"。
+//
+// 未登记时必须复刻执行器的**真实应答**：IsOk=true + **空结构体**（不是 IsOk=false）——
+// executor/query.go 的 Query_GetCrossChainInfo 对不存在的 symbol 就是回空记录 + nil error，
+// 该契约被 executor/query_test.go 钉住。早先这个替身回 IsOk=false，与真实契约不符：
+// 它让"链上还没有"看起来是个查询错误，恰好掩盖了"空记录被误判成链上是另一把钥"的死锁
+// （见 client.go 的 crossChainInfoAbsentOnChain）。
 func newChainInfoMock(infos map[string]*rtypes.CrossChainInfo) *typesmocks.Chain33Client {
 	m := &typesmocks.Chain33Client{}
 	m.On("QueryChain", mock.Anything, mock.Anything).Return(
@@ -56,7 +62,8 @@ func newChainInfoMock(infos map[string]*rtypes.CrossChainInfo) *typesmocks.Chain
 			}
 			info := infos[req.GetData()]
 			if info == nil {
-				return &types.Reply{IsOk: false, Msg: []byte("cross chain info not found")}, nil
+				// 链上没有该 symbol：空记录 + nil error（执行器的既有契约）。
+				info = &rtypes.CrossChainInfo{}
 			}
 			return &types.Reply{IsOk: true, Msg: types.Encode(info)}, nil
 		}, nil)

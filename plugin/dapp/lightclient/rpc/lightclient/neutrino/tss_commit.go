@@ -2,8 +2,10 @@ package neutrino
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"time"
 
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
@@ -70,6 +72,20 @@ func (t *tssService) buildCommitDKGPayload(symbol string) *rtypes.CommitDKG {
 // 持续超过 commitDKGStallErrorAfter 升级为 ERROR —— 需要运维介入的形态（链上是另一把钥、
 // guardian 未凑齐、本节点不是合法提交者）必须能一眼看见，且不该靠"多试几次"自愈。
 func (t *tssService) commitDKGToChain(payload *rtypes.CommitDKG) {
+	t.commitDKGToChainWith(t.client.ctx, payload, t.client.queryCrossChainInfoBounded, t.submitDKGToMainChain)
+}
+
+// submitDKGToMainChain 生产路径的提交依赖（单测用替身注入，见 commitDKGToChainWith）。
+func (t *tssService) submitDKGToMainChain(exec, action string, payload *rtypes.CommitDKG) (string, error) {
+	return t.client.submitMainChainTx(exec, action, payload)
+}
+
+// commitDKGToChainWith 是 commitDKGToChain 的实现，两个外部依赖（查链上状态、提交）显式传入，
+// 便于单测覆盖三种判据（链上无记录 ⇒ 提交、链上另一把钥 ⇒ 不提交、链上同一把钥 ⇒ 不重复提交）。
+func (t *tssService) commitDKGToChainWith(ctx context.Context, payload *rtypes.CommitDKG,
+	query func(symbol string) (*rtypes.CrossChainInfo, error),
+	submit func(exec, action string, payload *rtypes.CommitDKG) (string, error)) {
+
 	if payload == nil {
 		return
 	}
@@ -84,7 +100,21 @@ func (t *tssService) commitDKGToChain(payload *rtypes.CommitDKG) {
 	var lastReportAt int
 
 	for attempt := 1; ; attempt++ {
-		info, err := t.client.queryCrossChainInfoBounded(symbol)
+		select {
+		case <-ctx.Done():
+			log.Warn("commitDKGToChain client shutting down, stop waiting for the on-chain state",
+				"symbol", symbol)
+			return
+		default:
+		}
+		info, err := query(symbol)
+		// 防御：执行器对**不存在**的 symbol 返回空记录 + nil error（既有契约，见 client.go 的
+		// crossChainInfoAbsentOnChain）。判据落在记录内容上：空记录一律按"链上还没有"处理，
+		// 否则它会落进下面的"另一把钥"分支——那条分支不可自愈、也永远不会去提交（死锁）。
+		if err == nil && crossChainInfoAbsentOnChain(info) {
+			err = fmt.Errorf("%w: symbol=%s (the executor answers an empty record for an absent symbol)",
+				errCrossChainInfoNotOnChain, symbol)
+		}
 		switch {
 		case err == nil && bytes.Equal(info.GetPubkey(), localPub):
 			log.Info("commitDKG confirmed on chain", "symbol", symbol, "attempt", attempt,
@@ -106,7 +136,7 @@ func (t *tssService) commitDKGToChain(payload *rtypes.CommitDKG) {
 					"symbol", symbol)
 				break
 			}
-			hash, submitErr := t.client.submitMainChainTx(rtypes.RgbxX, rtypes.NameCommitDKGAction, payload)
+			hash, submitErr := submit(rtypes.RgbxX, rtypes.NameCommitDKGAction, payload)
 			if submitErr != nil {
 				reportCommitDKGStall(&reported, &lastReportAt, attempt, start,
 					"submit commitDKG failed", "symbol", symbol, "err", submitErr)
