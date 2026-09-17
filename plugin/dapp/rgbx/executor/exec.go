@@ -170,10 +170,39 @@ func (r *rgbx) Exec_Confirm(confirm *rtypes.ConfirmTx, tx *types.Transaction, in
 		return &types.Receipt{Ty: types.ExecOk}, nil
 	}
 
+	// mint 与 transfer 都走上面那份 UtxoProof/SpendingTx 证明，结算成功后统一登记"已消费"键。
+	var settleReceipt *types.Receipt
+	var settleErr error
 	if confirm.ActionType == rtypes.TyMintAction {
-		return r.mintAsset(confirm, txHash, confirmHash, spendHash)
+		settleReceipt, settleErr = r.mintAsset(confirm, txHash, confirmHash, spendHash)
+	} else {
+		settleReceipt, settleErr = r.transferAsset(confirm, txHash, confirmHash, spendHash)
 	}
-	return r.transferAsset(confirm, txHash, confirmHash, spendHash)
+	return markConfirmUsed(confirm.GetTxHash(), settleReceipt, settleErr)
+}
+
+// markConfirmUsed E14：mint / transfer 结算成功时，登记"该确认已在共识状态里消费"
+// （键见 formatConfirmUsedKey），作为 checkConfirmNotUsed 的权威判据。
+// 与提现侧 S3（confirmWithdrawSettlement 里的 formatWithdrawUsedKey）完全对称。
+//
+// 三条要点：
+//   - **随回执 KV 写入**（而不是局部/直接写库）：回执 KV 由框架随 stateDB 一起提交，
+//     重组回滚时一并撤销，所以不会误伤"回滚后重放同一笔确认"。
+//   - **只在真正结算成功的回执上写**：Exec_Confirm 里"仅标记/冻结"的两条早退路径
+//     （SpendingTx 非规范编码、OP_RETURN 承诺不成立）返回空回执、不改变任何资产归属，
+//     也就不能写键 —— 那类确认补一份正确证明后重试是合法的，写键会把合法重试挡掉。
+//     将本包装套在 mintAsset / transferAsset 的**返回值**上，冻结路径天然落在包装之外。
+//   - 错误 / 空回执一律不写（mintAsset / transferAsset 失败时不产生结算）。
+func markConfirmUsed(confirmHash []byte, receipt *types.Receipt, err error) (*types.Receipt, error) {
+
+	if err != nil || receipt == nil {
+		return receipt, err
+	}
+	receipt.KV = append(receipt.KV, &types.KeyValue{
+		Key:   formatConfirmUsedKey(confirmHash),
+		Value: []byte("used"),
+	})
+	return receipt, nil
 }
 
 func (r *rgbx) confirmWithdrawSettlement(confirm *rtypes.ConfirmTx, txHash, confirmHash string) (*types.Receipt, error) {

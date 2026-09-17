@@ -28,6 +28,8 @@ const (
 	depositUsedTxIDKeyPrefix = KeyPrefixStateDB + "deposited-txid-"
 	// withdrawUsedKeyPrefix 提现侧已消费（已结算）burn 集合前缀。
 	withdrawUsedKeyPrefix = KeyPrefixStateDB + "withdrawn-"
+	// confirmUsedKeyPrefix Confirm 结算（mint / transfer 两类 utxo 花费确认）已消费集合前缀（E14）。
+	confirmUsedKeyPrefix = KeyPrefixStateDB + "confirm-used-"
 )
 
 // formatDkgConfirmationsKey 按 (symbol, dkgAddress) 索引确认集合（BL-2）。
@@ -56,6 +58,31 @@ func formatDepositUsedTxIDKey(txID []byte) []byte {
 func formatWithdrawUsedKey(burnTxHash []byte) []byte {
 	hash := sha256.Sum256(burnTxHash)
 	return append([]byte(withdrawUsedKeyPrefix), hash[:]...)
+}
+
+// formatConfirmUsedKey 按**被确认交易**（mint / transfer 的那笔 chain33 交易）哈希索引已结算的
+// Confirm（E14）。与提现侧 formatWithdrawUsedKey、充值侧 formatDepositUsedTxIDKey 对称：
+// 三条资金流各自的"已消费"集合都落在共识状态（stateDB），而不是节点私有的 LocalDB。
+//
+// 为什么键取 confirm.GetTxHash()（被确认交易）而不是 SpendingTx 的 btc txid：
+//   - 去重单位就是"待确认的那笔 chain33 交易"：它既是 localdb pendingTx 记录的主体、也是
+//     checkConfirm 用 (TxBlockHeight, TxIndex) 定位并与 TxHash 逐字比对的对象，加载 payload
+//     用的还是同一个 key（formatPayloadKey(confirm.GetTxHash())）。stateDB 键取同一身份 ⇒
+//     与它替换掉的那条非共识守卫（ExecLocal_Confirm 写的 localdb pendingTx.Confirmed）粒度完全一致，
+//     只是从"各节点私有"换成"全网共识"。
+//   - 反过来，**一笔 BTC 花费可以合法地同时结算多笔 chain33 交易**：一个 BTC 交易允许多个输入
+//     各花费一个 rgbx utxo，并带多个 OP_RETURN 承诺（每个指向不同的 chain33 交易），checkConfirm
+//     是按 (TxBlockHeight, TxIndex) + 输入下标逐笔校验的，Exec_Confirm 的 mint 与 transfer 分支
+//     也共用同一份 UtxoProof/SpendingTx（见 exec.go）。若按 btc txid 建键，这类合法的批量结算
+//     （一笔 BTC 交易里同时确认一笔 mint 与一笔 transfer，或多笔 transfer）会被第二笔起的守卫误拒，
+//     且守卫粒度比它要替代的那条更粗 —— 故不取 btc txid（A2 用 btc txid 是另一回事：那是归属
+//     utxo id 的口径，不是去重键的口径）。
+//   - 口径安全性：confirm.GetTxHash() 是链上直接给出的 chain33 交易哈希字节，不经过"从可解析字节
+//     重新推导身份"这一步，故不存在 E1/A2 那类"同一身份的另一份编码"问题（chain33 交易哈希没有
+//     第二种编码）。定长化与 formatWithdrawUsedKey 一致：先 sha256 再拼接。
+func formatConfirmUsedKey(confirmTxHash []byte) []byte {
+	hash := sha256.Sum256(confirmTxHash)
+	return append([]byte(confirmUsedKeyPrefix), hash[:]...)
 }
 
 // formatSymbol 归一化 symbol：symbol 是资产的唯一身份（asset key / account key / CrossChainInfo key），
