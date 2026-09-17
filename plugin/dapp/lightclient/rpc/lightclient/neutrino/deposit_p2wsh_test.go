@@ -3,8 +3,11 @@ package neutrino
 import (
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -451,4 +454,61 @@ func mustWitnessAddr(t *testing.T, addrStr string) btcutil.Address {
 func mustPkScriptHex(t *testing.T, addrStr string, params *chaincfg.Params) []byte {
 	t.Helper()
 	return mustPkScriptOfAddr(t, addrStr, params)
+}
+
+// TestHandleDepositAddressRequest 充值地址发放 HTTP 的对外契约（E2E 与运维要对着它写脚本）：
+// GET/POST 两种形态、返回体字段、以及"拿不到地址就必须是错误码而不是 200"。
+func TestHandleDepositAddressRequest(t *testing.T) {
+	vectors := loadDepositVectors(t)
+	v := vectors[0]
+	pub, err := btcec.ParsePubKey(vectorPub(t, v))
+	require.NoError(t, err)
+	b, _, _ := newTestWallet(t, pub, config{})
+	b.notifyFn = func([]btcutil.Address) error { return nil }
+	n := &neutrinoClient{bw: b, cfg: config{}}
+
+	decode := func(t *testing.T, rec *httptest.ResponseRecorder) depositAddressHTTPResponse {
+		t.Helper()
+		var resp depositAddressHTTPResponse
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+		return resp
+	}
+
+	// GET ?chain33Addr=
+	rec := httptest.NewRecorder()
+	n.handleDepositAddressRequest(rec, httptest.NewRequest(http.MethodGet,
+		"/rgbx/v1/btc-deposit-address?chain33Addr="+v.UserID, nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	resp := decode(t, rec)
+	info, ok := resp.Data.(map[string]interface{})
+	require.True(t, ok, "data 必须是结构化的对象：%v", resp.Data)
+	assert.Equal(t, v.Addresses["regtest"], info["address"], "发放的地址必须与冻结向量一致")
+	assert.Equal(t, v.PkScript, info["pkScript"], "返回的 program 就是执行器会比对的字节")
+	assert.Equal(t, v.UserID, info["userID"])
+	assert.Equal(t, rtypes.P2WSHDepositSpecV1, info["spec"])
+	assert.Equal(t, float64(1), info["watchSize"])
+
+	// POST JSON 等价（幂等：同一个地址，watch 集不增长）
+	rec = httptest.NewRecorder()
+	body := `{"chain33Addr":"` + v.UserID + `"}`
+	n.handleDepositAddressRequest(rec, httptest.NewRequest(http.MethodPost,
+		"/rgbx/v1/btc-deposit-address", strings.NewReader(body)))
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, v.Addresses["regtest"], decode(t, rec).Data.(map[string]interface{})["address"])
+	assert.Equal(t, 1, b.depositScripts.size(), "重复请求不得让 watch 集增长")
+
+	// 缺参数 / 非法地址 / 方法不对：都必须是明确失败，绝不返回一个没被 watch 的地址。
+	rec = httptest.NewRecorder()
+	n.handleDepositAddressRequest(rec, httptest.NewRequest(http.MethodGet, "/rgbx/v1/btc-deposit-address", nil))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	rec = httptest.NewRecorder()
+	n.handleDepositAddressRequest(rec, httptest.NewRequest(http.MethodGet,
+		"/rgbx/v1/btc-deposit-address?chain33Addr=not-an-address", nil))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	rec = httptest.NewRecorder()
+	n.handleDepositAddressRequest(rec, httptest.NewRequest(http.MethodDelete, "/rgbx/v1/btc-deposit-address", nil))
+	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	assert.Equal(t, 1, b.depositScripts.size(), "失败请求不得改变 watch 集")
 }
