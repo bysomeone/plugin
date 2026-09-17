@@ -131,13 +131,18 @@ function scenario_user_deposit_sweep() {
         "no sweep tx found: nothing paying the main pool (${main_pool_addr}) spends the deposit ${deposit_tx} \
          (is neutrino.userDepositSweep.enable set on the official node? see chain33.para1.toml)"
 
+    # 上面那次发现可能落在 **mempool**（searchrawtransactions 默认含 mempool），而下面两条断言都
+    # 要求交易已经上链：`gettxout` 的"已花"判定、以及 `getrawtransaction` 的取值。先挖一块确认。
+    mine_btcd_blocks 1
+
     # 1) 那笔充值 UTXO 必须真的被花掉（扫集动了这笔钱本身，而不是主池碰巧收到别的钱）。
     local deposit_vout
     deposit_vout=$(${BTC_CTL} --"${BTC_NETWORK}" getrawtransaction "${deposit_tx}" 1 | jq -r --arg a "${deposit_addr}" \
         '[.vout[] | select((.scriptPubKey.address? == $a) or (((.scriptPubKey.addresses? // []) | index($a)) != null)) | .n] | first')
     assert_non_empty "${deposit_vout}" "deposit output to ${deposit_addr} not found in ${deposit_tx}"
     local live
-    live=$(${BTC_CTL} --"${BTC_NETWORK}" gettxout "${deposit_tx}" "${deposit_vout}" 2>/dev/null) || true
+    # 第三个参数 includemempool 显式给 true：要把"已被 mempool 花掉"也算作已花。
+    live=$(${BTC_CTL} --"${BTC_NETWORK}" gettxout "${deposit_tx}" "${deposit_vout}" true 2>/dev/null) || true
     assert_true "$([ -z "${live}" ] || [ "${live}" = "null" ] && echo true || echo false)" \
         "deposit utxo ${deposit_tx}:${deposit_vout} is still unspent after the sweep"
 
