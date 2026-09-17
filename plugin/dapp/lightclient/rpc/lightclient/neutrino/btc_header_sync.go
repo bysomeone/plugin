@@ -36,8 +36,9 @@ import (
  * 与既有约束的关系：
  *   - B7（单笔 ≤ maxBtcHeadersPerTx=64 头、批内高度必须逐个 +1）：本批区间由 btcHeaderBatchRange
  *     连续生成，批大小固定 64 —— 正好等于执行器上限，天然满足但**不得再调大**（见 btcHeaderBatchSize）；
- *   - B5（bootstrap 锚点）：链上还没有任何头时，起点只能用配置的 btcHeaderStartHeight（它必须是
- *     本网络锚点高度 + 1，见 CONFIG.md），不能由本地视图推出来；
+ *   - B5（bootstrap 锚点）：链上还没有任何头时，起点必须正好是"本网络最高锚点 + 1"（否则首个头
+ *     无法锚定到真实链，见执行器 checkBootstrapAnchor）；这个值由中继本地推出（btcHeaderStartHeight，
+ *     与执行器共用 ltypes.GetBtcChainParams），不是配置项 —— 不能由本地头视图推出来；
  *   - B3/B4（回退深度 24 + 按累积工作量选链）：本文件只负责"从一致点重发"，选链与深度判定仍在执行器。
  */
 
@@ -78,7 +79,7 @@ var (
 	// 要么只能是一条不占优的分叉，都没有意义。
 	errBtcReconcileLocalBehind = errors.New("btc header reconcile: local header view is behind the on-chain chain")
 	// errBtcReconcileNoCommonHeader 在允许的回退深度内找不到任何与链上 canonical 链一致的高度：
-	// 链上可能发生过超深重组、换过网络/起点，或 btcHeaderStartHeight 与链上起点（B5 锚点）不配套。
+	// 链上可能发生过超深重组、换过网络/起点，或本地推出的起点与链上起点（B5 锚点）不配套。
 	// 不可自愈，必须显式报错并停在这里（运维重新 bootstrap）。
 	errBtcReconcileNoCommonHeader = errors.New("btc header reconcile: no common canonical header within the allowed depth")
 	// errBtcAnchorQueryUnsupported 链上的 lightclient 执行器没有 GetBtcCheckpoint 查询（旧节点）。
@@ -107,7 +108,8 @@ type btcLocalHeaderView interface {
 type btcHeaderReconciler struct {
 	chain btcChainHeaderView
 	local btcLocalHeaderView
-	// startHeight 链上还没有任何头时的提交起点（cfg.BtcHeaderStartHeight）。
+	// startHeight 链上还没有任何头时的提交起点（= 本网络最高锚点 + 1，由 btcd 内置锚点本地推出，
+	// 见 btcHeaderStartHeight）。
 	startHeight uint64
 	// maxDepth 允许的最大回退深度，必须与执行器 maxBtcReorgDepth 一致。
 	maxDepth uint64
@@ -149,8 +151,8 @@ func (r *btcHeaderReconciler) plan(localTipHeight uint64) (*btcHeaderSyncPlan, e
 	plan := &btcHeaderSyncPlan{localTipHeight: localTipHeight}
 	if tip.GetHeight() == 0 {
 		// 链上还没有任何 BTC 头：这就是"同步起点"，其合法性由 B5 的锚点校验决定
-		// （首个头的父块必须能锚定到创世或本网络 checkpoint），因此只能用配置值，
-		// 不能由本地视图推出来。
+		// （首个头的父块必须能锚定到创世或本网络 checkpoint），因此只能用本地推出的
+		// "最高锚点 + 1"（btcHeaderStartHeight），不能由本地头视图推出来。
 		plan.nextSubmitHeight = r.startHeight
 		return plan, nil
 	}
@@ -198,17 +200,23 @@ func (r *btcHeaderReconciler) plan(localTipHeight uint64) (*btcHeaderSyncPlan, e
 		errBtcReconcileNoCommonHeader, chainTip, localTipHeight, plan.probes)
 }
 
-// btcBootstrapAnchorGuard 中继的 bootstrap 起点断言（L2）：把"btcHeaderStartHeight 与本网络锚点不配套"
+// btcBootstrapAnchorGuard 中继的 bootstrap 起点断言（L2）：把"本地推出的起点与链上锚点不配套"
 // 从运行期的 ErrBtcHeaderNoAnchor（执行器 checkBootstrapAnchor 拒收）提前成中继启动期的显式 ERROR。
 //
-// 背景：bootstrap（链上还没有任何 BTC 头）时首个头必须锚定到真实链，执行器只接受
-// "首个头的父块 == 本网络锚点"。锚点来自 btcd chaincfg（见执行器 btcCheckpointTable），中继无法靠
-// chain33 之外的任何信息知道它，于是配置写错时表现为：每个 batch 都被确定性拒收（ErrBtcHeaderNoAnchor），
-// 中继把该计划标记为 halted 后静默停在那里，链上头链停在空链状态 —— 除了翻执行器日志没有别的线索。
-// 这里在提交前用执行器的 Query_GetBtcCheckpoint 拿到同一个锚点，一次说清楚该填多少。
+// 比较的两个值是**同一个信任根的两次独立求值**：起点由中继从 ltypes.GetBtcChainParams 的 chaincfg
+// checkpoint 表推出（btcHeaderStartHeight），锚点由链上执行器从它自己那张 btcCheckpointTable 给出
+// （同源，但允许追加编译期扩展层 extraBtcCheckpoints）。两边对不上，说明**中继与执行器不是同一个
+// build（或不是同一版 btcd）**—— 锚点集合随 btcd 版本变化，这类"不同源"的典型症状就是头链走到某个
+// 高度后静默停滞 / bootstrap 的批被确定性拒收，所以必须在源头显式断开。
 //
-// 只在 bootstrap 分支断言：BtcHeaderStartHeight 只在"链上 tip==0"时被使用（见 btcHeaderSyncPlan.plan），
-// 头链一旦长起来，起点由对账得出，配置值就失效了（执行器侧同样只在链上 tip==0 时用它）。
+// 背景：bootstrap（链上还没有任何 BTC 头）时首个头必须锚定到真实链，执行器只接受"首个头的父块 ==
+// 本网络锚点"。中继无法靠 chain33 之外的任何信息知道执行器用的是哪张表，于是不同源时表现为：每个
+// batch 都被确定性拒收（ErrBtcHeaderNoAnchor），中继把该计划标记为 halted 后静默停在那里，链上头链
+// 停在空链状态 —— 除了翻执行器日志没有别的线索。这里在提交前用执行器的 Query_GetBtcCheckpoint 拿到
+// 同一个锚点，一次说清楚是"两边不同源"。
+//
+// 只在 bootstrap 分支断言：本地推出的起点只在"链上 tip==0"时被使用（见 btcHeaderSyncPlan.plan），
+// 头链一旦长起来，起点由对账得出，锚点就不再参与（执行器侧同样只在链上 tip==0 时用它）。
 // 因此这里不做常驻校验，避免在正常运行的链上误报。
 //
 // 不硬依赖：查询不被支持（旧执行器）或失败（主链未就绪）时 WARN 一次后照常提交；
@@ -222,7 +230,7 @@ type btcBootstrapAnchorGuard struct {
 	report btcHeaderReportLimiter
 }
 
-// check 判断本轮能否提交 bootstrap 批次；false 表示起点与链上锚点不配套，必须不发交易（fail-closed）。
+// check 判断本轮能否提交 bootstrap 批次；false 表示本地推出的起点与链上锚点不配套，必须不发交易（fail-closed）。
 func (g *btcBootstrapAnchorGuard) check(chain btcChainHeaderView, startHeight uint64) bool {
 	if !g.anchorRead {
 		anchor, err := chain.chainAnchor()
@@ -232,7 +240,7 @@ func (g *btcBootstrapAnchorGuard) check(chain btcChainHeaderView, startHeight ui
 			g.anchorRead = true
 			log.Warn("submitBitcoinHeaders the on-chain lightclient executor does not support the btc "+
 				"checkpoint query, skip the bootstrap start-height assertion", "err", err,
-				"btcHeaderStartHeight", startHeight)
+				"startHeight", startHeight)
 			return true
 		case err != nil:
 			// 查询失败（主链未就绪/网络抖动）：本轮不判定，下一轮再问（只报一次，不刷屏）。
@@ -254,13 +262,15 @@ func (g *btcBootstrapAnchorGuard) check(chain btcChainHeaderView, startHeight ui
 		return true
 	}
 	// 不配套：链上会拒收每一个 bootstrap 批（且是"重试同一批永远不会成功"的确定性拒收），
-	// 因此在源头断开：限流 ERROR + 不发交易，等配置改对（重启）或链上锚点变化。
+	// 因此在源头断开：限流 ERROR + 不发交易，等两边同源（升级 btcd / 换同一个 build）后重启。
 	if g.report.allow(fmt.Sprintf("mismatch:%d:%d", g.anchorHeight, startHeight)) {
-		log.Error("submitBitcoinHeaders btcHeaderStartHeight does not match the on-chain btc checkpoint, "+
-			"refusing to submit btc headers (fail-closed): the first bootstrap header's parent must be a "+
-			"known anchor, otherwise the main chain rejects it with ErrBtcHeaderNoAnchor",
-			"btcHeaderStartHeight", startHeight, "anchorHeight", g.anchorHeight,
-			"expectedBtcHeaderStartHeight", g.anchorHeight+1)
+		log.Error("submitBitcoinHeaders the locally derived bootstrap start height does not match the on-chain "+
+			"btc checkpoint, refusing to submit btc headers (fail-closed): the relay and the lightclient "+
+			"executor are not built against the same btc checkpoint table (upgrade btcd on both sides, or drop "+
+			"the compile-time extra checkpoints). The first bootstrap header's parent must be a known anchor, "+
+			"otherwise the main chain rejects every batch with ErrBtcHeaderNoAnchor",
+			"localStartHeight", startHeight, "onChainAnchorHeight", g.anchorHeight,
+			"onChainExpectedLocalStartHeight", g.anchorHeight+1)
 	}
 	return false
 }
@@ -310,7 +320,7 @@ var btcHeaderRejectedErrs = []string{
 	"ErrBtcHeaderDisorder",        // 高度跳高 / 与挂载点不连续
 	"ErrBtcHeaderDuplicateHeight", // 批内高度重复或跳高
 	"ErrBtcHeadersTooMany",        // 单笔头数超过上限
-	"ErrBtcHeaderNoAnchor",        // bootstrap 首个头无法锚定（btcHeaderStartHeight 与 checkpoint 不配套）
+	"ErrBtcHeaderNoAnchor",        // bootstrap 首个头无法锚定（本地推出的起点与链上 checkpoint 不配套）
 	"ErrBtcHeaderContextMissing",  // 挂载点在 canonical 链上但拿不到完整头
 	"ErrInvalidBtcBlockHash",
 	"ErrBtcTargetBits",

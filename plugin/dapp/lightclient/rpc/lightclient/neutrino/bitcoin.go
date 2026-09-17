@@ -21,6 +21,27 @@ import (
 	"github.com/btcsuite/btcwallet/walletdb"
 )
 
+// btcHeaderStartHeight 头链 bootstrap 的提交起点：**本网络最高锚点 + 1**；没有内置锚点的网络
+// （regtest/testnet4/signet/simnet）→ 1（创世之后第一个块）。
+//
+// 为什么本地推导而不是配置项：锚点是 btcd chaincfg 里的编译期常量，中继与执行器**共用同一份**
+// net→params 映射（ltypes.GetBtcChainParams：中继的 neutrino.Config.ChainParams 与执行器的
+// btcCheckpointTable 都从它来），因此两边能各自算出同一个值 —— 配置项只是在复述一个双方都能算出来
+// 的常量，却多出一条"填错了要等启动期断言（L2）才发现"的路径。
+//
+// 为什么起点有意义（不是"随便挑一个高度"）：bootstrap（链上还没有任何头）时，执行器要求首个头必须
+// 锚定到真实链（父块 == 本网络某个锚点，见 executor 的 checkBootstrapAnchor），所以起点必须正好是
+// 最高锚点 + 1；从锚点之前起会连一条链上无法证明的分叉。
+func btcHeaderStartHeight(netName string) uint64 {
+	top := uint64(0)
+	for _, cp := range ltypes.GetBtcChainParams(netName).Checkpoints {
+		if cp.Height > 0 && uint64(cp.Height) > top {
+			top = uint64(cp.Height)
+		}
+	}
+	return top + 1
+}
+
 /*
  * submitBitcoinHeaders 把 btcd/neutrino 的 canonical 头链提交到 chain33。
  *
@@ -31,10 +52,13 @@ import (
  */
 func (n *neutrinoClient) submitBitcoinHeaders() {
 
+	// 起点是本网络最高锚点 + 1（由 btcd 内置锚点推出，见 btcHeaderStartHeight）。
+	// 只在链上还没有任何头（tip==0）时被用到；头链一旦长起来，起点由对账得出。
+	startHeight := btcHeaderStartHeight(n.cfg.NetName)
 	reconciler := &btcHeaderReconciler{
 		chain:       &chain33BtcHeaderView{n: n},
 		local:       &neutrinoBtcHeaderView{n: n},
-		startHeight: n.cfg.BtcHeaderStartHeight,
+		startHeight: startHeight,
 		maxDepth:    maxBtcHeaderReorgDepth,
 	}
 	// 启动期等主链可查询（与改造前一致）：查不通时不提交，交给后续 tick 继续重试。
@@ -43,7 +67,7 @@ func (n *neutrinoClient) submitBitcoinHeaders() {
 		return err == nil
 	}, 0)
 
-	log.Info("submitBitcoinHeaders start", "startHeight", n.cfg.BtcHeaderStartHeight,
+	log.Info("submitBitcoinHeaders start", "startHeight", startHeight, "netName", n.cfg.NetName,
 		"maxReorgDepth", maxBtcHeaderReorgDepth, "batchSize", btcHeaderBatchSize)
 
 	interval := n.cfg.BtcBlockInterval/3 + 1
@@ -125,7 +149,8 @@ func (n *neutrinoClient) submitBtcHeadersOnce(r *btcHeaderReconciler, st *btcHea
 			// 显式报错，同一状态只报一次，停在这里等运维处理（重新 bootstrap）。
 			if st.report.allow("unreconcilable") {
 				log.Error("submitBitcoinHeaders cannot reconcile the local btc header view with the on-chain chain, "+
-					"header submission is stalled until this changes (re-bootstrap or check btcHeaderStartHeight against the anchor)",
+					"header submission is stalled until this changes (re-bootstrap, or make sure the relay and "+
+					"the lightclient executor are the same build, so their btc checkpoint tables match)",
 					"err", err, "localTip", localTip)
 			}
 		}
@@ -133,7 +158,7 @@ func (n *neutrinoClient) submitBtcHeadersOnce(r *btcHeaderReconciler, st *btcHea
 	}
 	st.report.reset()
 
-	// L2：只在 bootstrap（链上 tip==0，此时才用得上 cfg.BtcHeaderStartHeight）断言起点与链上锚点配套。
+	// L2：只在 bootstrap（链上 tip==0，此时才用得上本地推出的起点）断言起点与链上锚点配套。
 	// 不配套就是"每个 batch 都被执行器以 ErrBtcHeaderNoAnchor 确定性拒收"，这里直接不发交易（fail-closed），
 	// 并把期望值打进日志；链上不支持该查询（旧执行器）或本网络没有锚点时降级为照常提交。
 	if plan.chainTipHeight == 0 && !r.anchor.check(r.chain, r.startHeight) {

@@ -51,8 +51,6 @@ type config struct {
 	BtcBlockInterval uint32 `json:"btcBlockInterval"`
 	// BlockConfirmations 区块确认数
 	BlockConfirmations uint32 `json:"blockConfirmations"`
-	// BtcHeaderStartHeight 首次启动提交btc header的起始高度
-	BtcHeaderStartHeight uint64 `json:"btcHeaderStartHeight"`
 	// MaxUtxoRescanTime, utxo 检索最大时长，hour, 0为永不超时
 	MaxUtxoRescanTime int64 `json:"maxUtxoRescanTime"`
 	// BtcFullNodeRPC 可选，比特币全节点 RPC 配置，用于查询 block 构造SPV
@@ -157,9 +155,6 @@ func (n *neutrinoClient) initNeutrinoConfig(chainCfg *types.Chain33Config) error
 
 	if n.cfg.BtcBlockInterval <= 0 {
 		n.cfg.BtcBlockInterval = 600
-	}
-	if n.cfg.BtcHeaderStartHeight == 0 {
-		n.cfg.BtcHeaderStartHeight = 1
 	}
 	if n.cfg.BlockConfirmations == 0 {
 		n.cfg.BlockConfirmations = defaultRequiredConfs
