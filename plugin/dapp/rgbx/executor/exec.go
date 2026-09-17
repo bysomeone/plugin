@@ -212,6 +212,30 @@ func (r *rgbx) confirmWithdrawSettlement(confirm *rtypes.ConfirmTx, txHash, conf
 		return nil, err
 	}
 	symbol := ensureCrossChainSymbol(withdraw.GetAssetSymbol())
+	// S2：Exec 侧再核一次台账记录（纵深防御）。CheckTx 已在**同一笔交易执行内**先跑过完整判据
+	//（checkWithdrawOperationLedger，含供应量闸门），这里只需要挡住"没有登记过就销毁"这一种状态，
+	// 保证供应量计数不会漏记一笔 burn —— 记录与资产必须成对出现/成对回滚。
+	// 复用同一份派生与记录口径，避免两处判据漂移。
+	opID, err := rtypes.BurnOperationID(symbol, confirm.GetTxHash())
+	if err != nil {
+		elog.Error("confirmWithdrawSettlement derive burn operation id", "txHash", txHash,
+			"confirmHash", confirmHash, "symbol", symbol, "err", err)
+		return nil, ErrInvalidOperationID
+	}
+	rec := &rtypes.OperationRecord{}
+	if err = readDB(r.GetStateDB(), formatOperationRecordKey(opID), rec); err != nil {
+		elog.Error("confirmWithdrawSettlement read operation record", "txHash", txHash, "confirmHash", confirmHash,
+			"symbol", symbol, "opID", hex.EncodeToString(opID), "err", err)
+		return nil, ErrOperationNotExist
+	}
+	if rec.GetKind() != rtypes.OperationKindBurn || rec.GetSymbol() != formatSymbol(symbol) ||
+		rec.GetAmount() != withdraw.GetAmount() {
+		elog.Error("confirmWithdrawSettlement operation record mismatch", "txHash", txHash,
+			"confirmHash", confirmHash, "symbol", symbol, "opID", hex.EncodeToString(opID),
+			"kind", rec.GetKind(), "recSymbol", rec.GetSymbol(), "recAmount", rec.GetAmount(),
+			"payloadAmount", withdraw.GetAmount())
+		return nil, ErrOperationAmountMismatch
+	}
 	accDB, err := r.newAccount(symbol)
 	if err != nil {
 		return nil, err
@@ -229,6 +253,15 @@ func (r *rgbx) confirmWithdrawSettlement(confirm *rtypes.ConfirmTx, txHash, conf
 		Key:   formatWithdrawUsedKey(confirm.GetTxHash()),
 		Value: []byte("used"),
 	})
+	// S2：销毁成功，供应量台账 burned += amount（与充电侧的 minted += amount 对称）。
+	// 与上面的已消费键同一位置：结算成功才累加，回滚随 statedb。
+	burnedKV, err := r.bumpBurnedOperationSupply(symbol, withdraw.GetAmount())
+	if err != nil {
+		elog.Error("confirmWithdrawSettlement bump burned supply", "txHash", txHash, "confirmHash", confirmHash,
+			"symbol", symbol, "amount", withdraw.GetAmount(), "err", err)
+		return nil, err
+	}
+	receipt.KV = append(receipt.KV, burnedKV)
 	return receipt, nil
 }
 

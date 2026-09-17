@@ -2,12 +2,14 @@ package executor
 
 import (
 	"crypto/sha256"
+	"fmt"
 	"strings"
 
 	"github.com/33cn/chain33/common/address"
 	"github.com/33cn/chain33/common/db"
 	"github.com/33cn/chain33/system/dapp"
 	"github.com/33cn/chain33/types"
+	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 )
 
 /*
@@ -30,6 +32,23 @@ const (
 	withdrawUsedKeyPrefix = KeyPrefixStateDB + "withdrawn-"
 	// confirmUsedKeyPrefix Confirm 结算（mint / transfer 两类 utxo 花费确认）已消费集合前缀（E14）。
 	confirmUsedKeyPrefix = KeyPrefixStateDB + "confirm-used-"
+	// operationRecordKeyPrefix 全局操作台账的单条**不可变**记录前缀（S2）：
+	// key = 前缀 + 32 字节 operationId，value = types.Encode(operationRecord)。
+	operationRecordKeyPrefix = KeyPrefixStateDB + "oprec-"
+	// operationSupplyKeyPrefix 每 symbol 的铸造/销毁累计计数前缀（S2，单调累加，可回滚不可改写历史）。
+	operationSupplyKeyPrefix = KeyPrefixStateDB + "opsupply-"
+	// operationIndexKeyPrefix 每 symbol 每类操作的下标前缀（S2）：
+	// key = 前缀 + symbol + "-" + kindTag + "-" + 20 位十进制下标，value = operationId。
+	// 为什么需要它：执行期 stateDB 只有 Get/Set（没有 List），枚举某个 symbol 的操作必须靠
+	// "按已知下标逐个 Get"，所以下标要显式落盘（数量记在供应量记录里）。
+	operationIndexKeyPrefix = KeyPrefixStateDB + "opidx-"
+)
+
+// 操作台账下标里的类别标记（'m' = 铸造 / 'b' = 销毁）。用字符而不是二进制是为了
+// 运维直接用键前缀肉眼分辨（键本身不参与哈希，无编码歧义问题）。
+const (
+	operationIndexTagMint = 'm'
+	operationIndexTagBurn = 'b'
 )
 
 // formatDkgConfirmationsKey 按 (symbol, dkgAddress) 索引确认集合（BL-2）。
@@ -94,6 +113,50 @@ func formatConfirmUsedKey(confirmTxHash []byte) []byte {
 // isValidSymbolCharset 校验，ToUpper 在该字符集上是单射。
 func formatSymbol(symbol string) string {
 	return strings.ToUpper(symbol)
+}
+
+// formatOperationRecordKey 按 32 字节全局 operationId 索引单条台账记录（S2）。
+// 记录不可变：键由 operationId 派生、值是操作本身的事实，**没有任何更新路径**
+// （唯一的写入口 newOperationRecordKV 会拒绝已存在的键，见 executor/operation.go）。
+func formatOperationRecordKey(operationID []byte) []byte {
+	return append([]byte(operationRecordKeyPrefix), operationID...)
+}
+
+// formatOperationSupplyKey 按 symbol 索引铸造/销毁累计计数（S2）。
+//
+// 调用方必须传**归一化后的跨链账户符号**（executor 里的 ensureCrossChainSymbol 结果，如 "XBTC"）：
+// 写入侧用账户符号（台账与账户口径一致），查询侧也必须先做同一归一化，否则会读到空计数。
+// 本函数只做机械大小写归一（不做前缀补全），避免键的形态依赖节点配置。
+func formatOperationSupplyKey(symbol string) []byte {
+	return []byte(operationSupplyKeyPrefix + formatSymbol(symbol))
+}
+
+// formatOperationIndexKey 按 (symbol, kind, index) 索引 operationId（S2），
+// 供"枚举某 symbol 的某类操作"用（执行期 stateDB 无 List，只能按下标逐个 Get）。
+// 下标补零到定宽十进制：即使将来换成前缀扫描，字典序也等于数值序。
+func formatOperationIndexKey(symbol string, kind int32, index int64) []byte {
+	return []byte(fmt.Sprintf("%s%s-%c-%020d", operationIndexKeyPrefix, formatSymbol(symbol),
+		operationIndexTag(kind), index))
+}
+
+// operationIndexTag 操作类别 → 下标键里的标记字符。
+func operationIndexTag(kind int32) byte {
+	if kind == rtypes.OperationKindBurn {
+		return operationIndexTagBurn
+	}
+	return operationIndexTagMint
+}
+
+// operationNetwork 由 symbol 确定性导出"网络/资产域"标识（不读节点本地配置：
+// 网络名在 E5 里正是"本地配置影响共识判定"的反例，台账记录必须是各节点一致的结果）。
+// 口径 = 去掉跨链前缀后的基础资产符号（"XBTC"→"BTC"、"XRGB20_USDT"→"RGB20_USDT"）。
+func operationNetwork(symbol string) string {
+	normalized := formatSymbol(symbol)
+	network := strings.TrimPrefix(normalized, rgbxCfg.CrossChainAssetPrefix)
+	if network == "" {
+		return normalized
+	}
+	return network
 }
 
 // isValidSymbolCharset 校验 symbol 只含 ASCII 字母、数字与下划线（A6）。

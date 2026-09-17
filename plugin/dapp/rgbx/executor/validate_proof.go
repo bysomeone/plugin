@@ -93,6 +93,22 @@ func (r *rgbx) checkWithdrawConfirm(txHash, confirmHash string, confirm *rtypes.
 			return err
 		}
 	}
+	// S2：放款前必须对得上全局操作台账 —— 这笔 burn 在**锁定时**就登记过、金额与 payload 一致、
+	// 且待销毁额度不超过台账里"已铸造 − 已销毁"。判据全部落在共识状态（记录 + 供应量 + payload），
+	// 不读 LocalDB；判定式与边界见 checkWithdrawOperationLedger。
+	//
+	// 排在这里而不是最前面：前面几项（S3 去重 / SPV 证明 / OP_RETURN 承诺 / 金额脚本）判的是
+	// "这份证明本身对不对"，是最有诊断价值的拒绝（桥发来的东西有问题）；台账判的是"链上允不允许
+	// 放这笔款"。两者都是**永久性**判据，故都排在最后的暂时性判据（确认深度）之前。
+	withdraw := &rtypes.WithdrawAsset{}
+	if err = readDB(r.GetStateDB(), formatPayloadKey(confirm.GetTxHash()), withdraw); err != nil {
+		elog.Error("checkWithdrawConfirm read payload", "txHash", txHash, "confirmHash", confirmHash,
+			"burnTxHash", hex.EncodeToString(confirm.GetTxHash()), "err", err)
+		return ErrConfirmPayloadNotExist
+	}
+	if err = r.checkWithdrawOperationLedger(confirm.GetTxHash(), withdraw); err != nil {
+		return err
+	}
 	// B8：链上最小确认数（放最后，理由见 checkBtcConfirmations 的注释）。
 	return r.checkBtcConfirmations("withdrawConfirm", txHash, confirm.GetBtcTxProof())
 }
