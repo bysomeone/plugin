@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/33cn/chain33/system/crypto/tss"
+	"github.com/33cn/chain33/system/crypto/tss/cggmp"
 	"github.com/33cn/chain33/types"
 	typesmocks "github.com/33cn/chain33/types/mocks"
 	"github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient"
@@ -38,11 +38,27 @@ func p2wpkhScript(pub *btcec.PublicKey) []byte {
 	return append([]byte{txscript.OP_0, 0x14}, btcutil.Hash160(pub.SerializeCompressed())...)
 }
 
-// dkgResultForPubkey 由公钥坐标构造 DKGResult（tss.go saveDKGToDB 落盘的正是这个结构）。
-func dkgResultForPubkey(pub *btcec.PublicKey) *tss.DKGResult {
+// dkgResultForPubkey 由公钥坐标构造 CGGMP DKGResult（tss.go saveDKGToDB 落盘的正是这个结构，
+// JSON 编码 —— 切换 CGGMP 后落盘格式从 proto 变成 JSON，这里必须跟着同一口径，
+// 否则测的是"能读一份实际不存在的格式"）。
+func dkgResultForPubkey(pub *btcec.PublicKey) *cggmp.DKGResult {
 	x := pub.X().Bytes()
 	y := pub.Y().Bytes()
-	return &tss.DKGResult{PubX: x[:], PubY: y[:]}
+	return &cggmp.DKGResult{PubX: x, PubY: y}
+}
+
+// putTssRecord 往测试 DB 的 tss bucket 写一条记录（同一份编码口径：JSON）。
+func putTssRecord(t *testing.T, db walletdb.DB, key string, value interface{}) {
+	t.Helper()
+	data, err := json.Marshal(value)
+	require.NoError(t, err)
+	require.NoError(t, walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		bucket, err := tx.CreateTopLevelBucket([]byte(tssBucketName))
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(key), data)
+	}))
 }
 
 // newChainInfoMock 返回一个主链 grpc 替身：按 symbol 查 CrossChainInfo，未登记即"链上还没有"。
@@ -71,7 +87,7 @@ func newChainInfoMock(infos map[string]*rtypes.CrossChainInfo) *typesmocks.Chain
 }
 
 // newClientWithLocalDKG 造一个"本地已有 DKG 结果"的中继客户端（DB 里写入 dkgResult）。
-func newClientWithLocalDKG(t *testing.T, dkgResult *tss.DKGResult) *neutrinoClient {
+func newClientWithLocalDKG(t *testing.T, dkgResult *cggmp.DKGResult) *neutrinoClient {
 	t.Helper()
 	dir := t.TempDir()
 	_, db, err := openWalletDB(dir, "share_check.db")
@@ -79,14 +95,7 @@ func newClientWithLocalDKG(t *testing.T, dkgResult *tss.DKGResult) *neutrinoClie
 		t.Skipf("walletdb/bdb unavailable: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-
-	require.NoError(t, walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
-		bucket, err := tx.CreateTopLevelBucket([]byte(tssBucketName))
-		if err != nil {
-			return err
-		}
-		return bucket.Put([]byte(dkgResultKey), types.Encode(dkgResult))
-	}))
+	putTssRecord(t, db, dkgResultKey, dkgResult)
 
 	n := &neutrinoClient{ctx: context.Background()}
 	n.neutrinoCfg.Database = db
@@ -219,13 +228,7 @@ func Test_loadTssGroupPubKeyFromDB(t *testing.T) {
 	require.Nil(t, pub, "空 DB 应当读不到 DKG 结果")
 
 	want, _ := testPubkey(t)
-	require.NoError(t, walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
-		bucket, err := tx.CreateTopLevelBucket([]byte(tssBucketName))
-		if err != nil {
-			return err
-		}
-		return bucket.Put([]byte(dkgResultKey), types.Encode(dkgResultForPubkey(want)))
-	}))
+	putTssRecord(t, db, dkgResultKey, dkgResultForPubkey(want))
 
 	got, err := n.loadTssGroupPubKeyFromDB()
 	require.NoError(t, err)
