@@ -67,6 +67,15 @@ var (
 	// 文案保留 "already confirmed" 子串：桥侧重试路径按该子串把重复提交视为幂等成功
 	// （neutrino commitWithdrawConfirm 对含 "already confirmed" 的错误不再重试）。
 	ErrWithdrawAlreadyConfirmed = errors.New("withdraw already confirmed")
+	// ErrMintAlreadyConfirmed 同一笔 mint 确认已在共识状态里结算过（E14）。
+	// 与提现侧 S3 对称：真正的判据是 stateDB 的 formatConfirmUsedKey，不是 localdb 的
+	// pendingTx.Confirmed（那条只是辅助，见 checkConfirm）。
+	// 文案同样保留 "already confirmed" 子串：桥侧 commitPendingTx 按该子串把重复提交视为幂等成功。
+	ErrMintAlreadyConfirmed = errors.New("mint already confirmed")
+	// ErrTransferAlreadyConfirmed 同一笔 transfer 确认已在共识状态里结算过（E14，与 mint 侧对称）。
+	// mint 与 transfer 是 Exec_Confirm 里仅有的两条走 UtxoProof/SpendingTx 的结算分支，
+	// 二者的去重键与理由完全相同（见 formatConfirmUsedKey）。
+	ErrTransferAlreadyConfirmed = errors.New("transfer already confirmed")
 	// ErrNonCanonicalSpendingTx SpendingTx 尾部带多余字节（非规范编码）——同一笔花费的另一份编码，
 	// 必须拒绝：否则归属 utxo id 会随编码变化（E1 家族 A2，口径同充值侧 parseBtcTxIDStrict）。
 	ErrNonCanonicalSpendingTx = errors.New("non-canonical spending tx encoding")
@@ -435,6 +444,12 @@ func (r *rgbx) checkConfirm(fromAddr, txHash string, confirm *rtypes.ConfirmTx) 
 		return ErrPendingTxNotExist
 	}
 
+	// 注意（E14）：这条 **不是** 去重的权威判据。Confirmed 由非共识路径的 ExecLocal_Confirm
+	// 写进节点私有的 LocalDB —— 该写可被 exec.disableExecLocal 整块跳过、
+	// localdb 与 stateDB 又是两次独立提交（存在崩溃窗口），因此它可能"陈旧"（该为 true 却为 false）。
+	// 真正的共识权威判据是下面 checkConfirmNotUsed 查的 stateDB 键（Exec_Confirm 结算成功时
+	// 随回执 KV 写入）。这条保留作纵深防御（早退、少一次 stateDB 读、错误码更贴近旧行为），
+	// 但**去重不能依赖它**。
 	if pendingTx.Confirmed {
 		elog.Error("checkConfirm tx already confirmed", "action", action,
 			"txHash", txHash, "confirmTxHash", confirmTxHash)
@@ -467,6 +482,12 @@ func (r *rgbx) checkConfirm(fromAddr, txHash string, confirm *rtypes.ConfirmTx) 
 		elog.Debug("checkConfirm timeout", "action", action,
 			"txHash", txHash, "confirmTxHash", confirmTxHash)
 		return nil
+	}
+
+	// E14：mint / transfer 的确认去重（共识判据）。放在 timeout 早退之后：timeout 确认不结算
+	// 任何资产（Exec_Confirm 直接返回空回执），其行为与本次修复前完全一致，不受影响。
+	if err = r.checkConfirmNotUsed(confirm, txHash, confirmTxHash); err != nil {
+		return err
 	}
 
 	// A2：SpendingTx 必须是规范编码（解析后无尾部多余字节）。btcwire 的 DeserializeNoWitness
@@ -519,4 +540,27 @@ func (r *rgbx) checkConfirm(fromAddr, txHash string, confirm *rtypes.ConfirmTx) 
 	}
 
 	return nil
+}
+
+// checkConfirmNotUsed E14：mint / transfer 的确认去重守卫（共识判据）。
+// 与提现侧 S3（checkWithdrawConfirm 里的 formatWithdrawUsedKey）完全对称：
+// 键写在合约级 statedb 上，由 Exec_Confirm 在**结算成功**时随回执 KV 写入，
+// 因此随 stateDB 一起回滚（重组重放不会误伤），且全网各节点读到的结论一致。
+//
+// 读的失败语义与 S3 一致（fail-closed）：ErrNotFound ⇒ 未结算过、放行；
+// 其余任何错误（含键存在）⇒ 一律拒绝 —— 不把"读不到"当成"没结算过"。
+func (r *rgbx) checkConfirmNotUsed(confirm *rtypes.ConfirmTx, txHash, confirmTxHash string) error {
+
+	_, err := r.GetStateDB().Get(formatConfirmUsedKey(confirm.GetTxHash()))
+	if errors.Is(err, types.ErrNotFound) {
+		return nil
+	}
+	alreadyConfirmed := ErrTransferAlreadyConfirmed
+	if confirm.GetActionType() == rtypes.TyMintAction {
+		alreadyConfirmed = ErrMintAlreadyConfirmed
+	}
+	elog.Error("checkConfirm confirm already used", "action", rtypes.GetActionName(confirm.GetActionType()),
+		"txHash", txHash, "confirmTxHash", confirmTxHash,
+		"confirmHash", hex.EncodeToString(confirm.GetTxHash()), "err", err)
+	return alreadyConfirmed
 }
