@@ -251,14 +251,9 @@ func (n *neutrinoClient) depositWatcher() {
 				log.Debug("depositWatcher skip known rgb tx", "txHash", pendingTx.txHash.String())
 				continue
 			}
-			// 如果chain33DepositAddress为空，则使用第一个输入的utxo地址
-			if pendingTx.chain33DepositAddress == "" {
-				firstInputUtxo := pendingTx.tx.TxIn[0].PreviousOutPoint
-				pendingTx.chain33DepositAddress = rtypes.FormatUtxo(firstInputUtxo.Hash.String(), firstInputUtxo.Index)
-			}
-			if pendingTx.depositAmount <= 0 {
-				log.Error("depositWatcher invalid deposit amount", "txHash", pendingTx.txHash.String(),
-					"amount", pendingTx.depositAmount)
+			if err := validatePendingDeposit(pendingTx); err != nil {
+				log.Error("depositWatcher invalid deposit notification", "txHash", pendingTx.txHash.String(),
+					"amount", pendingTx.depositAmount, "userID", pendingTx.chain33DepositAddress, "err", err)
 				continue
 			}
 
@@ -269,6 +264,27 @@ func (n *neutrinoClient) depositWatcher() {
 		}
 	}
 }
+
+// validatePendingDeposit 校验一笔待提交的充值：归属（userID = chain33 地址串）与金额必须已经由
+// analyzeTransaction 从 **派生充值脚本** 反解出来（见 btcwallet.go 的 analyzeTransaction）。
+//
+// 硬切后**没有**"归属为空就退回第一个输入的 UTXO"这条兜底了：链上 checkDeposit 要求
+// depositAddress 是 chain33 地址串（P2WSH 派生里的 userID），UTXO 形态一律 ErrInvalidDepositAddress。
+// 兜底只会提交一份必被拒的交易，然后在 retryList 里每 30 秒重试、无限刷 ERROR —— 明确的
+// "这笔充值没有归属"比"永远重试一笔注定被拒的交易"更接近事实。
+func validatePendingDeposit(p *btcPendingTx) error {
+	if p == nil || p.tx == nil {
+		return fmt.Errorf("pending tx data missing")
+	}
+	if p.depositAmount <= 0 {
+		return fmt.Errorf("invalid deposit amount %d", p.depositAmount)
+	}
+	if p.chain33DepositAddress == "" {
+		return fmt.Errorf("deposit has no attributed user id: the tx pays no watched deposit script")
+	}
+	return validateDepositUserID(p.chain33DepositAddress)
+}
+
 func (n *neutrinoClient) commitDepositTx(pendingTx *btcPendingTx) error {
 	if state := n.getDepositState(pendingTx.txHash[:]); bytes.Equal(state, depositStatusProcessed) {
 		log.Debug("commitDepositTx already processed", "txHash", pendingTx.txHash.String())

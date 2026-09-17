@@ -59,6 +59,19 @@ type config struct {
 	Tss tssConfig `json:"tss"`
 	// Rgb20 RGB20 侧车桥配置（Phase 2b）。
 	Rgb20 rgb20Config `json:"rgb20"`
+
+	// DepositAddressListen 用户 BTC 充值地址发放 HTTP 监听地址（空 = 不开启）。
+	//
+	// 为什么需要一个"发放"入口：P2WSH 充值地址 = f(chain33 地址, TSS 群公钥) 是纯函数，谁都能自己算；
+	// 但**钱包必须先 watch 那个脚本才能看见充值**（analyzeTransaction 靠 program 反解归属），
+	// 所以"要地址"这件事必须真的到达桥、触发按需 import —— 这就是本入口的唯一职责。
+	// 地址本身不是秘密（离线可枚举，见 C0 §7 风险 1），注册别人地址也不会让别人丢钱
+	// （脚本绑定的是那个人的 userID），唯一可被滥用的是 watch 集增长，由
+	// maxWatchedDepositScripts 兜住。
+	DepositAddressListen string `json:"depositAddressListen"`
+	// MaxWatchedDepositScripts 用户充值脚本 watch 集上限：达到上限后**拒绝发放新地址**
+	// （明确失败优于静默变慢/静默漏认充值）。<=0 用默认值（defaultMaxWatchedDepositScripts）。
+	MaxWatchedDepositScripts int `json:"maxWatchedDepositScripts"`
 }
 
 // rgb20Config RGB20 跨链桥（RGB20 USDT）配置。

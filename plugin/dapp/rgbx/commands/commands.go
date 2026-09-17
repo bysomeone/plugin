@@ -27,6 +27,7 @@ func Cmd() *cobra.Command {
 		commitDKGCMD(),
 		btcAddrScriptCMD(),
 		btcDepositTxCMD(),
+		btcDepositAddressCMD(),
 		btcKeyInfoCMD(),
 		depositAssetCMD(),
 		withdrawAssetCMD(),

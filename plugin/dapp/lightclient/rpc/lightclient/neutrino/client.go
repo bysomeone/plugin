@@ -229,6 +229,16 @@ func (n *neutrinoClient) Start() {
 	}
 	go n.depositWatcher()
 	go n.withdrawalProcessor()
+	// 充值地址发放 HTTP（每用户 P2WSH 脚本按需 import，见 deposit_http.go / deposit_address.go）。
+	// 未配置时不开启，但要把后果说清楚：桥不会 watch 任何新用户的充值脚本，打到每用户地址上的
+	// BTC 除非已在 watch 集里（重启后从 neutrino.db 载入）否则**看不见**。
+	if n.cfg.DepositAddressListen != "" {
+		go n.serveDepositAddressHTTP(n.cfg.DepositAddressListen)
+	} else {
+		log.Warn("deposit address issuance is disabled (neutrino.depositAddressListen is empty): " +
+			"per-user P2WSH deposit scripts can no longer be imported on demand, deposits to addresses " +
+			"that are not already watched will be invisible to the bridge")
+	}
 	n.rgbx.start(n)
 	// RGB20 官方节点：充值轮询 + HTTP（consignment 上传/充值请求）。Start 非阻塞，后台等待侧车连接。
 	if n.rgb20 != nil {

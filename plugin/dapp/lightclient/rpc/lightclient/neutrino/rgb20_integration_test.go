@@ -81,29 +81,45 @@ func Test_analyzeTransaction_skipsKnownRgbTx(t *testing.T) {
 	require.Nil(t, pending, "known rgb tx must be skipped from BTC deposit path")
 }
 
-// Test_analyzeTransaction_normalDepositUnchanged 非 RGB 的普通充值仍走 BTC 路径。
-func Test_analyzeTransaction_normalDepositUnchanged(t *testing.T) {
+// Test_analyzeTransaction_normalDepositUsesDerivedScript 非 RGB 的普通充值走 BTC 路径，
+// 且**只认派生 P2WSH 脚本**（硬切后的唯一充值形态）：
+//   - 付给用户派生脚本 → 充值，归属 = 该 userID；
+//   - 付给主池 TSS P2WPKH 脚本（旧形态的收款地址）→ **不是充值**（OP_RETURN 已删，主池不再是充值地址）。
+func Test_analyzeTransaction_normalDepositUsesDerivedScript(t *testing.T) {
 	adapter := newTestRgb20Adapter(t)
 	b := testBtcWalletWithRgb20(adapter)
 
-	// 需要 tssPkScript / tssPubKey 才能判定普通充值。
+	// 需要 tssPkScript / tssPubKey / watch 集才能判定普通充值。
 	priv, err := btcec.NewPrivateKey()
 	require.NoError(t, err)
 	pub := priv.PubKey()
 	waddr, err := btcutilNewWitnessAddr(pub, &chaincfg.TestNet3Params)
 	require.NoError(t, err)
-	pkScript, err := txscript.PayToAddrScript(waddr)
+	poolScript, err := txscript.PayToAddrScript(waddr)
 	require.NoError(t, err)
-	b.tssPkScript = pkScript
+	b.tssPkScript = poolScript
 	b.tssPubKey = pub
+	b.chainParams = chaincfg.TestNet3Params
+
+	const userID = "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk"
+	depositScript, err := rtypes.DeriveDepositPkScript(userID, pub.SerializeCompressed())
+	require.NoError(t, err)
+	b.depositScripts = newDepositScriptSet()
+	b.depositScripts.add(userID, depositScript)
 
 	tx := wire.NewMsgTx(wire.TxVersion)
-	tx.AddTxOut(wire.NewTxOut(100000, pkScript))
-
+	tx.AddTxOut(wire.NewTxOut(100000, depositScript))
 	hash := tx.TxHash()
 	pending := b.analyzeTransaction(&hash, tx)
-	require.NotNil(t, pending)
+	require.NotNil(t, pending, "付给用户派生脚本的输出必须被认成充值")
 	require.Equal(t, transactionTypeDeposit, pending.txType)
+	require.Equal(t, userID, pending.chain33DepositAddress)
+
+	tx2 := wire.NewMsgTx(wire.TxVersion)
+	tx2.AddTxOut(wire.NewTxOut(100000, poolScript))
+	hash2 := tx2.TxHash()
+	require.Nil(t, b.analyzeTransaction(&hash2, tx2),
+		"主池脚本不再是充值地址：充值只认派生 P2WSH 脚本")
 }
 
 // derEncodeSignature 手工 DER 编码 (r, s)。
