@@ -101,6 +101,8 @@ WITHDRAW_DEST_ADDR="${WITHDRAW_DEST_ADDR:-bcrt1qnnwpfpljh5n8m3a8xtf3x5ayvhjjplxm
 BTC_FUNDING_PRIV_HEX="${BTC_FUNDING_PRIV_HEX:-0000000000000000000000000000000000000000000000000000000000000001}"
 BTC_DEPOSIT_AMOUNT_SATS="${BTC_DEPOSIT_AMOUNT_SATS:-20000000}"
 BTC_WITHDRAW_AMOUNT_SATS="${BTC_WITHDRAW_AMOUNT_SATS:-500000}"
+# 扫集场景（C4）的充值额：独立于上面那笔，断言只围绕它自己的 UTXO。
+SWEEP_DEPOSIT_AMOUNT_SATS="${SWEEP_DEPOSIT_AMOUNT_SATS:-3000000}"
 
 # ===== RGB20 (Phase 5) =====
 # RGB20 链全走 compose 内部网络：rgb-bitcoind(rgb 链) + rgb-electrs(索引) + rgb-sidecar(gRPC 50061 + test-sim 50064)。
@@ -228,8 +230,20 @@ function config_para_file() {
     # （btc wallet + 充值 watch 集），也只有它需要"按需 import 用户充值脚本"这个入口；
     # 非官方节点开了也没有钱包可发行（请求会 503），只是多一个空转的监听，故这里关掉。
     local deposit_address_listen=""
+    # 扫集（C4）：与"发放充值地址"同一个开关理由 —— 只有官方节点跑真正的 BTC 桥（钱包 + 充值
+    # watch 集），也只有它看得见那些停在用户 P2WSH 上的充值 UTXO。E2E 把阈值/间隔/确认数都压到
+    # 最小，好让扫集在场景里立刻发生；生产默认是 5 笔 / 300s / 6 确认（见 lightclient config.go）。
+    local sweep_block=""
     if [ "${official}" = "true" ]; then
         deposit_address_listen="0.0.0.0:17001"
+        sweep_block='
+
+[rpc.sub.light.neutrino.userDepositSweep]
+enable=true
+intervalSeconds=3
+minUtxos=1
+feeRate=2
+minConfirmations=1'
     fi
 
     local toml_peers
@@ -249,7 +263,7 @@ blockConfirmations=1
 maxUtxoRescanTime=60
 # 充值地址发放入口（空 = 不开启）。E2E 脚本按 127.0.0.1:17001 领地址，见 docker-compose.yml
 # 里 para1 的 17001 端口发布与 scripts/btc_test.sh 的 BRIDGE_DEPOSIT_URL。
-depositAddressListen="${deposit_address_listen}"
+depositAddressListen="${deposit_address_listen}"${sweep_block}
 
 [rpc.sub.light.neutrino.btcRPC]
 host="${BTC_RPC_ADDR}"

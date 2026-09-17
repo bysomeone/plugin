@@ -23,11 +23,17 @@ function testcase_entry() {
     # ---- P2WSH 充值（C1/C2 新流程）：向桥领派生地址 -> 用户付 BTC -> 桥按 program 归因 -> mint XBTC ----
     # 放在 RGB20 之后：本场景是新增覆盖（此前一直屏蔽），万一卡住也不该吞掉前面已验证过的用例结果。
     scenario_user_deposit_via_btc_tx
+
+    # ---- 扫集（C4）：把上面那笔充值（以及本场景自己那笔）归集回主池 ----
+    # 没有扫集，P2WSH 充值地址就是"钱进得去、出不来"：钱停在用户各自的 P2WSH 上，
+    # 而提现只能花主池的 BTC。
+    scenario_user_deposit_sweep
 }
 
 # 供 scripts/btc_test.sh 顶层分组调用（当前未启用）。
 function run_btc_functional_all() {
     scenario_user_deposit_via_btc_tx
+    scenario_user_deposit_sweep
     scenario_user_transfer_crosschain_asset
     scenario_user_withdraw_auto_confirm
     scenario_restart_recovery
