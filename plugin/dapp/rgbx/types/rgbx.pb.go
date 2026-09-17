@@ -1592,6 +1592,422 @@ func (x *TxBlockIndexList) GetBlockIndexList() []*TxBlockIndex {
 	return nil
 }
 
+// ================= 全局 operationId + 铸造台账（S2）=================
+//
+// 每笔充值（铸造）与提现（销毁）都分配一个 32 字节全局 operationId，链上留下一条**不可变**记录
+// （operationRecord），并维护每 symbol 的**单调**供应量计数（operationSupply）。
+// operationId 不是外部输入，而是由链上已校验的数据**确定性派生**（见 types/operation.go）：
+//   - 充值：sha256("rgbx:opid:v1:mint:" | symbol | btc txid | 充值地址 | 金额)；
+//   - 提现：sha256("rgbx:opid:v1:burn:" | symbol | burn 的 chain33 交易哈希)。
+//
+// 于是"同一个 operationId" ⟺ "同一笔操作"，派生式 id 无法被伪造、无法被顶替，也不需要
+// 在交易里额外携带字段（P2WSH 充值路径下没有 OP_RETURN 可承载）。
+//
+// 提现结算时以该台账为判据：必须存在对应的 burn 记录、金额与 payload 逐项一致，
+// 且**待提取的额度不超过台账里"已铸造 − 已销毁"** —— 即每个离开桥的单位都必须有一条
+// 充值铸造记录，而不是靠对某个地址的余额求和来推断。
+type OperationRecord struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	// operationId 32 字节全局操作 id（派生式，见上）
+	OperationId []byte `protobuf:"bytes,1,opt,name=operationId,proto3" json:"operationId,omitempty"`
+	// kind 1=铸造（充值） 2=销毁（提现）
+	Kind int32 `protobuf:"varint,2,opt,name=kind,proto3" json:"kind,omitempty"`
+	// symbol 归一化后的跨链资产符号（如 "XBTC" / "XRGB20_USDT"）
+	Symbol string `protobuf:"bytes,3,opt,name=symbol,proto3" json:"symbol,omitempty"`
+	// network 该操作所属的源/目标网络标识（由 symbol 确定性导出，不读节点本地配置）
+	Network string `protobuf:"bytes,4,opt,name=network,proto3" json:"network,omitempty"`
+	// amount 资产最小单位金额（充值=实际到账额；提现=锁定额）
+	Amount int64 `protobuf:"varint,5,opt,name=amount,proto3" json:"amount,omitempty"`
+	// owner 充值归属地址 / 提现发起地址
+	Owner string `protobuf:"bytes,6,opt,name=owner,proto3" json:"owner,omitempty"`
+	// btcTxID 充值：付款那笔 BTC 交易的规范 txid（32 字节）；提现为空
+	BtcTxID []byte `protobuf:"bytes,7,opt,name=btcTxID,proto3" json:"btcTxID,omitempty"`
+	// chain33TxHash 该操作所在的 chain33 交易哈希（充值=上链的充值交易；提现=burn 交易）
+	Chain33TxHash []byte `protobuf:"bytes,8,opt,name=chain33TxHash,proto3" json:"chain33TxHash,omitempty"`
+	// height / timestamp 该操作所在区块的高度与时间
+	Height    int64 `protobuf:"varint,9,opt,name=height,proto3" json:"height,omitempty"`
+	Timestamp int64 `protobuf:"varint,10,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// settled 仅由查询侧补算（提现=是否已结算放款；充值=已铸造，恒 true），**不入库**
+	Settled bool `protobuf:"varint,11,opt,name=settled,proto3" json:"settled,omitempty"`
+}
+
+func (x *OperationRecord) Reset() {
+	*x = OperationRecord{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_rgbx_proto_msgTypes[20]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *OperationRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OperationRecord) ProtoMessage() {}
+
+func (x *OperationRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_rgbx_proto_msgTypes[20]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OperationRecord.ProtoReflect.Descriptor instead.
+func (*OperationRecord) Descriptor() ([]byte, []int) {
+	return file_rgbx_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *OperationRecord) GetOperationId() []byte {
+	if x != nil {
+		return x.OperationId
+	}
+	return nil
+}
+
+func (x *OperationRecord) GetKind() int32 {
+	if x != nil {
+		return x.Kind
+	}
+	return 0
+}
+
+func (x *OperationRecord) GetSymbol() string {
+	if x != nil {
+		return x.Symbol
+	}
+	return ""
+}
+
+func (x *OperationRecord) GetNetwork() string {
+	if x != nil {
+		return x.Network
+	}
+	return ""
+}
+
+func (x *OperationRecord) GetAmount() int64 {
+	if x != nil {
+		return x.Amount
+	}
+	return 0
+}
+
+func (x *OperationRecord) GetOwner() string {
+	if x != nil {
+		return x.Owner
+	}
+	return ""
+}
+
+func (x *OperationRecord) GetBtcTxID() []byte {
+	if x != nil {
+		return x.BtcTxID
+	}
+	return nil
+}
+
+func (x *OperationRecord) GetChain33TxHash() []byte {
+	if x != nil {
+		return x.Chain33TxHash
+	}
+	return nil
+}
+
+func (x *OperationRecord) GetHeight() int64 {
+	if x != nil {
+		return x.Height
+	}
+	return 0
+}
+
+func (x *OperationRecord) GetTimestamp() int64 {
+	if x != nil {
+		return x.Timestamp
+	}
+	return 0
+}
+
+func (x *OperationRecord) GetSettled() bool {
+	if x != nil {
+		return x.Settled
+	}
+	return false
+}
+
+type OperationSupply struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Symbol  string `protobuf:"bytes,1,opt,name=symbol,proto3" json:"symbol,omitempty"`
+	Network string `protobuf:"bytes,2,opt,name=network,proto3" json:"network,omitempty"`
+	// minted / burned 累计铸造 / 累计销毁（资产最小单位）；minted - burned 即"桥仍欠的额度"
+	Minted int64 `protobuf:"varint,3,opt,name=minted,proto3" json:"minted,omitempty"`
+	Burned int64 `protobuf:"varint,4,opt,name=burned,proto3" json:"burned,omitempty"`
+	// nextMintIndex / nextBurnIndex 下一个索引下标（生成本 symbol 的操作列表用）
+	NextMintIndex int64 `protobuf:"varint,5,opt,name=nextMintIndex,proto3" json:"nextMintIndex,omitempty"`
+	NextBurnIndex int64 `protobuf:"varint,6,opt,name=nextBurnIndex,proto3" json:"nextBurnIndex,omitempty"`
+}
+
+func (x *OperationSupply) Reset() {
+	*x = OperationSupply{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_rgbx_proto_msgTypes[21]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *OperationSupply) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OperationSupply) ProtoMessage() {}
+
+func (x *OperationSupply) ProtoReflect() protoreflect.Message {
+	mi := &file_rgbx_proto_msgTypes[21]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OperationSupply.ProtoReflect.Descriptor instead.
+func (*OperationSupply) Descriptor() ([]byte, []int) {
+	return file_rgbx_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *OperationSupply) GetSymbol() string {
+	if x != nil {
+		return x.Symbol
+	}
+	return ""
+}
+
+func (x *OperationSupply) GetNetwork() string {
+	if x != nil {
+		return x.Network
+	}
+	return ""
+}
+
+func (x *OperationSupply) GetMinted() int64 {
+	if x != nil {
+		return x.Minted
+	}
+	return 0
+}
+
+func (x *OperationSupply) GetBurned() int64 {
+	if x != nil {
+		return x.Burned
+	}
+	return 0
+}
+
+func (x *OperationSupply) GetNextMintIndex() int64 {
+	if x != nil {
+		return x.NextMintIndex
+	}
+	return 0
+}
+
+func (x *OperationSupply) GetNextBurnIndex() int64 {
+	if x != nil {
+		return x.NextBurnIndex
+	}
+	return 0
+}
+
+type OperationRecords struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	Records []*OperationRecord `protobuf:"bytes,1,rep,name=records,proto3" json:"records,omitempty"`
+	// nextIndex 下一页的起始下标（本页取满 count 条时才有意义；否则为 0）
+	NextIndex int64 `protobuf:"varint,2,opt,name=nextIndex,proto3" json:"nextIndex,omitempty"`
+}
+
+func (x *OperationRecords) Reset() {
+	*x = OperationRecords{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_rgbx_proto_msgTypes[22]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *OperationRecords) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OperationRecords) ProtoMessage() {}
+
+func (x *OperationRecords) ProtoReflect() protoreflect.Message {
+	mi := &file_rgbx_proto_msgTypes[22]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OperationRecords.ProtoReflect.Descriptor instead.
+func (*OperationRecords) Descriptor() ([]byte, []int) {
+	return file_rgbx_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *OperationRecords) GetRecords() []*OperationRecord {
+	if x != nil {
+		return x.Records
+	}
+	return nil
+}
+
+func (x *OperationRecords) GetNextIndex() int64 {
+	if x != nil {
+		return x.NextIndex
+	}
+	return 0
+}
+
+type ReqGetOperation struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	OperationId []byte `protobuf:"bytes,1,opt,name=operationId,proto3" json:"operationId,omitempty"`
+}
+
+func (x *ReqGetOperation) Reset() {
+	*x = ReqGetOperation{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_rgbx_proto_msgTypes[23]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *ReqGetOperation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReqGetOperation) ProtoMessage() {}
+
+func (x *ReqGetOperation) ProtoReflect() protoreflect.Message {
+	mi := &file_rgbx_proto_msgTypes[23]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReqGetOperation.ProtoReflect.Descriptor instead.
+func (*ReqGetOperation) Descriptor() ([]byte, []int) {
+	return file_rgbx_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *ReqGetOperation) GetOperationId() []byte {
+	if x != nil {
+		return x.OperationId
+	}
+	return nil
+}
+
+type ReqListOperations struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	AssetSymbol string `protobuf:"bytes,1,opt,name=assetSymbol,proto3" json:"assetSymbol,omitempty"`
+	// kind 1=铸造 2=销毁（必须显式指定：两类操作各自一条索引）
+	Kind int32 `protobuf:"varint,2,opt,name=kind,proto3" json:"kind,omitempty"`
+	// start 起始下标（首次查询填 0；后续用上一次返回的 nextIndex 续查）
+	Start int64 `protobuf:"varint,3,opt,name=start,proto3" json:"start,omitempty"`
+	Count int32 `protobuf:"varint,4,opt,name=count,proto3" json:"count,omitempty"`
+}
+
+func (x *ReqListOperations) Reset() {
+	*x = ReqListOperations{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_rgbx_proto_msgTypes[24]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *ReqListOperations) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReqListOperations) ProtoMessage() {}
+
+func (x *ReqListOperations) ProtoReflect() protoreflect.Message {
+	mi := &file_rgbx_proto_msgTypes[24]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReqListOperations.ProtoReflect.Descriptor instead.
+func (*ReqListOperations) Descriptor() ([]byte, []int) {
+	return file_rgbx_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *ReqListOperations) GetAssetSymbol() string {
+	if x != nil {
+		return x.AssetSymbol
+	}
+	return ""
+}
+
+func (x *ReqListOperations) GetKind() int32 {
+	if x != nil {
+		return x.Kind
+	}
+	return 0
+}
+
+func (x *ReqListOperations) GetStart() int64 {
+	if x != nil {
+		return x.Start
+	}
+	return 0
+}
+
+func (x *ReqListOperations) GetCount() int32 {
+	if x != nil {
+		return x.Count
+	}
+	return 0
+}
+
 var File_rgbx_proto protoreflect.FileDescriptor
 
 var file_rgbx_proto_rawDesc = []byte{
@@ -1804,8 +2220,57 @@ var file_rgbx_proto_rawDesc = []byte{
 	0x65, 0x78, 0x4c, 0x69, 0x73, 0x74, 0x18, 0x01, 0x20, 0x03, 0x28, 0x0b, 0x32, 0x13, 0x2e, 0x74,
 	0x79, 0x70, 0x65, 0x73, 0x2e, 0x74, 0x78, 0x42, 0x6c, 0x6f, 0x63, 0x6b, 0x49, 0x6e, 0x64, 0x65,
 	0x78, 0x52, 0x0e, 0x62, 0x6c, 0x6f, 0x63, 0x6b, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x4c, 0x69, 0x73,
-	0x74, 0x32, 0x06, 0x0a, 0x04, 0x72, 0x67, 0x62, 0x78, 0x42, 0x0a, 0x5a, 0x08, 0x2e, 0x2e, 0x2f,
-	0x74, 0x79, 0x70, 0x65, 0x73, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
+	0x74, 0x22, 0xb7, 0x02, 0x0a, 0x0f, 0x6f, 0x70, 0x65, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x52,
+	0x65, 0x63, 0x6f, 0x72, 0x64, 0x12, 0x20, 0x0a, 0x0b, 0x6f, 0x70, 0x65, 0x72, 0x61, 0x74, 0x69,
+	0x6f, 0x6e, 0x49, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x0b, 0x6f, 0x70, 0x65, 0x72,
+	0x61, 0x74, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x12, 0x12, 0x0a, 0x04, 0x6b, 0x69, 0x6e, 0x64, 0x18,
+	0x02, 0x20, 0x01, 0x28, 0x05, 0x52, 0x04, 0x6b, 0x69, 0x6e, 0x64, 0x12, 0x16, 0x0a, 0x06, 0x73,
+	0x79, 0x6d, 0x62, 0x6f, 0x6c, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x73, 0x79, 0x6d,
+	0x62, 0x6f, 0x6c, 0x12, 0x18, 0x0a, 0x07, 0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x18, 0x04,
+	0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72, 0x6b, 0x12, 0x16, 0x0a,
+	0x06, 0x61, 0x6d, 0x6f, 0x75, 0x6e, 0x74, 0x18, 0x05, 0x20, 0x01, 0x28, 0x03, 0x52, 0x06, 0x61,
+	0x6d, 0x6f, 0x75, 0x6e, 0x74, 0x12, 0x14, 0x0a, 0x05, 0x6f, 0x77, 0x6e, 0x65, 0x72, 0x18, 0x06,
+	0x20, 0x01, 0x28, 0x09, 0x52, 0x05, 0x6f, 0x77, 0x6e, 0x65, 0x72, 0x12, 0x18, 0x0a, 0x07, 0x62,
+	0x74, 0x63, 0x54, 0x78, 0x49, 0x44, 0x18, 0x07, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x07, 0x62, 0x74,
+	0x63, 0x54, 0x78, 0x49, 0x44, 0x12, 0x24, 0x0a, 0x0d, 0x63, 0x68, 0x61, 0x69, 0x6e, 0x33, 0x33,
+	0x54, 0x78, 0x48, 0x61, 0x73, 0x68, 0x18, 0x08, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x0d, 0x63, 0x68,
+	0x61, 0x69, 0x6e, 0x33, 0x33, 0x54, 0x78, 0x48, 0x61, 0x73, 0x68, 0x12, 0x16, 0x0a, 0x06, 0x68,
+	0x65, 0x69, 0x67, 0x68, 0x74, 0x18, 0x09, 0x20, 0x01, 0x28, 0x03, 0x52, 0x06, 0x68, 0x65, 0x69,
+	0x67, 0x68, 0x74, 0x12, 0x1c, 0x0a, 0x09, 0x74, 0x69, 0x6d, 0x65, 0x73, 0x74, 0x61, 0x6d, 0x70,
+	0x18, 0x0a, 0x20, 0x01, 0x28, 0x03, 0x52, 0x09, 0x74, 0x69, 0x6d, 0x65, 0x73, 0x74, 0x61, 0x6d,
+	0x70, 0x12, 0x18, 0x0a, 0x07, 0x73, 0x65, 0x74, 0x74, 0x6c, 0x65, 0x64, 0x18, 0x0b, 0x20, 0x01,
+	0x28, 0x08, 0x52, 0x07, 0x73, 0x65, 0x74, 0x74, 0x6c, 0x65, 0x64, 0x22, 0xbf, 0x01, 0x0a, 0x0f,
+	0x6f, 0x70, 0x65, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x53, 0x75, 0x70, 0x70, 0x6c, 0x79, 0x12,
+	0x16, 0x0a, 0x06, 0x73, 0x79, 0x6d, 0x62, 0x6f, 0x6c, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09, 0x52,
+	0x06, 0x73, 0x79, 0x6d, 0x62, 0x6f, 0x6c, 0x12, 0x18, 0x0a, 0x07, 0x6e, 0x65, 0x74, 0x77, 0x6f,
+	0x72, 0x6b, 0x18, 0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x07, 0x6e, 0x65, 0x74, 0x77, 0x6f, 0x72,
+	0x6b, 0x12, 0x16, 0x0a, 0x06, 0x6d, 0x69, 0x6e, 0x74, 0x65, 0x64, 0x18, 0x03, 0x20, 0x01, 0x28,
+	0x03, 0x52, 0x06, 0x6d, 0x69, 0x6e, 0x74, 0x65, 0x64, 0x12, 0x16, 0x0a, 0x06, 0x62, 0x75, 0x72,
+	0x6e, 0x65, 0x64, 0x18, 0x04, 0x20, 0x01, 0x28, 0x03, 0x52, 0x06, 0x62, 0x75, 0x72, 0x6e, 0x65,
+	0x64, 0x12, 0x24, 0x0a, 0x0d, 0x6e, 0x65, 0x78, 0x74, 0x4d, 0x69, 0x6e, 0x74, 0x49, 0x6e, 0x64,
+	0x65, 0x78, 0x18, 0x05, 0x20, 0x01, 0x28, 0x03, 0x52, 0x0d, 0x6e, 0x65, 0x78, 0x74, 0x4d, 0x69,
+	0x6e, 0x74, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x12, 0x24, 0x0a, 0x0d, 0x6e, 0x65, 0x78, 0x74, 0x42,
+	0x75, 0x72, 0x6e, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x18, 0x06, 0x20, 0x01, 0x28, 0x03, 0x52, 0x0d,
+	0x6e, 0x65, 0x78, 0x74, 0x42, 0x75, 0x72, 0x6e, 0x49, 0x6e, 0x64, 0x65, 0x78, 0x22, 0x62, 0x0a,
+	0x10, 0x6f, 0x70, 0x65, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x52, 0x65, 0x63, 0x6f, 0x72, 0x64,
+	0x73, 0x12, 0x30, 0x0a, 0x07, 0x72, 0x65, 0x63, 0x6f, 0x72, 0x64, 0x73, 0x18, 0x01, 0x20, 0x03,
+	0x28, 0x0b, 0x32, 0x16, 0x2e, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x6f, 0x70, 0x65, 0x72, 0x61,
+	0x74, 0x69, 0x6f, 0x6e, 0x52, 0x65, 0x63, 0x6f, 0x72, 0x64, 0x52, 0x07, 0x72, 0x65, 0x63, 0x6f,
+	0x72, 0x64, 0x73, 0x12, 0x1c, 0x0a, 0x09, 0x6e, 0x65, 0x78, 0x74, 0x49, 0x6e, 0x64, 0x65, 0x78,
+	0x18, 0x02, 0x20, 0x01, 0x28, 0x03, 0x52, 0x09, 0x6e, 0x65, 0x78, 0x74, 0x49, 0x6e, 0x64, 0x65,
+	0x78, 0x22, 0x33, 0x0a, 0x0f, 0x52, 0x65, 0x71, 0x47, 0x65, 0x74, 0x4f, 0x70, 0x65, 0x72, 0x61,
+	0x74, 0x69, 0x6f, 0x6e, 0x12, 0x20, 0x0a, 0x0b, 0x6f, 0x70, 0x65, 0x72, 0x61, 0x74, 0x69, 0x6f,
+	0x6e, 0x49, 0x64, 0x18, 0x01, 0x20, 0x01, 0x28, 0x0c, 0x52, 0x0b, 0x6f, 0x70, 0x65, 0x72, 0x61,
+	0x74, 0x69, 0x6f, 0x6e, 0x49, 0x64, 0x22, 0x75, 0x0a, 0x11, 0x52, 0x65, 0x71, 0x4c, 0x69, 0x73,
+	0x74, 0x4f, 0x70, 0x65, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x12, 0x20, 0x0a, 0x0b, 0x61,
+	0x73, 0x73, 0x65, 0x74, 0x53, 0x79, 0x6d, 0x62, 0x6f, 0x6c, 0x18, 0x01, 0x20, 0x01, 0x28, 0x09,
+	0x52, 0x0b, 0x61, 0x73, 0x73, 0x65, 0x74, 0x53, 0x79, 0x6d, 0x62, 0x6f, 0x6c, 0x12, 0x12, 0x0a,
+	0x04, 0x6b, 0x69, 0x6e, 0x64, 0x18, 0x02, 0x20, 0x01, 0x28, 0x05, 0x52, 0x04, 0x6b, 0x69, 0x6e,
+	0x64, 0x12, 0x14, 0x0a, 0x05, 0x73, 0x74, 0x61, 0x72, 0x74, 0x18, 0x03, 0x20, 0x01, 0x28, 0x03,
+	0x52, 0x05, 0x73, 0x74, 0x61, 0x72, 0x74, 0x12, 0x14, 0x0a, 0x05, 0x63, 0x6f, 0x75, 0x6e, 0x74,
+	0x18, 0x04, 0x20, 0x01, 0x28, 0x05, 0x52, 0x05, 0x63, 0x6f, 0x75, 0x6e, 0x74, 0x32, 0x06, 0x0a,
+	0x04, 0x72, 0x67, 0x62, 0x78, 0x42, 0x0a, 0x5a, 0x08, 0x2e, 0x2e, 0x2f, 0x74, 0x79, 0x70, 0x65,
+	0x73, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
 }
 
 var (
@@ -1820,7 +2285,7 @@ func file_rgbx_proto_rawDescGZIP() []byte {
 	return file_rgbx_proto_rawDescData
 }
 
-var file_rgbx_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_rgbx_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_rgbx_proto_goTypes = []interface{}{
 	(*RgbxAction)(nil),        // 0: types.RgbxAction
 	(*RgbxAsset)(nil),         // 1: types.rgbxAsset
@@ -1842,6 +2307,11 @@ var file_rgbx_proto_goTypes = []interface{}{
 	(*BtcCommitment)(nil),     // 17: types.btcCommitment
 	(*TxBlockIndex)(nil),      // 18: types.txBlockIndex
 	(*TxBlockIndexList)(nil),  // 19: types.txBlockIndexList
+	(*OperationRecord)(nil),   // 20: types.operationRecord
+	(*OperationSupply)(nil),   // 21: types.operationSupply
+	(*OperationRecords)(nil),  // 22: types.operationRecords
+	(*ReqGetOperation)(nil),   // 23: types.ReqGetOperation
+	(*ReqListOperations)(nil), // 24: types.ReqListOperations
 }
 var file_rgbx_proto_depIdxs = []int32{
 	2,  // 0: types.RgbxAction.mint:type_name -> types.mintAsset
@@ -1857,11 +2327,12 @@ var file_rgbx_proto_depIdxs = []int32{
 	3,  // 10: types.pendingTx.utxo:type_name -> types.outPoint
 	12, // 11: types.pendingTxs.pendingList:type_name -> types.pendingTx
 	18, // 12: types.txBlockIndexList.blockIndexList:type_name -> types.txBlockIndex
-	13, // [13:13] is the sub-list for method output_type
-	13, // [13:13] is the sub-list for method input_type
-	13, // [13:13] is the sub-list for extension type_name
-	13, // [13:13] is the sub-list for extension extendee
-	0,  // [0:13] is the sub-list for field type_name
+	20, // 13: types.operationRecords.records:type_name -> types.operationRecord
+	14, // [14:14] is the sub-list for method output_type
+	14, // [14:14] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_rgbx_proto_init() }
@@ -2110,6 +2581,66 @@ func file_rgbx_proto_init() {
 				return nil
 			}
 		}
+		file_rgbx_proto_msgTypes[20].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*OperationRecord); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_rgbx_proto_msgTypes[21].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*OperationSupply); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_rgbx_proto_msgTypes[22].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*OperationRecords); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_rgbx_proto_msgTypes[23].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*ReqGetOperation); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_rgbx_proto_msgTypes[24].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*ReqListOperations); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
 	}
 	file_rgbx_proto_msgTypes[0].OneofWrappers = []interface{}{
 		(*RgbxAction_Mint)(nil),
@@ -2125,7 +2656,7 @@ func file_rgbx_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_rgbx_proto_rawDesc,
 			NumEnums:      0,
-			NumMessages:   20,
+			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

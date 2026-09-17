@@ -169,4 +169,72 @@ message txBlockIndexList {
     repeated txBlockIndex blockIndexList = 1;
 }
 
+// ================= 全局 operationId + 铸造台账（S2）=================
+//
+// 每笔充值（铸造）与提现（销毁）都分配一个 32 字节全局 operationId，链上留下一条**不可变**记录
+// （operationRecord），并维护每 symbol 的**单调**供应量计数（operationSupply）。
+// operationId 不是外部输入，而是由链上已校验的数据**确定性派生**（见 types/operation.go）：
+//   - 充值：sha256("rgbx:opid:v1:mint:" | symbol | btc txid | 充值地址 | 金额)；
+//   - 提现：sha256("rgbx:opid:v1:burn:" | symbol | burn 的 chain33 交易哈希)。
+//
+// 于是"同一个 operationId" ⟺ "同一笔操作"，派生式 id 无法被伪造、无法被顶替，也不需要
+// 在交易里额外携带字段（P2WSH 充值路径下没有 OP_RETURN 可承载）。
+//
+// 提现结算时以该台账为判据：必须存在对应的 burn 记录、金额与 payload 逐项一致，
+// 且**待提取的额度不超过台账里"已铸造 − 已销毁"** —— 即每个离开桥的单位都必须有一条
+// 充值铸造记录，而不是靠对某个地址的余额求和来推断。
+message operationRecord {
+    // operationId 32 字节全局操作 id（派生式，见上）
+    bytes  operationId   = 1;
+    // kind 1=铸造（充值） 2=销毁（提现）
+    int32  kind          = 2;
+    // symbol 归一化后的跨链资产符号（如 "XBTC" / "XRGB20_USDT"）
+    string symbol        = 3;
+    // network 该操作所属的源/目标网络标识（由 symbol 确定性导出，不读节点本地配置）
+    string network       = 4;
+    // amount 资产最小单位金额（充值=实际到账额；提现=锁定额）
+    int64  amount        = 5;
+    // owner 充值归属地址 / 提现发起地址
+    string owner         = 6;
+    // btcTxID 充值：付款那笔 BTC 交易的规范 txid（32 字节）；提现为空
+    bytes  btcTxID       = 7;
+    // chain33TxHash 该操作所在的 chain33 交易哈希（充值=上链的充值交易；提现=burn 交易）
+    bytes  chain33TxHash = 8;
+    // height / timestamp 该操作所在区块的高度与时间
+    int64  height        = 9;
+    int64  timestamp     = 10;
+    // settled 仅由查询侧补算（提现=是否已结算放款；充值=已铸造，恒 true），**不入库**
+    bool   settled       = 11;
+}
+
+message operationSupply {
+    string symbol        = 1;
+    string network       = 2;
+    // minted / burned 累计铸造 / 累计销毁（资产最小单位）；minted - burned 即"桥仍欠的额度"
+    int64  minted        = 3;
+    int64  burned        = 4;
+    // nextMintIndex / nextBurnIndex 下一个索引下标（生成本 symbol 的操作列表用）
+    int64  nextMintIndex = 5;
+    int64  nextBurnIndex = 6;
+}
+
+message operationRecords {
+    repeated operationRecord records = 1;
+    // nextIndex 下一页的起始下标（本页取满 count 条时才有意义；否则为 0）
+    int64                   nextIndex = 2;
+}
+
+message ReqGetOperation {
+    bytes operationId = 1;
+}
+
+message ReqListOperations {
+    string assetSymbol = 1;
+    // kind 1=铸造 2=销毁（必须显式指定：两类操作各自一条索引）
+    int32  kind        = 2;
+    // start 起始下标（首次查询填 0；后续用上一次返回的 nextIndex 续查）
+    int64  start       = 3;
+    int32  count       = 4;
+}
+
 service rgbx {}
