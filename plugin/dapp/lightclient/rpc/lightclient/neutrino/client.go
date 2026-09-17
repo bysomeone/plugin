@@ -207,6 +207,12 @@ func (n *neutrinoClient) Start() {
 			log.Info("Start rgb20 sidecar connected")
 		}()
 	}
+	// 跨节点 watch 集补齐（C4）：**每个节点**都下发自己那份登记并接收侧车持有的并集 ——
+	// 签名节点必须各自持有"哪些脚本是用户充值脚本"的登记，才能为花费它的交易出签名
+	// （IsUserDepositScript）。见 deposit_address.go 的 syncDepositScriptsWithSidecar。
+	if n.rgb20 != nil {
+		go n.depositScriptSyncWorker()
+	}
 	if !n.cfg.IsOfficialNode {
 		return
 	}
@@ -232,6 +238,15 @@ func (n *neutrinoClient) Start() {
 	// 充值地址发放 HTTP（每用户 P2WSH 脚本按需 import，见 deposit_http.go / deposit_address.go）。
 	// 未配置时不开启，但要把后果说清楚：桥不会 watch 任何新用户的充值脚本，打到每用户地址上的
 	// BTC 除非已在 watch 集里（重启后从 neutrino.db 载入）否则**看不见**。
+	// 扫集（C4）：把用户 P2WSH 上的充值 UTXO 闲时归集回主池 —— 没有它，P2WSH 充值地址上线后
+	// 提现会因为"主池没有 BTC 可花"而卡死（钱进得去、出不来）。只在发放充值地址的那个节点上开。
+	if n.cfg.UserDepositSweep.Enable {
+		go n.sweepWorker()
+	} else {
+		log.Info("user deposit sweep is disabled (neutrino.userDepositSweep.enable=false): " +
+			"BTC deposited to per-user P2WSH addresses stays there until it is swept, so withdrawals " +
+			"have no main-pool BTC to spend unless something else refills the pool")
+	}
 	if n.cfg.DepositAddressListen != "" {
 		go n.serveDepositAddressHTTP(n.cfg.DepositAddressListen)
 	} else {

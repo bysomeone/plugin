@@ -86,6 +86,11 @@ type fakeBridge struct {
 	broadcastErr error
 	// broadcastCalls 广播尝试次数。
 	broadcastCalls int
+	// sweepSignCalls/sweepSignErr 扫集签名次数与失败注入（C4）。
+	sweepSignCalls int
+	sweepSignErr   error
+	// rawBroadcasts 已定稿交易的广播（txid 列表，C4 扫集用）。
+	rawBroadcasts []string
 	// withdrawState 该笔提现落盘的本地状态（E9-A 的状态门；空 = 从未处理到广播）。
 	withdrawState []byte
 	// depositScripts 已登记的用户 P2WSH 充值脚本（pkScript hex → userID，C3 输入归属核对用）。
@@ -280,6 +285,25 @@ func (f *fakeBridge) BroadcastTx(_ []byte, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.broadcastCalls++
+	return f.broadcastErr
+}
+
+// SignSweepPsbt 扫集签名（C4）：假实现原样返回，签名内容由扫描用例自己核对。
+func (f *fakeBridge) SignSweepPsbt(psbtBytes []byte) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sweepSignCalls++
+	if f.sweepSignErr != nil {
+		return nil, f.sweepSignErr
+	}
+	return psbtBytes, nil
+}
+
+// BroadcastRawTx 广播已定稿的扫集交易（C4）。
+func (f *fakeBridge) BroadcastRawTx(rawTx []byte, txid string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rawBroadcasts = append(f.rawBroadcasts, txid)
 	return f.broadcastErr
 }
 

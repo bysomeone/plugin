@@ -11,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/btcutil/psbt"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
 )
 
 // 以下方法使 neutrinoClient 实现 rgb20.Chain33Bridge（提现侧）。
@@ -58,6 +59,48 @@ func (n *neutrinoClient) SignPsbt(req *rgb20.WithdrawSignRequest) ([]byte, error
 // 由本地配置 rgb20.testSignPsbt 显式开启；生产路径不经过这里。
 func (n *neutrinoClient) SignPsbtTestOnly(psbtBytes []byte) ([]byte, error) {
 	return n.tss.signPsbtTestOnly(psbtBytes)
+}
+
+// SignSweepPsbt 通过 TSS 组对一笔扫集 PSBT 签名（C4）。
+//
+// 扫集没有 chain33 上下文，签名节点能核对的是"钱有没有被挪出桥"：每个输入都是已登记的用户
+// 充值脚本（且带自己的 witnessScript）、每个输出都回主池、手续费有上界。判据全部来自 PSBT 与
+// 本节点自己的事实（见 rgb20.Adapter.ValidateSweepPsbt），不采信协调者的声称值。
+func (n *neutrinoClient) SignSweepPsbt(psbtBytes []byte) ([]byte, error) {
+	return n.tss.signSweepPsbt(psbtBytes)
+}
+
+// BroadcastRawTx 广播一笔已定稿的原始交易（扫集用）。
+//
+// 广播是幂等的：本笔可能已经在本节点可见（上一次广播其实成功了但回包丢失），节点会以
+// "已在 mempool/已存在"拒绝，但钱已经在路上 —— 与 BroadcastTx 同一口径，把它算成功。
+func (n *neutrinoClient) BroadcastRawTx(rawTx []byte, txid string) error {
+	if n == nil || n.bw == nil {
+		return fmt.Errorf("btc wallet not started")
+	}
+	var tx wire.MsgTx
+	if err := tx.Deserialize(bytes.NewReader(rawTx)); err != nil {
+		return fmt.Errorf("decode sweep tx: %w", err)
+	}
+	if txid != "" && tx.TxHash().String() != txid {
+		return fmt.Errorf("sweep tx hash %s != expected %s", tx.TxHash().String(), txid)
+	}
+	var lookup txLookup
+	if n.bw.rpcClient != nil {
+		lookup = n.bw.rpcClient
+	}
+	if txKnownToNode(lookup, txid) {
+		log.Info("BroadcastRawTx sweep already known to the node, skip broadcast", "btcTxid", txid)
+		return nil
+	}
+	if err := n.bw.broadcastTransaction(&tx, txid); err != nil {
+		if !broadcastOutcomeIsSuccess(lookup, txid, err) {
+			return err
+		}
+		log.Warn("BroadcastRawTx sweep broadcast failed but the tx is known to the node, treating as success",
+			"btcTxid", txid, "err", err)
+	}
+	return nil
 }
 
 // WithdrawState 返回该笔提现落盘的本地状态（空 = 从未处理到广播）。

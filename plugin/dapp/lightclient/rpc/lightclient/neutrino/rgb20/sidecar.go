@@ -159,6 +159,29 @@ func (s *Sidecar) FinalizeWithdrawal(ctx context.Context, req *pb.FinalizeWithdr
 	return s.client.FinalizeWithdrawal(cctx, req)
 }
 
+// RegisterDepositScripts 把桥的用户 P2WSH 充值脚本登记下发给侧车（C4），返回侧车登记的**并集**
+// （含别的节点推来的条目）。侧车不采信下发内容：逐条按自己的 tssPub 重新派生核对。
+func (s *Sidecar) RegisterDepositScripts(ctx context.Context, req *pb.RegisterDepositScriptsRequest) (*pb.RegisterDepositScriptsResponse, error) {
+	cctx, cancel := s.ctx(ctx)
+	defer cancel()
+	return s.client.RegisterDepositScripts(cctx, req)
+}
+
+// BuildSweep 请求侧车构造一笔扫集（把用户 P2WSH 上的充值 UTXO 归集回主池）。
+// `input_count == 0` 表示当前没有值得扫的（未达阈值/确认数），不是错误。
+func (s *Sidecar) BuildSweep(ctx context.Context, req *pb.BuildSweepRequest) (*pb.BuildSweepResponse, error) {
+	cctx, cancel := s.ctx(ctx)
+	defer cancel()
+	return s.client.BuildSweep(cctx, req)
+}
+
+// FinalizeSweep 提交已签的扫集 PSBT：侧车重新核对不变式（输出必须全回主池）后返回交易字节。
+func (s *Sidecar) FinalizeSweep(ctx context.Context, req *pb.FinalizeSweepRequest) (*pb.FinalizeSweepResponse, error) {
+	cctx, cancel := s.ctx(ctx)
+	defer cancel()
+	return s.client.FinalizeSweep(cctx, req)
+}
+
 // ParseBtcTx 解析 BTC 交易是否携带 RGB 承诺。
 func (s *Sidecar) ParseBtcTx(ctx context.Context, req *pb.ParseBtcTxRequest) (*pb.ParseBtcTxResponse, error) {
 	cctx, cancel := s.ctx(ctx)

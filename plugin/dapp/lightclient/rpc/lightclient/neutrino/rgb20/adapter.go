@@ -167,6 +167,16 @@ type Chain33Bridge interface {
 	// TSSPkScript 返回桥 TSS P2WPKH 输出的 pkScript（16 进制? 不，raw bytes）。
 	// 签名节点交叉核对提现 PSBT 时，用它判断额外输入/找零输出是否受桥（TSS）控制。
 	TSSPkScript() []byte
+	// SignSweepPsbt 通过 TSS 组对一笔**扫集** PSBT 签名（C4）。
+	//
+	// 与 SignPsbt（提现）的差别在于可核对的东西：提现能拿链上 pending 当真值逐项比对，扫集没有
+	// 任何链上上下文可对，所以签名节点改为核对"这笔交易有没有把桥的钱挪出桥"——每个输入都是
+	// 桥控制的已登记用户充值脚本、每个输出都回主池、手续费有上界（见 Adapter.ValidateSweepPsbt）。
+	// 判据全部来自 PSBT 与本节点自己的事实，不采信协调者的任何声称值。
+	SignSweepPsbt(psbtBytes []byte) ([]byte, error)
+	// BroadcastRawTx 广播一笔已定稿的原始交易（扫集用；提现走 BroadcastTx 是因为它还要登记
+	// txid↔chain33 提现哈希的映射与 pending 确认跟踪，扫集两者都不需要）。
+	BroadcastRawTx(rawTx []byte, txid string) error
 	// IsUserDepositScript 判断某个输出脚本是否为**已登记**的用户 P2WSH 充值脚本
 	// （桥发放过地址、且已纳入 watch 集），返回其 userID（= chain33 充值地址串）。
 	//

@@ -487,6 +487,10 @@ func (s *stubRgb20Bridge) TSSPkScript() []byte { return testRgb20TssScript }
 // IsUserDepositScript 本用例没有登记任何用户充值脚本（C3 的输入归属核对只会认主池脚本）。
 func (s *stubRgb20Bridge) IsUserDepositScript([]byte) (string, bool) { return "", false }
 
+// SignSweepPsbt / BroadcastRawTx：C4 扫集接口。本用例不跑扫集，占位即可。
+func (s *stubRgb20Bridge) SignSweepPsbt(psbtBytes []byte) ([]byte, error) { return psbtBytes, nil }
+func (s *stubRgb20Bridge) BroadcastRawTx([]byte, string) error            { return nil }
+
 func (s *stubRgb20Bridge) TSSAddress() string { return "bcrt1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh" }
 
 // testRgb20TssScript 与 rgb20 包单测同形的 P2WPKH 脚本（OP_0 <20B>）。
