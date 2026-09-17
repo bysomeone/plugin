@@ -701,14 +701,25 @@ func (t *tssService) signPsbtWithSigners(p *psbt.Packet, signers []string, signF
 	txHash := p.UnsignedTx.TxHash()
 	sessions := make([]string, len(p.Inputs))
 	sigHashes := make([][]byte, len(p.Inputs))
+	// p2wshScripts[i] 非空 = 第 i 个输入是原生 P2WSH，值是该输入的 witnessScript（= scriptCode）。
+	// **逐输入承载**：同一笔 tx 的不同输入可以属于不同 witnessScript（扫集/提现会把多个用户的
+	// 充值 UTXO 与主池 UTXO 拼在一起），绝不能假设"整笔只有一个脚本"。每个输入的 sighash
+	// 用它自己的 scriptCode 算（BIP143 就是逐输入定义），签名轮次也按输入下标独立
+	// （sessions[i] = "psbt-<txid>-<i>"，见下）。
+	p2wshScripts := make([][]byte, len(p.Inputs))
 	for i := range p.Inputs {
 		op := p.UnsignedTx.TxIn[i].PreviousOutPoint
 		prevOut := prevOutFetcher.FetchPrevOutput(op)
+		scriptCode, witnessScript, err := resolvePsbtInputScriptCode(&p.Inputs[i], prevOut, i)
+		if err != nil {
+			return nil, err
+		}
+		p2wshScripts[i] = witnessScript
 		sigHashType := p.Inputs[i].SighashType
 		if sigHashType == 0 {
 			sigHashType = txscript.SigHashAll // 缺省 SIGHASH_ALL（PSBT_IN_SIGHASH_TYPE）
 		}
-		sigHash, err := txscript.CalcWitnessSigHash(prevOut.PkScript, txSigHashes, sigHashType, p.UnsignedTx, i, prevOut.Value)
+		sigHash, err := txscript.CalcWitnessSigHash(scriptCode, txSigHashes, sigHashType, p.UnsignedTx, i, prevOut.Value)
 		if err != nil {
 			return nil, fmt.Errorf("calc sig hash for input %d: %w", i, err)
 		}
@@ -738,11 +749,26 @@ func (t *tssService) signPsbtWithSigners(p *psbt.Packet, signers []string, signF
 			PubKey:    pubKeyBytes,
 			Signature: sigWithHash,
 		})
-		log.Debug("signPsbt applied partial sig", "input", i)
+		log.Debug("signPsbt applied partial sig", "input", i, "p2wsh", len(p2wshScripts[i]) > 0)
 	}
 	// Phase 5 修复：签完所有输入后 finalize（partial sig → final witness）。
 	// 根因：sign-psbt 之前返回只含 partial_sigs 的未 finalize PSBT，侧车 extract_tx()
 	// 会丢弃 partial sig 得到无 witness 交易，广播报 "Witness program hash mismatch"。
+	//
+	// P2WSH 输入必须**自建** final witness，不能交给 psbt.MaybeFinalizeAll：上游 finalizer 对
+	// P2WSH 只支持多签（finalizer.go 顶部注释 "p2sh (legacy) and p2wsh currently support only
+	// multisig and no other custom script"），我们的充值脚本 `<push userID> OP_DROP
+	// <push tssPub> OP_CHECKSIG` 走上去会 ErrUnsupportedScriptType。
+	// 先自建 P2WSH 的（MaybeFinalize 对已 finalized 的输入直接返回成功），再把剩下的交给上游，
+	// 这样"一笔 tx 里同时有 P2WSH 与 P2WPKH 输入"也能各自走对路径。
+	for i := range p.Inputs {
+		if len(p2wshScripts[i]) == 0 {
+			continue
+		}
+		if err := finalizeP2WSHInput(&p.Inputs[i], p2wshScripts[i]); err != nil {
+			return nil, fmt.Errorf("finalize p2wsh input %d: %w", i, err)
+		}
+	}
 	if err := psbt.MaybeFinalizeAll(p); err != nil {
 		return nil, fmt.Errorf("finalize psbt: %w", err)
 	}
@@ -751,6 +777,90 @@ func (t *tssService) signPsbtWithSigners(p *psbt.Packet, signers []string, signF
 		return nil, fmt.Errorf("serialize psbt: %w", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// resolvePsbtInputScriptCode 求某个 PSBT 输入在 BIP143 下计算 sighash 所需的 **scriptCode**，
+// 并返回"这个输入是不是原生 P2WSH"（非 nil 的第二个返回值即该输入的 witnessScript）。
+//
+//   - 原生 P2WSH（prevout = `OP_0 <sha256(witnessScript)>`）：scriptCode **就是 witnessScript**，
+//     取自 PSBT_IN_WITNESS_SCRIPT。
+//   - 其余（P2WPKH）：scriptCode = prevout.PkScript —— BIP143 对 P2WPKH 要求的正是 p2pkh 形态
+//     脚本，btcd 的 CalcWitnessSigHash 内部会由 pubkey hash 重建，直接传 pkScript 即可。
+//
+// 传错 scriptCode 不是"轻微偏差"而是**签名必废**：同一条 witnessScript 与它的 output program
+// （34 字节的 `00 20 || program`）会算出两个不同的 sighash，用后者签出的签名在链上必被
+// OP_CHECKSIG 拒（可复现证明见 rgbx/types/p2wsh_deposit_spend_test.go）。
+//
+// 三条 fail-closed 校验都在签名之前做：
+//   - P2WSH 输入必须带 witnessScript（缺了就没有正确的 scriptCode，签出来的只会是废签名）；
+//   - **witnessScript 的 sha256 必须等于 prevout 的 program** —— 这条把"被签的消息"钉死在这笔
+//     UTXO 上。没有它，一份构造过的 PSBT 就能让 TSS 组对任意脚本（乃至任意语义的 scriptCode）
+//     出签名，等于把签名轮次变成通用签名预言机；
+//   - 不得携带 redeemScript（原生 P2WSH 没有嵌套 P2SH 那一层，带了说明形态不是我们要签的）。
+func resolvePsbtInputScriptCode(in *psbt.PInput, prevOut *wire.TxOut, idx int) (scriptCode, witnessScript []byte, err error) {
+	if in == nil || prevOut == nil {
+		return nil, nil, fmt.Errorf("input %d: prevout unavailable", idx)
+	}
+	if !txscript.IsPayToWitnessScriptHash(prevOut.PkScript) {
+		return prevOut.PkScript, nil, nil
+	}
+	if len(in.WitnessScript) == 0 {
+		return nil, nil, fmt.Errorf("input %d is p2wsh but the psbt carries no witness script: "+
+			"BIP143 scriptCode must be the witnessScript itself, not the 34-byte output program %x",
+			idx, prevOut.PkScript)
+	}
+	if len(in.RedeemScript) != 0 {
+		return nil, nil, fmt.Errorf("input %d is native p2wsh but carries a redeem script", idx)
+	}
+	sum := sha256.Sum256(in.WitnessScript)
+	if !bytes.Equal(sum[:], witnessProgramOf(prevOut.PkScript)) {
+		return nil, nil, fmt.Errorf("input %d witness script does not hash to the prevout program "+
+			"(refusing to sign an unbound scriptCode)", idx)
+	}
+	return in.WitnessScript, in.WitnessScript, nil
+}
+
+// witnessProgramOf 取 `OP_0 <push 32> <program>` 里的 program（调用方已用
+// txscript.IsPayToWitnessScriptHash 确认过形态，这里只做边界防御）。
+func witnessProgramOf(pkScript []byte) []byte {
+	if len(pkScript) < 34 {
+		return nil
+	}
+	return pkScript[2:]
+}
+
+// finalizeP2WSHInput 为**原生 P2WSH** 输入自建 final witness（partial sig → witness 栈）。
+//
+// witness 栈就是 [sig||sighashType, witnessScript] 两项：userID 在脚本里只被 push 后立即
+// OP_DROP，是纯标签、不需要花费方提供（见 rgbx/types/p2wsh_deposit.go 与
+// p2wsh_deposit_spend_test.go 的 CleanStack 断言）。
+//
+// 为什么不能交给 psbt.MaybeFinalizeAll：上游 finalizer 对 P2WSH 只认多签，非多签脚本会
+// ErrUnsupportedScriptType；即便强行走通也会在栈顶塞一个 CHECKMULTISIG 的 dummy nil，
+// 产出非标准的 [nil, sig, witnessScript]（语义上仍能过验证，但属于靠运气）。
+//
+// 只接受**恰好 1 个** partial sig：多签/多钥形态不在本方案里，宁可失败也不猜。
+func finalizeP2WSHInput(in *psbt.PInput, witnessScript []byte) error {
+	if in == nil {
+		return fmt.Errorf("nil input")
+	}
+	if len(in.PartialSigs) != 1 {
+		return fmt.Errorf("expected exactly 1 partial sig for the p2wsh script, got %d", len(in.PartialSigs))
+	}
+	var buf bytes.Buffer
+	// psbt.WriteTxWitness 就是 PSBT final_script_witness 的线格式（varint 项数 + 逐项 varbytes），
+	// 与上游 finalizer 写 final witness 用的是同一个函数。
+	if err := psbt.WriteTxWitness(&buf, wire.TxWitness{in.PartialSigs[0].Signature, witnessScript}); err != nil {
+		return fmt.Errorf("write witness: %w", err)
+	}
+	in.FinalScriptWitness = buf.Bytes()
+	// 与上游 Finalize 的收尾一致：final witness 落定后清掉中间态（partial sig / sighash type），
+	// 避免同一份 PSBT 里"已 finalize"与"待 finalize"两种状态并存被下游误读。
+	// witnessScript 与 witness_utxo 保留：前者是审计线索（脚本原文），后者广播/侧车提取仍要用，
+	// 且 psbt.MaybeFinalizeAll 对已 finalized 的输入直接跳过，不会因为 witnessScript 在场而重跑。
+	in.PartialSigs = nil
+	in.SighashType = 0
+	return nil
 }
 
 // processSignRgb20Deposit 发起 rgb20-deposit TSS 签名轮次（BL-3/HR-6）：
