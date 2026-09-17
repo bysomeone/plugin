@@ -38,9 +38,12 @@ import (
 const depositVectorsPath = "../../../../rgbx/types/testdata/p2wsh_deposit_vectors.json"
 
 type depositVector struct {
-	Name          string            `json:"name"`
-	UserID        string            `json:"userID"`
-	TssPubKey     string            `json:"tssPubKey"`
+	Name      string `json:"name"`
+	UserID    string `json:"userID"`
+	TssPubKey string `json:"tssPubKey"`
+	// TssPrivKey 仅用于**可复现的花费验签**（C1 的 p2wsh_deposit_spend_test.go 与 C3 的
+	// tss_psbt_p2wsh_test.go），是向量里公开的测试私钥，禁止用于任何真实资产。
+	TssPrivKey    string            `json:"tssPrivKey"`
 	WitnessScript string            `json:"witnessScript"`
 	Program       string            `json:"programSHA256"`
 	PkScript      string            `json:"pkScript"`
