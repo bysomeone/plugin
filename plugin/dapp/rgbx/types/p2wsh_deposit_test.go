@@ -115,7 +115,6 @@ func TestP2WSHDepositVectors(t *testing.T) {
 				back, err := txscript.PayToAddrScript(decoded)
 				require.NoError(t, err)
 				require.Equal(t, pkScript, back, "地址必须解回同一个 P2WSH program")
-				require.True(t, IsNativeP2WSHScript(back))
 			}
 
 			require.True(t, IsDepositPkScript(pkScript, v.UserID, pub))
@@ -243,23 +242,43 @@ func TestDeriveDeposit_rejectsInvalidInputs(t *testing.T) {
 	require.Equal(t, pub, got)
 }
 
-// TestIsNativeP2WSHScript 只认 witness v0 + 32 字节 program；P2WPKH / P2SH / P2TR 都不算。
-func TestIsNativeP2WSHScript(t *testing.T) {
+// TestIsDepositWitnessScriptShape 模板判定：<任意 push> OP_DROP push(tssPub) OP_CHECKSIG，
+// 且必须恰好是这个形状（userID 未知也能认出来）。
+func TestIsDepositWitnessScriptShape(t *testing.T) {
 	pub, err := hex.DecodeString("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
 	require.NoError(t, err)
-	p2wsh, err := DeriveDepositPkScript("addr", pub)
+	otherPub, err := hex.DecodeString("03d1ee32d73a68fe4cef8b5736a0ec96bd4cd3395b3dfee7d6423acc857b286ec2")
 	require.NoError(t, err)
-	require.True(t, IsNativeP2WSHScript(p2wsh))
 
-	// P2WPKH（主池脚本形态）：v0 + 20 字节 program → 不是 native P2WSH
-	require.False(t, IsNativeP2WSHScript(append([]byte{0x00, 0x14}, make([]byte, 20)...)))
-	// P2TR：v1 + 32 字节 → 不是
-	require.False(t, IsNativeP2WSHScript(append([]byte{0x51, 0x20}, make([]byte, 32)...)))
-	// P2SH（嵌套 P2SH-P2WSH 的输出脚本就是这个形态）→ 不是
-	require.False(t, IsNativeP2WSHScript(append([]byte{0xa9, 0x14}, make([]byte, 21)...)))
-	// 非法脚本
-	require.False(t, IsNativeP2WSHScript(nil))
-	require.False(t, IsNativeP2WSHScript([]byte{0x6a}))
+	// 我们的派生结果必然符合模板（userID 换成任意串也符合 —— 这正是"认得出自己的脚本"）
+	for _, userID := range []string{"addr", "1AmRYcURfDGxBhiaJAvEGdRkvkoM7ztn1u", strings.Repeat("m", 75), "\x05"} {
+		ws, err := DeriveDepositWitnessScript(userID, pub)
+		require.NoError(t, err)
+		require.Truef(t, IsDepositWitnessScriptShape(ws, pub), "userID=%q 的脚本应符合模板", userID)
+		// 换一把群公钥就不算（判断"是不是**本 symbol** 的充值脚本"）
+		require.False(t, IsDepositWitnessScriptShape(ws, otherPub))
+	}
+
+	// 反例：多签脚本（交易所/多签钱包常见形态）不是我们的充值脚本
+	multisig, err := txscript.NewScriptBuilder().
+		AddOp(txscript.OP_2).AddData(pub).AddData(otherPub).
+		AddOp(txscript.OP_2).AddOp(txscript.OP_CHECKMULTISIG).Script()
+	require.NoError(t, err)
+	require.False(t, IsDepositWitnessScriptShape(multisig, pub))
+
+	// 反例：只在结尾像（前面没有 OP_DROP 的 CHECKSIG 脚本）
+	noDrop, err := txscript.NewScriptBuilder().AddData(pub).AddOp(txscript.OP_CHECKSIG).Script()
+	require.NoError(t, err)
+	require.False(t, IsDepositWitnessScriptShape(noDrop, pub))
+
+	// 反例：尾部多一个字节（不是同一模板 —— 程序侧同样会因为哈希不同而认不出）
+	ws, err := DeriveDepositWitnessScript("addr", pub)
+	require.NoError(t, err)
+	require.False(t, IsDepositWitnessScriptShape(append(append([]byte{}, ws...), 0x00), pub))
+
+	// 反例：tssPub 长度不对 / 空脚本
+	require.False(t, IsDepositWitnessScriptShape(ws, pub[:32]))
+	require.False(t, IsDepositWitnessScriptShape(nil, pub))
 }
 
 func vectorNames(doc p2wshVectorDoc) []string {

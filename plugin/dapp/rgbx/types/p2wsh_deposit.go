@@ -165,16 +165,42 @@ func IsDepositPkScript(pkScript []byte, userID string, tssPub []byte) bool {
 	return bytes.Equal(pkScript, expect)
 }
 
-// IsNativeP2WSHScript 判断脚本是否为 native P2WSH（witness v0，32 字节 program）。
+// IsDepositWitnessScriptShape 判断一段 **witnessScript** 是否符合本项目的充值脚本模板：
 //
-// 用途一（E15-a）：合约侧**禁止 native P2WSH 作为提现目标** —— 桥的提现付款若落到
-// native P2WSH，该笔付款可被收款人回头当作充值证明（见 validate_proof.go 的不变式注释）。
-// 用途二（C2/C3）：桥侧自检"自有付款没有落到任何用户 P2WSH"。
-// 嵌套 P2SH-P2WSH 的输出脚本是 P2SH，不会被误判。
-func IsNativeP2WSHScript(pkScript []byte) bool {
-	witVer, program, err := txscript.ExtractWitnessProgramInfo(pkScript)
-	if err != nil {
+//	<任意数据 push> OP_DROP push(tssPub) OP_CHECKSIG     （tssPub = 传入的 33 字节压缩公钥）
+//
+// 用途（E15-a 的规范化描述）：答"这段脚本是不是我们自己的充值脚本（只是 userID 未知）"。
+//
+// **链上不可用**：链上只能拿到目标地址的输出脚本，对 native P2WSH 只有 34 字节的
+// `OP_0 <sha256(witnessScript)>`，witnessScript 是它的原像、在花费之前不可见 ——
+// 所以合约侧无法用本函数判"提现目标是不是充值脚本"（那边用的是可判定的等价形式：
+// program 是否等于按 (发起人, tssPub) 重建出来的充值 program，见 executor 的 checkWithdraw）。
+// 本函数的消费者在链下（桥 / 侧车）：它们在**手里有 witnessScript** 时判定归属，
+// 例如扫集时判断某个待花费的 P2WSH 输入是不是用户充值脚本、或自检"自有付款没有落到
+// 充值脚本上"（C2/C4）。
+//
+// **不要**用它做"禁用 native P2WSH 目标"的一刀切判定：交易所、多签钱包、闪电通道
+// 大量使用 P2WSH/P2TR 地址，那样会把合法提现拒掉。只拒"我们自己的充值脚本"。
+func IsDepositWitnessScriptShape(script, tssPub []byte) bool {
+	if len(tssPub) != depositTssPubKeyLen {
 		return false
 	}
-	return witVer == 0 && len(program) == 32
+	tokenizer := txscript.MakeScriptTokenizer(0, script)
+	// 1) push(userID)：任意数据 push（含 OP_0 空 push），长度上限同规格
+	if !tokenizer.Next() || tokenizer.Opcode() > txscript.OP_DATA_75 {
+		return false
+	}
+	// 2) OP_DROP
+	if !tokenizer.Next() || tokenizer.Opcode() != txscript.OP_DROP {
+		return false
+	}
+	// 3) push(tssPub)：push 的数据必须逐字节等于该 symbol 的群公钥
+	if !tokenizer.Next() || !bytes.Equal(tokenizer.Data(), tssPub) {
+		return false
+	}
+	// 4) OP_CHECKSIG，且脚本到此为止（多一个字节都不算同一模板）
+	if !tokenizer.Next() || tokenizer.Opcode() != txscript.OP_CHECKSIG {
+		return false
+	}
+	return !tokenizer.Next() && tokenizer.Err() == nil
 }
