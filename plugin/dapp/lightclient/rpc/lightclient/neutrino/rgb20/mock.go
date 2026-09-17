@@ -32,6 +32,17 @@ type MockSidecar struct {
 	CreateReceiveFn func(ctx context.Context, req *pb.CreateReceiveRequest) (*pb.ReceiveData, error)
 	OnProvide       func(ctx context.Context, req *pb.ProvideConsignmentRequest) (*pb.TransferState, error)
 	SidecarAddr     string // 提供给 BuildWithdrawal 的找零地址（TSS 地址）
+	// buildReqs 依次记录收到的 BuildWithdrawal 请求（断言重放时下发 input_seals、状态门拦住时不下发）。
+	buildReqs []*pb.BuildWithdrawalRequest
+}
+
+// buildRequests 返回全部 BuildWithdrawal 请求（副本）。
+func (m *MockSidecar) buildRequests() []*pb.BuildWithdrawalRequest {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*pb.BuildWithdrawalRequest, len(m.buildReqs))
+	copy(out, m.buildReqs)
+	return out
 }
 
 // NewMockSidecar 构造假侧车。
@@ -152,9 +163,10 @@ func (m *MockSidecar) ListAssets(_ context.Context, _ *pb.ListAssetsRequest) (*p
 	return &pb.ListAssetsResponse{}, nil
 }
 
-func (m *MockSidecar) BuildWithdrawal(_ context.Context, _ *pb.BuildWithdrawalRequest) (*pb.BuildWithdrawalResponse, error) {
+func (m *MockSidecar) BuildWithdrawal(_ context.Context, req *pb.BuildWithdrawalRequest) (*pb.BuildWithdrawalResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.buildReqs = append(m.buildReqs, proto.Clone(req).(*pb.BuildWithdrawalRequest))
 	if m.BuildErr != nil {
 		return nil, m.BuildErr
 	}

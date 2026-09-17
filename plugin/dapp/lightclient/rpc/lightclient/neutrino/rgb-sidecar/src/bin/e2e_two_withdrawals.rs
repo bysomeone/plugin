@@ -274,7 +274,7 @@ fn main() -> Result<()> {
     let mut first_result: Option<(String, String, Option<String>)> = None;
     for round in 1..=2u32 {
         let before = engine.get_balance("USDT").0;
-        let w = engine.build_withdrawal("USDT", WITHDRAW_AMOUNT, &user_invoice, &tss_addr, 2)?;
+        let w = engine.build_withdrawal("USDT", WITHDRAW_AMOUNT, &user_invoice, &tss_addr, 2, &[])?;
         let inputs: Vec<String> = w
             .psbt
             .unsigned_tx

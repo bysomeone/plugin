@@ -140,6 +140,13 @@ message BuildWithdrawalRequest {
   string recipient_invoice = 4;        // 用户 RGB 钱包生成的 invoice
   string change_address = 5;           // TSS 地址（change seal）
   uint32 fee_rate = 6;                 // sat/vB
+  // input_seals 复用重建（E9-A）：非空时**跳过按状态选 seal**，直接按给定 outpoint 构建
+  // （outpoint 形如 "txid:vout"）。用于同一笔 chain33 burn 的重试——第一次构建/上链后账本已
+  // 推进（原 seal → consumed、找零 seal → minted），再按状态选就会选到**另一组** seal，产出
+  // 另一笔独立有效的转移（用户得两份资产、链上只结算一次）。按给定 outpoint 重建才能得到
+  // 同一笔交易（同一 txid），使重试退化为幂等重放。
+  // 侧车不盲信：仍逐个校验这些 outpoint 确实承载该资产的状态，否则拒绝构建。
+  repeated string input_seals = 7;
 }
 message BuildWithdrawalResponse {
   bytes psbt = 1;                      // 未签 PSBT（TSS 将签名）

@@ -265,6 +265,21 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 	if changeAddr == "" {
 		return nil, fmt.Errorf("change address not configured (set rgb20.changeAddress or wait for TSS address)")
 	}
+	// 与 BTC 侧同构的状态门（bitcoin.go 的 withdrawReqChan 分支：state 非空且 stickyUTXO 为空
+	// 则跳过重试）：状态非空 = 本笔已经走到过广播（见 neutrino.BroadcastTx 落盘 withdrawStatusSent），
+	// 而 sticky 记录为空 = 我们已经无法重建"上一次到底花了哪组 seal"（记录丢失/存储被清）——此时
+	// 按当前账本重新选 seal 构建正是 E9 的双付形态（同一笔 burn 付两次，链上只结算一次），
+	// 只能停下（fail-closed，且判为不可恢复：重试不会让那条记录回来）。
+	if a.bridge != nil {
+		if state := a.bridge.WithdrawState(req.Chain33TxHash); len(state) > 0 && a.GetStickySeal(req.Chain33TxHash) == "" {
+			return nil, NewStickySealMismatchError(fmt.Errorf(
+				"withdraw state %q but no sticky seal recorded", string(state)))
+		}
+	}
+	// E9-A：已有 sticky 记录时把它作为 input_seals 下发，侧车按这组 seal **重放**上一次的构建
+	// （同一份未签 PSBT、同一 txid）。没有它的话，重试会按当前账本（原 seal 已 consumed、找零 seal
+	// 已 minted）重新选 seal，产出另一笔独立有效的转移——用户得两份资产、链上只结算一次。
+	// 空记录（首次）⇒ 不下发，侧车走常规选 seal 路径。
 	rsp, err := a.sidecar.Load().BuildWithdrawal(ctx, &pb.BuildWithdrawalRequest{
 		AssetSymbol:      contract.sidecarAssetSymbol(),
 		AssetId:          contract.AssetID,
@@ -272,6 +287,7 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 		RecipientInvoice: req.RecipientInvoice,
 		ChangeAddress:    changeAddr,
 		FeeRate:          uint32(req.FeeRate),
+		InputSeals:       decodeStickySeals(a.GetStickySeal(req.Chain33TxHash)),
 	})
 	if err != nil {
 		// 分类在这一层做（而不是调用方）：只有这里看得到侧车的原始 gRPC 错误码。
@@ -299,6 +315,9 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 		return nil, fmt.Errorf("validate withdrawal: %w", err)
 	}
 	// sticky-seal：持久化该笔提现绑定的 seal（重试时不可改选；已有记录必须一致，绝不覆盖）。
+	// 这一层同时是「构建后比对」：stickySeals 由**本份**已验证的 PSBT 与 consignment 推出
+	// （PSBT 输入 ∩ closed_seals），与既有记录不一致即判不可恢复——即使侧车没有按 input_seals
+	// 重放（旧版侧车/记录缺失导致重选），也绝不会让同一笔 burn 换一组 seal 悄悄付第二次。
 	if err := a.persistStickySeal(req.Chain33TxHash, stickySeals); err != nil {
 		return nil, err
 	}
@@ -689,6 +708,22 @@ func encodeStickySeals(seals []string) string {
 	}
 	sort.Strings(uniq)
 	return strings.Join(uniq, ",")
+}
+
+// decodeStickySeals 是 encodeStickySeals 的逆：把落盘的规范形式还原成 outpoint 列表，
+// 作为 BuildWithdrawalRequest.input_seals 下发给侧车（触发重放）。
+func decodeStickySeals(recorded string) []string {
+	if recorded == "" {
+		return nil
+	}
+	parts := strings.Split(recorded, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // CheckStickySeal 签名节点侧 sticky seal 核对（E9-B）：一笔 chain33 burn 只能绑定一组 RGB seal。
