@@ -98,12 +98,10 @@ func Test_checkShareAgainstChainInfos(t *testing.T) {
 	otherPubScript := p2wpkhScript(otherPubFromBytes(t, otherPubBytes))
 
 	tests := []struct {
-		name        string
-		symbols     []string
-		infos       map[string]*rtypes.CrossChainInfo
-		queryErr    error
-		wantSkipped bool // 连查询都没发生（本用例用不到）
-		wantCount   int
+		name      string
+		symbols   []string
+		infos     map[string]*rtypes.CrossChainInfo
+		wantCount int
 	}{
 		{
 			name:    "rgb20 pubkey matches",
@@ -165,9 +163,6 @@ func Test_checkShareAgainstChainInfos(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			query := func(symbol string) (*rtypes.CrossChainInfo, error) {
-				if tt.queryErr != nil {
-					return nil, tt.queryErr
-				}
 				return tt.infos[symbol], nil
 			}
 			mismatches := checkShareAgainstChainInfos(localPub, tt.symbols, query)
