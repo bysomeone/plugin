@@ -244,33 +244,9 @@ best >= H + B + N - 1          （等价于：提交后链上可见深度 >= N�
 ### 4.4 `[rpc.sub.light.neutrino.rgb20]`
 
 RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentListen` / `contracts` / `precision` /
-`changeAddress`）见 `RGB_USDT_INTEGRATION.md`；这里说明与签名侧去重、充值重试相关的两项。
-本节的配置项都**不需要**与主链 `[exec.sub.rgbx]` 人肉对齐：链上最小确认数 N 由中继直接查链上
-（见 2.2），本节只描述行为。
-
-- `signedDepositTTL` (int64)
-  - 含义：**签名侧"已签集合"的保留期（TTL），单位 = BTC 区块数**（不是秒/小时）。
-  - 作用：签名节点在签出 `thresholdSig`（= chain33 铸币授权）**成功之后**，把那笔 BTC 付款交易的
-    `txid` 记进本地已签集合（顶层 bucket `rgb20-signed-deposit`，与 receive/seal 同一个 KVStore）；
-    同一个 `txid` 再来时直接拒绝签名，不再进入签名轮次。付款交易所在 BTC 高度记为锚点，
-    `链上 canonical tip 高度 - 记录高度 >= signedDepositTTL` 即视为过期：过期记录被清掉，
-    同一 `txid` 允许再次签名。
-  - `0` 或 `-1`（任何 ≤ 0 的值，**默认 0**）：**只增不删** —— 已签记录永久保留，永不因 TTL 被清理，
-    也不做任何链上高度查询（默认配置下这条机制零查询、零行为变化）。
-  - 正数：按 BTC 块数保留。参考值：`144` ≈ 1 天（10 分钟/块）、`1008` ≈ 1 周、`4320` ≈ 1 个月。
-    取值越大，同一个 `txid` 能被重复签名的窗口越窄（越保守）；但**过期后同一 txid 会被重新放行**，
-    这是 TTL 的固有取舍，链上 txid 去重（`formatDepositUsedTxIDKey`）不受影响，仍是最终兜底。
-  - **改配置重启立即生效**：启动时若 TTL 为正，会**立刻做一次清理**，把已过期的旧记录（包括之前
-    TTL=0 期间攒下的、或从更大的 TTL 调小后超期的记录）一并删掉；清理在后台执行（取链上高度可能
-    因启动竞态失败，会按 3s 间隔重试），不阻塞节点启动。之后在每次标记成功时顺带清理一次。
-  - 单位选 BTC 高度而不是时钟：高度由链决定，四个签名节点看到的是同一个、单调的计数，不受本机
-    时钟漂移/回拨影响，也不要求节点自己有 neutrino 头库（validator 节点的本地 bestBlock 是空的）。
-    代价是 TTL 判定要读一次链上 tip（lightclient 的 `GetBtcLastHeader` 查询，带 5s 超时），
-    因此只在 TTL > 0 且确有一条记录要判定时才查。
-  - 失败取向（fail-closed）：TTL > 0 但链上高度取不到时，**保持拒绝**（按"仍在保留期"处理），
-    不会因为查询失败就放行重复签名。
-  - 注意：这条去重是**纵深防御**，不是铸币闸门 —— 即使重复签出 `thresholdSig`，链上也会按 txid
-    拒绝第二笔铸造（不多铸）；它挡住的是"给协调者多余的签名产物 + 白跑签名轮次"。
+`changeAddress`）见 `RGB_USDT_INTEGRATION.md`；本节只描述充值重试相关的行为，**没有额外配置项**。
+本节的行为都**不需要**与主链 `[exec.sub.rgbx]` 人肉对齐：链上最小确认数 N 由中继直接查链上
+（见 2.2）。
 
 #### 4.4.1 充值提交的深度门控（无配置项）
 
@@ -282,23 +258,26 @@ RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentLi
 - 取不到 best（neutrino 还没同步出 best block）或读不到链上 N → 不提交（fail-closed），日志限流
   WARN/ERROR（同一个 receive 只报一次）。
 
-#### 4.4.2 签名落盘、重试只重发（无配置项）
+#### 4.4.2 签名落盘、重试优先重发（无配置项）
 
 充值签名轮次产出的完整 `DepositAsset`（含 `thresholdSig`）会**落盘**（与 receive/seal 同一个 KVStore
 的顶层 bucket `rgb20-deposit-sig`，key = 付款交易 txid），顺序是**先落盘、再提交**。于是：
 
-- **重试只重发**这份已签对象，不再驱动签名轮次：不再每 30s 空跑一轮 GG18，也不会因为签名节点的
-  "已签集合"（4.4）而"每 30s 失败一次、记录永不 minted"（TTL ≤ 0 的默认配置下原本是永久卡死）。
-- 签名轮次只在"没有可用产物"时驱动一次；铸造成功后产物被清掉（不只增不删）。
+- **重试优先重发**这份已签对象，不再驱动签名轮次：不再每 30s 空跑一轮 GG18（签名轮次是整条链路上
+  最贵的一步，30s 起）。
+- 这份落盘产物是**性能缓存，不是重试的唯一依据**：产物丢了就重新签一轮，记录自己能走通，不会卡死。
+  重签是安全的 —— 签的是 `C = sha256(types.Encode(DepositAsset{thresholdSig:nil}))`，内容只有金额 /
+  目标地址 / 资产符号 + SPV 证明，没有 nonce、时间戳或 UTXO 选择，所以同一笔充值每次重签得到的 `C`
+  逐字节相同；链上还按 txid 去重（`formatDepositUsedTxIDKey`）兜底，不会多铸。
+- 铸造成功后产物被清掉（不只增不删）。
 - 重发被链上按 btc-txid 去重拒绝（`duplicate deposit proof`）时按**已铸造**处理：这是链上已认过这笔
   付款交易的信号（多半是上次提交其实进了链、只是本地没记上 minted），否则会每 30s 重发一次、永远停在
   settled。
-- 重启/崩溃不影响：产物在盘上，重启后继续重发。**落盘失败就不提交**（下一轮重试落盘；进程若在落盘
-  成功前重启，则退化为下面那条异常）。
-- **异常态**（本节点已签过这笔付款交易、但本地没有签名产物：落盘后进程重启且数据目录被清、从旧快照
-  恢复等）：中继**不重签**（其它签名节点的已签集合会拒绝这一轮，重签只会每 30s 白等一轮 GG18 超时），
-  而是限流报一条 ERROR 并**停止推进这条记录**。自愈出口：把 `signedDepositTTL` 配成正数并重启，
-  等已签集合过期后该记录会重新正常签名；或从备份恢复该 bucket。
+- 重启/崩溃不影响：产物在盘上就继续重发。**落盘失败就不提交**（下一轮重试落盘）；进程若在落盘成功前
+  重启，产物随之丢失，下一轮重新签一轮即可（只多花一轮 GG18，不影响正确性）。
+- **产物丢失是可自愈的常态**（落盘失败后重启、数据目录被清、从旧快照恢复等原因，导致本地只剩一条
+  settled 的 receive 而没有 `rgb20-deposit-sig` 记录）：中继直接走"构造 + 签名 + 落盘 + 提交"的正常
+  路径，不需要任何人工干预，也没有需要运维放行的异常态。
 
 ## 5. Bitcoin 节点关键配置项
 
@@ -440,10 +419,6 @@ certFile="/path/to/rpc.cert"
 peers=["1addrA","1addrB","1addrC","1addrD"]
 threshold=3
 rank=0 # 官方节点；第三方节点配置为 rank=1，且 isOfficialNode=false
-
-[rpc.sub.light.neutrino.rgb20]
-# 签名侧已签集合的保留期（BTC 块数）：0/-1 = 只增不删（默认，不清理）；正数 = 过期后同一 txid 可再签
-signedDepositTTL=0
 ```
 
 第三方节点相对官方节点的最小差异：
@@ -472,12 +447,6 @@ signedDepositTTL=0
 - 提交头数过大（`ErrBtcHeadersTooMany`）：单笔超过 64 个头会被拒（中继自身 batchSize=64，正好在上限，
   且会截断更大的批）。自行写中继脚本时同样要 ≤ 64
 - 批内高度重复/跳高（`ErrBtcHeaderDuplicateHeight`）：中继必须按高度逐个 +1 提交，不能跳块或重发
-- 重复签名被拒（`deposit tx ... already signed by this node`）：该付款交易 txid 已在本地已签集合里
-  （见 4.4）。属预期行为，不是故障；确需放行只能等 TTL 到期（或把 `signedDepositTTL` 调小后重启，
-  启动清理会立即删掉超期记录）
-- `signedDepositTTL` 配了正数却像"没生效"：TTL 以**付款交易所在高度**为锚点，付款高度与链上 tip
-  差距超过 TTL 的记录本就已过期（一签字就过期），对这类老付款不提供去重——去重窗口是"付款后
-  TTL 个块内"
 - 充值迟迟不到账（比预期晚几个块）：正常行为，见 2.2.1/4.4.1 —— 中继会等
   `best >= H + B + N - 1` 才提交（延迟 ≈ N 个 BTC 块）。想缩短就把链上 `minBtcConfirmations`（N）
   调小（代价是重组风险，见 2.2），**不要**去改 `blockConfirmations`（它同时是头链保留深度与充值通知
@@ -485,9 +454,6 @@ signedDepositTTL=0
 - 充值一直不提交、日志里 `deposit depth gate: ... confirmations unavailable`：中继读不到链上 N
   （主链未就绪，或主链执行器是旧版本、没有 `GetRgbxMinBtcConfirmations` 查询）。中继按 fail-closed
   不提交（见 2.2），升级主链执行器即恢复，不需要改中继配置
-- 充值不提交、日志里 `already signed this deposit tx but the signed artifact is missing`：本节点签过
-  这笔交易但本地签名产物丢了（见 4.4.2 的异常态）。按日志提示处理（配正数 `signedDepositTTL` 重启让
-  已签集合过期，或从备份恢复 `rgb20-deposit-sig` bucket），**不要**手工去清已签集合绕过
 - E2E/CI 里看不出"提交那一刻链上深度是 0"的坑：CI 把 `blockConfirmations=1` 与
   `minBtcConfirmations=1` 一起配（见 2.2 与 4.1），N=1 时深度 0 也够，等于把这条交互掩盖了。本地验证
   必须显式用 N > 1（单测已覆盖，见 `rgb20/deposit_retry_test.go`）

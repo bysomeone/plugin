@@ -138,8 +138,9 @@ func (a *Adapter) pollTransfersOnce() {
 
 // onSettledTransfer 按 receive_id 归因并推进充值流程。
 // 已归因但未 minted 的记录会在后续轮询中持续重试 submitDeposit：
-//   - 签名产物已落盘 → 只重发，不再驱动签名轮次（不再与签名节点的"已签集合"冲突）；
+//   - 签名产物已落盘 → 只重发，省掉一轮 GG18（签名轮次是整条链路上最贵的一步）；
 //   - 没有签名产物 → 先做本地深度门控（链上可见深度还不够就不签、不提交）、再签一次并落盘提交。
+//     没有产物是可自愈的常态（首次归因、重启后产物被清等），重签一份逐字节相同的对象没有副作用。
 //
 // 于是重试只剩两种：等深度（廉价、无签名）与真失败（网络/主链暂时不可用）。
 func (a *Adapter) onSettledTransfer(t *pb.TransferState) error {
@@ -189,15 +190,18 @@ func (a *Adapter) onSettledTransfer(t *pb.TransferState) error {
 
 // submitDeposit 推进一笔充值的铸造，分两条路径（重试也走这里）：
 //
-//	已有落盘的签名产物 → 只重发（不再驱动签名轮次，不与签名节点的"已签集合"冲突）；
+//	已有落盘的签名产物 → 只重发（省掉一轮 GG18；重发的是"签的是什么就发什么"）；
 //	没有签名产物       → 校验链上可见深度够不够（够才签）→ 签名 → **落盘** → 提交。
 //
 // 顺序上的两个关键约定：
-//   - **先落盘、再提交**：提交前产物必须已持久化，否则重启/崩溃后会落进"已签集合里有、落盘产物没有"
-//     的异常态（见 checkSignedArtifactMissing）；
+//   - **先落盘、再提交**：提交前产物必须先持久化，否则一次重启就丢掉产物、要重跑一轮签名；
 //   - **深度门控在签名之前**：链上注定拒绝的提交不该消耗一轮 GG18（30s 起）。
 //
 // 提交失败（含被链上拒绝）不丢产物：下一轮轮询直接重发同一份已签对象。
+// 产物真的丢了（落盘失败后重启、数据目录被清、从旧快照恢复）也能自愈：没有产物就走下面
+// 构造 + 签名那条路径，重签一份完全相同的对象再提交 —— 充值重签是逐字节幂等的
+// （签的是 C = sha256(Encode(DepositAsset{thresholdSig:nil}))，内容只有金额/地址/符号 + SPV 证明，
+// 没有 nonce、时间戳或 UTXO 选择），链上仍按 txid 去重（formatDepositUsedTxIDKey）兜底。
 func (a *Adapter) submitDeposit(rec *ReceiveRecord) error {
 	if rec == nil {
 		return fmt.Errorf("nil receive record")
@@ -209,7 +213,7 @@ func (a *Adapter) submitDeposit(rec *ReceiveRecord) error {
 		return fmt.Errorf("chain33 bridge not set")
 	}
 
-	// 1) 已有签名产物：只重发（不再驱动签名轮次）。
+	// 1) 已有签名产物：只重发。
 	art, err := a.depositSigs.Get(rec.Txid)
 	if err != nil {
 		return fmt.Errorf("load signed deposit: %w", err)
@@ -218,23 +222,18 @@ func (a *Adapter) submitDeposit(rec *ReceiveRecord) error {
 		return a.submitSignedDeposit(rec, art)
 	}
 
-	// 2) 没有签名产物：异常态检查（本节点已签过这笔交易，产物却不在本地）。
-	if err := a.checkSignedArtifactMissing(rec.Txid); err != nil {
-		return err
-	}
-
-	// 3) 构造 SPV 证明（深度门控要知道付款交易高度 H）。
+	// 2) 构造 SPV 证明（深度门控要知道付款交易高度 H）。
 	proof, err := a.bridge.BuildSpvProof(rec.Txid)
 	if err != nil {
 		return fmt.Errorf("build spv proof: %w", err)
 	}
-	// 4) 本地深度门控（签名前的这一次）：链上可见深度不够就等，不签名、不提交。
+	// 3) 本地深度门控（签名前的这一次）：链上可见深度不够就等，不签名、不提交。
 	// 提交前 submitSignedDeposit 还会再核对一次（最贴近动作的那次），这里拦的是"白跑一轮 GG18"。
 	if err := a.checkSubmitDepth(proof.BlockHeight); err != nil {
 		return err
 	}
 
-	// 5) 签名轮次（一整轮 GG18，代价最高的那一步）。
+	// 4) 签名轮次（一整轮 GG18，代价最高的那一步）。
 	dep := &rtypes.DepositAsset{
 		Amount:         rec.Amount,
 		DepositAddress: rec.Chain33Addr,
@@ -265,8 +264,8 @@ func (a *Adapter) submitDeposit(rec *ReceiveRecord) error {
 	}
 	dep.ThresholdSig = sig
 
-	// 6) 落盘（先落盘、再提交）：产物是"重试只重发"的唯一依据，丢一次就要重跑签名轮次，
-	// 而重跑会被签名节点的已签集合拒绝 —— 所以落盘失败就不提交，下一轮重试落盘。
+	// 5) 落盘（先落盘、再提交）：产物是"重试只重发"的依据 —— 有它在盘上就不必再跑一轮 GG18；
+	// 落盘失败就不提交，下一轮重试落盘（真丢了也能重签，见 submitDeposit 的说明）。
 	art = &SignedDepositArtifact{
 		Txid:      rec.Txid,
 		ReceiveID: rec.ReceiveID,
@@ -281,10 +280,12 @@ func (a *Adapter) submitDeposit(rec *ReceiveRecord) error {
 }
 
 // persistArtifactFailed 落盘失败：限流记一条 ERROR 并返回错误（调用方不提交）。
+// 产物仍在内存缓存里，下一轮 Put 会重试落盘；若在落盘成功前进程重启，产物随之丢失，下一轮会
+// 重新走一轮签名（重签幂等，只是白花一轮 GG18），不会卡死这条记录。
 func (a *Adapter) persistArtifactFailed(rec *ReceiveRecord, err error) error {
 	if a.depositNotes.allow("persist-sig:" + rec.Txid) {
 		log.Error("submitDeposit persist signed deposit failed, withholding submission (the signature is kept in "+
-			"memory and the write is retried next round; a restart before it succeeds needs operator intervention)",
+			"memory and the write is retried next round; losing it to a restart only costs one extra signing round)",
 			"receiveId", rec.ReceiveID, "txid", rec.Txid, "err", err)
 	}
 	return fmt.Errorf("persist signed deposit: %w", err)
@@ -295,7 +296,7 @@ func (a *Adapter) submitSignedDeposit(rec *ReceiveRecord, art *SignedDepositArti
 	if art == nil || art.Deposit == nil {
 		return fmt.Errorf("invalid signed deposit artifact for receive %s", rec.ReceiveID)
 	}
-	// 产物必须先持久化：否则一次重启就落到"已签集合有、产物没有"的异常态。
+	// 产物先持久化：为的是重启后还能只重发；真丢了也只是重签一轮，不影响正确性。
 	if err := a.depositSigs.Put(art); err != nil {
 		return a.persistArtifactFailed(rec, err)
 	}
@@ -347,14 +348,10 @@ var errDepositDepthPending = errors.New("deposit awaiting on-chain btc confirmat
 // errDepositGateUnavailable 门控算不出来（取不到 best / 读不到链上 N）——fail-closed，同样不提交。
 var errDepositGateUnavailable = errors.New("deposit depth gate unavailable")
 
-// errSignedArtifactMissing 异常态：签名节点已登记这笔付款交易（本节点已签过），但本地没有签名产物。
-var errSignedArtifactMissing = errors.New("signed deposit artifact missing")
-
-// isDepositRetryNote 判断错误是不是"已知的等待/异常状态"（submitDeposit 已自行限流记录，调用方别再刷屏）。
+// isDepositRetryNote 判断错误是不是"已知的等待状态"（submitDeposit 已自行限流记录，调用方别再刷屏）。
 func isDepositRetryNote(err error) bool {
 	return errors.Is(err, errDepositDepthPending) ||
-		errors.Is(err, errDepositGateUnavailable) ||
-		errors.Is(err, errSignedArtifactMissing)
+		errors.Is(err, errDepositGateUnavailable)
 }
 
 // requiredSubmitHeight 本地 depth 门控的阈值：中继本地 best 达到该高度才允许提交一份高度为
@@ -388,7 +385,7 @@ func requiredSubmitHeight(proofHeight, headerConfs, minConfs uint64) (uint64, bo
 // 调用方**不得**继续签名/提交，等下一轮轮询再试（那时 best 通常已经长够，一次提交即成）。
 //
 // 为什么不能依赖"提交被拒后再重试"：被拒发生在签名轮次之后（TSS 已经白跑一轮 GG18，30s 起），
-// 而重试又会撞上签名节点的已签集合 —— 于是变成"每 30s 失败一次、记录永不 minted"（默认 TTL 下永久卡死）。
+// 每 30s 失败一次纯属浪费；在签名之前拦住，重试就只剩"等深度"这一件廉价的事。
 //
 // fail-closed：取不到 best（neutrino 还没同步出 best block）或链上 N 查不到（主链未就绪/旧执行器）时
 // 一律按"还不够"处理 —— 算不出深度就不提交，绝不用猜测值凑门控。
@@ -431,38 +428,6 @@ func (a *Adapter) gateUnavailable(proofHeight uint64, reason string, cause error
 	return fmt.Errorf("%w: %s (proofHeight=%d): %w", errDepositGateUnavailable, reason, proofHeight, cause)
 }
 
-// checkSignedArtifactMissing 异常态检查：签名节点已登记这笔付款交易（= 本节点已为它签过），
-// 但本地没有签名产物。
-//
-// 策略：**不重签，报错并停止推进这条记录**（fail-closed）。理由：
-//   - 重签注定失败：签名成功 = 四个节点都签过，其它节点的已签集合会直接拒绝这一轮，本节点每 30s
-//     白等一轮 GG18 超时 —— 正是本方案要消灭的行为；
-//   - 走到这里说明"本节点产出过签名、但本地没有它的记录"（落盘失败且进程重启、数据目录被清、
-//     从旧快照恢复），本地状态已不可信，静默重签只会把不一致掩盖过去；
-//   - 有明确的自愈出口：把 signedDepositTTL 配成正数并重启（已签集合按 TTL 过期，过期后这条记录
-//     不再算"已签"，重试会正常走签名），或从备份恢复该 bucket（rgb20-deposit-sig）。
-func (a *Adapter) checkSignedArtifactMissing(txid string) error {
-	if a.signed == nil {
-		return nil
-	}
-	signed, err := a.signed.IsSigned(txid)
-	if err != nil {
-		// 判不了（链上高度取不到）时按"已签"处理，与已签集合自身的 fail-closed 取向一致。
-		return fmt.Errorf("deposit depth gate: signed-set check tx %s: %w", txid, err)
-	}
-	if !signed {
-		return nil
-	}
-	if a.depositNotes.allow("missing-sig:" + txid) {
-		log.Error("submitDeposit: this node already signed this deposit tx but the signed artifact is missing "+
-			"locally (lost signature artifact); not re-signing (the other signers' signed set would refuse it). "+
-			"Set a positive rgb20.signedDepositTTL and restart to let the signed set expire, or restore the "+
-			"rgb20-deposit-sig bucket from a backup",
-			"txid", txid)
-	}
-	return fmt.Errorf("%w: txid=%s", errSignedArtifactMissing, txid)
-}
-
 // BuildDepositSignMessage 构造 rgb20-deposit 签名消息（主节点侧）。
 func (a *Adapter) BuildDepositSignMessage(rec *ReceiveRecord, consignment []byte, blockHeight uint64, blockHash string, txIndex uint32) (*DepositSignPayload, error) {
 	if rec == nil {
@@ -487,20 +452,13 @@ func (a *Adapter) BuildDepositSignMessage(rec *ReceiveRecord, consignment []byte
 }
 
 // ValidateDepositConsignment 签名节点对 rgb20-deposit 消息做独立校验（BL-3）：
-// 去重（本节点已签集合 + 本地 receive 已 minted）+ 地址绑定 + 金额匹配 +
-// 侧车 ValidateConsignment + 同步高度门槛。
+// 本地 receive 已 minted 去重 + 地址绑定 + 金额匹配 + 侧车 ValidateConsignment + 同步高度门槛。
 func (a *Adapter) ValidateDepositConsignment(payload *DepositSignPayload) error {
 	if payload == nil || payload.Deposit == nil {
 		return fmt.Errorf("invalid rgb20-deposit payload")
 	}
 	if len(payload.Consignment) == 0 {
 		return fmt.Errorf("empty consignment")
-	}
-	// A3（签名侧去重）：本节点已为这笔付款交易签过则直接拒绝，不进入签名轮次。
-	// 原先的去重只有下面的"本地 receive 已 minted 则拒"，而 validator 节点的本地 store 里
-	// 通常没有 receive 记录，那条检查对它们形同虚设。txid 严格从 TxProof.TxData 解析（见 signedset.go）。
-	if err := a.CheckDepositSigned(payload); err != nil {
-		return err
 	}
 	// 本地 receive 可能存在（官方节点）也可能不存在（validator 节点：receive 只在官方节点
 	// 通过 CreateReceive 创建，validator 的本地 store 没有）。validator 节点退化为用

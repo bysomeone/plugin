@@ -12,11 +12,24 @@ import (
 	pb "github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20/pb"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/btcutil/psbt"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// testDepositTxData 构造一笔最小但**规范编码**的 BTC 付款交易（无 witness、reader 恰好消费完）。
+// nonce 用来区分不同的付款交易（不同 txid）。签名节点侧对 TxData 的规范性校验（A3）要求这种编码。
+func testDepositTxData(t *testing.T, nonce uint32) []byte {
+	t.Helper()
+	tx := wire.NewMsgTx(wire.TxVersion)
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{byte(nonce)}, Index: nonce}, nil, nil))
+	tx.AddTxOut(wire.NewTxOut(int64(1000+int(nonce)), []byte{0x51}))
+	var buf bytes.Buffer
+	require.NoError(t, tx.SerializeNoWitness(&buf))
+	return buf.Bytes()
+}
 
 func validValidation(synced uint64) *pb.ConsignmentValidation {
 	return &pb.ConsignmentValidation{
@@ -50,10 +63,6 @@ type fakeBridge struct {
 	spvProof   *SpvProof
 	sig        []byte
 	signedPSBT []byte
-	// btcTip/btcTipErr 链上 BTC tip 高度（已签集合 TTL 判定用）；tipCalls 记查询次数。
-	btcTip    uint64
-	btcTipErr error
-	tipCalls  int
 	// bestHeight/err 本地 BTC best height（深度门控用）；minConfs 链上 rgbx 最小确认数 N。
 	bestHeight  uint64
 	bestErr     error
@@ -161,13 +170,6 @@ func (f *fakeBridge) SignPsbt(psbtBytes []byte) ([]byte, error) {
 	return psbtBytes, nil
 }
 
-func (f *fakeBridge) BtcTipHeight() (uint64, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.tipCalls++
-	return f.btcTip, f.btcTipErr
-}
-
 // BtcBestHeight 本地 best height（深度门控用）。
 // 未用 setDepth 显式配置时给一个"深度永远够"的默认值：既有用例关心的是别的路径，不该被门控挡住；
 // 深度门控自己的用例一律显式 setDepth。
@@ -220,25 +222,6 @@ func (f *fakeBridge) setSubmitErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.submitErr = err
-}
-
-// tipCallCount 链上高度查询次数（断言"默认配置零查询"用）。
-func (f *fakeBridge) tipCallCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.tipCalls
-}
-
-func (f *fakeBridge) setTip(tip uint64) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.btcTip = tip
-}
-
-func (f *fakeBridge) setTipErr(err error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.btcTipErr = err
 }
 
 func (f *fakeBridge) BroadcastTx(_ []byte, _ string) error { return nil }
@@ -411,7 +394,7 @@ func Test_ValidateDepositConsignment(t *testing.T) {
 			Amount:         1000,
 			DepositAddress: "addr",
 			AssetSymbol:    "RGB20_USDT",
-			// 签名侧去重要从 TxProof.TxData 严格解析 txid，这里给一笔规范编码的付款交易。
+			// SPV 校验要求一笔规范编码的付款交易（A3：reader 必须恰好消费完）。
 			TxProof: &rtypes.BtcTxProof{TxData: testDepositTxData(t, 1), BlockHeight: 100},
 		},
 		Consignment:    []byte("consignment"),

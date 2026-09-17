@@ -14,9 +14,8 @@ import (
  *
  *  ① 本地深度门控：链上可见深度不够时**不签、不提交**（重试只等，不空跑签名轮次）；
  *  ② N 来自链上（桥接查询），不是中继自己镜像的配置；
- *  ③ 签名产物落盘：重试只重发，签名轮次只被驱动一次；
- *  ④ 已签集合里有 txid、但落盘产物缺失 → 异常，不重签、不再推进；
- *  ⑤ 与已签集合不冲突：产物存在时走重发，根本不看已签集合。
+ *  ③ 签名产物落盘：重试优先重发，签名轮次不必重跑；
+ *  ④ 产物丢失（rgb20-deposit-sig 无记录）时可自愈：重新签名一轮并提交成功。
  *
  * 注意 N > 1 是这些用例的重点：CI 里 [exec.sub.rgbx].minBtcConfirmations=1 会让"提交那一刻
  * 链上可见深度是 0"这件事被掩盖（N=1 时深度 0 也够），本地单测必须显式覆盖 N > 1。
@@ -162,7 +161,7 @@ func TestSubmitDeposit_FailsClosedWhenGateInputsUnavailable(t *testing.T) {
 	})
 }
 
-// TestSubmitDeposit_RetryOnlyResubmits ③：签名产物落盘后，重试只重发、**签名轮次只被驱动一次**；
+// TestSubmitDeposit_RetryOnlyResubmits ③：签名产物落盘后，重试只重发、**签名轮次不再被驱动**；
 // 且重发的对象与签名时那份完全一致（txid/金额/SPV 证明/thresholdSig 都不变，签名才对得上）。
 func TestSubmitDeposit_RetryOnlyResubmits(t *testing.T) {
 	bridge := &fakeBridge{}
@@ -195,7 +194,7 @@ func TestSubmitDeposit_RetryOnlyResubmits(t *testing.T) {
 }
 
 // TestSubmitDeposit_ArtifactSurvivesRestart ③：产物是落盘的，重启（新适配器、同一个 store）后
-// 依然只重发、不重签 —— 否则重启就要重跑签名轮次，而重跑会被其它签名节点的已签集合拒绝。
+// 依然只重发、不重签 —— 省掉一轮 GG18（产物丢了也只是重签，见下一条用例）。
 func TestSubmitDeposit_ArtifactSurvivesRestart(t *testing.T) {
 	store := NewMemStore()
 
@@ -233,49 +232,60 @@ func TestSubmitDeposit_DuplicateProofTreatedAsMinted(t *testing.T) {
 	require.False(t, adapter.seals.IsPendingMint(rec.Seal))
 }
 
-// TestSubmitDeposit_MissingArtifactIsAnomalyStops ④：已签集合里有该 txid、但本地没有签名产物 →
-// 是异常，**不重签**（重签会被其它节点的已签集合拒绝）也不再推进这条记录。
-func TestSubmitDeposit_MissingArtifactIsAnomalyStops(t *testing.T) {
-	bridge := &fakeBridge{}
-	adapter := newDepositTestAdapter(t, bridge, nil)
-	rec := seedSettledReceive(t, adapter, "recv-lost", testDepositTxid, 1000)
-	bridge.setDepth(testRequiredBest+10, testRgbxConfs)
+// TestSubmitDeposit_ResignsWhenArtifactLost ④：落盘产物丢失（`rgb20-deposit-sig` 里没有这条 txid）
+// 时，重试会**重新签名一轮**并成功提交 —— 这条记录能自愈。
+//
+// 场景：签名成功、产物落盘，提交失败；随后进程重启且数据目录被清 / 从旧快照恢复 —— 本地只剩一条
+// settled 的 receive，产物没了。重签之所以安全：签的是 C = sha256(Encode(DepositAsset{thresholdSig:nil}))，
+// 内容只有金额/目标地址/资产符号 + SPV 证明，没有 nonce、时间戳或 UTXO 选择 —— 同一笔充值每次重签
+// 得到的 C 逐字节相同，链上还按 txid 去重（formatDepositUsedTxIDKey）兜底。
+func TestSubmitDeposit_ResignsWhenArtifactLost(t *testing.T) {
+	store := NewMemStore()
 
-	// 模拟"本节点签过这笔交易"（已签集合有记录），但产物不在本地（落盘失败后重启/被清）。
-	require.NoError(t, adapter.signed.Mark(testDepositTxid, testProofHeight))
+	bridge1 := &fakeBridge{}
+	adapter1 := newDepositTestAdapter(t, bridge1, store)
+	rec := seedSettledReceive(t, adapter1, "recv-lost-artifact", testDepositTxid, 1000)
+	bridge1.setDepth(testRequiredBest+10, testRgbxConfs)
+	bridge1.setSubmitErr(errors.New("chain33 busy"))
+	require.Error(t, adapter1.submitDeposit(rec))
+	require.Equal(t, 1, bridge1.signCallCount())
+	require.Equal(t, 1, adapter1.depositSigs.Len(), "第一轮应已把签名产物落盘")
 
-	err := adapter.submitDeposit(rec)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, errSignedArtifactMissing), "应报产物缺失异常, got %v", err)
-	require.False(t, errors.Is(err, errDepositDepthPending), "这不是'等深度'，不要被当成可自愈的等待")
-	require.Equal(t, 0, bridge.signCallCount(), "异常态不得重签")
-	require.Equal(t, 0, bridge.submitCallCount())
-	require.Equal(t, ReceiveStatusSettled, mustReceiveStatus(t, adapter, rec.ReceiveID))
+	// 产物丢失：抹掉 `rgb20-deposit-sig` 里的记录（等价于重启后数据目录被清 / 从旧快照恢复）。
+	require.NoError(t, store.Delete(depositSigBucket, []byte(testDepositTxid)))
 
-	// 再轮询一轮：同样停在异常态（错误被限流记录，不会反复刷屏也不会悄悄放行）。
-	require.Error(t, adapter.submitDeposit(rec))
-	require.Equal(t, 0, bridge.signCallCount())
+	// 重启：新适配器（新内存缓存）读同一个 store —— 产物不在，只剩待铸造的 receive。
+	bridge2 := &fakeBridge{}
+	bridge2.setDepth(testRequiredBest+10, testRgbxConfs)
+	adapter2 := newDepositTestAdapter(t, bridge2, store)
+	require.Equal(t, 0, adapter2.depositSigs.Len(), "产物应确实不在本地")
+
+	// 自愈：没有产物就重新签一轮，提交成功、正常 minted（不得停在异常态）。
+	require.NoError(t, adapter2.submitDeposit(rec))
+	require.Equal(t, 1, bridge2.signCallCount(), "产物丢失时必须重新驱动签名轮次")
+	require.Equal(t, 1, bridge2.submitCallCount())
+	require.Equal(t, ReceiveStatusMinted, mustReceiveStatus(t, adapter2, rec.ReceiveID))
+	require.Equal(t, 0, adapter2.depositSigs.Len(), "铸造成功后应清掉落盘产物")
+	require.False(t, adapter2.seals.IsPendingMint(rec.Seal))
 }
 
-// TestSubmitDeposit_SignedSetDoesNotBlockResend ⑤：产物存在时走重发，根本不问签名节点 ——
-// 已签集合里同时有该 txid 也不影响（这正是修复前"每 30s 失败一次"的冲突点）。
-func TestSubmitDeposit_SignedSetDoesNotBlockResend(t *testing.T) {
+// TestSubmitDeposit_ResubmitWithArtifactKeepsOneSignatureRound ⑤：产物存在时走重发，**签名轮次
+// 一次都不再驱动** —— 这是落盘产物存在的全部意义（省一轮 GG18），也是"提交失败不丢产物"的价值。
+func TestSubmitDeposit_ResubmitWithArtifactKeepsOneSignatureRound(t *testing.T) {
 	bridge := &fakeBridge{}
 	adapter := newDepositTestAdapter(t, bridge, nil)
-	rec := seedSettledReceive(t, adapter, "recv-signedset", testDepositTxid, 1000)
+	rec := seedSettledReceive(t, adapter, "recv-resubmit", testDepositTxid, 1000)
 	bridge.setDepth(testRequiredBest+10, testRgbxConfs)
 
 	bridge.setSubmitErr(errors.New("chain33 busy"))
 	require.Error(t, adapter.submitDeposit(rec))
 	require.Equal(t, 1, bridge.signCallCount())
+	require.Equal(t, 1, adapter.depositSigs.Len())
 
-	// 签名成功后签名侧会登记已签集合（本节点在 P2P 回环里同样会标记）。
-	require.NoError(t, adapter.signed.Mark(testDepositTxid, testProofHeight))
-
-	// 重试：走重发路径，不被已签集合拦住。
+	// 重试：走重发路径，不再签名。
 	bridge.setSubmitErr(nil)
 	require.NoError(t, adapter.submitDeposit(rec))
-	require.Equal(t, 1, bridge.signCallCount(), "不得因为已签集合而重签/卡死")
+	require.Equal(t, 1, bridge.signCallCount(), "有产物时重试不得再驱动签名轮次")
 	require.Equal(t, 2, bridge.submitCallCount())
 	require.Equal(t, ReceiveStatusMinted, mustReceiveStatus(t, adapter, rec.ReceiveID))
 }
