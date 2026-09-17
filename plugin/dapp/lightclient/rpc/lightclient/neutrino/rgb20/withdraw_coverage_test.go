@@ -610,6 +610,82 @@ func Test_Withdraw_StickySealBlocksSealSwitch(t *testing.T) {
 	require.Equal(t, stickySealA, adapter.GetStickySeal(chain33Hash), "记录不得被覆盖")
 }
 
+// Test_Withdraw_ReselectedChangeSealIsStoppedByStickySeal 钉住 E13 指出的路径及其**实际**
+// 收敛点，避免后人误以为 HR-5（closed seal 不得 pending-mint）是这条路径的防线。
+//
+// E13 的形态（真实事故路径）：第一笔提现的找零 seal 在本地被登记为 pending-mint，而它在侧车
+// 侧由 sync() 依据 TSS UTXO 集合推导——tx1 一进 mempool 该 UTXO 就算 unspent ⇒ 侧车已把它
+// 升为 minted 且 select_seals 会选中它。校验前的 refreshSealStatuses 用侧车视图对齐本地，
+// 于是本地也被提升为 minted，HR-5 护栏**不触发**（E13 说"方向反了"，指的就是这里）。
+//
+// 真正拦住它的是 E9/E11 的 sticky seal 绑定：本笔 burn 第一次构建时就记录了 seal 集合
+// {A}（persistStickySeal 绝不覆盖），重试选到 {找零 seal} ⇒ 判为不可恢复，**在签名之前**
+// 就停下——没有第二份签名、没有第二次付款。签名节点侧同样拒签（CheckStickySeal）。
+// 链上那笔 burn 停在不可恢复态，如何处置属产品决策（见 plan 的 E9-A 残留）。
+//
+// 与 Test_Withdraw_StickySealBlocksSealSwitch 的区别：那条用"另一组无关的 seal"，这条走的是
+// E13 描述的具体形态——**第一笔的找零 seal 被重选**，且侧车/本地状态确实已按 minted 对齐。
+func Test_Withdraw_ReselectedChangeSealIsStoppedByStickySeal(t *testing.T) {
+	const withdraw = int64(500000)
+	chain33Hash := []byte("chain33-withdraw-hash")
+	req := &WithdrawRequest{
+		Chain33TxHash:    chain33Hash,
+		Amount:           withdraw,
+		FeeRate:          1,
+		RecipientInvoice: "rgb:invoice",
+		AssetSymbol:      "RGB20_USDT",
+		TxBlockHeight:    100,
+	}
+
+	mock := NewMockSidecar()
+	bridge := &fakeBridge{}
+	adapter, cleanup := newTestAdapter(t, mock, bridge)
+	defer cleanup()
+
+	armBuild := func(seal string, txid string) {
+		psbtBytes := buildAnchoredWithdrawPSBT(t, seal)
+		mock.BuildResp = &pb.BuildWithdrawalResponse{
+			Psbt:        psbtBytes,
+			Consignment: []byte("consignment-" + seal),
+		}
+		mock.ValidateResp = []*pb.ConsignmentValidation{
+			anchoredConsignment(t, psbtBytes, 200000, []string{seal}, anchoredSeal{vout: 1, amount: withdraw}),
+		}
+		mock.FinalizeResp = &pb.FinalizeWithdrawalResponse{Txid: txid, ChangeSealOutpoint: stickySealChange}
+	}
+
+	// 第一次：被花 seal = A，找零 seal = change（本地登记为 pending-mint）。
+	armBuild(stickySealA, "tx-a")
+	_, err := adapter.Withdraw(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, stickySealA, adapter.GetStickySeal(chain33Hash))
+	require.True(t, adapter.seals.IsPendingMint(stickySealChange), "找零 seal 由 FinalizeWithdrawal 登记为 pending-mint")
+	firstSign := bridge.signRequest()
+	require.Equal(t, []byte("consignment-"+stickySealA), firstSign.Consignment)
+
+	// tx1 广播/上链：侧车 sync 把找零 seal 升为 minted（A 被花掉 ⇒ consumed），
+	// 于是它变成可被下一笔（或本笔重试）选中的 seal——E13 的起点。
+	mock.seals[stickySealChange] = &pb.SealInfo{Outpoint: stickySealChange, Status: SealStatusMinted, Amount: 200000}
+	mock.seals[stickySealA] = &pb.SealInfo{Outpoint: stickySealA, Status: SealStatusConsumed, Amount: withdraw}
+
+	// 重试同一笔 burn：侧车按新账本重选，这次选中找零 seal。
+	armBuild(stickySealChange, "tx-b")
+	_, err = adapter.Withdraw(context.Background(), req)
+	require.Error(t, err, "同一笔 burn 换一组 seal 必须失败，不能付第二次")
+	class, unrecoverable := IsUnrecoverableWithdraw(err)
+	require.True(t, unrecoverable, "err=%v", err)
+	require.Equal(t, unrecoverableClassStickySealMismatch, class)
+	require.Equal(t, stickySealA, adapter.GetStickySeal(chain33Hash), "记录不得被覆盖")
+
+	// HR-5 护栏在这条路径上确实不触发（刷新已按侧车视图把本地提升为 minted）：
+	// 这是 E13 描述的事实，安全性来自 sticky 绑定而不是这条护栏。
+	require.False(t, adapter.seals.IsPendingMint(stickySealChange))
+	require.NotContains(t, err.Error(), "pending-mint")
+	// 关键后果：拦截发生在签名之前——桥没有下发第二份待签 PSBT。
+	require.Same(t, firstSign, bridge.signRequest(), "重试不得走到签名")
+	require.Equal(t, []byte("consignment-"+stickySealA), bridge.signRequest().Consignment)
+}
+
 // Test_ClassifyWithdrawSignError 签名失败的错误分类：类型化错误原样保留；跨进程只回文本时按
 // 固定措辞识别 sticky-seal-mismatch；其余（超时等）必须保持"可重试"，不能误判为永久失败。
 func Test_ClassifyWithdrawSignError(t *testing.T) {
