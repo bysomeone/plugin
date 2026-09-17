@@ -42,12 +42,9 @@ var (
 
 // p2wshDepositFixture 一个 (userID, tssPub) → P2WSH program 的派生结果。
 type p2wshDepositFixture struct {
-	name        string
 	depositAddr string
 	tssPub      []byte
-	tssPubHex   string
 	pkScript    []byte
-	pkScriptHex string
 }
 
 func newP2WSHDepositFixture(t *testing.T, v p2wshFrozenVector) *p2wshDepositFixture {
@@ -59,10 +56,7 @@ func newP2WSHDepositFixture(t *testing.T, v p2wshFrozenVector) *p2wshDepositFixt
 	// 双重锚定：实现重算的结果必须与冻结字面量逐字节相同
 	require.Equal(t, v.pkScriptHex, hex.EncodeToString(pkScript),
 		"派生实现与冻结向量 %s 不一致（types/testdata/p2wsh_deposit_vectors.json）", v.name)
-	return &p2wshDepositFixture{
-		name: v.name, depositAddr: v.userID, tssPub: tssPub, tssPubHex: v.tssPubHex,
-		pkScript: pkScript, pkScriptHex: v.pkScriptHex,
-	}
+	return &p2wshDepositFixture{depositAddr: v.userID, tssPub: tssPub, pkScript: pkScript}
 }
 
 // crossChainInfo 该 symbol 的链上跨链信息：主池脚本（P2WPKH）+ TSS 群公钥。
