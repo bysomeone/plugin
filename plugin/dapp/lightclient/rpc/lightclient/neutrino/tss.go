@@ -8,12 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"runtime"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/33cn/chain33/system/crypto/tss"
-	"github.com/33cn/chain33/system/crypto/tss/gg18"
+	"github.com/33cn/chain33/system/crypto/tss/cggmp"
 	"github.com/33cn/chain33/types"
 	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
 	"github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20"
@@ -56,9 +57,101 @@ const (
 
 	// Database bucket and keys
 	tssBucketName  = "rgbx-tss"
-	dkgResultKey   = "dkg-result"
+	dkgResultKey   = "cggmp-dkg-result"
 	dkgSessionName = "rgbx-btc-dkg"
+
+	// refreshResultKey CGGMP refresh 阶段的产物（bucket 同 tssBucketName）。
+	//
+	// ⚠️ 这份记录里的 Paillier 私钥素数（paillierP/paillierQ）与 YSecret 的**敏感度等同 share**：
+	// 拿到 share + 它就能参与组签名。落盘位置、加密与备份范围必须与 dkg-result **完全一致**
+	// （两者同在一个 bucket、同一个 neutrino.db 文件里，按"整个数据目录"备份即可覆盖；
+	// 只备份 dkg-result 是不完整的，见 CONFIG.md §4.3.1）。
+	refreshResultKey = "cggmp-refresh-result"
+
+	// refreshSessionPrefix refresh 会话名 = 前缀 + DKG 的 rid。同一个 key 的所有节点必须用
+	// **同一个**会话名（refresh 的 ZK 挑战由会话名派生，不一致会互相验不过）。用 rid 派生而不是
+	// 每次随机：rid 每把钥唯一，于是"重启后发现自己缺 refresh 记录"的节点能和各节点落在同一轮。
+	refreshSessionPrefix = "rgbx-btc-refresh-"
+
+	// tssRefreshTimeout refresh 阶段的超时。
+	//
+	// refresh 在每个节点上现生成 2048-bit Paillier **安全素数**（本机 4 节点实测 ≈23s），
+	// 而 DKG/PPK/sign 三个阶段的 30s 默认值对它明显偏紧（真实网络/较慢机器必炸）。
+	// cggmp 包装器已给 refresh 单独设了 5min 默认值（F4 硬化），这里显式再给一次：
+	// 它是**本桥的**运维上限（超时 ⇒ 本轮失败 ⇒ 重试），不跟着包装器默认值漂移。
+	tssRefreshTimeout = 5 * time.Minute
 )
+
+// refreshRecord refresh 落盘的记录 = 结果本身 + 它对应的 DKG rid。
+//
+// 带上 rid 是为了载入时能判断"这份 refresh 是不是**当前这把钥**的产物"：rid 由 DKG 生成、
+// 每把钥唯一，换钥/重跑 DKG 后必变。rid 不符 = 这份记录已经没用了（签名会因材料不配套而失败），
+// 必须重跑 refresh。
+type refreshRecord struct {
+	DkgRid string               `json:"dkgRid"`
+	Result *cggmp.RefreshResult `json:"result"`
+}
+
+// errTssKeyMaterialNotReady 本节点的 CGGMP 密钥材料还没就绪（DKG 或 refresh 未完成）。
+// 签名前必须两道都在：DKG 给 share 与群公钥，refresh 给 Paillier/Pedersen（CGGMP 的阶段约束）。
+var errTssKeyMaterialNotReady = fmt.Errorf("tss key material not ready: dkg/refresh result missing on this node")
+
+// errRedkgRefusedOnChainWithoutLocalShare **链上已有该 symbol 的 CrossChainInfo，而本节点没有
+// DKG 结果** —— 拒绝自动重跑 DKG（#28）。
+//
+// 为什么绝不能"链上已有记录就重跑一次 DKG"：DKG 会换出新的群公钥，而链上 CrossChainInfo
+// **每个 symbol 只有一份、写死不可改**（同一 symbol 的再次 CommitDKG 会被 ErrDuplicateDKGCommit 拒）。
+// 于是重跑 DKG 之后：链上仍钉着旧群公钥 ⇒ 桥发出的每个 P2WSH 充值地址（= f(userID, 旧群公钥)）
+// 收到的 BTC 没有任何签名能花掉，RGB20 充值的 threshold_sig 也永远验不过 —— **资金永久锁死**，
+// 且表现是"静默失灵"而不是报错。
+//
+// 正确处置（错误信息里带上，运维要能照着做）：把与本组同一代的 neutrino.db 还原回来；
+// 若整组密钥材料都必须重建，那就连链一起重建（全新链 ⇒ 没有旧记录）；
+// 而**只换 key 材料、不换群公钥**的诉求由 CGGMP refresh 承担（见 ensureRefreshResult）。
+type errRedkgRefusedOnChainWithoutLocalShare struct {
+	symbol     string
+	tssAddress string
+	chainPub   string
+}
+
+func (e *errRedkgRefusedOnChainWithoutLocalShare) Error() string {
+	return fmt.Sprintf("refuse to run a new DKG for symbol %s: the on-chain cross chain info already exists "+
+		"(tssAddress=%s, pubkey=%s) but this node has no local DKG result. A re-DKG would produce a NEW group "+
+		"public key, and the on-chain record is immutable per symbol (a second CommitDKG is rejected as "+
+		"duplicate), so every deposit address derived from the on-chain key would keep receiving BTC that no "+
+		"signature can ever spend and every RGB20 mint proof would fail to verify — the funds would be locked "+
+		"forever. Fix by restoring this node's neutrino.db from the backup of the SAME group (bucket %q); to "+
+		"rebuild the whole group, wipe the chain state as well (a fresh chain has no CrossChainInfo). To rotate "+
+		"key material WITHOUT changing the group public key use the CGGMP refresh path instead (see CONFIG.md, "+
+		"tss.rank/refresh sections)",
+		e.symbol, e.tssAddress, e.chainPub, tssBucketName)
+}
+
+// existingChainInfoBlocksDKG 判断"链上已有该 symbol 的 CrossChainInfo"是否必须拦住本次 DKG（#28）。
+//
+// 返回 nil = 链上还没有记录（或只有一份不成形的空记录，见 crossChainInfoAbsentOnChain 的口径）
+// ⇒ 可以跑 DKG；返回错误 = **必须拒绝启动**（详见 errRedkgRefusedOnChainWithoutLocalShare 的说明）。
+//
+// 抽成函数是为了让这条规则能被单测直接钉住 —— 它是"资金永久锁死"的唯一一道闸门，
+// 藏在 init() 的 goroutine 里只能靠 E2E 才发现，代价太大。
+func existingChainInfoBlocksDKG(info *rtypes.CrossChainInfo) error {
+	if info == nil || info.GetTssAddress() == "" {
+		return nil
+	}
+	return &errRedkgRefusedOnChainWithoutLocalShare{
+		symbol:     rtypes.BTCSymbol,
+		tssAddress: info.GetTssAddress(),
+		chainPub:   hexOrEmpty(info.GetPubkey()),
+	}
+}
+
+// errChainGroupKeyMismatch 链上该 symbol 的 CrossChainInfo 存在，但群公钥**不是**本地这把。
+// 与 errRedkgRefusedOnChainWithoutLocalShare 同类（不可自愈），区别只是本节点有没有 share。
+var errChainGroupKeyMismatch = fmt.Errorf("the on-chain cross chain info carries a different tss pubkey " +
+	"than this node's DKG result; the on-chain group key is immutable per symbol and a re-DKG cannot replace " +
+	"it (its CommitDKG is rejected as duplicate), so this node can only produce signatures the chain rejects. " +
+	"Fix by restoring the neutrino.db of the group the chain was committed with (bucket " + tssBucketName + "), " +
+	"or rebuild the whole group with a fresh chain")
 
 type signTask struct {
 	idx         int
@@ -78,11 +171,16 @@ type tssService struct {
 	cfg    tssConfig
 
 	// TSS related
-	dkgResult    *tss.DKGResult
-	tssPublicKey *btcec.PublicKey
-	tssAddress   btcutil.Address
-	pkScript     []byte
-	dkgCompleted atomic.Bool
+	//
+	// dkgResult / refreshResult 是 CGGMP 的**两份**密钥材料，必须成对使用（GG18 只有一份）：
+	// DKG 给群公钥与 share，refresh 给签名阶段的 Paillier/Pedersen 材料。后者在签名时**复用**
+	// （每把钥只跑一次 refresh），不是每签一次跑一次。
+	dkgResult     *cggmp.DKGResult
+	refreshResult *cggmp.RefreshResult
+	tssPublicKey  *btcec.PublicKey
+	tssAddress    btcutil.Address
+	pkScript      []byte
+	dkgCompleted  atomic.Bool
 
 	// P2P channels
 	subChan    chan *types.TopicData
@@ -96,7 +194,7 @@ type tssService struct {
 	signRoundSigners map[string][]string
 	// signRejections 其它签名节点对本节点发起的提现签名轮次的**确定性拒签**
 	// （chain33 哈希 hex → 拒签回执）。拒签是终态（重试不会变好），因此记录保留到进程结束：
-	// 后续重试据此立刻短路并归类为不可恢复，不再等 GG18 超时、也不再每秒重试刷屏。
+	// 后续重试据此立刻短路并归类为不可恢复，不再等组签名超时、也不再每秒重试刷屏。
 	signRejections map[string]rgb20.WithdrawSignReject
 }
 
@@ -142,7 +240,17 @@ func (t *tssService) handleSignTask() {
 }
 
 func (t *tssService) init() {
-	// Phase 5 DKG 修复：本地已有 DKG 结果（重启 / 数据目录保留）时**不重跑** GG18 DKG
+	// 配置自检：CGGMP 的 rank 是 **Birkhoff rank**（导数阶，不是节点序号），alice 要求
+	// rank + 1 < threshold（见 cggmp README 的 Notes）。取错值不是"性能差一点"，而是 DKG 直接被
+	// alice 拒（utils.EnsureRank）⇒ 每 60s 重试一次、永远起不来。所以在这里 fail-closed：
+	// 4 节点 + threshold=3 的正确取值是 {0,1,1,1}（照抄 GG18 那套 0,1,2,3 的 2/3 会被拒）。
+	if err := validateCggmpRank(t.cfg.Rank, t.cfg.Threshold); err != nil {
+		log.Error("init tssService invalid tss rank, refuse to start", "err", err, "rank", t.cfg.Rank,
+			"threshold", t.cfg.Threshold)
+		panic(err)
+	}
+
+	// Phase 5 DKG 修复：本地已有 DKG 结果（重启 / 数据目录保留）时**不重跑** DKG
 	// —— 但载入之后**必须**继续做链上核对与提交（见 ensureDKGOnChain）。
 	//
 	// 为什么不能载入即 return（踩过一次）：para 首启时 nodegroup 往往还没 approve，
@@ -155,9 +263,10 @@ func (t *tssService) init() {
 	if err := t.loadDKGFromDB(); err == nil {
 		log.Info("ensureDKG load from local db")
 		t.ensureDKGOnChain()
+		t.ensureRefreshResult()
 		t.dkgCompleted.Store(true)
 		// Phase 5 修复：loadDKGFromDB 分支也必须设置 selfPeerId，否则 handleSignNotify 的
-		// isSigner 检查永远失败（selfPeerId 空），该节点不参与 GG18 签名（sign-psbt 超时）。
+		// isSigner 检查永远失败（selfPeerId 空），该节点不参与组签名（sign-psbt 超时）。
 		t.waitSelfPeerId()
 		return
 	}
@@ -170,26 +279,24 @@ func (t *tssService) init() {
 		info = t.client.getCrossChainInfo(rtypes.BTCSymbol)
 	}
 
-	if info.GetTssAddress() != "" {
-		log.Debug("ensureDKG already exist on chain, loading from database")
-		err := t.loadDKGFromDB()
-		if err == nil {
-			// 与上方同理：链上已有记录仍要走一遍核对/提交（幂等：pubkey 相符即刻返回）。
-			t.ensureDKGOnChain()
-			t.dkgCompleted.Store(true)
-			t.waitSelfPeerId()
-			return
-		}
-		// DB 中无 DKG 结果（容器重建/数据目录清空）：不 panic，继续走下方重新 DKG。
-		log.Warn("ensureDKG loadDKGFromDB error, redo DKG", "err", err)
+	if err := existingChainInfoBlocksDKG(info); err != nil {
+		// #28：链上**已经有**该 symbol 的 CrossChainInfo，而本节点没有 DKG 结果
+		// （容器重建 / 数据目录被清 / 换过钥）。这里**必须拒绝启动**，不能像以前那样"重跑一次 DKG"。
+		//
+		// 为什么是 panic 而不是"打日志等运维"：这是不可自愈且**后果不可逆**的形态，
+		// 安静地跑起来（甚至只是安静地重跑 DKG）都会把损失从"这台机器"扩大到"整条跨链桥"。
+		// 与 client.go 的 share 自检同一处置风格（fail-closed，逃生阀只在那边）。
+		log.Error("init tssService refuse to start", "err", err)
+		panic(err)
 	}
 	log.Info("init tssService starting new DKG process")
 
 	// Perform DKG process with retry
-	var dkgResult *tss.DKGResult
+	var dkgResult *cggmp.DKGResult
 	var err error
 	for {
-		dkgResult, err = gg18.ProcessDKG(t.cfg.Peers, t.cfg.Threshold, t.cfg.Rank, dkgSessionName)
+		// peers 必须包含本节点，且各节点用同一份列表；threshold 由配置给定。
+		dkgResult, err = cggmp.ProcessDKG(t.cfg.Peers, t.cfg.Threshold, t.cfg.Rank, dkgSessionName)
 		if err == nil {
 			break
 		}
@@ -200,9 +307,9 @@ func (t *tssService) init() {
 	t.dkgResult = dkgResult
 
 	// Extract public key from DKG result (PubX, PubY coordinates)
-	pubkey, err := tss.ParseBtcecPublicKey(dkgResult)
+	pubkey, err := groupPubKeyFromDKG(dkgResult)
 	if err != nil {
-		log.Error("init tssService ParseBtcecPublicKey error", "err", err)
+		log.Error("init tssService groupPubKeyFromDKG error", "err", err)
 		return
 	}
 	t.tssPublicKey = pubkey
@@ -214,12 +321,46 @@ func (t *tssService) init() {
 		return
 	}
 
-	// Save DKG result to database with retry
+	// 落盘顺序刻意如此：DKG 结果（share）**先于** refresh 落盘。refresh 只是把签名用的
+	// Paillier/Pedersen 材料 provision 出来，丢了可以重跑；share 丢了就只能从备份还原。
+	// 两者都落盘之后才置 dkgCompleted（签名需要两份材料齐备）。
 	t.saveDKGToDB()
 
 	t.ensureDKGOnChain()
+
+	// refresh 放在提交之后：提交只依赖 DKG 的群公钥，而 refresh 要在每个节点上现生成 2048-bit
+	// Paillier 安全素数（本机 4 节点实测 ≈23s）。先提交能让链上 CrossChainInfo 尽早落地，
+	// 不被 refresh 拖慢（E2E 的 wait_auto_dkg_commit 等的就是它）。
+	t.ensureRefreshResult()
+
 	t.dkgCompleted.Store(true)
 	t.waitSelfPeerId()
+}
+
+// validateCggmpRank 校验本地配置的 rank 满足 CGGMP 的约束：rank 是 Birkhoff rank，取值必须
+// <= threshold-2（等价于 alice 的 rank+1 < threshold）。threshold < 2 时无解（CGGMP 至少要 2-of-n）。
+func validateCggmpRank(rank, threshold uint32) error {
+	if threshold < 2 {
+		return fmt.Errorf("invalid tss threshold %d: cggmp needs a threshold of at least 2", threshold)
+	}
+	if rank > threshold-2 {
+		return fmt.Errorf("invalid tss rank %d: cggmp's rank is the Birkhoff rank of this node and must "+
+			"satisfy rank+1 < threshold (rank <= %d for threshold %d); it is NOT an index — with 4 nodes and "+
+			"threshold 3 the valid ranks are {0,1,1,1}", rank, threshold-2, threshold)
+	}
+	return nil
+}
+
+// groupPubKeyFromDKG 取 CGGMP DKG 结果的群公钥（btcec 形式）。
+//
+// tss.ParseBtcecPublicKey 只读 PubX/PubY 两个坐标，而 CGGMP 的 DKGResult 与 GG18 的同一形态
+// （cggmp README：群公钥与签名的格式与 GG18 一致），所以直接复用它——下游的地址派生、验签、
+// CommitDKG 载荷口径因此与切换前**完全一致**，不需要各写一份。
+func groupPubKeyFromDKG(d *cggmp.DKGResult) (*btcec.PublicKey, error) {
+	if d == nil {
+		return nil, types.ErrInvalidParam
+	}
+	return tss.ParseBtcecPublicKey(&tss.DKGResult{PubX: d.PubX, PubY: d.PubY})
 }
 
 // ensureDKGOnChain 让链上每个 symbol 的 CrossChainInfo 达到"存在、且群公钥 == 本地群公钥"，阻塞到达成。
@@ -229,29 +370,40 @@ func (t *tssService) init() {
 //
 // 成功判据是**链上状态**而不是"提交没报错"，载荷与核对逻辑见 tss_commit.go。
 func (t *tssService) ensureDKGOnChain() {
-	t.ensureDKGOnChainWith(t.client.ctx, t.client.shareCheckSymbols(),
+	err := t.ensureDKGOnChainWith(t.client.ctx, t.client.shareCheckSymbols(),
 		t.client.queryCrossChainInfoBounded, t.submitDKGToMainChain)
+	if err != nil {
+		// 链上已钉着另一把群公钥（errChainGroupKeyMismatch）：不可自愈的形态，且**不能**靠
+		// 重跑 DKG 修（换钥上不了链）。与 client.go 的 share 自检同一处置：拒绝启动。
+		log.Error("ensureDKGOnChain unrecoverable on-chain group key mismatch, refuse to start", "err", err)
+		panic(err)
+	}
 }
 
 // ensureDKGOnChainWith 是 ensureDKGOnChain 的实现，symbol 集合与两个依赖显式传入（便于单测）。
 //
 // symbols 用 shareCheckSymbols()：BTC + 配置里的每个 RGB20 合约，去重且跳过空 symbol ——
 // 与自检（checkTssShareAgainstChain）覆盖**同一集合**，两处不能各说各话。
+//
+// 返回非 nil 只有一个来源：链上该 symbol 的记录是**另一把群公钥**（不可自愈）。
 func (t *tssService) ensureDKGOnChainWith(ctx context.Context, symbols []string,
 	query func(symbol string) (*rtypes.CrossChainInfo, error),
-	submit func(exec, action string, payload *rtypes.CommitDKG) (string, error)) {
+	submit func(exec, action string, payload *rtypes.CommitDKG) (string, error)) error {
 
 	for _, symbol := range symbols {
 		// 与 BTC 同一套判据（提交后核对链上 pubkey）：4 个 guardian 都会提交，先到者创建记录，
 		// 其余节点拿到 ErrDuplicateDKGCommit —— 但"被拒为重复"本身不是成功的判据，链上那把钥
 		// 必须逐字节等于本地群公钥，否则该 symbol 的充值/提现（RGB20 的 thresholdSig 校验）
 		// 或 BTC 充值地址（P2WSH = f(userID, tssPub)）会静默失灵。
-		t.commitDKGToChainWith(ctx, t.buildCommitDKGPayload(symbol), query, submit)
+		if err := t.commitDKGToChainWith(ctx, t.buildCommitDKGPayload(symbol), query, submit); err != nil {
+			return err
+		}
 		log.Info("ensureDKGOnChain commitDKG", "symbol", symbol)
 	}
+	return nil
 }
 
-// waitSelfPeerId 等待 P2P 自节点 peer id 就绪（GG18 签名时 handleSignNotify 的 isSigner 检查依赖它）。
+// waitSelfPeerId 等待 P2P 自节点 peer id 就绪（CGGMP 签名时 handleSignNotify 的 isSigner 检查依赖它）。
 func (t *tssService) waitSelfPeerId() {
 	for {
 		peers, err := tss.FetchConnectedPeers(t.client.qclient, time.Second*3)
@@ -264,39 +416,63 @@ func (t *tssService) waitSelfPeerId() {
 	}
 }
 
-func (t *tssService) loadDKGFromDB() error {
-	var dkgData []byte
-
+// readTssRecord 从 neutrino.db 的 tss bucket 读一条记录。bucket/key 不存在也返回 error。
+func (t *tssService) readTssRecord(key string) ([]byte, error) {
+	var data []byte
 	err := walletdb.View(t.client.neutrinoCfg.Database, func(tx walletdb.ReadTx) error {
 		bucket := tx.ReadBucket([]byte(tssBucketName))
 		if bucket == nil {
 			return walletdb.ErrBucketNotFound
 		}
-
-		// Load DKG result
-		dkgData = bucket.Get([]byte(dkgResultKey))
-		if dkgData == nil {
+		data = bucket.Get([]byte(key))
+		if data == nil {
 			return types.ErrNotFound
 		}
-
 		return nil
 	})
+	return data, err
+}
+
+// writeTssRecord 把一条记录写进 neutrino.db 的 tss bucket（带重试，直到成功）。
+func (t *tssService) writeTssRecord(key string, data []byte) {
+	for {
+		err := walletdb.Update(t.client.neutrinoCfg.Database, func(tx walletdb.ReadWriteTx) error {
+			bucket, err := tx.CreateTopLevelBucket([]byte(tssBucketName))
+			if err != nil {
+				return err
+			}
+			return bucket.Put([]byte(key), data)
+		})
+		if err == nil {
+			log.Debug("writeTssRecord success", "key", key, "len", len(data))
+			return
+		}
+		log.Error("writeTssRecord retry", "key", key, "err", err)
+		time.Sleep(time.Second * 3)
+	}
+}
+
+// loadDKGFromDB 载入 CGGMP DKG 结果（bucket rgbx-tss / key cggmp-dkg-result，JSON）。
+//
+// 用 JSON 而不是原来的 proto（types.Encode）：CGGMP 的 DKGResult 里带 map-of-points（Bks /
+// PartialPubKeys），proto 表达啰嗦，而它只做本节点本地持久化、不走共识（见 cggmp README 的
+// "Kept separate" 一节：两个 DKG 结果类型刻意不合并，各自序列化）。
+func (t *tssService) loadDKGFromDB() error {
+	dkgData, err := t.readTssRecord(dkgResultKey)
 	if err != nil {
 		return err
 	}
 
-	// Decode DKG result
-	var dkgResult tss.DKGResult
-	err = types.Decode(dkgData, &dkgResult)
-	if err != nil {
-		return err
+	var dkgResult cggmp.DKGResult
+	if err := json.Unmarshal(dkgData, &dkgResult); err != nil {
+		return fmt.Errorf("decode local cggmp dkg result: %w", err)
 	}
 	t.dkgResult = &dkgResult
 
 	// Extract public key from DKG result coordinates
-	pubKey, err := tss.ParseBtcecPublicKey(&dkgResult)
+	pubKey, err := groupPubKeyFromDKG(&dkgResult)
 	if err != nil {
-		log.Error("loadDKGFromDB ParseBtcecPublicKey error", "err", err)
+		log.Error("loadDKGFromDB groupPubKeyFromDKG error", "err", err)
 		return err
 	}
 	t.tssPublicKey = pubKey
@@ -307,27 +483,88 @@ func (t *tssService) loadDKGFromDB() error {
 
 // saveDKGToDB saves DKG result to database with retry until success
 func (t *tssService) saveDKGToDB() {
-	// Encode DKG result
-	dkgData := types.Encode(t.dkgResult)
+	dkgData, err := json.Marshal(t.dkgResult)
+	if err != nil {
+		log.Error("saveDKGToDB marshal", "err", err)
+		return
+	}
+	t.writeTssRecord(dkgResultKey, dkgData)
+}
+
+// loadRefreshFromDB 载入本节点已落盘的 CGGMP refresh 产物，并核对它是不是**当前这把钥**的
+// （rid 相符）。rid 不符或记录损坏都算"没有可用记录"，由调用方决定重跑 refresh。
+func (t *tssService) loadRefreshFromDB() error {
+	if t.dkgResult == nil {
+		return errTssKeyMaterialNotReady
+	}
+	data, err := t.readTssRecord(refreshResultKey)
+	if err != nil {
+		return err
+	}
+	var rec refreshRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return fmt.Errorf("decode local cggmp refresh result: %w", err)
+	}
+	if rec.Result == nil {
+		return fmt.Errorf("local cggmp refresh record carries no result")
+	}
+	if rec.DkgRid != hex.EncodeToString(t.dkgResult.Rid) {
+		return fmt.Errorf("local cggmp refresh result belongs to another key (record rid=%s, current rid=%s)",
+			rec.DkgRid, hex.EncodeToString(t.dkgResult.Rid))
+	}
+	t.refreshResult = rec.Result
+	return nil
+}
+
+// saveRefreshToDB 落盘 refresh 产物（连同它对应的 DKG rid）。⚠️ 含 Paillier 私钥素数 + YSecret，
+// 敏感度等同 share，备份范围必须覆盖（见 refreshResultKey 的说明）。
+func (t *tssService) saveRefreshToDB() {
+	rec := &refreshRecord{DkgRid: hex.EncodeToString(t.dkgResult.Rid), Result: t.refreshResult}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		log.Error("saveRefreshToDB marshal", "err", err)
+		return
+	}
+	t.writeTssRecord(refreshResultKey, data)
+}
+
+// refreshSessionName refresh 轮的会话名：由 DKG 的 rid 派生，同一个 key 的所有节点一致。
+func refreshSessionName(rid []byte) string {
+	return refreshSessionPrefix + hex.EncodeToString(rid)
+}
+
+// ensureRefreshResult 保证内存里有"当前这把钥的" CGGMP refresh 结果：先从 DB 载入，没有再跑一轮。
+//
+// refresh 是 CGGMP 的**必经阶段**（不是可选）：DKG 之后每把钥必须跑一次 refresh 才能签名，
+// 产物（本节点 Paillier 私钥素数 + 各 peer 的 Pedersen/ppk/y 参数）落盘后由**每次签名复用** ——
+// 不要每签一次就跑一次 refresh。
+//
+// 补跑 refresh（本节点缺记录）为什么要发一轮新协议：refresh 是多方协议，单节点无法凭空造出材料。
+// 会话名由 rid 派生 ⇒ 所有缺记录的节点会落在**同一轮**；已经持有记录的节点不参与。因此补跑的
+// 前提是**缺记录的节点一起重启**（正常路径不会出现部分节点缺记录：DKG 与 refresh 的落盘是
+// 同一条启动路径上先后两步，中断只可能发生在两者之间）。重跑失败按分钟重试，不置 dkgCompleted
+// —— 没有 refresh 材料就签不了名，"看起来起来了"比不起来更危险。
+func (t *tssService) ensureRefreshResult() {
+	if err := t.loadRefreshFromDB(); err == nil {
+		log.Info("ensureRefresh load refresh result from local db", "dkgRid", hexOrEmpty(t.dkgResult.Rid))
+		return
+	} else {
+		log.Warn("ensureRefresh no usable local refresh result, running a refresh round "+
+			"(every signing node that lacks one must join; restart them together so they share the round)",
+			"err", err, "dkgRid", hexOrEmpty(t.dkgResult.Rid))
+	}
 
 	for {
-		err := walletdb.Update(t.client.neutrinoCfg.Database, func(tx walletdb.ReadWriteTx) error {
-			bucket, err := tx.CreateTopLevelBucket([]byte(tssBucketName))
-			if err != nil {
-				return err
-			}
-
-			// Save DKG result
-			return bucket.Put([]byte(dkgResultKey), dkgData)
-		})
-
+		res, err := cggmp.ProcessRefresh(t.cfg.Peers, t.cfg.Threshold, t.dkgResult,
+			refreshSessionName(t.dkgResult.Rid), cggmp.WithTimeout(tssRefreshTimeout))
 		if err == nil {
-			log.Debug("saveDKGToDB success")
+			t.refreshResult = res
+			t.saveRefreshToDB()
+			log.Info("ensureRefresh refresh round done", "dkgRid", hexOrEmpty(t.dkgResult.Rid))
 			return
 		}
-
-		log.Error("saveDKGToDB retry", "err", err)
-		time.Sleep(time.Second * 3)
+		log.Error("ensureRefresh ProcessRefresh retry", "err", err, "dkgRid", hexOrEmpty(t.dkgResult.Rid))
+		time.Sleep(time.Minute)
 	}
 }
 
@@ -356,13 +593,108 @@ func (t *tssService) generateTssAddress() error {
 	return nil
 }
 
+// waitForSufficientSigners 等到"能凑出一个合法签名者组合"为止，返回**恰好 threshold 个**签名节点。
+//
+// CGGMP 与 GG18 在这里有个必须理解的差别（切换时最容易踩的坑）：alice 的 cggmp.ProcessSign
+// 要求 `len(peers) == threshold`，而且要签的这 threshold 个节点的 Birkhoff rank 升序后满足
+// rank_i <= i。因此**不能**沿用 GG18 的写法"把连上的合法节点全塞进去"：4 节点的 rank 是
+// {0,1,1,1}，全塞进去是 4 个 ≠ threshold 3，会被 ProcessSign 直接拒
+// （cggmp: sign: len(peers)=4, threshold=3）。
 func (t *tssService) waitForSufficientSigners() []string {
 	var signers []string
 	t.client.waitUntilDone("waitForSufficientSigners", func() bool {
-		signers = tss.GetValidPeerCombination(t.client.qclient, t.cfg.Threshold, t.dkgResult.Bks)
+		signers = t.pickSigners()
 		return len(signers) > 0
 	}, time.Second*3)
 	return signers
+}
+
+// dkgBks 取本轮 DKG 的 Birkhoff 参数表（DKG 结果缺失时返回 nil，调用方的查表自然失败）。
+func (t *tssService) dkgBks() map[string]*tss.BK {
+	if t.dkgResult == nil {
+		return nil
+	}
+	return t.dkgResult.Bks
+}
+
+// pickSigners 从"已连接且在本轮 DKG 里持有 bk"的节点里选出恰好 threshold 个签名者。
+func (t *tssService) pickSigners() []string {
+	if t.dkgResult == nil {
+		return nil
+	}
+	connected, err := tss.FetchConnectedPeers(t.client.qclient, 3*time.Second)
+	if err != nil {
+		log.Warn("pickSigners FetchConnectedPeers", "err", err)
+		return nil
+	}
+	candidates := make([]string, 0, len(connected))
+	for _, peer := range connected {
+		if bk, ok := t.dkgResult.Bks[peer.Name]; ok && bk != nil {
+			candidates = append(candidates, peer.Name)
+		}
+	}
+	return selectSignerCombination(candidates, t.dkgResult.Bks, t.cfg.Threshold)
+}
+
+// selectSignerCombination 从候选节点里选出**恰好 threshold 个**满足 CGGMP Birkhoff 条件的签名者；
+// 凑不出来返回 nil（调用方等下一轮）。
+//
+// 选法：按 (rank, peerID) 升序取前 threshold 个。**按 rank 再按 peerID 排序是关键**——签名者集合
+// 必须所有参与节点一致（每个节点都把消息发给"自己那份名单"，名单不一致会导致部分节点收不到消息、
+// 整轮失败），而 peerID 是各节点都看得到的同一串，排序结果因此与"谁在看"无关，只与"看到了哪些
+// 节点"有关。4 节点 {0,1,1,1} + threshold 3 ⇒ 取到 rank [0,1,1]（rank0 必须在场，另两个是 peerID
+// 最小的 rank1 节点）。
+func selectSignerCombination(candidates []string, bks map[string]*tss.BK, threshold uint32) []string {
+	if threshold == 0 || len(candidates) < int(threshold) {
+		return nil
+	}
+	sorted := append([]string(nil), candidates...)
+	sort.Slice(sorted, func(i, j int) bool {
+		ri, rj := bks[sorted[i]].GetRank(), bks[sorted[j]].GetRank()
+		if ri != rj {
+			return ri < rj
+		}
+		return sorted[i] < sorted[j]
+	})
+	pick := sorted[:threshold]
+	if err := validateSignerCombination(pick, bks, threshold); err != nil {
+		log.Debug("selectSignerCombination no valid combination", "err", err, "candidates", len(candidates))
+		return nil
+	}
+	return pick
+}
+
+// validateSignerCombination 校验签名者集合满足 CGGMP 的签名条件：恰好 threshold 个、每个都有 bk、
+// 且 Birkhoff rank 升序后 rank_i <= i。判据与 chain33 `tss.GetValidPeerCombination` 内部那条一致
+// （alice 的 Birkhoff 插值系数就要求这个条件）。
+//
+// 签名节点收到协调者下发的 Signers 时也用它核对：集合不合法 ⇒ 组签名必然失败，
+// 早拒（有自己的判据）比等到超时好定位，也不让协调者用一份畸形名单把本节点拖进必败的轮次。
+func validateSignerCombination(signers []string, bks map[string]*tss.BK, threshold uint32) error {
+	if uint32(len(signers)) != threshold {
+		return fmt.Errorf("signer count %d != threshold %d", len(signers), threshold)
+	}
+	ranks := make([]uint32, 0, len(signers))
+	seen := make(map[string]bool, len(signers))
+	for _, s := range signers {
+		if seen[s] {
+			return fmt.Errorf("duplicate signer %s", s)
+		}
+		seen[s] = true
+		bk, ok := bks[s]
+		if !ok || bk == nil {
+			return fmt.Errorf("signer %s has no birkhoff parameter in this key", s)
+		}
+		ranks = append(ranks, bk.GetRank())
+	}
+	sort.Slice(ranks, func(i, j int) bool { return ranks[i] < ranks[j] })
+	for i := uint32(0); i < threshold; i++ {
+		if ranks[i] > i {
+			return fmt.Errorf("invalid birkhoff rank combination %v for threshold %d "+
+				"(need rank_i <= i after sorting)", ranks, threshold)
+		}
+	}
+	return nil
 }
 
 // processSignBtcTx processes a Bitcoin transaction using TSS protocol
@@ -389,18 +721,29 @@ func (t *tssService) processSignBtcTx(tx *wire.MsgTx, txType string, inputAmount
 	return t.signBtcTx(tx, inputAmounts, signers)
 }
 
+// signMsg 跑一轮 CGGMP 阈值签名（4 轮）。
+//
+// 与 GG18 的差别：多传 threshold 与 refresh 产物（Paillier/Pedersen 在 refresh 阶段一次性
+// provision 好，签名时复用，不在每轮现生成），且 signers 必须**恰好** threshold 个
+// （见 waitForSufficientSigners）。产物用 cggmp.ToBtcecSignature 转成与 GG18 同形的 btcec 签名。
 func (t *tssService) signMsg(msg []byte, sessionName string, signers []string) *signResult {
 	result := &signResult{}
-	sigResult, err := gg18.ProcessSign(signers, msg, t.dkgResult, sessionName)
+	if t.dkgResult == nil || t.refreshResult == nil {
+		log.Error("signMsg key material not ready", "hasDkg", t.dkgResult != nil,
+			"hasRefresh", t.refreshResult != nil)
+		result.err = errTssKeyMaterialNotReady
+		return result
+	}
+	sigResult, err := cggmp.ProcessSign(signers, t.cfg.Threshold, msg, t.dkgResult, t.refreshResult, sessionName)
 	if err != nil {
 		log.Error("signMsg ProcessSign", "err", err)
 		result.err = err
 		return result
 	}
 
-	signature, err := gg18.AliceToBtcecSignature(sigResult)
+	signature, err := cggmp.ToBtcecSignature(sigResult)
 	if err != nil {
-		log.Error("signMsg AliceToBtcecSignature", "err", err)
+		log.Error("signMsg ToBtcecSignature", "err", err)
 		result.err = err
 		return result
 	}
@@ -481,13 +824,13 @@ func computeRgb20DepositMsg(dep *rtypes.DepositAsset) []byte {
 	return h[:]
 }
 
-// signPsbt 解析 PSBT，逐输入签名（GG18），写 partial_sigs，广播前 low-S 归一化。
+// signPsbt 解析 PSBT，逐输入签名（CGGMP），写 partial_sigs，广播前 low-S 归一化。
 // 侧车 BuildWithdrawal 产出的 PSBT 已固定输入/输出与 RGB 承诺锚点，TSS 只签 witness（Spike 2 §5 结论）。
-// psbtSignFunc 对单个输入的 sigHash 进行签名，返回 GG18 阈值签名（DER）。
+// psbtSignFunc 对单个输入的 sigHash 进行签名，返回 CGGMP 阈值签名（DER）。
 type psbtSignFunc func(sigHash []byte, sessionName string) *signResult
 
 // signPsbt 协调者侧发起 RGB20 提现签名：发布 rgb20-withdraw 签名通知（**带完整提现上下文**，
-// E11）让其它签名节点独立核对后入场，再本地参与 GG18。
+// E11）让其它签名节点独立核对后入场，再本地参与 CGGMP 组签名。
 //
 // 上下文（chain33 提现哈希 + 金额/费率/高度门槛/收款 invoice + consignment）是签名节点唯一
 // 的核对依据：不带上下文的签名通知一律被拒签（签名节点无从执行 ValidateWithdrawPsbt），
@@ -496,7 +839,7 @@ func (t *tssService) signPsbt(req *rgb20.WithdrawSignRequest) ([]byte, error) {
 	if req == nil || len(req.Psbt) == 0 || len(req.Chain33TxHash) == 0 || len(req.Consignment) == 0 {
 		return nil, fmt.Errorf("invalid rgb20 withdraw sign request: psbt/hash/consignment required")
 	}
-	// 本笔已收到确定性拒签回执 ⇒ 直接按不可恢复返回：不再发通知、不再等 GG18 超时，
+	// 本笔已收到确定性拒签回执 ⇒ 直接按不可恢复返回：不再发通知、不再等组签名超时，
 	// 也不再被协调者的重试循环每秒重复一遍（见 handleRgb20WithdrawReject）。
 	if err := t.takeSignRejection(req.Chain33TxHash); err != nil {
 		return nil, err
@@ -574,7 +917,7 @@ func (t *tssService) sweepSignFeeRate() uint32 {
 }
 
 // signSweepPsbt 协调者侧发起扫集签名：先在自己这里过一遍 ValidateSweepPsbt，再发布 btc-sweep
-// 签名通知让其它签名节点独立核对后入场，最后本地参与 GG18。
+// 签名通知让其它签名节点独立核对后入场，最后本地参与 CGGMP 组签名。
 func (t *tssService) signSweepPsbt(psbtBytes []byte) ([]byte, error) {
 	if len(psbtBytes) == 0 {
 		return nil, fmt.Errorf("invalid sweep sign request: empty psbt")
@@ -613,7 +956,7 @@ func (t *tssService) signSweepPsbt(psbtBytes []byte) ([]byte, error) {
 //  1. 通知必须带 PSBT（扫集没有 payload：没有链上上下文可声称，也就没有可被伪造的声称值）；
 //  2. ValidateSweepPsbt 独立核对（输入全为已登记用户充值脚本 + 各自带 witnessScript、
 //     输出全回主池、手续费区间）；
-//  3. 全部通过才参与 GG18 签名。
+//  3. 全部通过才参与 CGGMP 组签名。
 //
 // 与提现路径不同，这里**没有**"Payload 为空就跳过校验"的旁路：空 Payload 在本类型下是正常的
 // （本来就没有上下文），所以判据只能是 PSBT 自己 —— 拒绝核对就等于拒绝签名。
@@ -630,7 +973,7 @@ func (t *tssService) handleBtcSweepSign(notify *ltypes.TssSignNotify) error {
 	}); err != nil {
 		return fmt.Errorf("validate btc sweep: %w", err)
 	}
-	if _, err := t.signPsbtInternal(notify.Psbt); err != nil {
+	if _, err := t.signPsbtInternal(notify.Psbt, notify.Signers); err != nil {
 		return fmt.Errorf("sign btc sweep psbt: %w", err)
 	}
 	log.Info("handleBtcSweepSign signed sweep psbt", "psbtLen", len(notify.Psbt))
@@ -745,13 +1088,20 @@ func (t *tssService) publishSignRejection(payloadBytes []byte, err error) {
 	}))
 }
 
-// signPsbtInternal 签名节点参与 GG18 PSBT 签名（不发布通知，避免递归）。
-func (t *tssService) signPsbtInternal(psbtBytes []byte) ([]byte, error) {
+// signPsbtInternal 签名节点参与 PSBT 组签名（不发布通知，避免递归）。
+//
+// signers 是**协调者下发的那份名单**（notify.Signers），不是本地重算的：CGGMP 要求
+// len(peers) == threshold 且各参与节点名单完全一致，而"本地重算"在连通性视图不完全一致时
+// 会算出不同的子集（组签名里每个节点只把消息发给自己名单上的人 ⇒ 名单不一致直接整轮失败）。
+// 协调者给出的名单由 handleSignNotify 统一校验过（恰好 threshold 个 + Birkhoff 条件）。
+func (t *tssService) signPsbtInternal(psbtBytes []byte, signers []string) ([]byte, error) {
+	if len(signers) == 0 {
+		return nil, fmt.Errorf("no signers for this round")
+	}
 	p, err := psbt.NewFromRawBytes(bytes.NewReader(psbtBytes), false)
 	if err != nil {
 		return nil, fmt.Errorf("decode psbt: %w", err)
 	}
-	signers := t.waitForSufficientSigners()
 	return t.signPsbtWithSigners(p, signers, func(sigHash []byte, sessionName string) *signResult {
 		return t.signMsg(sigHash, sessionName, signers)
 	})
@@ -974,7 +1324,7 @@ func (t *tssService) processSignRgb20Deposit(payload *rgb20.DepositSignPayload) 
 	log.Debug("processSignRgb20Deposit published", "receiveId", payload.ReceiveID,
 		"sessionId", payload.SessionID, "signers", signers)
 
-	// 主节点本地签名（GG18 组内产生同一阈值签名）
+	// 主节点本地签名（CGGMP 组内产生同一阈值签名）
 	msg := computeRgb20DepositMsg(payload.Deposit)
 	res := t.signMsg(msg, payload.SessionID, signers)
 	if res.err != nil {
@@ -1137,6 +1487,15 @@ func (t *tssService) handleSignNotify(data *types.TopicData) {
 		return
 	}
 
+	// 名单本身要先合规：CGGMP 要求恰好 threshold 个签名者、且 Birkhoff rank 升序后 rank_i <= i。
+	// 不合规的名单（数量不对 / 缺 rank0 / 混入非本轮参与者）组签名必然失败，与其等超时，
+	// 不如在这里用**本节点自己的判据**直接拒（名单是协调者给的，不能因为"它这么说"就照单全收）。
+	if err := validateSignerCombination(notify.Signers, t.dkgBks(), t.cfg.Threshold); err != nil {
+		log.Error("handleSignNotify invalid signer combination", "err", err,
+			"signers", notify.Signers, "type", notify.TxType)
+		return
+	}
+
 	isSigner := false
 	for _, signer := range notify.Signers {
 		if signer == t.selfPeerId {
@@ -1274,7 +1633,7 @@ func (t *tssService) handleRgb20WithdrawSign(notify *ltypes.TssSignNotify) error
 	if err != nil {
 		return err
 	}
-	if _, err := t.signPsbtInternal(psbtBytes); err != nil {
+	if _, err := t.signPsbtInternal(psbtBytes, notify.Signers); err != nil {
 		return fmt.Errorf("sign rgb20 withdrawal psbt: %w", err)
 	}
 	// sticky 记录只在签名成功之后写（镜像 BTC 侧 handleSignNotify → setWithdrawStickyUTXO）：
@@ -1366,7 +1725,7 @@ func checkWithdrawClaims(payload *rgb20.WithdrawSignPayload, pendingTx *rtypes.P
 }
 
 // handleTestSignNotify 仅 E2E 的 sign-psbt 测试端点使用：不带提现上下文 ⇒ 不做任何提现核对，
-// 只参与 GG18 组签名。必须由本地配置 rgb20.testSignPsbt 显式开启（默认关闭），否则拒签。
+// 只参与 CGGMP 组签名。必须由本地配置 rgb20.testSignPsbt 显式开启（默认关闭），否则拒签。
 func (t *tssService) handleTestSignNotify(notify *ltypes.TssSignNotify) error {
 	if !t.testSignEnabled() {
 		return fmt.Errorf("test sign notify refused: rgb20.testSignPsbt is not enabled on this node")
@@ -1376,7 +1735,7 @@ func (t *tssService) handleTestSignNotify(notify *ltypes.TssSignNotify) error {
 	}
 	log.Warn("handleTestSignNotify signing psbt WITHOUT any withdrawal validation (test-only)",
 		"psbtLen", len(notify.Psbt))
-	if _, err := t.signPsbtInternal(notify.Psbt); err != nil {
+	if _, err := t.signPsbtInternal(notify.Psbt, notify.Signers); err != nil {
 		return err
 	}
 	return nil

@@ -175,8 +175,18 @@ type tssConfig struct {
 	// Peers peers name
 	Peers []string `json:"peers"`
 	// Threshold peer threshold
+	//
+	// CGGMP 下它同时是**签名者个数**：alice 的 cggmp.ProcessSign 要求 len(peers) == threshold，
+	// 所以每轮签名只挑 threshold 个节点参与（挑法见 tss.go 的 selectSignerCombination），
+	// 不再是 GG18 那种"连上的合法节点全上"。
 	Threshold uint32 `json:"threshold"`
-	// Rank peer rank
+	// Rank 本节点的 **Birkhoff rank**（不是节点序号！），必须满足 rank + 1 < threshold
+	// （即 rank <= threshold-2；等价于 alice 的 utils.EnsureRank）。
+	//
+	// 本项目 4 节点 + threshold=3 的正确取值是 {0,1,1,1}：官方节点 0，其余三个第三方节点都是 1。
+	// **多个节点共用同一个 rank 是正常的**（alice 靠各自的 x 坐标区分），照抄"0,1,2,3"这种
+	// 索引式分配会被 alice 直接拒（rank=2/3 不满足 rank+1<3）⇒ DKG 永远跑不起来。
+	// 启动时会自检（tss.go validateCggmpRank），不合规直接拒绝启动而不是每分钟重试一次。
 	Rank uint32 `json:"rank"`
 	// AllowShareMismatch 逃生阀，默认 false（不写即关闭）：启动自检（见 client.go
 	// checkTssShareAgainstChain）发现本地 share 与链上 CrossChainInfo 不一致时，是否仍允许启动。
