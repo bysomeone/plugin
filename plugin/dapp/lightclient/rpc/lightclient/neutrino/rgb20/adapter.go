@@ -146,7 +146,7 @@ type Chain33Bridge interface {
 	// （E11：签名节点必须拿到上下文才可能执行 ValidateWithdrawPsbt；缺上下文的签名一律拒签）。
 	SignPsbt(req *WithdrawSignRequest) ([]byte, error)
 	// SignPsbtTestOnly 仅 E2E 的 sign-psbt 测试端点使用：**无提现上下文**，签名节点不做任何
-	// 提现核对就直接参与 GG18。生产提现路径永远不走这里（见 Config.TestSignPsbt）。
+	// 提现核对就直接参与 CGGMP 组签名。生产提现路径永远不走这里（见 Config.TestSignPsbt）。
 	SignPsbtTestOnly(psbtBytes []byte) ([]byte, error)
 	// BtcBestHeight 返回本节点 BTC 视图的 best height（中继自己的头链视图，与头链提交同源）。
 	// 充值提交前的本地深度门控用它算"提交那一刻链上可见 tip 到哪"；取不到时返回错误（门控 fail-closed）。
@@ -180,7 +180,7 @@ type Chain33Bridge interface {
 	// IsUserDepositScript 判断某个输出脚本是否为**已登记**的用户 P2WSH 充值脚本
 	// （桥发放过地址、且已纳入 watch 集），返回其 userID（= chain33 充值地址串）。
 	//
-	// 这类脚本同样受桥（TSS 群钥）控制 —— 脚本里的 `<tssPub>` 就是群公钥，花费需要 GG18 签名
+	// 这类脚本同样受桥（TSS 群钥）控制 —— 脚本里的 `<tssPub>` 就是群公钥，花费需要 CGGMP 组签名
 	// —— 因此签名节点交叉核对输入归属时必须接受它们；反过来，**未登记**的 P2WSH 一律不接受
 	// （登记与否是签名节点自己的判断，不采信协调者下发的 PSBT 自称）。
 	IsUserDepositScript(pkScript []byte) (string, bool)

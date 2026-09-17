@@ -454,7 +454,7 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 
 	// ---- 输入侧交叉核对 ----
 	// 每个输入都必须受桥（TSS）控制：RGB seal 输入与 fee 输入都在 TSS 单脚本钱包下，prevout
-	// 脚本 == TSS 脚本即证明其受桥控制（非 TSS 的 UTXO 无法被 GG18 签名）。fee 输入（如
+	// 脚本 == TSS 脚本即证明其受桥控制（非 TSS 的 UTXO 无法被 CGGMP 组签名）。fee 输入（如
 	// deposit 找零）只携带 BTC、不携带 RGB 状态；若官方节点夹带其它 TSS 状态 seal 作 fee
 	// 输入，其状态会因未在 consignment 中关闭而丢失——该风险由 build_transfer 只选非 seal
 	// UTXO 作费输入 + 签名节点对金额/输出结构的核对兜底（见输出侧），与 deposit 校验一致。
@@ -475,7 +475,7 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 			continue // 主池 TSS P2WPKH：桥直接控制
 		}
 		// C3：用户 P2WSH 充值脚本（`<push userID> OP_DROP <push tssPub> OP_CHECKSIG`）的
-		// program 收进来的 BTC 同样只有 GG18 群签名才能花掉 —— 花费它的 PSBT 输入必须带
+		// program 收进来的 BTC 同样只有 CGGMP 群签名才能花掉 —— 花费它的 PSBT 输入必须带
 		// witness_script 作 scriptCode，签名节点在这里核对"这个脚本是不是我们发放过的"。
 		//
 		// **只认已登记的**：登记只发生在桥按需发放充值地址时（bitcoin.go 的

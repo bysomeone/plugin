@@ -625,8 +625,9 @@ plugin/dapp/rgbx/executor/
 │   └── key: btcTxHash, value: {processed}
 ├── rgbx-btcwallet-monitor       # BTC监控断点
 │   └── min-pending-height
-└── rgbx-tss                     # TSS DKG结果
-    └── dkg-result
+└── rgbx-tss                     # TSS 密钥材料（CGGMP：DKG + refresh 两份）
+    ├── cggmp-dkg-result         # CGGMP DKG 结果（群公钥/share/bks/rid/partial pubkeys）
+    └── cggmp-refresh-result     # CGGMP refresh 结果（share/Paillier 私钥素数/ySecret/Pedersen 参数）
 ```
 
 ---

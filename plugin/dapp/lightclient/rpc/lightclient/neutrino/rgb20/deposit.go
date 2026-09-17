@@ -138,7 +138,7 @@ func (a *Adapter) pollTransfersOnce() {
 
 // onSettledTransfer 按 receive_id 归因并推进充值流程。
 // 已归因但未 minted 的记录会在后续轮询中持续重试 submitDeposit：
-//   - 签名产物已落盘 → 只重发，省掉一轮 GG18（签名轮次是整条链路上最贵的一步）；
+//   - 签名产物已落盘 → 只重发，省掉一轮 CGGMP 签名（签名轮次是整条链路上最贵的一步）；
 //   - 没有签名产物 → 先做本地深度门控（链上可见深度还不够就不签、不提交）、再签一次并落盘提交。
 //     没有产物是可自愈的常态（首次归因、重启后产物被清等），重签一份逐字节相同的对象没有副作用。
 //
@@ -190,12 +190,12 @@ func (a *Adapter) onSettledTransfer(t *pb.TransferState) error {
 
 // submitDeposit 推进一笔充值的铸造，分两条路径（重试也走这里）：
 //
-//	已有落盘的签名产物 → 只重发（省掉一轮 GG18；重发的是"签的是什么就发什么"）；
+//	已有落盘的签名产物 → 只重发（省掉一轮 CGGMP 签名；重发的是"签的是什么就发什么"）；
 //	没有签名产物       → 校验链上可见深度够不够（够才签）→ 签名 → **落盘** → 提交。
 //
 // 顺序上的两个关键约定：
 //   - **先落盘、再提交**：提交前产物必须先持久化，否则一次重启就丢掉产物、要重跑一轮签名；
-//   - **深度门控在签名之前**：链上注定拒绝的提交不该消耗一轮 GG18（30s 起）。
+//   - **深度门控在签名之前**：链上注定拒绝的提交不该消耗一轮 CGGMP 签名（30s 起）。
 //
 // 提交失败（含被链上拒绝）不丢产物：下一轮轮询直接重发同一份已签对象。
 // 产物真的丢了（落盘失败后重启、数据目录被清、从旧快照恢复）也能自愈：没有产物就走下面
@@ -228,12 +228,12 @@ func (a *Adapter) submitDeposit(rec *ReceiveRecord) error {
 		return fmt.Errorf("build spv proof: %w", err)
 	}
 	// 3) 本地深度门控（签名前的这一次）：链上可见深度不够就等，不签名、不提交。
-	// 提交前 submitSignedDeposit 还会再核对一次（最贴近动作的那次），这里拦的是"白跑一轮 GG18"。
+	// 提交前 submitSignedDeposit 还会再核对一次（最贴近动作的那次），这里拦的是"白跑一轮 CGGMP 签名"。
 	if err := a.checkSubmitDepth(proof.BlockHeight); err != nil {
 		return err
 	}
 
-	// 4) 签名轮次（一整轮 GG18，代价最高的那一步）。
+	// 4) 签名轮次（一整轮 CGGMP 签名，代价最高的那一步）。
 	dep := &rtypes.DepositAsset{
 		Amount:         rec.Amount,
 		DepositAddress: rec.Chain33Addr,
@@ -264,7 +264,7 @@ func (a *Adapter) submitDeposit(rec *ReceiveRecord) error {
 	}
 	dep.ThresholdSig = sig
 
-	// 5) 落盘（先落盘、再提交）：产物是"重试只重发"的依据 —— 有它在盘上就不必再跑一轮 GG18；
+	// 5) 落盘（先落盘、再提交）：产物是"重试只重发"的依据 —— 有它在盘上就不必再跑一轮 CGGMP 签名；
 	// 落盘失败就不提交，下一轮重试落盘（真丢了也能重签，见 submitDeposit 的说明）。
 	art = &SignedDepositArtifact{
 		Txid:      rec.Txid,
@@ -281,7 +281,7 @@ func (a *Adapter) submitDeposit(rec *ReceiveRecord) error {
 
 // persistArtifactFailed 落盘失败：限流记一条 ERROR 并返回错误（调用方不提交）。
 // 产物仍在内存缓存里，下一轮 Put 会重试落盘；若在落盘成功前进程重启，产物随之丢失，下一轮会
-// 重新走一轮签名（重签幂等，只是白花一轮 GG18），不会卡死这条记录。
+// 重新走一轮签名（重签幂等，只是白花一轮 CGGMP 签名），不会卡死这条记录。
 func (a *Adapter) persistArtifactFailed(rec *ReceiveRecord, err error) error {
 	if a.depositNotes.allow("persist-sig:" + rec.Txid) {
 		log.Error("submitDeposit persist signed deposit failed, withholding submission (the signature is kept in "+
@@ -384,7 +384,7 @@ func requiredSubmitHeight(proofHeight, headerConfs, minConfs uint64) (uint64, bo
 // checkSubmitDepth 本地深度门控（提交前）：链上可见深度还不够时返回 errDepositDepthPending，
 // 调用方**不得**继续签名/提交，等下一轮轮询再试（那时 best 通常已经长够，一次提交即成）。
 //
-// 为什么不能依赖"提交被拒后再重试"：被拒发生在签名轮次之后（TSS 已经白跑一轮 GG18，30s 起），
+// 为什么不能依赖"提交被拒后再重试"：被拒发生在签名轮次之后（TSS 已经白跑一轮 CGGMP 签名，30s 起），
 // 每 30s 失败一次纯属浪费；在签名之前拦住，重试就只剩"等深度"这一件廉价的事。
 //
 // fail-closed：取不到 best（neutrino 还没同步出 best block）或链上 N 查不到（主链未就绪/旧执行器）时

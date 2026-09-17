@@ -14,10 +14,10 @@ import (
  * 背景：submitDeposit 原本每次重试都走"组 DepositAsset → TSS 签 → 提交"整条链路。这带来两个问题：
  *
  *  1. 链上深度不够时（B8：链上要求 canonical tip >= H + N - 1，而中继上链的头链只到 best - B），
- *     首笔提交注定被拒，而每次 30s 重试都会**空跑一整轮 GG18 签名**；
+ *     首笔提交注定被拒，而每次 30s 重试都会**空跑一整轮 CGGMP 签名**；
  *  2. 签名产物只存在于内存里，进程重启即丢，哪怕是"签名成功、提交瞬间失败"这种最该直接续上的情况。
  *
- * 因此把签名轮次的产出落盘：**先落盘、再提交**；重试时若已有落盘产物就只重发，省掉一轮 GG18。
+ * 因此把签名轮次的产出落盘：**先落盘、再提交**；重试时若已有落盘产物就只重发，省掉一轮 CGGMP 签名。
  *
  * 注意这只是**性能缓存**，不是重试的唯一依据：产物丢了（落盘失败后重启、数据目录被清、从旧快照
  * 恢复）就再签一轮 —— 充值重签是逐字节幂等的（签的是 C = sha256(Encode(DepositAsset{thresholdSig:nil}))，
@@ -95,7 +95,7 @@ func (s *DepositSignatureStore) Get(txid string) (*SignedDepositArtifact, error)
 // 落盘失败时**缓存里仍然有这份产物**（返回错误给调用方）：签名已经产出，不能因为一次写盘失败就
 // 丢掉它；调用方下次调用 Put 即可重试落盘。契约：调用方在产物 durable 之前**不得提交**
 // （见 submitDeposit 的"先落盘、再提交"）—— 进程若在落盘成功前重启，产物随之丢失，下一轮重签一份
-// 完全相同的对象即可（重签幂等，只是白花一轮 GG18）。
+// 完全相同的对象即可（重签幂等，只是白花一轮 CGGMP 签名）。
 func (s *DepositSignatureStore) Put(art *SignedDepositArtifact) error {
 	if art == nil || art.Txid == "" || art.Deposit == nil {
 		return fmt.Errorf("invalid signed deposit artifact")
