@@ -563,6 +563,45 @@ func Test_Query_OperationLedger(t *testing.T) {
 	require.Equal(t, types.ErrInvalidParam, err)
 }
 
+// Test_Query_OperationLedgerJSONContract 审计/CLI 的**对外契约**：查询结果的 JSON 键名。
+//
+// 为什么单独钉：proto 字段名一改（例如曾经把 threshold_sig 改成 thresholdSig），CLI/审计脚本读的
+// JSON 键就跟着变，而这类改动在单测里是"静默通过"的。台账是给外部核对用的，键名就是接口。
+func Test_Query_OperationLedgerJSONContract(t *testing.T) {
+	f := newOperationLedgerFixture(t)
+	burnOpID := burnForTest(t, f, "btc", "user-a", 600, []byte("json-burn"))
+
+	msg, err := f.r.Query_GetOperation(&rtypes.ReqGetOperation{OperationId: burnOpID})
+	require.NoError(t, err)
+	jsonBytes, err := types.PBToJSONUTF8(msg)
+	require.NoError(t, err)
+	t.Logf("GetOperation -> %s", string(jsonBytes))
+
+	for _, key := range []string{
+		"operationId", "kind", "symbol", "network", "amount", "owner",
+		"btcTxID", "chain33TxHash", "height", "timestamp", "settled",
+	} {
+		require.Containsf(t, string(jsonBytes), `"`+key+`"`, "台账记录的 JSON 契约必须保留键 %q", key)
+	}
+
+	msg, err = f.r.Query_GetOperationSupply(&types.ReqString{Data: "btc"})
+	require.NoError(t, err)
+	jsonBytes, err = types.PBToJSONUTF8(msg)
+	require.NoError(t, err)
+	t.Logf("GetOperationSupply -> %s", string(jsonBytes))
+	for _, key := range []string{"symbol", "network", "minted", "burned", "nextMintIndex", "nextBurnIndex"} {
+		require.Containsf(t, string(jsonBytes), `"`+key+`"`, "供应量的 JSON 契约必须保留键 %q", key)
+	}
+
+	msg, err = f.r.Query_ListOperations(&rtypes.ReqListOperations{
+		AssetSymbol: "btc", Kind: rtypes.OperationKindBurn, Start: 0, Count: 10})
+	require.NoError(t, err)
+	jsonBytes, err = types.PBToJSONUTF8(msg)
+	require.NoError(t, err)
+	t.Logf("ListOperations -> %s", string(jsonBytes))
+	require.Contains(t, string(jsonBytes), `"records"`)
+}
+
 // Test_OperationLedger_networkIsConfigDerived network 由 symbol 确定性导出（不读节点本地配置）。
 func Test_OperationLedger_networkIsConfigDerived(t *testing.T) {
 	origin := rgbxCfg.CrossChainAssetPrefix
