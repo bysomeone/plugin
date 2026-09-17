@@ -20,6 +20,10 @@ type config struct {
 	CommitAddress        string `json:"commitAddress"`
 	BtcNetName           string `json:"btcNetName"`
 	AllowRegtestTimeWarp bool   `json:"allowRegtestTimeWarp"`
+	// AllowBtcIndexMismatch 逃生阀（默认 false）：localdb 的逐高度头与 statedb 的 canonical 窗口/tip
+	// 不一致时，查询默认 fail-closed 拒绝（见 btc_index_guard.go）。仅在确认要冷修（重建本地索引）时
+	// 临时打开；打开后不一致只报错、不拒绝。
+	AllowBtcIndexMismatch bool `json:"allowBtcIndexMismatch"`
 }
 
 var (

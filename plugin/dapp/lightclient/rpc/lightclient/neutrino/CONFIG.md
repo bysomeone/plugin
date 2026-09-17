@@ -41,6 +41,34 @@
 - `allowRegtestTimeWarp`
   - 含义：仅用于 regtest 测试场景的时间容错开关
   - 建议：仅在 regtest 打开，生产网络关闭
+- `allowBtcIndexMismatch` (bool)
+  - 含义：**逃生阀**，默认 `false`（不写即关闭）。关闭时，`GetBtcHeader` / `GetBtcHeaderByHash`
+    会拿共识状态（statedb 的 `btc-chainstate` 窗口与 `btc-lastheader`）交叉校验 localdb
+    （`LODB-lightclient-btc-header-*`，节点私有的逐高度头索引）：
+    - localdb 在**共识 tip 高度**上的头必须与 `btc-lastheader` 一致（丢库 / 落后 / 停在别的链上 → 拒）；
+    - 请求高度落在 canonical 窗口里时，localdb 的头必须与窗口节点的 hash 一致
+      （头 hash 已承诺 merkleRoot，校验 hash 即校验 merkleRoot）→ 不一致即拒。
+    拒绝是 **fail-closed**：本节点拒收依赖该高度的区块 / 充值证明，表现为**本节点掉队停机**
+    （错误码 `ErrBtcLocalIndexMismatch` / `ErrBtcHeaderNotCanonical`），不是全网静默分叉。
+    窗口里没有该高度（比窗口更老 / 窗口尚未写入的老链）**不做判定**，维持原有行为；节点在
+    该高度上**没有** localdb 数据时仍是原来的"取不到"语义（`ErrNotFound`），不报成不一致。
+  - 打开（`true`）后：不一致只打一条 ERROR 日志，查询照原样返回。**只用于确认要做冷修
+    （重建本地索引）时的临时手段**，修好后必须改回 `false` —— 打开期间"区块是否合法"重新变成
+    依赖节点私有数据。
+  - 恢复（localdb 丢 / 被判定不一致时）：**目前没有按需重建的入口**，需要按下面的现状处置。
+    - 重启不会重放：chain33 启动只执行新块，不会重跑历史区块的 `ExecLocal`。
+    - 已有的重建通道都是**版本升级触发**的（都会重跑每个区块的 `ExecLocal`，从而重建 dapp localdb）：
+      `blockchain.reindex` 路径（`LocalDBMeta` 大版本变化时 `delAllKeys` + 逐高度重放，
+      但 `delAllKeys` **不含** `LODB-<execer>-` 前缀，即不删 dapp localdb）；
+      以及 `[blockchain] enableReExecLocal=true` 配合 `StoreDBMeta` 大版本变化触发的 `ReExecBlock`
+      （见 chain33 `blockchain/reindex.go`、`restore.go` 与 `blockstore.AddTxs`）。两个版本号都是
+      chain33 二进制里的常量，运维无法自行触发。
+    - 因此：真发生 localdb 丢失，当前只能等一次带版本升级的发布（或临时打开本逃生阀让节点带病运行），
+      "扫链上 `BtcHeaders` 交易重建本地索引"的最小重建工具列为后续项（代价：全链区块扫描 + 复用
+      `btcHeadersLocalKV` 的同一套 KV 逻辑，需要一次 E2E 验证）。
+    - 另注意 localdb 与 statedb 是**两次独立提交**（执行器先落 localdb、blockchain 后落 statedb），
+      崩溃窗口内 localdb 可能领先于 statedb —— 那是正常形态（本校验只看共识 tip 高度那一条，
+      不受影响）。
 
 ### 2.1.1 BTC 头链锚点（bootstrap 信任根）
 

@@ -20,6 +20,13 @@ var (
 	ErrBtcReorgTooDeep = errors.New("ErrBtcReorgTooDeep")
 	// ErrBtcHeaderContextMissing 挂载点在 canonical 链上，但拿不到它的完整头（localdb 缺数据），无法校验
 	ErrBtcHeaderContextMissing = errors.New("ErrBtcHeaderContextMissing")
+	// ErrBtcHeaderNotCanonical localdb 里该高度的头与 statedb canonical 窗口里的节点不一致
+	// （读 localdb 做共识判定的交叉校验失败，见 btc_index_guard.go）
+	ErrBtcHeaderNotCanonical = errors.New("ErrBtcHeaderNotCanonical")
+	// ErrBtcLocalIndexMismatch localdb 在共识 tip 高度上没有与 btc-lastheader 一致的头
+	ErrBtcLocalIndexMismatch = errors.New("ErrBtcLocalIndexMismatch")
+	// ErrBtcLocalIndexUnavailable 节点没有可用的 localdb（exec.disableExecLocal / 未绑定）
+	ErrBtcLocalIndexUnavailable = errors.New("ErrBtcLocalIndexUnavailable")
 
 	ErrBtcTargetBits        = errors.New("ErrBtcTargetBits")
 	ErrBtcHeaderTimeTooOld  = errors.New("ErrBtcHeaderTimeTooOld")
