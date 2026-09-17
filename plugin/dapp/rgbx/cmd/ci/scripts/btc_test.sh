@@ -18,7 +18,9 @@ function scenario_user_deposit_via_btc_tx() {
     # 桥侧需配置：neutrino.depositAddressListen（见 lightclient CONFIG.md）+ 把该端口暴露给本脚本。
     local bridge_deposit_url="${BRIDGE_DEPOSIT_URL:-http://127.0.0.1:17001/rgbx/v1/btc-deposit-address}"
     local deposit_addr
-    deposit_addr=$(curl -sf "${bridge_deposit_url}?chain33Addr=${USER_MAIN_ADDR}" | jq -r '.data.address // empty')
+    # `|| true`：curl 连不上时（--fail 非 2xx / 连接被拒）赋值会因 set -e 直接结束整个 run，
+    # 后面那句带排障提示的 assert 就永远看不到。这里让 assert 来报错，失败信息才有指向性。
+    deposit_addr=$(curl -sf "${bridge_deposit_url}?chain33Addr=${USER_MAIN_ADDR}" | jq -r '.data.address // empty') || true
     assert_non_empty "${deposit_addr}" \
         "deposit address empty from ${bridge_deposit_url} (is neutrino.depositAddressListen configured and reachable?)"
 
