@@ -215,6 +215,7 @@ impl RgbSidecar for RgbSidecarService {
                 &req.recipient_invoice,
                 &req.change_address,
                 req.fee_rate as u64,
+                &req.input_seals,
             )
             .map_err(err)?;
         Ok(Response::new(BuildWithdrawalResponse {

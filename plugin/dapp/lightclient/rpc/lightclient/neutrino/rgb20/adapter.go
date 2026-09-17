@@ -157,6 +157,10 @@ type Chain33Bridge interface {
 	RgbxMinBtcConfirmations() (uint64, error)
 	// BroadcastTx 广播已签提现交易（由 neutrino 主包实现，走 btcwallet）。
 	BroadcastTx(psbtSigned []byte, txid string) error
+	// WithdrawState 返回该笔提现落盘的本地状态（空 = 从未处理到广播；见 neutrino 的
+	// withdrawStateBucket）。RGB20 提现用它做与 BTC 侧同构的状态门：状态非空说明本笔已经走到过
+	// 广播，此时若 sticky seal 记录为空，重新选 seal 构建就是 E9 的双付形态，必须停下。
+	WithdrawState(chain33Hash []byte) []byte
 	// TSSAddress 返回桥 TSS 的 P2WPKH 地址（regtest bcrt1…/testnet tb1…/mainnet bc1…）。
 	// RGB20 提现的找零地址；config.changeAddress 留空时据此自动填充。
 	TSSAddress() string

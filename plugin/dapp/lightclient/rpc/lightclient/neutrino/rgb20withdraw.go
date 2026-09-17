@@ -8,7 +8,9 @@ import (
 	"github.com/33cn/chain33/types"
 	"github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
+	"github.com/btcsuite/btcd/btcjson"
 	"github.com/btcsuite/btcd/btcutil/psbt"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 )
 
 // 以下方法使 neutrinoClient 实现 rgb20.Chain33Bridge（提现侧）。
@@ -48,8 +50,50 @@ func (n *neutrinoClient) SignPsbtTestOnly(psbtBytes []byte) ([]byte, error) {
 	return n.tss.signPsbtTestOnly(psbtBytes)
 }
 
+// WithdrawState 返回该笔提现落盘的本地状态（空 = 从未处理到广播）。
+// 供 rgb20 适配器做与 BTC 侧同构的状态门（见 rgb20.Withdraw 里的 sticky 检查）。
+func (n *neutrinoClient) WithdrawState(chain33TxHash []byte) []byte {
+	return n.getWithdrawState(chain33TxHash)
+}
+
+// txLookup 是「该 txid 在本节点是否可见」的最小查询面。生产用 btcd 全节点 RPC 的
+// *rpcclient.Client（与 BuildSpvProof 同源，需要节点开 --txindex）；单测注入假实现。
+type txLookup interface {
+	GetRawTransactionVerbose(hash *chainhash.Hash) (*btcjson.TxRawResult, error)
+}
+
+// txKnownToNode 判断 txid 是否已经在本节点可见（mempool 或链上）。
+// 查询能力不可用（没有全节点 RPC，例如纯 neutrino 部署）时返回 false：那只是退回到
+// 「按广播结果判定」的既有行为，不会把真正的失败误判成成功。
+func txKnownToNode(lookup txLookup, txid string) bool {
+	if lookup == nil || txid == "" {
+		return false
+	}
+	hash, err := chainhash.NewHashFromStr(txid)
+	if err != nil {
+		return false
+	}
+	_, err = lookup.GetRawTransactionVerbose(hash)
+	return err == nil
+}
+
+// broadcastOutcomeIsSuccess 广播的结果是否应当算成功：广播没报错自然算成功；报了错时，只有
+// 「节点其实已经知道这笔交易」才算成功——上一次广播的回包可能在中途丢失（超时/连接重置），
+// 节点已经收下并转发，只是这次重试被以「已在 mempool / 已存在」拒绝。其余错误照旧失败。
+func broadcastOutcomeIsSuccess(lookup txLookup, txid string, broadcastErr error) bool {
+	if broadcastErr == nil {
+		return true
+	}
+	return txKnownToNode(lookup, txid)
+}
+
 // BroadcastTx 从已签 PSBT 提取交易并广播，同时登记到 btcwallet pending 缓存用于确认跟踪
 // （确认后经 withdrawChan → processWithdrawConfirm 提交 rgbx Confirm，合约 RGB20 分支跳过 commitment）。
+//
+// 广播是**幂等**的：本笔可能已经在本节点可见——上一次广播其实成功了但回包丢失（连接超时/重置，
+// 见 E9 的事故形态），或侧车按 input_seals 重放出了同一笔交易。这两种情况下节点会以「已在
+// mempool / 已存在」拒绝，但钱已经在路上：把它算成功，重试才能收敛（否则重试永远失败，链上那笔
+// burn 会一直挂着）。判定依据是「节点是否已经知道这个 txid」，而不是错误文本，避免依赖节点措辞。
 func (n *neutrinoClient) BroadcastTx(psbtSigned []byte, txid string) error {
 	p, err := psbt.NewFromRawBytes(bytes.NewReader(psbtSigned), false)
 	if err != nil {
@@ -63,14 +107,30 @@ func (n *neutrinoClient) BroadcastTx(psbtSigned []byte, txid string) error {
 	if err != nil {
 		return fmt.Errorf("extract tx: %w", err)
 	}
-	if err := n.bw.broadcastTransaction(tx, txid); err != nil {
-		return err
-	}
 	// 通过 txid↔chain33 提现哈希映射找到 pending（H4：弃用 OP_RETURN correlation）。
 	var chain33Hash []byte
 	if n.rgb20 != nil {
 		chain33Hash, _ = n.rgb20.GetChain33HashByTxid(txid)
 	}
+
+	var lookup txLookup
+	if n.bw != nil && n.bw.rpcClient != nil {
+		lookup = n.bw.rpcClient
+	}
+	switch {
+	case txKnownToNode(lookup, txid):
+		log.Info("BroadcastTx rgb20 withdraw already known to the node, skip broadcast",
+			"btcTxid", txid, "chain33Hash", hex.EncodeToString(chain33Hash))
+	default:
+		if err := n.bw.broadcastTransaction(tx, txid); err != nil {
+			if !broadcastOutcomeIsSuccess(lookup, txid, err) {
+				return err
+			}
+			log.Warn("BroadcastTx rgb20 withdraw broadcast failed but the tx is known to the node, treating as success",
+				"btcTxid", txid, "chain33Hash", hex.EncodeToString(chain33Hash), "err", err)
+		}
+	}
+
 	n.bw.addPendingTx(&btcPendingTx{
 		tx:                    tx,
 		submitTime:            types.Now(),
@@ -80,6 +140,14 @@ func (n *neutrinoClient) BroadcastTx(psbtSigned []byte, txid string) error {
 		txType:                transactionTypeWithdraw,
 		chain33WithdrawTxHash: chain33Hash,
 	})
+	// 状态门（与 BTC 侧 processWithdrawRequest 的同名落盘对齐）：广播成功后落 withdrawStatusSent，
+	// 配合 rgb20 适配器的「state 非空且 sticky 为空则停下」护栏，以及后续的 Confirm/不可恢复状态。
+	if len(chain33Hash) > 0 {
+		if err := n.setWithdrawState(chain33Hash, withdrawStatusSent); err != nil {
+			log.Error("BroadcastTx rgb20 setWithdrawState", "btcTxid", txid,
+				"chain33Hash", hex.EncodeToString(chain33Hash), "err", err)
+		}
+	}
 	log.Info("BroadcastTx rgb20 withdraw tracked", "btcTxid", txid, "chain33Hash", hex.EncodeToString(chain33Hash))
 	return nil
 }

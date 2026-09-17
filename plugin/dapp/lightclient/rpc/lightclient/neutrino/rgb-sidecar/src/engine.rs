@@ -37,7 +37,7 @@ use crate::config::Config;
 use crate::invoice::{
     consignment_from_bytes, consignment_to_bytes, network_to_chainnet, parse_invoice,
 };
-use crate::ledger::{AssetRec, Ledger, ReceiveRec};
+use crate::ledger::{AssetRec, FinalizedWithdrawalRec, Ledger, ReceiveRec, RecordedWithdrawal};
 use crate::rpc::BtcdRpc;
 use crate::types::{recv_status, SealStatus, SealTxOut};
 use crate::wallet::{BtcWallet, WalletUtxo};
@@ -155,13 +155,8 @@ struct PendingWithdrawal {
 
 /// Result of a finalized withdrawal, kept so a repeated `finalize_withdrawal` is a no-op
 /// returning the same values instead of failing with "no pending withdrawal".
-#[derive(Clone, Debug)]
-struct FinalizedWithdrawal {
-    pub txid: Txid,
-    pub recipient_outpoint: String,
-    pub change_outpoint: Option<String>,
-}
-
+///
+/// The record lives in the (persisted) ledger, see [`ledger::FinalizedWithdrawalRec`].
 pub struct RgbEngine {
     cfg: Config,
     pub stock: Stock,
@@ -173,8 +168,6 @@ pub struct RgbEngine {
     tss_address: Address,
     resolver: BtcdResolver,
     pending_withdrawals: HashMap<String, PendingWithdrawal>,
-    /// Withdrawals already finalized, by txid: makes a repeated finalize idempotent.
-    finalized_withdrawals: HashMap<String, FinalizedWithdrawal>,
     /// Txs built by `build_transfer` that are not yet broadcast (withdrawal anchors awaiting TSS
     /// signature). Shared with `resolver` so pre-broadcast consignment validation can resolve them.
     local_anchors: Arc<Mutex<HashMap<Txid, Transaction>>>,
@@ -226,7 +219,6 @@ impl RgbEngine {
             tss_address,
             resolver,
             pending_withdrawals: HashMap::new(),
-            finalized_withdrawals: HashMap::new(),
             local_anchors,
         })
     }
@@ -869,6 +861,22 @@ impl RgbEngine {
     // Withdrawals
     // ===================================================================
 
+    /// Build an unsigned withdrawal.
+    ///
+    /// `input_seals` empty ⇒ the usual path: pick spendable (minted) seals covering `amount`, and
+    /// record the resulting build.
+    ///
+    /// `input_seals` non-empty ⇒ **replay** (E9-A): spend exactly these outpoints, ignoring their
+    /// lifecycle status, and re-issue the recorded build for them (same PSBT ⇒ same txid). The
+    /// bridge uses it to retry a withdrawal whose first attempt already advanced the ledger (spent
+    /// seal → `Consumed`, change seal → `Minted`): selecting by status then picks a *different*
+    /// seal set, which yields a second, independently valid transfer — the user is paid twice for a
+    /// single on-chain burn. If no build is recorded for the given seals (the record is gone), the
+    /// build is made from them directly: same seals, but a different transaction.
+    ///
+    /// The caller is not trusted: each outpoint must actually carry `symbol`'s contract state in
+    /// the Stock (the same check `build_transfer` performs per input, made explicit here so the
+    /// failure names the seal).
     pub fn build_withdrawal(
         &mut self,
         symbol: &str,
@@ -876,21 +884,41 @@ impl RgbEngine {
         recipient_invoice: &str,
         change_address: &str,
         fee_rate: u64,
+        input_seals: &[String],
     ) -> Result<BuildTransferOutcome> {
         // 先从链上对账 seal 生命周期：上一笔提现的 change seal 只有在其锚定 tx 上链后
         // （PendingMint -> Minted，sync 依据 TSS UTXO 集合推导）才可花。否则紧接的下一笔
         // 提现在 select_seals 阶段会报 "0 minted seals"（充值 settle 路径在 test_sim 里
         // 会显式 sync，提现路径漏了这步）。
         self.sync()?;
-        let (seals, _total) = self.ledger.select_seals(symbol, amount)?;
-        let input_outpoints: Vec<OutPoint> = seals
-            .iter()
-            .map(|s| OutPoint::from_str(&s.outpoint))
-            .collect::<Result<_, _>>()?;
+        let input_outpoints: Vec<OutPoint> = if input_seals.is_empty() {
+            let (seals, _total) = self.ledger.select_seals(symbol, amount)?;
+            seals
+                .iter()
+                .map(|s| OutPoint::from_str(&s.outpoint))
+                .collect::<Result<_, _>>()?
+        } else {
+            self.replay_input_seals(symbol, input_seals)?
+        };
         let change_script = Address::from_str(change_address)?
             .require_network(self.cfg.network)
             .map_err(|e| anyhow!("change address network: {e}"))?
             .script_pubkey();
+        // Replay: hand back the recorded build of this seal set verbatim. Rebuilding instead would
+        // produce a *different* transaction — the build draws fresh random blinding factors for the
+        // recipient/change seals on every run, so even identical inputs give a different RGB
+        // commitment (and txid), i.e. a second, conflicting spend of the same seal rather than a
+        // replay. Only a recorded PSBT can be replayed byte for byte.
+        if !input_seals.is_empty() {
+            if let Some(rec) = self.ledger.withdrawal_builds.get(&seal_set_key(&input_outpoints)) {
+                return self.replay_recorded_withdrawal(
+                    rec.clone(),
+                    symbol,
+                    recipient_invoice,
+                    change_address,
+                );
+            }
+        }
         let outcome = self.build_transfer(
             symbol,
             &input_outpoints,
@@ -904,6 +932,23 @@ impl RgbEngine {
             .asset(symbol)
             .map(|a| a.asset_id.clone())
             .unwrap_or_default();
+        // Record the build so a retry of this withdrawal (same seals) can replay it verbatim.
+        self.ledger.withdrawal_builds.insert(
+            seal_set_key(&input_outpoints),
+            RecordedWithdrawal {
+                txid: outcome.txid.to_string(),
+                asset_id: asset_id.clone(),
+                asset_symbol: symbol.to_string(),
+                input_outpoints: input_outpoints.iter().map(|o| o.to_string()).collect(),
+                change_vout: outcome.change_vout,
+                change_amount: outcome.change_amount,
+                psbt_hex: hex_encode(&outcome.psbt.serialize()),
+                consignment_hex: hex_encode(&outcome.consignment),
+                input_amounts: outcome.input_amounts.clone(),
+                fascia_hex: hex_encode(&fascia_to_bytes(&outcome.fascia)?),
+            },
+        );
+        self.save()?;
         self.pending_withdrawals.insert(
             outcome.txid.to_string(),
             PendingWithdrawal {
@@ -919,6 +964,139 @@ impl RgbEngine {
         Ok(outcome)
     }
 
+    /// Re-issue the withdrawal build recorded for a seal set (`RecordedWithdrawal`): the same
+    /// unsigned PSBT, consignment and fascia, hence the same txid — an idempotent replay of the
+    /// first attempt instead of a second payment for the same on-chain burn.
+    ///
+    /// The record is keyed by the seal set, so a request that happens to name the same seals but is
+    /// a *different* withdrawal would otherwise be handed someone else's build. It is therefore
+    /// checked against the request (asset, recipient, change script, sent amount) before it is
+    /// re-issued; a mismatch is an error, never a quiet substitution.
+    fn replay_recorded_withdrawal(
+        &mut self,
+        rec: RecordedWithdrawal,
+        symbol: &str,
+        recipient_invoice: &str,
+        change_address: &str,
+    ) -> Result<BuildTransferOutcome> {
+        if rec.asset_symbol != symbol {
+            return Err(anyhow!(
+                "recorded withdrawal {} is for asset {}, not {symbol}",
+                rec.txid,
+                rec.asset_symbol
+            ));
+        }
+        let psbt = Psbt::deserialize(&hex_decode(&rec.psbt_hex)?)
+            .map_err(|e| anyhow!("recorded withdrawal {}: bad psbt: {e}", rec.txid))?;
+        let invoice = parse_invoice(recipient_invoice)?;
+        let recipient_script = invoice
+            .witness_script
+            .clone()
+            .ok_or_else(|| anyhow!("blinded-receive invoices not supported for transfers (v1)"))?;
+        let change_script = Address::from_str(change_address)?
+            .require_network(self.cfg.network)
+            .map_err(|e| anyhow!("change address network: {e}"))?
+            .script_pubkey();
+        let mismatch = |what: &str| anyhow!("recorded withdrawal {}: {what} differs from the request", rec.txid);
+        let recipient_out = psbt
+            .unsigned_tx
+            .output
+            .get(1)
+            .ok_or_else(|| mismatch("no recipient output"))?;
+        if recipient_out.script_pubkey != recipient_script {
+            return Err(mismatch("recipient script"));
+        }
+        if let Some(vout) = rec.change_vout {
+            let change_out = psbt
+                .unsigned_tx
+                .output
+                .get(vout as usize)
+                .ok_or_else(|| mismatch("no change output"))?;
+            if change_out.script_pubkey != change_script {
+                return Err(mismatch("change script"));
+            }
+        }
+        let sent: i64 = rec.input_amounts.iter().sum::<i64>() - rec.change_amount;
+        if let Some(amount) = invoice.amount {
+            if sent != amount.value() as i64 {
+                return Err(mismatch("sent amount"));
+            }
+        }
+        let fascia = fascia_from_bytes(&hex_decode(&rec.fascia_hex)?)?;
+        let input_outpoints = rec
+            .input_outpoints
+            .iter()
+            .map(|s| OutPoint::from_str(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Re-arm the in-memory pending entry: after a sidecar restart it is empty, and
+        // `finalize_withdrawal` needs it to merge the transition. (When the first attempt already
+        // finalized, the persisted `finalized_withdrawals` record short-circuits that instead.)
+        self.pending_withdrawals.insert(
+            rec.txid.clone(),
+            PendingWithdrawal {
+                txid: psbt.unsigned_tx.compute_txid(),
+                asset_id: rec.asset_id,
+                asset_symbol: rec.asset_symbol,
+                input_outpoints,
+                change_vout: rec.change_vout,
+                change_amount: rec.change_amount,
+                fascia: fascia.clone(),
+            },
+        );
+        let input_btc_values = psbt
+            .inputs
+            .iter()
+            .map(|i| i.witness_utxo.as_ref().map(|u| u.value.to_sat()).unwrap_or(0))
+            .collect();
+        Ok(BuildTransferOutcome {
+            txid: psbt.unsigned_tx.compute_txid(),
+            input_amounts: rec.input_amounts,
+            input_btc_values,
+            consignment: hex_decode(&rec.consignment_hex)?,
+            fascia,
+            psbt,
+            recipient_vout: 1,
+            change_vout: rec.change_vout,
+            change_amount: rec.change_amount,
+        })
+    }
+
+    /// Resolve caller-given replay input seals (see `build_withdrawal`).
+    ///
+    /// The seal *status* is deliberately **not** filtered — a replay spends seals the first
+    /// attempt already marked `Consumed`, which is the whole point. What is enforced instead is
+    /// that every outpoint really carries this contract's state in the Stock: without that check
+    /// a caller could make the sidecar build a transfer out of arbitrary UTXOs.
+    fn replay_input_seals(&self, symbol: &str, input_seals: &[String]) -> Result<Vec<OutPoint>> {
+        let asset = self
+            .ledger
+            .asset(symbol)
+            .ok_or_else(|| PermanentError(format!("asset {symbol} not issued")))?;
+        let contract_id = ContractId::from_str(&asset.asset_id)?;
+        let mut out: Vec<OutPoint> = Vec::with_capacity(input_seals.len());
+        for s in input_seals {
+            let outpoint =
+                OutPoint::from_str(s).map_err(|e| anyhow!("invalid input seal {s:?}: {e}"))?;
+            let assignments = self
+                .stock
+                .contract_assignments_for(contract_id, [outpoint])
+                .map_err(|e| anyhow!("assignments: {e:?}"))?;
+            if !assignments.contains_key(&OutputSeal::new(outpoint)) {
+                return Err(anyhow!(
+                    "requested input seal {outpoint} has no {} state",
+                    asset.asset_id
+                ));
+            }
+            if !out.contains(&outpoint) {
+                out.push(outpoint);
+            }
+        }
+        if out.is_empty() {
+            return Err(anyhow!("empty input seal list"));
+        }
+        Ok(out)
+    }
+
     /// Complete a withdrawal: verify the signed PSBT (segwit signing keeps the txid),
     /// mark input seals consumed, record the change seal, return (txid, recipient, change).
     pub fn finalize_withdrawal(
@@ -928,10 +1106,15 @@ impl RgbEngine {
         let tx = signed_psbt.clone().extract_tx()?;
         let txid = tx.compute_txid();
 
-        // Idempotent re-finalize (e.g. the bridge retrying after a restart): return the values
-        // recorded by the first call instead of double-applying the transition.
-        if let Some(fin) = self.finalized_withdrawals.get(&txid.to_string()) {
-            return Ok((fin.txid, fin.recipient_outpoint.clone(), fin.change_outpoint.clone()));
+        // Idempotent re-finalize (e.g. the bridge retrying after its broadcast failed): return the
+        // values recorded by the first call instead of double-applying the transition.
+        //
+        // The record lives in the *persisted* ledger, so it survives a sidecar restart — a retry
+        // that rebuilds the very same transaction (same seals ⇒ same txid, see `build_withdrawal`)
+        // finds it and returns, instead of failing with "no pending withdrawal" or merging the
+        // same fascia into the Stock twice. Either way the on-chain burn would never settle.
+        if let Some(fin) = self.ledger.finalized_withdrawals.get(&txid.to_string()) {
+            return Ok((txid, fin.recipient_outpoint.clone(), fin.change_outpoint.clone()));
         }
 
         // Keep the pending entry until the Stock merge succeeded, so a failure here leaves the
@@ -989,17 +1172,20 @@ impl RgbEngine {
                 secret_seal_hex: None,
             });
         }
-        self.save()?;
         let recipient_outpoint = format!("{txid}:1");
         let change_outpoint = pending.change_vout.map(|v| format!("{txid}:{v}"));
-        self.finalized_withdrawals.insert(
+        // Recorded before `save()` so the "already finalized" marker is persisted in the same
+        // write as the seal statuses it stands for — a crash in between must not leave the
+        // transition applied in the Stock without the record that makes the retry a no-op.
+        self.ledger.finalized_withdrawals.insert(
             txid.to_string(),
-            FinalizedWithdrawal {
-                txid,
+            FinalizedWithdrawalRec {
+                txid: txid.to_string(),
                 recipient_outpoint: recipient_outpoint.clone(),
                 change_outpoint: change_outpoint.clone(),
             },
         );
+        self.save()?;
         Ok((txid, recipient_outpoint, change_outpoint))
     }
 
@@ -1117,9 +1303,43 @@ fn rand_hex(n: usize) -> String {
     bitcoin::hex::DisplayHex::to_hex_string(&buf, bitcoin::hex::Case::Lower)
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    bitcoin::hex::DisplayHex::to_hex_string(bytes, bitcoin::hex::Case::Lower)
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>> {
+    use bitcoin::hashes::hex::FromHex;
+    Vec::<u8>::from_hex(s).map_err(|e| anyhow!("bad hex: {e}"))
+}
+
+/// Serialize an RGB fascia for the ledger (same strict encoding the consignment helpers use).
+fn fascia_to_bytes(fascia: &Fascia) -> Result<Vec<u8>> {
+    use amplify::confinement::U24;
+    use strict_encoding::StrictSerialize;
+    Ok(fascia.to_strict_serialized::<U24>()?.release())
+}
+
+fn fascia_from_bytes(bytes: &[u8]) -> Result<Fascia> {
+    use amplify::confinement::{Confined, U24};
+    use strict_encoding::StrictDeserialize;
+    let confined: Confined<Vec<u8>, 0, U24> =
+        Confined::try_from(bytes.to_vec()).map_err(|e| anyhow!("fascia too large: {e}"))?;
+    Fascia::from_strict_serialized::<U24>(confined).map_err(|e| anyhow!("deserialize fascia: {e}"))
+}
+
 fn split_outpoint(s: &str) -> Result<(String, u32)> {
     let (txid, vout) = s
         .rsplit_once(':')
         .ok_or_else(|| anyhow!("bad outpoint {s}"))?;
     Ok((txid.to_string(), vout.parse::<u32>()?))
+}
+
+/// Canonical key of a set of RGB seals: sorted by outpoint, comma-joined. Matches the bridge's
+/// own encoding of its sticky-seal record (`rgb20.encodeStickySeals`), so a replay request and the
+/// build it replays resolve to the same key.
+fn seal_set_key(seals: &[OutPoint]) -> String {
+    let mut v: Vec<String> = seals.iter().map(|o| o.to_string()).collect();
+    v.sort();
+    v.dedup();
+    v.join(",")
 }

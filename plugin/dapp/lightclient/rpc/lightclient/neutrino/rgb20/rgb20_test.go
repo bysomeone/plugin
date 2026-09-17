@@ -81,6 +81,12 @@ type fakeBridge struct {
 	depthSet bool
 	// signFn 可按次改写签名结果（默认返回 sig 或固定值）。
 	signFn func(*DepositSignPayload) ([]byte, error)
+	// broadcastErr 非空则提现广播失败（驱动"广播失败 → 重试"的事故路径）。
+	broadcastErr error
+	// broadcastCalls 广播尝试次数。
+	broadcastCalls int
+	// withdrawState 该笔提现落盘的本地状态（E9-A 的状态门；空 = 从未处理到广播）。
+	withdrawState []byte
 }
 
 // 深度门控的测试默认值：未显式配置时"永远够深"，不让门控干扰与它无关的用例。
@@ -249,7 +255,33 @@ func (f *fakeBridge) setSubmitErr(err error) {
 	f.submitErr = err
 }
 
-func (f *fakeBridge) BroadcastTx(_ []byte, _ string) error { return nil }
+func (f *fakeBridge) BroadcastTx(_ []byte, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.broadcastCalls++
+	return f.broadcastErr
+}
+
+// broadcastCallCount 广播尝试次数（驱动"重试也走广播"的用例）。
+func (f *fakeBridge) broadcastCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.broadcastCalls
+}
+
+// setBroadcastErr 让后续广播失败（驱动"广播失败 → 重试"的事故路径）。
+func (f *fakeBridge) setBroadcastErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.broadcastErr = err
+}
+
+// WithdrawState 该笔提现落盘的本地状态（空 = 从未处理到广播）。见 Chain33Bridge 注释。
+func (f *fakeBridge) WithdrawState(_ []byte) []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.withdrawState
+}
 
 func (f *fakeBridge) TSSAddress() string {
 	return "bcrt1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"

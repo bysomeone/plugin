@@ -189,7 +189,7 @@ async fn main() -> Result<()> {
         InflatableFungibleAsset::schema().schema_id(),
         50_000_000, // 0.5 USDT
     )?;
-    let w = engine.build_withdrawal("USDT", 50_000_000, &user_invoice, &tss_addr, 2)?;
+    let w = engine.build_withdrawal("USDT", 50_000_000, &user_invoice, &tss_addr, 2, &[])?;
     println!("E2E: build_withdrawal txid={} inputs={}", w.txid, w.input_amounts.len());
 
     // 8. Sign (external test key = TSS seam), broadcast, mine.

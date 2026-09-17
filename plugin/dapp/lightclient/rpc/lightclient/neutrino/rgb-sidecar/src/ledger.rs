@@ -44,6 +44,51 @@ pub struct ReceiveRec {
     pub secret_seal_hex: Option<String>,
 }
 
+/// A withdrawal whose RGB transition has already been merged into the Stock.
+///
+/// Persisted (not just kept in memory) so `finalize_withdrawal` stays idempotent **across a
+/// sidecar restart**: the bridge retries a withdrawal whose broadcast failed by rebuilding the
+/// very same transaction (same seals ⇒ same txid), and that retry calls finalize again. With an
+/// in-memory-only record the retry would hit "no pending withdrawal" — or worse, re-merge the
+/// same fascia into the Stock — and the on-chain burn would stay stuck forever.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FinalizedWithdrawalRec {
+    pub txid: String,
+    pub recipient_outpoint: String,
+    pub change_outpoint: Option<String>,
+}
+
+/// A withdrawal build, recorded so that a retry can replay the **same transaction** byte for byte.
+///
+/// Rebuilding from the same seals is *not* enough to reproduce a txid: each build draws fresh
+/// random blinding factors for the recipient/change seals (`BlindSeal::new_random_vout`), so the
+/// RGB commitment written into the carrier tx — and with it the txid — differs every time. Only
+/// the built PSBT itself can be replayed; anything else is a second, conflicting spend of the same
+/// seal (and, if it lands first, a consignment handed to the user that does not match the tx the
+/// network accepted).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecordedWithdrawal {
+    /// txid of the built (and, on the first attempt, broadcast) transaction.
+    pub txid: String,
+    pub asset_id: String,
+    pub asset_symbol: String,
+    /// The seal inputs of the build, in the order the tx spends them.
+    pub input_outpoints: Vec<String>,
+    #[serde(default)]
+    pub change_vout: Option<u32>,
+    pub change_amount: i64,
+    /// Hex of the built (unsigned) PSBT — the object that is replayed.
+    pub psbt_hex: String,
+    /// Hex of the build's consignment (what the user is handed with the withdrawal).
+    pub consignment_hex: String,
+    /// Per-input asset amounts (`BuildWithdrawalResponse.input_amounts`).
+    pub input_amounts: Vec<i64>,
+    /// Hex of the build's RGB fascia: merging it into the Stock is what registers the transition's
+    /// output seals. Needed to finalize a replayed build whose transition was never merged (the
+    /// first attempt failed before finalize, or the sidecar restarted in between).
+    pub fascia_hex: String,
+}
+
 /// The whole persistent bookkeeping state.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Ledger {
@@ -52,6 +97,14 @@ pub struct Ledger {
     pub receives: BTreeMap<String, ReceiveRec>,
     /// index receive_id -> outpoint for settled receives (reverse lookup for attribution).
     pub settled_by_outpoint: BTreeMap<String, String>,
+    /// Finalized withdrawals by txid (`serde(default)` keeps ledgers written before this field
+    /// existed loadable).
+    #[serde(default)]
+    pub finalized_withdrawals: BTreeMap<String, FinalizedWithdrawalRec>,
+    /// Withdrawal builds by seal set (see [`RecordedWithdrawal`]): what a replay request resolves
+    /// its `input_seals` to.
+    #[serde(default)]
+    pub withdrawal_builds: BTreeMap<String, RecordedWithdrawal>,
 }
 
 impl Ledger {
