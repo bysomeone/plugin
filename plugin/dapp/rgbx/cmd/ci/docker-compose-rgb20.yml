@@ -41,10 +41,12 @@ services:
   # RGB 链 = btcd（base compose）。侧车/issue_usdt/test-sim 全部通过 btcd JSON-RPC（TLS，信任
   # btcd 自签 rpc.cert，凭据 root/1314）读取同一条链，与 para neutrino(connectPeers=btcd:18444)
   # 同步的头一致 → 解 lightclient SPV 头验证 EOF。
+  # 侧车源码只有一个权威副本：plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb-sidecar/
+  # （Dockerfile 也在那里，compose 默认取上下文里的 Dockerfile）。本文件被 make docker-compose
+  # 拷进 build/ci/rgbx-ci/ 后在那里运行，故相对路径 ../../.. 即仓根；可用 RGB_SIDECAR_SRC 覆盖。
   rgb-sidecar:
     build:
-      context: .
-      dockerfile: Dockerfile.sidecar
+      context: ${RGB_SIDECAR_SRC:-../../../plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb-sidecar}
     environment:
       RGB_SIDECAR_DATA_DIR: /data
       RGB_SIDECAR_NETWORK: regtest

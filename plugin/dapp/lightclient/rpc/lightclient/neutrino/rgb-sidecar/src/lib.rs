@@ -13,6 +13,7 @@ pub mod config;
 pub mod engine;
 pub mod invoice;
 pub mod ledger;
+pub mod rpc;
 pub mod service;
 pub mod test_sim;
 pub mod types;

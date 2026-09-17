@@ -16,8 +16,8 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 # ---- 依赖层：只拷 Cargo 清单 + build.rs + proto，占位 lib 引用全部直接依赖 ----
-COPY rgb-sidecar-src/Cargo.toml rgb-sidecar-src/Cargo.lock rgb-sidecar-src/build.rs ./
-COPY rgb-sidecar-src/proto ./proto
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto ./proto
 RUN mkdir -p src && cat > src/lib.rs <<'EOF'
 pub use bdk_wallet;
 pub use bdk_electrum;
@@ -47,7 +47,7 @@ pub use base64;
 EOF
 RUN cargo build --release --bin rgb-sidecar --bin issue_usdt || true
 # ---- 源码层：拷全量源码，增量编译 ----
-COPY rgb-sidecar-src/src ./src
+COPY src ./src
 RUN touch build.rs && cargo build --release --bin rgb-sidecar --bin issue_usdt
 
 FROM ubuntu:22.04

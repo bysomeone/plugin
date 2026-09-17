@@ -115,7 +115,10 @@ async fn main() -> Result<()> {
 
     let cfg = Config {
         data_dir: DATA_DIR.into(),
-        electrum_url: ELECTRUM.into(),
+        btc_rpc_host: "127.0.0.1:18443".into(),
+        btc_rpc_user: "root".into(),
+        btc_rpc_pass: "1314".into(),
+        btc_rpc_cert: None,
         network: Network::Regtest,
         tss_pubkey_hex,
         grpc_listen: "0.0.0.0:0".into(),

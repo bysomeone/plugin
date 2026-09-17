@@ -89,7 +89,7 @@ BTC_WITHDRAW_AMOUNT_SATS="${BTC_WITHDRAW_AMOUNT_SATS:-500000}"
 
 # ===== RGB20 (Phase 5) =====
 # RGB20 链全走 compose 内部网络：rgb-bitcoind(rgb 链) + rgb-electrs(索引) + rgb-sidecar(gRPC 50061 + test-sim 50064)。
-# 侧车镜像在 Docker 内构建（Dockerfile.sidecar，宿主 macOS 二进制无法进 Linux 容器）。
+# 侧车镜像在 Docker 内构建（源码目录里的 Dockerfile，宿主 macOS 二进制无法进 Linux 容器）。
 RGB20_SYMBOL="${RGB20_SYMBOL:-RGB20_USDT}"
 RGB20_SIDECAR_SYMBOL="${RGB20_SIDECAR_SYMBOL:-USDT}"
 RGB20_SIDECAR_ADDR="${RGB20_SIDECAR_ADDR:-rgb-sidecar:50061}"
