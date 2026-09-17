@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/33cn/chain33/common/merkle"
@@ -103,6 +102,12 @@ type btcWallet struct {
 	tssPubKey   *btcec.PublicKey
 	tssPkScript []byte // 预计算的TSS地址脚本
 
+	// depositScripts 用户 P2WSH 充值脚本的 watch 集（program ↔ userID 双向索引，
+	// 按需增长，见 deposit_address.go）。
+	depositScripts *depositScriptSet
+	// notifyFn 可选：注入"订阅地址"的实现（默认走 chainClient.NotifyReceived），仅测试用。
+	notifyFn func([]btcutil.Address) error
+
 	// 通知channel
 	depositChan       chan *btcPendingTx
 	withdrawChan      chan *btcPendingTx
@@ -129,11 +134,9 @@ type btcPendingTx struct {
 	txType                string // "deposit" or "withdraw"
 	depositAmount         btcutil.Amount
 	withdrawAmount        btcutil.Amount
-	chain33DepositAddress string // Chain33充值地址
+	chain33DepositAddress string // Chain33充值地址（= P2WSH 派生里的 userID，由充值脚本反解得到）
 	withdrawAddress       string
 	chain33WithdrawTxHash []byte // Chain33提现交易哈希
-	// OP_RETURN数据
-	opReturnData opReturnData // 原始OP_RETURN解析数据
 }
 
 func newBtcWallet(n *neutrinoClient) (*btcWallet, error) {
@@ -146,6 +149,7 @@ func newBtcWallet(n *neutrinoClient) (*btcWallet, error) {
 		removePendingChan: make(chan chainhash.Hash, 100),
 		requiredConfs:     int32(n.cfg.BlockConfirmations),
 		pendingTxs:        make(map[chainhash.Hash]*btcPendingTx),
+		depositScripts:    newDepositScriptSet(),
 	}
 
 	if n.cfg.BtcRPC.Host != "" {
@@ -237,6 +241,9 @@ func (b *btcWallet) waitAndImportTSSAddress() {
 		return true
 	}, time.Second*3)
 	log.Info("waitAndImportTSSAddress success", "address", b.tssAddress.String())
+	// 用户充值脚本的 watch 集（P2WSH 每用户地址）：从 neutrino.db 载入并重新导入钱包，
+	// 见 deposit_address.go。必须在钱包打开之后（这里）、HTTP 发放地址之前完成。
+	b.loadDepositScripts()
 }
 
 func (b *btcWallet) importTSSPublicKey() error {
@@ -249,17 +256,35 @@ func (b *btcWallet) importTSSPublicKey() error {
 	if !waddrmgr.IsError(err, waddrmgr.ErrScopeNotFound) {
 		return err
 	}
-
-	scope := waddrmgr.KeyScopeBIP0084
-	schema, ok := waddrmgr.ScopeAddrMap[scope]
-	if !ok {
+	if _, err = b.ensureScopedKeyManager(waddrmgr.KeyScopeBIP0084); err != nil {
 		return err
 	}
+	return b.Wallet.ImportPublicKey(b.tssPubKey, waddrmgr.WitnessPubKey)
+}
+
+// ensureScopedKeyManager 取指定 scope 的 key manager；旧/外部钱包库可能没有该 scope
+// （BIP84 = m/84'/coin'），按需创建后重取。
+//
+// 为什么用户充值脚本的导入也要走它：钱包（尤其全新 watching-only 库）默认可能没有 BIP84，
+// 而导入脚本必须落在某个 scope 的 imported account 上。不依赖"TSS 公钥已经导入过所以 scope 一定在"
+// 这种隐含顺序 —— 那种顺序一旦被改动（例如以后 TSS 主池换成别的地址类型）就会变成运行时失败。
+func (b *btcWallet) ensureScopedKeyManager(scope waddrmgr.KeyScope) (*waddrmgr.ScopedKeyManager, error) {
+	manager, err := b.Wallet.Manager.FetchScopedKeyManager(scope)
+	if err == nil {
+		return manager, nil
+	}
+	if !waddrmgr.IsError(err, waddrmgr.ErrScopeNotFound) {
+		return nil, err
+	}
+	schema, ok := waddrmgr.ScopeAddrMap[scope]
+	if !ok {
+		return nil, err
+	}
 	if _, addErr := b.Wallet.AddScopeManager(scope, schema); addErr != nil {
-		log.Warn("importTSSPublicKey AddScopeManager failed, retry import anyway",
+		log.Warn("ensureScopedKeyManager AddScopeManager failed, retry fetch anyway",
 			"scope", scope, "err", addErr)
 	}
-	return b.Wallet.ImportPublicKey(b.tssPubKey, waddrmgr.WitnessPubKey)
+	return b.Wallet.Manager.FetchScopedKeyManager(scope)
 }
 
 func (b *btcWallet) loadMinPendingHeight() int32 {
@@ -512,33 +537,26 @@ func (b *btcWallet) removePendingTx(txHash chainhash.Hash) {
 	b.removePendingChan <- txHash
 }
 
-// OpReturnData OP_RETURN数据结构
-type opReturnData struct {
-	protocol string // "rgbx"
-	action   string // "deposit" | "withdraw"
-	payload  string // chain33地址 或 交易哈希
+// parseWithdrawCommitment 解析提现承诺 OP_RETURN：`rgbx:withdraw:<32 字节 chain33 提现哈希>`。
+//
+// 只有提现走 OP_RETURN（H4 只对 RGB20 跳过），充值侧已硬切到 P2WSH 派生 —— 归属由
+// "付给了谁的派生脚本" 认定，tx 里不需要（也不再接受）任何充值承诺。
+// 严格校验前缀与总长：旧实现按 ":" 切分取第 3 段，格式不符时会把任意 OP_RETURN 的
+// 中段当成提现哈希。
+func parseWithdrawCommitment(pkScript []byte) ([]byte, bool) {
+	// OP_RETURN + 长度字节 + 数据（<76 字节走最小 push，前缀 13 + 32 字节哈希）
+	if len(pkScript) != 2+withdrawOpReturnDataLen || pkScript[0] != txscript.OP_RETURN ||
+		pkScript[1] != byte(withdrawOpReturnDataLen) {
+		return nil, false
+	}
+	payload := pkScript[2:]
+	if !bytes.HasPrefix(payload, []byte(withdrawOpReturnPrefix)) {
+		return nil, false
+	}
+	return payload[len(withdrawOpReturnPrefix):], true
 }
 
-// parseOpReturn 解析OP_RETURN数据
-func (b *btcWallet) parseOpReturn(pkScript []byte) (*opReturnData, error) {
-	// 提取数据（跳过OP_RETURN和长度字节, 解析格式: protocol:action:payload
-	dataStr := string(pkScript[2:])
-	parts := strings.Split(dataStr, ":")
-	if len(parts) < 3 {
-		log.Error("parseOpReturn invalid data", "data", dataStr)
-		return nil, fmt.Errorf("invalid OP_RETURN format: expected 3 parts, got %d", len(parts))
-	}
-
-	opData := &opReturnData{
-		protocol: parts[0],
-		action:   parts[1],
-		payload:  parts[2],
-	}
-
-	return opData, nil
-}
-
-// analyzeTransaction 分析交易类型（优化版本）
+// analyzeTransaction 分析交易类型
 // 返回: ("deposit"|"withdraw"|"", pendingTx)
 func (b *btcWallet) analyzeTransaction(hash *chainhash.Hash, tx *wire.MsgTx) *btcPendingTx {
 	info := &btcPendingTx{}
@@ -547,39 +565,42 @@ func (b *btcWallet) analyzeTransaction(hash *chainhash.Hash, tx *wire.MsgTx) *bt
 	// 先查"已知 RGB txid"集合（来自侧车 ListTransfers 轮询 + RGB20 提现 txid 映射）。
 	// - 是已知 RGB 充值 receive 交易 → 跳过 BTC 充值路径（RGB 铸币走侧车路径，避免双入账）；
 	// - 是已知 RGB20 提现交易 → 跳过 BTC 提现路径（否则 getPendingTxBlockIndex("") 死循环）。
-	if b.client.rgb20 != nil && hash != nil && b.client.rgb20.IsKnownRgbTxid(hash.String()) {
+	if b.client != nil && b.client.rgb20 != nil && hash != nil && b.client.rgb20.IsKnownRgbTxid(hash.String()) {
 		log.Debug("analyzeTransaction skip known rgb tx", "txHash", hash.String())
 		return nil
 	}
 
-	// 检查输出：查找TSS地址、非TSS地址的输出和OP_RETURN
-	var hasTssOutput bool
-	var depositAmount, withdrawAmount btcutil.Amount
+	// 检查输出。三类的判定口径：
+	//   - 用户 P2WSH 充值脚本（watch 集反解 userID）→ 充值候选，**归属就是这个 userID**；
+	//   - 主池 TSS P2WPKH 脚本 → 提现找零/扫集回池，**不构成充值**（充值已硬切到 P2WSH）；
+	//   - 其余 → 提现目标地址候选（取第一个）。
+	var withdrawAmount btcutil.Amount
 	var firstNonTssOutputAddress string
-	var parsed *opReturnData
-	var err error
+	var withdrawTxHash []byte
+	// deposits 一笔 tx 里各用户的充值额（一笔 tx 可以给多个用户的 P2WSH 付款）。
+	deposits := make(map[string]btcutil.Amount)
 
 	for i, output := range tx.TxOut {
-		// 检查并解析 OP_RETURN 输出
-		if len(output.PkScript) > 2 && output.PkScript[0] == txscript.OP_RETURN && parsed == nil {
-			parsed, err = b.parseOpReturn(output.PkScript)
-			if err != nil {
-				log.Error("analyzeTransaction parseOpReturn failed", "txHash", hash.String(),
-					"outputIndex", i, "err", err, "pkScript", hex.EncodeToString(output.PkScript))
-			} else {
-
-				info.opReturnData = *parsed
-				log.Debug("analyzeTransaction parseOpReturn success", "txHash", hash.String(),
-					"protocol", parsed.protocol, "action", parsed.action, "payloadLen", len(parsed.payload))
-			}
+		if payload, ok := parseWithdrawCommitment(output.PkScript); ok {
+			withdrawTxHash = payload
+			log.Debug("analyzeTransaction withdraw commitment found", "txHash", hash.String(),
+				"outputIndex", i, "chain33WithdrawHash", hex.EncodeToString(payload))
 			continue
 		}
 
-		// 直接比较脚本（预计算的TSS地址脚本）
-		if bytes.Equal(output.PkScript, b.tssPkScript) {
-			hasTssOutput = true
-			depositAmount += btcutil.Amount(output.Value)
-			log.Debug("analyzeTransaction TSS output found", "txHash", hash.String(), "outputIndex", i, "amount", btcutil.Amount(output.Value))
+		// 充值归因：**只看脚本**。program 是按 (userID, tssPub) 派生的，链上执行器用同一份派生
+		// 认定归属，所以"能反解出 userID"就等于"链上会把这笔算给该 userID"。
+		if userID, ok := b.depositScripts.lookupUser(output.PkScript); ok {
+			deposits[userID] += btcutil.Amount(output.Value)
+			log.Debug("analyzeTransaction user deposit script found", "txHash", hash.String(),
+				"outputIndex", i, "userID", userID, "amount", btcutil.Amount(output.Value))
+			continue
+		}
+
+		// 主池脚本：既不是充值（不再有 OP_RETURN 承诺），也不是提现目标。
+		if len(b.tssPkScript) > 0 && bytes.Equal(output.PkScript, b.tssPkScript) {
+			log.Debug("analyzeTransaction tss pool output found", "txHash", hash.String(),
+				"outputIndex", i, "amount", btcutil.Amount(output.Value))
 			continue
 		}
 
@@ -597,36 +618,58 @@ func (b *btcWallet) analyzeTransaction(hash *chainhash.Hash, tx *wire.MsgTx) *bt
 
 	hasTssInput := false
 	// 检查输入：直接从witness解析公钥验证是否来自TSS地址（仅支持 P2WPKH，不支持 Taproot/嵌套 SegWit）
-	if len(tx.TxIn) > 0 {
+	if len(tx.TxIn) > 0 && b.tssPubKey != nil {
 		if witness := tx.TxIn[0].Witness; len(witness) == 2 &&
 			bytes.Equal(witness[1], b.tssPubKey.SerializeCompressed()) {
 			hasTssInput = true
 		}
 	}
 
-	log.Debug("analyzeTransaction analysis result", "txHash", hash.String(),
-		"hasTssInput", hasTssInput, "hasTssOutput", hasTssOutput,
-		"depositAmount", depositAmount, "firstNonTssAddress", firstNonTssOutputAddress)
-
-	// 根据规则判断交易类型
-	// 提现交易特征：有TSS输入，有非TSS输出
+	// 根据规则判断交易类型。
+	// 提现交易特征：有TSS输入，有非TSS输出。顺序不能反：桥的自有付款若落到用户 P2WSH
+	// （被 E15-a 与提现护栏挡住，但顺序在这里是第二道），也必须是提现而不是充值。
 	if hasTssInput && firstNonTssOutputAddress != "" {
 		info.withdrawAddress = firstNonTssOutputAddress
 		info.txType = transactionTypeWithdraw
 		info.withdrawAmount = withdrawAmount
-		info.chain33WithdrawTxHash = []byte(info.opReturnData.payload)
+		info.chain33WithdrawTxHash = withdrawTxHash
 		return info
-	} else if hasTssOutput && !hasTssInput { // 充值交易特征：有TSS输出，无TSS输入
-		info.depositAmount = depositAmount
+	}
+
+	// 充值交易特征：无TSS输入，且付给了用户 P2WSH 充值脚本（不看 OP_RETURN）。
+	if len(deposits) > 0 && !hasTssInput {
+		userID, amount := pickDepositUser(hash, deposits)
+		info.depositAmount = amount
 		info.txType = transactionTypeDeposit
-		info.chain33DepositAddress = info.opReturnData.payload
+		info.chain33DepositAddress = userID
 		return info
 	}
 
 	// 不符合充值或提现特征，可能是小额合并交易
 	log.Debug("analyzeTransaction not deposit/withdraw", "txHash", hash.String(),
-		"hasTssInput", hasTssInput, "hasTssOutput", hasTssOutput)
+		"hasTssInput", hasTssInput, "depositUsers", len(deposits), "firstNonTssAddress", firstNonTssOutputAddress)
 	return nil
+}
+
+// pickDepositUser 一笔充值 tx 命中多个用户的 P2WSH 时选一个认领（金额最大者）。
+//
+// 链上同一笔 btc txid 只能被认领一次（checkDepositDuplicate 按 btc txid 去重，见
+// executor/checktx.go），所以"一笔 tx 付给多个用户"这件事本身只能有一个用户拿到账：
+// 这里取最大额那笔并告警，剩下的只能等 bridge/C4 侧另想办法（例如按用户分别付款）。
+func pickDepositUser(hash *chainhash.Hash, deposits map[string]btcutil.Amount) (string, btcutil.Amount) {
+	var bestUser string
+	var bestAmount btcutil.Amount
+	for userID, amount := range deposits {
+		if bestUser == "" || amount > bestAmount {
+			bestUser, bestAmount = userID, amount
+		}
+	}
+	if len(deposits) > 1 {
+		log.Error("analyzeTransaction one btc tx pays several deposit scripts: only one of them can ever be "+
+			"claimed (the chain dedups deposit proofs by btc txid), claiming the largest",
+			"txHash", hash.String(), "users", len(deposits), "claimedUser", bestUser, "claimedAmount", bestAmount)
+	}
+	return bestUser, bestAmount
 }
 
 // sendTransactionNotification 发送交易确认通知
@@ -653,6 +696,20 @@ func (b *btcWallet) buildWithdrawTx(req *withdrawRequest) (*wire.MsgTx, []int64,
 	pkScript, err := txscript.PayToAddrScript(toAddr)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("create pk script failed: %w", err)
+	}
+
+	// 护栏（不动式）：桥的自有付款不得落到用户 P2WSH 充值脚本上。
+	// 违反它的后果见 rgbx/executor/validate_proof.go 的"冻结不变式"：桥自己付出去的那笔交易，
+	// 收款用户可以拿回来当**充值证明**再铸一次（链上分不清付款方）。链上只挡得住"发起人自己的
+	// 充值地址"（checkWithdraw 的 E15-a），用**另一个自己控制的 chain33 地址**当提现目标那一段
+	// 只能由桥侧兜底 —— 就是这里：watch 集里的脚本都是已发放的充值地址，命中即拒。
+	// 只拒"我们自己发放过的脚本"，普通 P2WSH（交易所/多签/闪电通道）不受影响。
+	if userID, ok := b.isWatchedDepositScript(pkScript); ok {
+		log.Error("buildWithdrawTx refuse to pay a user deposit script (bridge self-payment invariant)",
+			"toAddress", req.toAddress, "depositUserID", userID)
+		return nil, nil, nil, fmt.Errorf("withdraw target %s is a user deposit script (userID %s): "+
+			"paying it would let the payee re-claim the same btc tx as a deposit (double mint), refused",
+			req.toAddress, userID)
 	}
 
 	outputs := []*wire.TxOut{

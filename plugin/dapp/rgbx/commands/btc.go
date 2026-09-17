@@ -56,11 +56,11 @@ func btcAddrScript(cmd *cobra.Command, _ []string) {
 func btcDepositTxCMD() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "btcDepositTx",
-		Short: "build, sign and broadcast btc deposit tx",
+		Short: "build, sign and broadcast btc deposit tx (pays the per-user P2WSH deposit address)",
 		Run:   btcDepositTx,
 		Example: "btcDepositTx --net regtest --rpcHost 127.0.0.1:18443 " +
-			"--wif <wif> --utxo <txid:vout:amountSats:pkScriptHex> --tssAddress <btcAddr> --depositAddress <addr> " +
-			"--amount 100000 --fee 300",
+			"--wif <wif> --utxo <txid:vout:amountSats:pkScriptHex> --depositAddress <chain33Addr> " +
+			"--tssPubkey <tssPubkeyHex> --amount 100000 --fee 300",
 	}
 	cmd.Flags().String("net", "regtest", "bitcoin network: mainnet|testnet|regtest|simnet")
 	cmd.Flags().String("rpcHost", "127.0.0.1:18443", "bitcoin rpc host")
@@ -70,13 +70,70 @@ func btcDepositTxCMD() *cobra.Command {
 	cmd.Flags().String("rpcCertFile", "", "bitcoin rpc cert file path (optional, required when TLS enabled)")
 	cmd.Flags().String("wif", "", "sender private key in WIF format")
 	cmd.Flags().String("utxo", "", "single input utxo, format: txid:vout:amountSats:pkScriptHex")
-	cmd.Flags().String("tssAddress", "", "tss deposit address")
-	cmd.Flags().String("depositAddress", "", "chain33 deposit address for OP_RETURN rgbx:deposit:<addr>")
+	cmd.Flags().String("depositAddress", "", "chain33 deposit address (= userID of the p2wsh derivation)")
+	cmd.Flags().String("tssPubkey", "", "tss group pubkey, 33-byte compressed hex (from rgbx getCrossChainInfo)")
 	cmd.Flags().Int64("amount", 0, "deposit amount in satoshis")
 	cmd.Flags().Int64("fee", 0, "tx fee in satoshis")
 	cmd.Flags().String("changeAddress", "", "optional change address, default from private key")
-	markRequired(cmd, "wif", "utxo", "tssAddress", "depositAddress", "amount", "fee")
+	markRequired(cmd, "wif", "utxo", "depositAddress", "tssPubkey", "amount", "fee")
 	return cmd
+}
+
+// btcDepositAddressCMD 本地推导某用户的 P2WSH 充值地址（纯函数，不依赖桥）。
+//
+// 用途：对账/排障/离线核对（以及与桥发放的地址交叉验证）。
+// **注意**：本命令不会让桥 watch 该脚本 —— 桥只 watch 它自己发放过的地址（用户要地址时按需 import，
+// 见 neutrino 的充值地址发放 HTTP）。所以真正给用户发地址要走桥的接口；这里算出来的地址如果桥没
+// watch，用户打进去的 BTC 桥是看不见的（钱不会丢，但不会被自动认领）。
+func btcDepositAddressCMD() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "btcDepositAddress",
+		Short:   "derive the per-user p2wsh btc deposit address (offline, does not register it at the bridge)",
+		Run:     btcDepositAddress,
+		Example: "btcDepositAddress --net regtest -d <chain33Addr> -k <tssPubkeyHex>",
+	}
+	cmd.Flags().String("net", "regtest", "bitcoin network: mainnet|testnet|regtest|simnet")
+	cmd.Flags().StringP("depositAddress", "d", "", "chain33 deposit address (= userID of the derivation)")
+	cmd.Flags().StringP("tssPubkey", "k", "", "tss group pubkey, 33-byte compressed hex")
+	markRequired(cmd, "depositAddress", "tssPubkey")
+	return cmd
+}
+
+func btcDepositAddress(cmd *cobra.Command, _ []string) {
+	netName, _ := cmd.Flags().GetString("net")
+	chain33Addr, _ := cmd.Flags().GetString("depositAddress")
+	pubkeyHex, _ := cmd.Flags().GetString("tssPubkey")
+
+	params, err := parseNetParams(netName)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "invalid net: %s, err: %v\n", netName, err)
+		return
+	}
+	pubkey, err := hex.DecodeString(strings.TrimSpace(pubkeyHex))
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "invalid tssPubkey: %s, decode err: %v\n", pubkeyHex, err)
+		return
+	}
+	userID := strings.TrimSpace(chain33Addr)
+	addr, err := rtypes.DeriveDepositAddress(userID, pubkey, params)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "derive deposit address failed: %v\n", err)
+		return
+	}
+	pkScript, err := rtypes.DeriveDepositPkScript(userID, pubkey)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "derive deposit pkScript failed: %v\n", err)
+		return
+	}
+	witnessScript, err := rtypes.DeriveDepositWitnessScript(userID, pubkey)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "derive deposit witnessScript failed: %v\n", err)
+		return
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "note: this address is derived locally; the bridge only sees deposits to "+
+		"scripts it has imported (request the address from the bridge to register it)\n")
+	fmt.Printf("{\"address\":\"%s\",\"pkScript\":\"%s\",\"witnessScript\":\"%s\",\"spec\":\"%s\"}\n",
+		addr, hex.EncodeToString(pkScript), hex.EncodeToString(witnessScript), rtypes.P2WSHDepositSpecV1)
 }
 
 type depositUTXO struct {
@@ -124,7 +181,7 @@ func btcDepositTx(cmd *cobra.Command, _ []string) {
 	rpcCertFile, _ := cmd.Flags().GetString("rpcCertFile")
 	wifStr, _ := cmd.Flags().GetString("wif")
 	utxoRaw, _ := cmd.Flags().GetString("utxo")
-	tssAddrStr, _ := cmd.Flags().GetString("tssAddress")
+	tssPubkeyHex, _ := cmd.Flags().GetString("tssPubkey")
 	chain33Addr, _ := cmd.Flags().GetString("depositAddress")
 	amount, _ := cmd.Flags().GetInt64("amount")
 	fee, _ := cmd.Flags().GetInt64("fee")
@@ -154,11 +211,29 @@ func btcDepositTx(cmd *cobra.Command, _ []string) {
 		_, _ = fmt.Fprintf(os.Stderr, "invalid wif: %v\n", err)
 		return
 	}
-	tssAddr, err := btcutil.DecodeAddress(strings.TrimSpace(tssAddrStr), params)
+	// 充值目标 = 按 (userID, tssPub) 派生的 P2WSH 地址（冻结规格见 rgbx/types/p2wsh_deposit.go）。
+	// 硬切后**不再构造 OP_RETURN 充值承诺**：归属由"付给了谁的派生脚本"认定，链上会按同一份派生
+	// 重建 program 并核金额；带 OP_RETURN 的旧形态现在必被 checkDeposit 拒（它只看派生脚本）。
+	// tssPubkey 只能来自该 symbol 的 CrossChainInfo（rgbx getCrossChainInfo -s BTC），
+	// 用错世代（re-DKG 后）的钥会让钱落到桥认不出的脚本里。
+	tssPub, err := hex.DecodeString(strings.TrimSpace(tssPubkeyHex))
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "invalid tssAddress: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "invalid tssPubkey: %v\n", err)
 		return
 	}
+	userID := strings.TrimSpace(chain33Addr)
+	depositAddrStr, err := rtypes.DeriveDepositAddress(userID, tssPub, params)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "derive deposit address failed: %v\n", err)
+		return
+	}
+	depositAddr, err := btcutil.DecodeAddress(depositAddrStr, params)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "decode derived deposit address failed: %v\n", err)
+		return
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "deposit address (p2wsh, derived from chain33 %s): %s\n", userID, depositAddrStr)
+
 	var changeAddr btcutil.Address
 	if strings.TrimSpace(changeAddrStr) == "" {
 		changeAddr, err = btcutil.NewAddressPubKeyHash(
@@ -179,20 +254,12 @@ func btcDepositTx(cmd *cobra.Command, _ []string) {
 	tx := wire.NewMsgTx(wire.TxVersion)
 	tx.AddTxIn(wire.NewTxIn(wire.NewOutPoint(utxo.hash, utxo.vout), nil, nil))
 
-	tssScript, err := txscript.PayToAddrScript(tssAddr)
+	depositScript, err := txscript.PayToAddrScript(depositAddr)
 	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "build tss script failed: %v\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "build deposit script failed: %v\n", err)
 		return
 	}
-	tx.AddTxOut(wire.NewTxOut(amount, tssScript))
-
-	opData := []byte("rgbx:deposit:" + strings.TrimSpace(chain33Addr))
-	opScript, err := txscript.NullDataScript(opData)
-	if err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "build op_return failed: %v\n", err)
-		return
-	}
-	tx.AddTxOut(wire.NewTxOut(0, opScript))
+	tx.AddTxOut(wire.NewTxOut(amount, depositScript))
 
 	change := utxo.amount - amount - fee
 	if change > 546 {

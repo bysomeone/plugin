@@ -105,9 +105,9 @@
 
 bootstrap（链上还没有任何 BTC 头）时，首个头的父块必须正好是上表里的某个锚点（或能沿 `prevHash` 回溯到
 创世/锚点），否则报 `ErrBtcHeaderNoAnchor` 并拒收；**错误与日志会一并给出照做就能过的信息**：本网络已知
-锚点高度列表、首个头的高度、以及期望的首个提交高度（= 最高锚点 + 1）。注意执行器侧这条信息里的日志键名
-仍是 `expectedBtcHeaderStartHeight`（历史名，该项已不是配置项，见 4.1.1）——它给出的值应当与中继本地推出
-的起点一致；两边对不上说明中继与执行器**不是同一个 build**。
+锚点高度列表、首个头的高度、以及期望的中继提交起点（= 最高锚点 + 1）。注意执行器侧这条信息里的日志键名
+是 `expectedRelayStartHeight`（**它不是配置项**，见 4.1.1）——它给出的值应当与中继本地推出
+的起点一致；两边对不上说明中继与执行器**不是同一个 build**（或执行器额外加了编译期锚点，见 `extraBtcCheckpoints`）。
 
 此外，单笔交易（`BtcHeaders` action）允许提交的头数上限为 **64**，且同一笔交易内的头高度必须逐个 +1
 （重复高度或跳高都会被拒绝）。中继自身 `batchSize=64`——**正好用满**这个上限（mainnet 内置锚点只到
@@ -264,6 +264,42 @@ best >= H + B + N - 1          （等价于：提交后链上可见深度 >= N�
 - **推论（重要）**：全新节点首启**看不到首启之前**的充值（生日 = 现在），这与任何配置无关；`btcwallet.db`
   被清/重建同样看不到（且旧 TSS UTXO 对钱包不可见，那部分 BTC 桥上花不出去），**只能从备份还原
   `btcwallet.db`**。唯一靠重放能救的是"只清了 `neutrino.db`、钱包 DB 还在"。
+
+#### 4.1.3 每用户 P2WSH 充值地址（充值发放与 watch 集）
+
+BTC 充值不再打到单一的 TSS P2WPKH 地址上，而是**每个用户一个 P2WSH 地址**：
+
+```
+witnessScript = push(userID) OP_DROP push(tssPub) OP_CHECKSIG     // userID = chain33 充值地址串
+program       = sha256(witnessScript);  address = bech32 v0(program)
+```
+
+派生是纯函数（冻结规格见 `plugin/dapp/rgbx/types/p2wsh_deposit.go`，链上执行器用同一份派生认定归属），
+所以**桥不保存任何"地址簿"**。桥唯一要记住的是 **watch 集**：钱包必须先 import 该脚本才看得见打进来的
+充值（若看不到，那笔充值不会被自动认领 —— 钱不会丢，但会卡在桥控脚本里）。
+
+- `depositAddressListen` (string)
+  - 含义：**充值地址发放 HTTP** 的监听地址（空 = 不开启，也是默认）。
+  - 接口（明文 HTTP，应只对可信网段开放）：
+    - `GET  /rgbx/v1/btc-deposit-address?chain33Addr=<chain33 地址>`
+    - `POST /rgbx/v1/btc-deposit-address` body `{"chain33Addr":"<chain33 地址>"}`
+    - 返回 `{"code":200,"message":"ok","data":{"userID","address","pkScript","spec","watchSize"}}`
+  - 副作用（**这是它存在的唯一理由**）：把该用户的派生脚本按需 import 进钱包并订阅（幂等）。
+    地址本身是公开可算的（离线可枚举），注册别人的地址也不会让别人丢钱（脚本绑定的是那个人的 userID）；
+    可被滥用的只有 watch 集增长，由下面的上限兜住。
+  - **不配置的后果**：桥不会 watch 任何新用户的充值脚本 —— 打到每用户地址上的 BTC 除非已经在
+    watch 集里（重启后从 `neutrino.db` 载入），否则**看不见**。启动时会打一条 WARN 说明这一点。
+- `maxWatchedDepositScripts` (int)
+  - 含义：watch 集上限，达到上限后**拒绝发放新地址**（明确失败优于静默变慢/静默漏认充值）。
+  - 默认行为：未设置或 <=0 时用默认值 10000。
+  - 代价量级：每个脚本往 neutrino 的 watch 列表加一个 34 字节 program（内存 + 每块 filter 匹配的常数项，
+    **不产生逐地址的 RPC**）；大头是**首次 import 触发的那次 rescan**（rescan 未在跑时会从钱包生日回扫），
+    批量发放/集中 import 可以把多个用户并进同一次 rescan。
+- 运维要点
+  - 换群公钥（re-DKG）会让**所有**已有充值地址作废：watch 集里对不上当前群公钥的条目在启动载入时
+    会被跳过并告警（见 `deposit_address.go` 的 `loadDepositScripts`），旧地址上的 BTC 桥也花不了。
+  - 桥的自有付款（提现、扫集找零）**不得**落到用户充值脚本上，否则收款用户能把那笔交易当充值证明
+    再铸一次（见 `rgbx/executor/validate_proof.go` 的冻结不变式）。提现侧已按 watch 集拒付。
 
 ### 4.2 `[rpc.sub.light.neutrino.btcRPC]`
 
@@ -529,7 +565,7 @@ rank=0 # 官方节点；第三方节点配置为 rank=1，且 isOfficialNode=fal
 - 首个 BTC 头被拒（`ErrBtcHeaderNoAnchor`）：bootstrap 起点既不是创世、也没命中锚点表。错误信息里
   已经给出本网络已知锚点高度列表与期望的首个提交高度（= 最高锚点 + 1，日志键名见下），照做即可（见 2.1.1）。
   中继侧同一问题会在启动期先报一次 fail-closed 的 ERROR（见 4.1.1 的 L2 断言），不必等到运行期。
-  注意该值不是配置项：执行器那条信息里的 `expectedBtcHeaderStartHeight` 是历史键名，它给出的值应当与
+  注意该值不是配置项：执行器那条信息里的 `expectedRelayStartHeight` 就是它，给出的值应当与
   中继本地推出的起点一致（两边同源，见 4.1.1）
 - 启动期 ERROR "the locally derived bootstrap start height does not match the on-chain btc checkpoint,
   refusing to submit btc headers"：与上一条同源 —— 中继**本地推出**的起点与主链执行器给出的锚点不配套，

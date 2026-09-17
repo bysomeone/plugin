@@ -8,9 +8,19 @@ function scenario_user_deposit_via_btc_tx() {
     utxo=$(build_mature_coinbase_utxo)
     assert_non_empty "${utxo}" "funding utxo empty"
 
-    local tss_addr
-    tss_addr=$(${MAIN_CLI} rgbx getCrossChainInfo -s "${MINT_SYMBOL}" | jq -r '.tssAddress // empty')
-    assert_non_empty "${tss_addr}" "tssAddress empty before deposit"
+    # 充值地址 = P2WSH(chain33 地址, TSS 群公钥) 派生，链上按同一份派生认定归属（无 OP_RETURN）。
+    local tss_pubkey
+    tss_pubkey=$(${MAIN_CLI} rgbx getCrossChainInfo -s "${MINT_SYMBOL}" | jq -r '.pubkey // empty')
+    assert_non_empty "${tss_pubkey}" "tss pubkey empty before deposit (checkCommitDKG must carry it)"
+
+    # 桥必须先 watch 该用户的派生脚本才看得见这笔充值 —— 地址要**向桥要**（发放接口会按需 import），
+    # 本地推导的地址（rgbx btcDepositAddress）仅供对账，桥不会因为本地推导就去 watch。
+    # 桥侧需配置：neutrino.depositAddressListen（见 lightclient CONFIG.md）+ 把该端口暴露给本脚本。
+    local bridge_deposit_url="${BRIDGE_DEPOSIT_URL:-http://127.0.0.1:17001/rgbx/v1/btc-deposit-address}"
+    local deposit_addr
+    deposit_addr=$(curl -sf "${bridge_deposit_url}?chain33Addr=${USER_MAIN_ADDR}" | jq -r '.data.address // empty')
+    assert_non_empty "${deposit_addr}" \
+        "deposit address empty from ${bridge_deposit_url} (is neutrino.depositAddressListen configured and reachable?)"
 
     local deposit_tx_hash
     deposit_tx_hash=$(compose_cmd exec -T main /root/chain33-cli rgbx btcDepositTx \
@@ -22,8 +32,8 @@ function scenario_user_deposit_via_btc_tx() {
         --rpcCertFile "${BTCD_RPC_CERT_IN_CONTAINER}" \
         --wif "${BTC_FUNDING_WIF}" \
         --utxo "${utxo}" \
-        --tssAddress "${tss_addr}" \
         --depositAddress "${USER_MAIN_ADDR}" \
+        --tssPubkey "${tss_pubkey}" \
         --amount "${BTC_DEPOSIT_AMOUNT_SATS}" \
         --fee 500)
     assert_length "${deposit_tx_hash}" 64 "btc deposit tx hash length mismatch"
