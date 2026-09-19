@@ -45,6 +45,60 @@ function para1_logs_since() {
     compose_cmd logs --no-color --since "${elapsed}s" para1 2>&1 || true
 }
 
+# main（主链）节点在 since_epoch（unix 秒）之后新产生的日志。
+# 用途与 para1_logs_since 相同，但**判定发生在主链**的那些护栏要看这里：rgbx 的 CheckTx
+# （充值/提现/确认的共识判据）在主链上跑，护栏的诊断日志因此写在 main 而不是 para1。
+function main_logs_since() {
+    local since_epoch="$1"
+    local elapsed=$(( $(date +%s) - since_epoch ))
+    if [ "${elapsed}" -lt 1 ]; then
+        elapsed=1
+    fi
+    compose_cmd logs --no-color --since "${elapsed}s" main 2>&1 || true
+}
+
+# 主链节点**日志文件**的候选路径（相对 chain33 进程的 CWD；CI 镜像的 WORKDIR=/root，
+# 日志文件名来自 chain33.test.toml 的 logFile="logs/chain33.log"）。
+#
+# 为什么取证要读文件而不是 docker logs：CI 的日志配置是 loglevel=debug 但
+# logConsoleLevel=info —— Debug 行只进文件、不上 stdout，而 docker logs 抓的是 stdout。
+# 护栏的"进入"证据（窗口外查询的诊断）正是 Debug 级别，只在文件里。
+MAIN_LOG_FILE_CANDIDATES="${MAIN_LOG_FILE_CANDIDATES:-/root/logs/chain33.log logs/chain33.log}"
+
+# 选中第一个可读且非空的日志文件路径（都读不到时输出空串，调用方据此判失败）。
+function main_log_file_path() {
+    local path n
+    for path in ${MAIN_LOG_FILE_CANDIDATES}; do
+        n=$(compose_cmd exec -T main sh -c "wc -l < '${path}'" 2>/dev/null | tr -d '[:space:]' || true)
+        if [[ "${n}" =~ ^[0-9]+$ ]] && [ "${n}" -gt 0 ]; then
+            echo "${path}"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+# 主链日志文件的当前行数（读不到回 0）。
+function main_log_line_count() {
+    local path="$1" n
+    n=$(compose_cmd exec -T main sh -c "wc -l < '${path}'" 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ "${n}" =~ ^[0-9]+$ ]]; then
+        echo "${n}"
+        return 0
+    fi
+    echo 0
+}
+
+# 打印主链日志文件自 start_line（含）之后的新行。
+function main_log_file_since_line() {
+    local path="$1" start_line="$2" from
+    from="${start_line}"
+    if ! [[ "${from}" =~ ^[0-9]+$ ]] || [ "${from}" -lt 1 ]; then
+        from=1
+    fi
+    compose_cmd exec -T main sh -c "tail -n +${from} '${path}'" 2>&1 || true
+}
+
 # 本轮这笔提现在链上的 pending 金额（= CLI 换算出的最小单位数，= 实际 burn 额）。
 function query_pending_withdraw_amount() {
     local from_addr="$1"
@@ -569,6 +623,242 @@ function run_rgb20_sidecar_genesis_withdraw_probe() {
             -run Test_SidecarLive_GenesisOnlyWithdrawal -v 2>&1 | tail -20
     ) || fail "rgb20 genesis-only withdrawal probe failed"
     log_step "RGB20 genesis-only withdrawal probe OK"
+}
+
+# =====================================================================
+# E14 主动负例：同一笔确认提交两次必须被去重判据拒绝
+# =====================================================================
+#
+# 为什么需要它：E14 的护栏（stateDB 的 formatConfirmUsedKey + checkConfirm 里的
+# checkConfirmNotUsed）在整个 E2E 里**从来没被触发过** —— 所有场景都只提交过一次确认，
+# 所以"全绿"证明不了这条护栏有效。这里主动构造负例：拿一笔链上已经确认结算过的 mint，
+# 用 `chain33-cli rgbx confirm` 把**同一笔确认再提交一次**，断言它被拒绝、且护栏自己的
+# 诊断日志出现在主链日志里。
+#
+# 诚实边界（重要，别把本场景读成"stateDB 键单独被验证了"）：
+#   checkConfirm 里有**两层**去重，localdb 的 pendingTx.Confirmed（ExecLocal_Confirm 写的
+#   纵深防御层）排在 stateDB 键之前。健康节点上 localdb 一定是新鲜的，所以重复确认会先被
+#   第一层拦下，stateDB 键那一层**在线上不可达**（要它可达必须是"localdb 陈旧"，而那正是
+#   E14 的真实故障前提，E2E 无法构造）。因此：
+#     - 本场景证明的是"重复确认被去重机制拒绝 + 去重护栏在活跃路径上真的执行了"；
+#     - E14 的 stateDB 键本身由 executor 的单测 confirm_dedup_test.go /
+#       confirm_dedup_failclosed_test.go 覆盖（那里的 fixture 刻意把 localdb 留成陈旧态，
+#       并且断言错误码是 ErrMintAlreadyConfirmed 而不是第一层的 ErrTxAlreadyConfirmed）。
+#   - 本场景在"两层去重整体被拿掉"时会变红：那时重复确认会走到证明校验、报另一个错、
+#     主链日志里不会出现去重诊断。
+#
+# 重复确认的 proof 字段故意留空：checkConfirmNotUsed 排在 validateBtcTxProof **之前**，
+# 被拦下时根本走不到证明校验；反过来若它真被放行，空证明会以 ErrInvalidBtcTxProof 失败，
+# 而日志里不会有去重诊断 —— 正是我们要判成失败的那种情形。
+
+# 重复提交一笔已确认的 Confirm，打印 CLI 输出并把退出码作为返回值。
+# 自带超时：CheckTx 被拒时 CLI 未必立刻返回（在等回执），绝不能挂住整个 E2E。
+function replay_confirm_bounded() {
+    local action_type="$1"
+    local tx_block_height="$2"
+    local tx_index="$3"
+    local tx_hash_hex="$4"
+    local timeout_sec="${5:-30}"
+
+    local out_file rc_file i rc
+    out_file=$(mktemp)
+    rc_file=$(mktemp)
+    (
+        set +e
+        ${MAIN_CLI} send rgbx confirm \
+            --actionType "${action_type}" \
+            --txBlockHeight "${tx_block_height}" \
+            --txIndex "${tx_index}" \
+            --txHash "${tx_hash_hex}" \
+            -k "${AUTH_KEY1}" >"${out_file}" 2>&1
+        echo "$?" >"${rc_file}"
+    ) &
+    local pid=$!
+
+    for ((i = 0; i < timeout_sec; i++)); do
+        [ -s "${rc_file}" ] && break
+        sleep 1
+    done
+
+    if [ -s "${rc_file}" ]; then
+        cat "${out_file}"
+        rc=$(cat "${rc_file}" 2>/dev/null || echo 1)
+        rm -f "${out_file}" "${rc_file}"
+        return "${rc}"
+    fi
+
+    kill "${pid}" 2>/dev/null || true
+    log_step "  (replay confirm CLI 未在 ${timeout_sec}s 内返回，已 kill；判据交给主链日志里的去重诊断)"
+    echo "TIMEOUT: replay confirm CLI did not return within ${timeout_sec}s"
+    rm -f "${out_file}" "${rc_file}"
+    return 1
+}
+
+# scenario_duplicate_confirm_rejected <已经确认结算过的 chain33 tx hash>
+function scenario_duplicate_confirm_rejected() {
+    local mint_hash="$1"
+    log_step "scenario: duplicate confirm must be rejected by the dedup guard (E14 negative case)"
+
+    mint_hash="${mint_hash#0x}"
+    assert_non_empty "${mint_hash}" "duplicate-confirm: mint tx hash empty"
+
+    # 1. 这笔 mint 在链上的位置 = 它的 pending 键（ExecLocal_Mint 按 (height, index) 登记）
+    local details height index
+    details=$(${MAIN_CLI} tx query -s "${mint_hash}" 2>/dev/null || true)
+    height=$(echo "${details}" | jq -r '.height // 0' 2>/dev/null || echo 0)
+    index=$(echo "${details}" | jq -r '.index // 0' 2>/dev/null || echo 0)
+    if ! [[ "${height}" =~ ^[0-9]+$ ]] || [ "${height}" -le 0 ]; then
+        fail "duplicate-confirm: 找不到 mint 交易 ${mint_hash} 的落块高度（tx query 返回：$(echo "${details}" | head -c 200)）"
+    fi
+    log_step "  mint tx ${mint_hash} at height=${height} index=${index}"
+
+    local minted_before
+    minted_before=$(${MAIN_CLI} rgbx getAsset -s NATIVE1 | jq -r '.totalAmount // 0')
+    assert_non_empty "${minted_before}" "duplicate-confirm: cannot read NATIVE1 supply before replay"
+
+    local replay_started_at replay_out replay_rc
+    replay_started_at=$(date +%s)
+    set +e
+    replay_out=$(replay_confirm_bounded 101 "${height}" "${index}" "${mint_hash}" 30 2>&1)
+    replay_rc=$?
+    set -e
+    log_step "  replay confirm rc=${replay_rc}, out=$(echo "${replay_out}" | head -c 300)"
+
+    # 2. 日志判据（主判据）：去重护栏自己的诊断必须出现。
+    #    两层去重分别打 "already confirmed"（localdb 层）与 "already used"（E14 stateDB 层），
+    #    任一层命中都算"护栏执行了"；两层都没有 = 重复确认没被去重拦下 ⇒ 场景失败。
+    local logs
+    logs=$(main_logs_since "${replay_started_at}")
+    if ! echo "${logs}" | grep -qE "already confirmed|already used"; then
+        fail "重复确认没有被去重护栏拒绝：主链日志里没有去重诊断（期望 checkConfirm 打出 'already confirmed' 或 'already used'）。replay rc=${replay_rc}, out=$(echo "${replay_out}" | head -c 300)"
+    fi
+
+    # 3. 重复确认不得被接受（CLI 返回 0 = 交易进了 mempool）
+    if [ "${replay_rc}" -eq 0 ]; then
+        fail "重复确认被接受（replay rc=0）：去重护栏没拦住它，out=$(echo "${replay_out}" | head -c 300)"
+    fi
+
+    # 4. 供给不变（二次结算的最直接后果就是发行量翻倍）
+    local minted_after
+    minted_after=$(${MAIN_CLI} rgbx getAsset -s NATIVE1 | jq -r '.totalAmount // 0')
+    assert_eq "${minted_after}" "${minted_before}" \
+        "重复确认改变了已发行总量（去重失效的二次结算后果）"
+
+    log_step "duplicate confirm rejected by the dedup guard (minted supply unchanged: ${minted_before})"
+}
+
+# =====================================================================
+# E6(b) + #47 布防观测：BTC 头查询的共识权威校验必须处于"武装"状态且在活跃路径上服务
+# =====================================================================
+#
+# 背景：E6(b) 的护栏（lightclient/executor/btc_index_guard.go 的 checkBtcLocalIndexTip +
+# checkBtcHeaderCanonical）用 statedb 的 canonical 窗口/tip 交叉校验 localdb 取到的头，
+# 默认 fail-closed；逃生阀 allowBtcIndexMismatch 默认 false。E2E 里 localdb 与 statedb
+# 从没分叉过，所以此前"全绿"不能说明这条护栏在活跃路径上、也没被打开逃生阀。
+#
+# 本场景**能**证明的三件事（都是可判定的）：
+#   1. 护栏是"武装"的：CI 生成的 toml 里没有把 allowBtcIndexMismatch 打开（开启即等于
+#      关掉这条护栏 —— 这是文档里唯一的绕过方式，所以这条断言在"有人把 CI 改成绕过"时变红）；
+#   2. 护栏在**活跃路径**上服务且结论一致：直接向主链发起被护栏包住的查询
+#      （lightcli btc header → Query_GetBtcHeader），断言它与共识侧读到的 tip 完全一致；
+#   3. **护栏在活跃路径上执行过的直接证据**（本场景的主判据）：窗口外高度的查询会走
+#      checkBtcHeaderCanonical 的"维持原行为"分支，护栏自己会打一条 Debug 诊断
+#      （"height not in canonical window, keep unchanged"）。断言这条诊断出现 ⇒
+#      **把 checkBtcHeaderCanonical 的调用摘掉/绕过，本场景立刻变红**（这就是"注释掉护栏
+#      必须变红"的可判定形式）；同时它钉住了"窗口外不得因为校验不了就拒"这条语义。
+#      取证读的是**节点日志文件**：CI 的日志配置是 loglevel=debug + logConsoleLevel=info，
+#      Debug 行只进文件、不上 stdout，docker logs 抓不到。
+#
+# **本场景仍然不能证明的**（诚实记账，别读成"护栏的判定分支被验证了"）：
+#   判定分支（窗口内 hash 比对 ⇒ 不一致即拒）没有被触发过 —— 健康的 E2E 里 localdb 恒等于
+#   statedb，比对永远走"一致 ⇒ 放行"，不产生可观测差异；要构造出分叉，线上没有可行手段
+#   （localdb 与 statedb 由同一次执行写入，重组路径还会主动删掉残留的逐高度头），
+#   localdb 陈旧/丢库这类真实前提也无法在 E2E 里安全生产。该分支由
+#   lightclient/executor/btc_index_guard_test.go 的用例覆盖（那里直接构造分叉）。
+#   另外这里同时钉住 #47：生成的 toml 里不得再出现已删除的 btcHeaderStartHeight 键。
+
+# scenario_btc_header_guard_armed 需要主链头链已提交（run_rgb20_env 之后）。
+function scenario_btc_header_guard_armed() {
+    log_step "scenario: btc header consensus guard armed + on the live path (E6(b)) + no stale config key (#47)"
+
+    # ---- 1. 武装 + #47：生成出来的配置不得绕过护栏 / 不得带已删除的键 ----
+    local toml
+    for toml in "${ROOT_DIR}"/chain33.test.toml "${ROOT_DIR}"/chain33.para*.toml; do
+        [ -f "${toml}" ] || continue
+        if grep -qE '^[[:space:]]*allowBtcIndexMismatch[[:space:]]*=[[:space:]]*true' "${toml}"; then
+            fail "E6(b) 护栏被绕过：${toml} 里打开了 allowBtcIndexMismatch=true（那是文档里的冷修逃生阀，CI 必须保持关闭）"
+        fi
+        if grep -qE '^[[:space:]]*[Bb]tcHeaderStartHeight[[:space:]]*=' "${toml}"; then
+            fail "#47 回归：生成的 ${toml} 里又出现了已删除的配置键 btcHeaderStartHeight（该键已不存在，起点由 btcd 内置锚点本地推出）"
+        fi
+    done
+    log_step "  guard armed: no allowBtcIndexMismatch=true and no stale btcHeaderStartHeight key in generated configs"
+
+    # ---- 2. 活跃路径：被护栏包住的查询必须与共识侧的 tip 一致 ----
+    local started_at tip tip_height header header_hash
+    started_at=$(date +%s)
+    tip=$(${MAIN_CLI} lightcli btc last | jq -r '.hash // empty')
+    tip_height=$(${MAIN_CLI} lightcli btc last | jq -r '.height // 0')
+    assert_non_empty "${tip}" "lightcli btc last 为空：主链头链还没提交过头（本场景必须跑在 run_rgb20_env 之后）"
+
+    header=$(${MAIN_CLI} lightcli btc header -t "${tip_height}" || true)
+    header_hash=$(echo "${header}" | jq -r '.hash // empty' 2>/dev/null || echo "")
+    assert_eq "${header_hash}" "${tip}" \
+        "被护栏包住的 GetBtcHeader 返回的头与共识侧 tip 不一致：cross-check 的输入/结论已经不可信"
+
+    # 窗口大小 = btcWorkWindowSize = maxBtcReorgDepth + 1 = 25（statedb 里的 btc-chainstate 只留
+    # 最近 25 个**逐头**节点）。头链必须比窗口长，否则构造不出"窗口外"的高度，第 3 步没有证据 ——
+    # 那种情况下判失败并说明原因，而不是让断言静默失去意义。
+    if ! [[ "${tip_height}" =~ ^[0-9]+$ ]] || [ "${tip_height}" -le 26 ]; then
+        fail "E6(b) 取证失败：主链头链太短（tip=${tip_height}，窗口=最近 25 个逐头节点），构造不出窗口外的高度 —— 没有证据故判失败"
+    fi
+
+    # ---- 3. 护栏"进入过"的**直接证据**（本场景的主判据，可判定、可反向验证）----
+    #
+    # 窗口外（高度 < tip - btcWorkWindowSize）的查询走**维持原行为**那条分支：护栏函数
+    # checkBtcHeaderCanonical 会打一条 Debug 诊断（"height not in canonical window, keep
+    # unchanged"）然后放行。这条诊断有两个用处：
+    #   a) 证明护栏**确实在活跃路径上执行过**（把调用注释掉 ⇒ 诊断消失 ⇒ 本场景变红）；
+    #   b) 同时钉住"窗口外不得因为校验不了就拒"这条**语义**（放行而不是报错）。
+    # 它证明的是"护栏进入了并且放行了不可比的高度"，**不是**"判定分支（窗口内 hash 比对）
+    # 拒绝过什么"—— 后者在健康的 E2E 里不可构造（localdb 恒等于 statedb），见文件头注释。
+    local log_path line_before probe_heights out_height probe_out probe_hash ok_probe guard_logs
+    log_path=$(main_log_file_path)
+    assert_non_empty "${log_path}" \
+        "E6(b) 取证失败：读不到主链日志文件（候选：${MAIN_LOG_FILE_CANDIDATES}）。护栏的'进入'证据是 Debug 级、只写文件不上 stdout（CI 的 logConsoleLevel=info），没有它就没有证据，故判失败而不是静默通过"
+    log_step "  main log file: ${log_path}"
+
+    line_before=$(main_log_line_count "${log_path}")
+    probe_heights="$((tip_height - 30)) 1"
+    ok_probe=""
+    for out_height in ${probe_heights}; do
+        if ! [[ "${out_height}" =~ ^[0-9]+$ ]] || [ "${out_height}" -lt 1 ] || [ "${out_height}" -ge "${tip_height}" ]; then
+            continue
+        fi
+        probe_out=$(${MAIN_CLI} lightcli btc header -t "${out_height}" || true)
+        probe_hash=$(echo "${probe_out}" | jq -r '.hash // empty' 2>/dev/null || echo "")
+        if [ -n "${probe_hash}" ]; then
+            ok_probe="${out_height}:${probe_hash}"
+            break
+        fi
+    done
+    assert_non_empty "${ok_probe}" \
+        "E6(b)：构造不出窗口外查询（tip=${tip_height}，试过 ${probe_heights}）—— 头链太短或 localdb 缺该高度，无法取证"
+
+    guard_logs=$(main_log_file_since_line "${log_path}" "$((line_before + 1))")
+    if ! echo "${guard_logs}" | grep -q "checkBtcHeaderCanonical height not in canonical window"; then
+        fail "E6(b)：窗口外查询被服务了（${ok_probe}）但护栏没有留下诊断 —— 说明护栏没在活跃路径上执行（例如 checkBtcHeaderCanonical 被摘掉/绕过）。判失败。本窗口新日志：$(echo "${guard_logs}" | tail -5)"
+    fi
+    log_step "  guard entered: out-of-window probe ${ok_probe} left the guard's own diagnostic (window miss -> pass through)"
+
+    # ---- 4. 本轮不得出现护栏的分歧诊断（出现即说明 localdb 与共识状态真的分叉了）----
+    local logs
+    logs=$(main_logs_since "${started_at}")
+    if echo "${logs}" | grep -qE "disagrees with the on-chain canonical chain|no matching header at the on-chain btc tip"; then
+        fail "E6(b) 护栏报了 localdb/共识状态分叉：$(echo "${logs}" | grep -m1 -E 'disagrees with the on-chain canonical chain|no matching header at the on-chain btc tip')"
+    fi
+
+    log_step "btc header guard observation OK: armed, entered on the live path, served the live query, tip=${tip_height}:${tip}"
 }
 
 # =====================================================================

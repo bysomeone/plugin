@@ -1088,6 +1088,9 @@ function scenario_native_asset_mint() {
                 local total_amount
                 total_amount=$(echo "${asset_info}" | jq -r '.totalAmount // 0')
                 log_step "native asset NATIVE1 created, totalAmount=${total_amount}"
+                # 导出给 testcase.sh 的重复确认负例用（E14：同一笔确认提交两次必须被去重拒绝）。
+                # 只做记录，不改变本场景的任何判定。
+                NATIVE_MINT_TX_HASH="${mint_hash}"
                 return 0
             fi
         fi
