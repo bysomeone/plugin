@@ -20,6 +20,10 @@ function testcase_entry() {
     # ---- RGB20 全部：env + 充值 + 提现 + sidecar smoke ----
     run_rgb20_all
 
+    # ---- E6(b)：BTC 头查询的共识权威校验必须"武装 + 在活跃路径上服务" ----
+    # 放在 RGB20 之后：本场景直接查主链头链（lightcli btc last/header），要求头链已提交。
+    scenario_btc_header_guard_armed
+
     # ---- P2WSH 充值（C1/C2 新流程）：向桥领派生地址 -> 用户付 BTC -> 桥按 program 归因 -> mint XBTC ----
     # 放在 RGB20 之后：本场景是新增覆盖（此前一直屏蔽），万一卡住也不该吞掉前面已验证过的用例结果。
     scenario_user_deposit_via_btc_tx
@@ -34,6 +38,11 @@ function testcase_entry() {
     # 与 BTC 桥充值不同的路径，失败不影响前面已验过的过桥用例；合并确认路径
     # （checkConfirm 改以 merkle 认证过的交易为准）后需要它来证明旧路径没被改坏。
     scenario_native_asset_mint
+
+    # ---- E14 主动负例：把上面那笔 mint 的确认**再提交一次**，断言被去重护栏拒绝 ----
+    # 依赖 scenario_native_asset_mint 导出的 NATIVE_MINT_TX_HASH（在它成功分支里赋值）。
+    # 放最后：它需要一笔"已经确认结算过"的 mint，且失败不该吞掉前面已验过的用例结果。
+    scenario_duplicate_confirm_rejected "${NATIVE_MINT_TX_HASH}"
 }
 
 # 供 scripts/btc_test.sh 顶层分组调用（当前未启用）。
