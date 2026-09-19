@@ -63,6 +63,10 @@ function main_logs_since() {
 # 为什么取证要读文件而不是 docker logs：CI 的日志配置是 loglevel=debug 但
 # logConsoleLevel=info —— Debug 行只进文件、不上 stdout，而 docker logs 抓的是 stdout。
 # 护栏的"进入"证据（窗口外查询的诊断）正是 Debug 级别，只在文件里。
+#
+# 已实机确认（2026-09-19 主会话跑的 E2E，非仅代码推导）：`/root/logs/chain33.log` 存在且可读，
+# 场景从它里面读到了护栏的窗口外诊断（scenario_btc_header_guard_armed 全绿）。
+# 保留候选列表只是兜底，不影响已验证的路径。
 MAIN_LOG_FILE_CANDIDATES="${MAIN_LOG_FILE_CANDIDATES:-/root/logs/chain33.log logs/chain33.log}"
 
 # 选中第一个可读且非空的日志文件路径（都读不到时输出空串，调用方据此判失败）。
@@ -649,9 +653,23 @@ function run_rgb20_sidecar_genesis_withdraw_probe() {
 #
 # 重复确认的 proof 字段故意留空：checkConfirmNotUsed 排在 validateBtcTxProof **之前**，
 # 被拦下时根本走不到证明校验；反过来若它真被放行，空证明会以 ErrInvalidBtcTxProof 失败，
-# 而日志里不会有去重诊断 —— 正是我们要判成失败的那种情形。
+# 而输出里不会有去重诊断 —— 正是我们要判成失败的那种情形。
+#
+# ⚠️ 判据为什么**不能**用退出码（2026-09-19 主会话在跑起来的 E2E 上实测，勿"修"回去）：
+#   `chain33-cli send rgbx confirm` 在这条路上**恒定返回 0**，即使交易被 CheckTx 拒绝。
+#   原因是 CLI 的实现（chain33 的 system/dapp/commands/send.go oneStepSend）：内层
+#   `wallet send` 失败时它只是 `fmt.Fprintln(os.Stderr, err)` 然后 return，**不设置退出码**；
+#   而内层错误文本（含链上回的错误 `tx already confirmed`）会出现在 stderr 上。
+#   实测：
+#     $ docker exec <main> ... send rgbx confirm --actionType 101 --txBlockHeight 106 --txIndex 0 \
+#           --txHash 1d2cd556... -k 0x6da92a...
+#       stdout = []   stderr = ["exit status 1", "tx already confirmed"]   rc = 0
+#     容器内不经 docker exec 再测一次同样 rc=0（排除 docker exec 的问题）：
+#     $ docker exec <main> /bin/sh -c 'exit 7'; echo $?  →  7（docker exec 是透传退出码的）
+#   ⇒ 判据只能是 **CLI 自己的输出里带护栏的拒绝诊断**（见下面第 3 条），rc 仅作诊断信息。
 
-# 重复提交一笔已确认的 Confirm，打印 CLI 输出并把退出码作为返回值。
+# 重复提交一笔已确认的 Confirm，打印 CLI 输出并把退出码作为返回值（**rc 仅供诊断**：
+# 如上所述 CLI 被拒时也返回 0，任何断言都不得以 rc 为准）。
 # 自带超时：CheckTx 被拒时 CLI 未必立刻返回（在等回执），绝不能挂住整个 E2E。
 function replay_confirm_bounded() {
     local action_type="$1"
@@ -722,9 +740,9 @@ function scenario_duplicate_confirm_rejected() {
     replay_out=$(replay_confirm_bounded 101 "${height}" "${index}" "${mint_hash}" 30 2>&1)
     replay_rc=$?
     set -e
-    log_step "  replay confirm rc=${replay_rc}, out=$(echo "${replay_out}" | head -c 300)"
+    log_step "  replay confirm: rc=${replay_rc}（仅供诊断，rc 不是判据）, out=$(echo "${replay_out}" | head -c 300)"
 
-    # 2. 日志判据（主判据）：去重护栏自己的诊断必须出现。
+    # 2. 节点侧判据：去重护栏自己的诊断必须出现在主链日志里。
     #    两层去重分别打 "already confirmed"（localdb 层）与 "already used"（E14 stateDB 层），
     #    任一层命中都算"护栏执行了"；两层都没有 = 重复确认没被去重拦下 ⇒ 场景失败。
     local logs
@@ -733,9 +751,17 @@ function scenario_duplicate_confirm_rejected() {
         fail "重复确认没有被去重护栏拒绝：主链日志里没有去重诊断（期望 checkConfirm 打出 'already confirmed' 或 'already used'）。replay rc=${replay_rc}, out=$(echo "${replay_out}" | head -c 300)"
     fi
 
-    # 3. 重复确认不得被接受（CLI 返回 0 = 交易进了 mempool）
-    if [ "${replay_rc}" -eq 0 ]; then
-        fail "重复确认被接受（replay rc=0）：去重护栏没拦住它，out=$(echo "${replay_out}" | head -c 300)"
+    # 3. CLI 侧判据（本场景的主判据）：**CLI 自己的输出必须带护栏的拒绝诊断**。
+    #    不能用 exit code —— 实测 CLI 被拒时也返回 0（见上面 ⚠️ 那段）。用输出文本才分得清：
+    #      护栏在   ⇒ wallet send 以 CheckTx 的错误失败，CLI 把 "tx already confirmed"
+    #                 （= ErrTxAlreadyConfirmed；stateDB 层则是 "mint already confirmed"）
+    #                 打到 stderr，被下面的 grep 命中；
+    #      护栏被摘 ⇒ checkConfirm 放行，wallet send 成功并把**新交易的 tx hash** 打到 stdout，
+    #                 输出里没有任何 "already confirmed|already used" ⇒ 本断言变红。
+    #                 （此时若空证明又被后面的判据拒绝，报的是 "invalid btc tx proof" 之类的
+    #                  另一个错，同样命不中本 grep —— 两种情形都判红，正是我们要的。）
+    if ! echo "${replay_out}" | grep -qE "already confirmed|already used"; then
+        fail "重复确认的 CLI 输出里没有去重护栏的拒绝诊断：说明它没被去重拦下（被放行、或被别的判据拒绝）。out=$(echo "${replay_out}" | head -c 300)"
     fi
 
     # 4. 供给不变（二次结算的最直接后果就是发行量翻倍）
