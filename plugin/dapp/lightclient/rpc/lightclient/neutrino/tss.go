@@ -312,6 +312,10 @@ func (t *tssService) init() {
 	for {
 		// peers 必须包含本节点，且各节点用同一份列表；threshold 由配置给定。
 		// 显式给 DKG 超时（理由见 tssDKGTimeout 的注释）。
+		//
+		// 重试**刻意复用同一个 dkgSessionName**：alice 的 DKG ZK 挑战由 sid 派生，各节点的会话名
+		// 必须一致，随手换个随机名会把四个节点拆到不同轮次。同名重试可行是 chain33 侧的契约
+		// （cggmp/session.go：注册全有或全无 ⇒ 失败后同名重注册必成功），别在这里改成随机名。
 		dkgResult, err = cggmp.ProcessDKG(t.cfg.Peers, t.cfg.Threshold, t.cfg.Rank, dkgSessionName,
 			cggmp.WithTimeout(tssDKGTimeout))
 		if err == nil {
@@ -1180,10 +1184,11 @@ func (t *tssService) signPsbtWithSigners(p *psbt.Packet, signers []string, signF
 		//
 		// 代价是重试同一笔时会复用同一个会话名，于是上一轮迟到/残留的消息可能被 chain33 的会话
 		// 注册表（未注册会话的消息按会话名缓存、注册时回灌，上限 32 条）灌进重试轮 ⇒ 该轮以
-		// register session failed / state Init -> Failed 结束。影响有界且可自愈：回灌后缓存即被
-		// 清空，下一轮不再受污染（E2E 实测出现过一次，下一轮自愈）。彻底修法在 chain33 的 tss
-		// 包装器侧（removeSession 时一并清掉该会话的 pending 缓存），或把轮次标识随通知下发、
-		// 让会话名每轮变化 —— 两者都需要改包装器/通知格式，见 CONFIG.md §4.3.3。
+		// register session failed / state Init -> Failed 结束。这是**快速失败**：chain33 侧
+		// 注册失败/会话注销时会把该会话连同缓存消息一起丢掉（cggmp/session.go 的
+		// registerSession/removeSession），所以既不会卡住这个名字、也不会把残留带进下一轮，
+		// 下一轮从干净状态重来（E2E 实测出现过一次，下一轮自愈）。要彻底消除"当轮混入残留"，
+		// 只能把轮次标识随通知下发、让会话名每轮变化，见 CONFIG.md §4.3.3。
 		sessions[i] = fmt.Sprintf("psbt-%s-%d", txHash, i)
 	}
 	for i := range p.Inputs {
