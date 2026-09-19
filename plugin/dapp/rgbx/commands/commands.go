@@ -3,6 +3,7 @@ package commands
 
 import (
 	"encoding/json"
+
 	jsonrpc "github.com/33cn/chain33/rpc/jsonclient"
 	rpctypes "github.com/33cn/chain33/rpc/types"
 	"github.com/33cn/chain33/types"
@@ -28,6 +29,7 @@ func Cmd() *cobra.Command {
 		btcAddrScriptCMD(),
 		btcDepositTxCMD(),
 		btcDepositAddressCMD(),
+		btcMintSpendCMD(),
 		btcKeyInfoCMD(),
 		depositAssetCMD(),
 		withdrawAssetCMD(),

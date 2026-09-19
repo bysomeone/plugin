@@ -8,6 +8,7 @@ import (
 	"github.com/33cn/chain33/types"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
 )
 
 /*
@@ -145,27 +146,39 @@ func (r *rgbx) Exec_Confirm(confirm *rtypes.ConfirmTx, tx *types.Transaction, in
 		return r.confirmWithdrawSettlement(confirm, txHash, confirmHash)
 	}
 
-	// A2：归属 utxo id 取自 SpendingTx 的规范身份（解析后交易的 btc txid），不再对原始字节取
-	// DoubleHashH：后者对"同一笔花费的另一份编码"（尾部追加字节）会给出不同的 owner id，
-	// 使同一笔花费被记到另一个 owner 名下（checkConfirm 已按规范编码拒绝，这里再兜底一次：
-	// 解析失败即视为承诺不成立，仅标记、不改变任何资产归属）。
-	spendingTx, err := parseSpendingTxStrict(txHash, confirm.GetUtxoProof().GetSpendingTx())
-	if err != nil {
-		elog.Error("Exec_Confirm parse spending tx", "action", action,
-			"txHash", txHash, "confirmHash", confirmHash,
-			"btcSpendingTxLen", len(confirm.GetUtxoProof().GetSpendingTx()), "err", err)
-		return &types.Receipt{Ty: types.ExecOk}, nil
-	}
-	spendHash := spendingTx.TxHash().String()
+	// 归属 utxo id（spendHash）取 **merkle 证明所绑定**的那笔 BTC 交易的身份，不看
+	// UtxoProof.SpendingTx 这份调用方自带的字节：后者与 merkle 证明之间没有任何绑定关系，
+	// 改了它照样能过证明。txid 由解析后的交易重算（TxHash() 内部按 no-witness 重新序列化），
+	// 不直接对原始字节取 DoubleHashH —— 尾随字节能改变后者却改变不了交易本身，
+	// 会让同一笔花费落到另一个 owner id / 另一个 GenesisBtcTxHash 上。
+	//
+	// 注：本分支早前用 parseSpendingTxStrict 做同一件事（严格解析 SpendingTx、拒尾随字节）。
+	// 合并上游后口径更强（认证过的交易优先），那条路在 mint/transfer 确认上已不再需要；
+	// CheckTx 侧同样以 merkle 认证过的交易为准（见 checkConfirm）。
+	btcTxData := confirm.GetBtcTxProof().GetTxData()
 	// 绑定资产的utxo已经在btc链上花费，但op return不存在或承诺数据不正确，
 	// 交易仅做标记并返回，相关资产永久冻结，无法转移
-	commitment, _ := txscript.NullDataScript(confirm.GetTxHash())
-	if confirm.GetUtxoProof().GetOpRetOutputIdx() < 0 ||
-		!bytes.Equal(commitment, confirm.GetUtxoProof().OpRetOutputPkScript) {
+	var btcTx wire.MsgTx
+	opRetIdx := confirm.GetUtxoProof().GetOpRetOutputIdx()
+	if opRetIdx >= 0 && len(btcTxData) > 0 {
+		if err := btcTx.DeserializeNoWitness(bytes.NewReader(btcTxData)); err != nil {
+			elog.Error("Exec_Confirm deserialize btc tx", "action", action,
+				"txHash", txHash, "confirmHash", confirmHash, "err", err)
+			return nil, err
+		}
+	}
+	// spendHash 取 merkle 证明所绑定交易的 txid（解析后重序列化的 no-witness 哈希），
+	// 不用原始字节直接哈希——原始字节可拼接尾随字节改变 DoubleHashH 结果，
+	// 导致 spendHash 与 merkle 验证过的 txid 不一致，污染 GenesisBtcTxHash 与资产 owner
+	spendHash := btcTx.TxHash().String()
 
-		elog.Warn("checkConfirm op return commitment", "action", action,
-			"txHash", txHash, "confirmHash", confirmHash, "opRetIdx", confirm.GetUtxoProof().GetOpRetOutputIdx(),
-			"spendHash", spendHash, "commit", hex.EncodeToString(confirm.GetUtxoProof().OpRetOutputPkScript),
+	commitment, _ := txscript.NullDataScript(confirm.GetTxHash())
+	if opRetIdx < 0 || int(opRetIdx) >= len(btcTx.TxOut) ||
+		!bytes.Equal(commitment, btcTx.TxOut[opRetIdx].PkScript) {
+
+		elog.Warn("Exec_Confirm op return commitment", "action", action,
+			"txHash", txHash, "confirmHash", confirmHash, "opRetIdx", opRetIdx,
+			"spendHash", spendHash, "txOutLen", len(btcTx.TxOut),
 			"expectCommit", hex.EncodeToString(commitment))
 		return &types.Receipt{Ty: types.ExecOk}, nil
 	}

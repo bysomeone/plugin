@@ -26,11 +26,10 @@ var (
 	ErrTxAlreadyConfirmed               = errors.New("tx already confirmed")
 	ErrConfirmedHashNotEqual            = errors.New("confirmed hash not equal")
 	ErrSpendingInputNotEqual            = errors.New("spending input not equal")
-	ErrOpRetOutputPkScriptNotEqual      = errors.New("op return output pkScript not equal")
-	ErrInvalidCommitAddress             = errors.New("invalid commit address")
-	ErrFromUtxoPkScriptNotSet           = errors.New("from utxo pkScript not set")
-	ErrInvalidAssetPrecision            = errors.New("invalid asset precision")
-	ErrInvalidAssetSender               = errors.New("invalid asset sender")
+	ErrInvalidCommitAddress             = errors.New("ErrInvalidCommitAddress")
+	ErrFromUtxoPkScriptNotSet           = errors.New("ErrFromUtxoPkScriptNotSet")
+	ErrInvalidAssetPrecision            = errors.New("ErrInvalidAssetPrecision")
+	ErrInvalidAssetSender               = errors.New("ErrInvalidAssetSender")
 	ErrInvalidFromUtxo                  = errors.New("invalid from utxo")
 	ErrInvalidSpendingTxIn              = errors.New("invalid spending tx input")
 	ErrInvalidWithdrawAmount            = errors.New("invalid withdraw amount")
@@ -62,7 +61,6 @@ var (
 	ErrInvalidAssetSymbol               = errors.New("invalid asset symbol")
 	ErrInvalidBtcTxProof                = errors.New("invalid btc tx proof")
 	ErrWithdrawConfirmTimeoutNotAllowed = errors.New("withdraw confirm timeout not allowed")
-	ErrInvalidBtcProofIndex             = errors.New("invalid btc proof tx index")
 	ErrInvalidBtcBlockHash              = errors.New("invalid btc block hash")
 	ErrGetBtcHeader                     = errors.New("get btc header error")
 	ErrInvalidBtcProofBlock             = errors.New("invalid btc proof block info")
@@ -94,9 +92,6 @@ var (
 	// mint 与 transfer 是 Exec_Confirm 里仅有的两条走 UtxoProof/SpendingTx 的结算分支，
 	// 二者的去重键与理由完全相同（见 formatConfirmUsedKey）。
 	ErrTransferAlreadyConfirmed = errors.New("transfer already confirmed")
-	// ErrNonCanonicalSpendingTx SpendingTx 尾部带多余字节（非规范编码）——同一笔花费的另一份编码，
-	// 必须拒绝：否则归属 utxo id 会随编码变化（E1 家族 A2，口径同充值侧 parseBtcTxIDStrict）。
-	ErrNonCanonicalSpendingTx = errors.New("non-canonical spending tx encoding")
 	// ErrInsufficientBtcConfirmations B8：证明所在 BTC 区块在 canonical 头链里的确认数不足
 	// （tip.Height < proof.BlockHeight + minBtcConfirmations - 1），或无法确定 tip
 	// （查询失败 / 头链为空）时一律拒绝。错误信息带 tip 高度 / 证明高度 / 要求的 N。
@@ -564,53 +559,52 @@ func (r *rgbx) checkConfirm(fromAddr, txHash string, confirm *rtypes.ConfirmTx) 
 		return err
 	}
 
-	// A2：SpendingTx 必须是规范编码（解析后无尾部多余字节）。btcwire 的 DeserializeNoWitness
-	// 不做该项校验，给同一笔花费追加尾部字节后输入/OP_RETURN 承诺比对都不变、只有原始字节变，
-	// 而归属 utxo id 由该交易导出 → 同一笔花费会被记到另一个 owner id。
-	// 归属 id 的口径同时改为解析后的交易身份 TxHash()（见 Exec_Confirm），与充值侧 txid 口径一致。
-	spendingTx, err := parseSpendingTxStrict(txHash, confirm.GetUtxoProof().GetSpendingTx())
+	// 内容判据一律以 **merkle 认证过的** BtcTxProof.TxData 为准，不看 UtxoProof.SpendingTx
+	// 这份调用方自带的字节：后者与 merkle 证明之间没有绑定关系，改了它照样能过证明。
+	// 这同时覆盖了本分支早前用 parseSpendingTxStrict 防的尾随字节可塑性问题
+	// （见 validateBtcTxProof 的尾随字节校验）；对 mint/transfer 确认而言，
+	// 认证过的交易优先，SpendingTx 在这条路径上不再参与判定。
+	btcTx, err := r.validateBtcTxProof(txHash, confirm.GetBtcTxProof())
 	if err != nil {
-		elog.Error("checkConfirm parse spending tx", "action", action,
-			"txHash", txHash, "confirmTxHash", hex.EncodeToString(confirm.GetTxHash()),
-			"btcSpendingTxLen", len(confirm.GetUtxoProof().GetSpendingTx()), "err", err)
+		elog.Error("checkConfirm validate btc tx proof", "action", action,
+			"txHash", txHash, "confirmTxHash", confirmTxHash,
+			"btcProof", btcProof2String(confirm.GetBtcTxProof()), "err", err)
 		return err
 	}
-	btcSpendHash := spendingTx.TxHash().String()
 
 	spendingInputIdx := int(confirm.GetUtxoProof().GetSpendingInputIdx())
-	if spendingInputIdx >= len(spendingTx.TxIn) {
+	if spendingInputIdx >= len(btcTx.TxIn) {
 		elog.Error("checkConfirm spending tx input", "action", action,
-			"txHash", txHash, "confirmTxHash", hex.EncodeToString(confirm.GetTxHash()),
-			"inputIdx", spendingInputIdx, "txInLen", len(spendingTx.TxIn), "btcSpendHash", btcSpendHash)
+			"txHash", txHash, "confirmTxHash", confirmTxHash,
+			"inputIdx", spendingInputIdx, "txInLen", len(btcTx.TxIn))
 		return ErrInvalidSpendingTxIn
 	}
 
 	// check input
 	expectInput := pendingTx.Utxo.ToString()
-	actualInput := spendingTx.TxIn[int(confirm.GetUtxoProof().GetSpendingInputIdx())].PreviousOutPoint.String()
+	actualInput := btcTx.TxIn[spendingInputIdx].PreviousOutPoint.String()
 	if expectInput != actualInput {
 		elog.Error("checkConfirm input utxo not equal", "action", action,
-			"txHash", txHash, "confirmTxHash", hex.EncodeToString(confirm.GetTxHash()),
-			"expectInput", expectInput, "actualInput", actualInput, "btcSpendHash", btcSpendHash)
+			"txHash", txHash, "confirmTxHash", confirmTxHash,
+			"expectInput", expectInput, "actualInput", actualInput)
 		return ErrSpendingInputNotEqual
 	}
 
 	opRetOutIdx := int(confirm.GetUtxoProof().GetOpRetOutputIdx())
 	// 表示op_return输出不存在，即utxo已经在btc链花费, 但没有构建rgbx所约束的op_return输出
-	if opRetOutIdx < 0 || opRetOutIdx >= len(spendingTx.TxOut) {
+	if opRetOutIdx < 0 || opRetOutIdx >= len(btcTx.TxOut) {
 		elog.Debug("checkConfirm opReturn output not exist",
 			"action", action, "txHash", txHash,
-			"confirmTxHash", confirmTxHash, "btcSpendHash", btcSpendHash)
+			"confirmTxHash", confirmTxHash)
 		return nil
 	}
 
-	// 提供的op_return pkScript参数非法，和btc原始交易中的输出不符
-	if !bytes.Equal(confirm.GetUtxoProof().OpRetOutputPkScript,
-		spendingTx.TxOut[int(confirm.GetUtxoProof().GetOpRetOutputIdx())].PkScript) {
-		elog.Error("checkConfirm opReturn pkScript not equal",
+	// 验证指定输出是否为OP_RETURN，如果不是则说明该utxo已花费但无有效承诺（资产冻结）
+	if len(btcTx.TxOut[opRetOutIdx].PkScript) == 0 || btcTx.TxOut[opRetOutIdx].PkScript[0] != txscript.OP_RETURN {
+		elog.Debug("checkConfirm opReturn output not OP_RETURN",
 			"action", action, "txHash", txHash,
-			"confirmTxHash", confirmTxHash, "btcSpendHash", btcSpendHash)
-		return ErrOpRetOutputPkScriptNotEqual
+			"confirmTxHash", confirmTxHash)
+		return nil
 	}
 
 	return nil
