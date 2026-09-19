@@ -6,12 +6,15 @@ import (
 
 	"github.com/33cn/chain33/client/mocks"
 	"github.com/33cn/chain33/common/db"
+	"github.com/33cn/chain33/common/merkle"
 	"github.com/33cn/chain33/types"
 	"github.com/33cn/chain33/util"
+	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -31,7 +34,9 @@ import (
 //   - localdb 那条 pendingTx.Confirmed 保留作纵深防御，但不再是去重依据。
 
 // e14ConfirmFixture 一笔 mint / transfer 确认的最小可用环境：
-// statedb payload + statedb 去重键读写的 stateDB + localdb pendingTx + 一份规范编码的 BTC 花费交易。
+// statedb payload + statedb 去重键读写的 stateDB + localdb pendingTx + 一份规范编码、且带
+// **merkle 证明与区块头 mock** 的 BtcTxProof（内容判据的唯一来源；UtxoProof.SpendingTx /
+// OpRetOutputPkScript 两个字段上游已删除，脚本/mock 形态与 checktx_test.go 的 btcProofCases 一致）。
 type e14ConfirmFixture struct {
 	r     *rgbx
 	state db.DB
@@ -40,8 +45,28 @@ type e14ConfirmFixture struct {
 	confirm *rtypes.ConfirmTx
 	txHash  []byte // 被确认交易的 chain33 哈希（payload 键与 stateDB 去重键的身份）
 
-	pendingUtxo string // 被花费的 rgbx utxo（= pendingTx.Utxo.ToString()）
-	ownerUtxo   string // mint/transfer 的归属 utxo（解析后花费交易的 txid + opRetOutIdx + 1）
+	pendingUtxo string          // 被花费的 rgbx utxo（= pendingTx.Utxo.ToString()）
+	ownerUtxo   string          // mint/transfer 的归属 utxo（解析后花费交易的 txid + opRetOutIdx + 1）
+	prevHash    *chainhash.Hash // 被花费的 btc outpoint 哈希（重建花费交易字节时复用）
+}
+
+// e14ProofHeight E14 fixture 的 BtcTxProof.BlockHeight（也是 GetBtcHeader mock 的高度）。
+const e14ProofHeight = 100
+
+// e14BtcSpendTxData 构造 E14 fixture 的 BTC 花费交易字节：input[0] 花掉 prevHash:0，
+// output[0] 是承诺 opRetData 的 OP_RETURN（opRetOutIdx = 0），output[1] 是所有者输出（opRetOutIdx + 1）。
+func e14BtcSpendTxData(t *testing.T, prevHash chainhash.Hash, opRetData []byte) []byte {
+	t.Helper()
+	commitment, err := txscript.NullDataScript(opRetData)
+	require.NoError(t, err)
+	spendTx := &wire.MsgTx{Version: 2}
+	spendTx.TxIn = append(spendTx.TxIn,
+		wire.NewTxIn(&wire.OutPoint{Hash: prevHash, Index: 0}, nil, nil))
+	spendTx.TxOut = append(spendTx.TxOut,
+		wire.NewTxOut(0, commitment), wire.NewTxOut(1000, []byte("owner-out")))
+	buf := bytes.NewBuffer(make([]byte, 0, spendTx.SerializeSizeStripped()))
+	require.NoError(t, spendTx.SerializeNoWitness(buf))
+	return buf.Bytes()
 }
 
 func newE14ConfirmFixture(t *testing.T, symbol string, actionType int32) *e14ConfirmFixture {
@@ -61,16 +86,22 @@ func newE14ConfirmFixture(t *testing.T, symbol string, actionType int32) *e14Con
 
 	// BTC 花费交易：input[0] 花掉 pending utxo，output[0] 是承诺该 chain33 交易的 OP_RETURN，
 	// output[1] 是所有者输出（归属 utxo / 默认找零地址取 opRetOutIdx + 1）。
-	commitment, err := txscript.NullDataScript(f.txHash)
-	require.NoError(t, err)
 	prevHash := chainhash.DoubleHashH([]byte("e14-prevout-" + symbol))
-	spendTx := &wire.MsgTx{Version: 2}
-	spendTx.TxIn = append(spendTx.TxIn,
-		wire.NewTxIn(&wire.OutPoint{Hash: prevHash, Index: 0}, nil, nil))
-	spendTx.TxOut = append(spendTx.TxOut,
-		wire.NewTxOut(0, commitment), wire.NewTxOut(1000, []byte("owner-out")))
-	buf := bytes.NewBuffer(make([]byte, 0, spendTx.SerializeSizeStripped()))
-	require.NoError(t, spendTx.SerializeNoWitness(buf))
+	f.prevHash = &prevHash
+	txData := e14BtcSpendTxData(t, prevHash, f.txHash)
+	var spendTx wire.MsgTx
+	require.NoError(t, spendTx.DeserializeNoWitness(bytes.NewReader(txData)))
+
+	// merkle 证明 + 区块头 mock：checkConfirm 的内容判据走 validateBtcTxProof，
+	// 没有它们连"证明本身有效"都到不了去重判据。单交易区块 ⇒ header.merkleRoot == txid。
+	spendTxID := spendTx.TxHash()
+	leaves := [][]byte{spendTxID.CloneBytes()}
+	_, branch := merkle.GetMerkleRootAndBranch(leaves, 0)
+	rootHash, err := chainhash.NewHash(merkle.GetMerkleRoot(leaves))
+	require.NoError(t, err)
+	api.On("Query", ltypes.LightclientX, "GetBtcHeader", mock.Anything).Return(&ltypes.BtcHeader{
+		Hash: "e14-block", Height: e14ProofHeight, MerkleRoot: rootHash.String(),
+	}, nil)
 
 	f.pendingUtxo = rtypes.FormatUtxo(prevHash.String(), 0)
 	f.ownerUtxo = rtypes.FormatUtxo(spendTx.TxHash().String(), 1)
@@ -79,11 +110,13 @@ func newE14ConfirmFixture(t *testing.T, symbol string, actionType int32) *e14Con
 		TxBlockHeight: 0,
 		TxIndex:       0,
 		TxHash:        f.txHash,
-		UtxoProof: &rtypes.UtxoSpendingProof{
-			SpendingTx:          buf.Bytes(),
-			SpendingInputIdx:    0,
-			OpRetOutputIdx:      0,
-			OpRetOutputPkScript: commitment,
+		UtxoProof:     &rtypes.UtxoSpendingProof{SpendingInputIdx: 0, OpRetOutputIdx: 0},
+		BtcTxProof: &rtypes.BtcTxProof{
+			TxData:      txData,
+			BlockHeight: e14ProofHeight,
+			BlockHash:   "e14-block",
+			TxIndex:     0,
+			MerkleProof: branch,
 		},
 	}
 
@@ -198,9 +231,11 @@ func Test_rgbx_confirmDedup_freezeDoesNotConsume(t *testing.T) {
 	f := newE14ConfirmFixture(t, symbol, rtypes.TyMintAction)
 	f.setPayload(t, &rtypes.MintAsset{Symbol: symbol, TotalAmount: 7})
 
-	// 冻结路径：OP_RETURN 承诺不指向本确认交易 ⇒ 空回执、无状态变更、不写键
+	// 冻结路径：认证交易里的 OP_RETURN 承诺不指向本确认交易（承诺了别的数据）⇒ 空回执、无状态变更、不写键。
+	// 内容判据只认 BtcTxProof.TxData（上游删掉了 OpRetOutputPkScript 这个可由调用方自带的字段），
+	// 所以这里换掉整份交易字节而不是某个"声称的 pkScript"。
 	frozen := proto.Clone(f.confirm).(*rtypes.ConfirmTx)
-	frozen.UtxoProof.OpRetOutputPkScript = []byte("wrong-commitment")
+	frozen.BtcTxProof.TxData = e14BtcSpendTxData(t, *f.prevHash, []byte("other-commitment"))
 	frozenRecp := testExec(t, f.r, rtypes.NameConfirmAction, frozen, nil, 0)
 	require.Empty(t, frozenRecp.KV, "冻结路径不得产生任何状态变更（含去重键）")
 	_, err := f.state.Get(formatConfirmUsedKey(f.txHash))
@@ -256,20 +291,35 @@ func Test_rgbx_confirmUsedKey_multiActionPerSpend(t *testing.T) {
 	buf := bytes.NewBuffer(make([]byte, 0, spendTx.SerializeSizeStripped()))
 	require.NoError(t, spendTx.SerializeNoWitness(buf))
 
+	// 两笔确认共用同一份 merkle 认证交易（这正是"键取被确认交易而非花费交易"要守的场景）：
+	// 证明与区块头 mock 只需一套。
+	spendTxID := spendTx.TxHash()
+	leaves := [][]byte{spendTxID.CloneBytes()}
+	_, branch := merkle.GetMerkleRootAndBranch(leaves, 0)
+	rootHash, err := chainhash.NewHash(merkle.GetMerkleRoot(leaves))
+	require.NoError(t, err)
+	api.On("Query", ltypes.LightclientX, "GetBtcHeader", mock.Anything).Return(&ltypes.BtcHeader{
+		Hash: "e14-multi-block", Height: e14ProofHeight, MerkleRoot: rootHash.String(),
+	}, nil)
+
+	btcProof := func() *rtypes.BtcTxProof {
+		return &rtypes.BtcTxProof{
+			TxData: buf.Bytes(), BlockHeight: e14ProofHeight, BlockHash: "e14-multi-block",
+			TxIndex: 0, MerkleProof: branch,
+		}
+	}
 	mintConfirm := func() *rtypes.ConfirmTx {
 		return &rtypes.ConfirmTx{
 			ActionType: rtypes.TyMintAction, TxHash: mintHash, TxBlockHeight: 0, TxIndex: 0,
-			UtxoProof: &rtypes.UtxoSpendingProof{
-				SpendingTx: buf.Bytes(), SpendingInputIdx: 0, OpRetOutputIdx: 0, OpRetOutputPkScript: mintCommit,
-			},
+			UtxoProof:  &rtypes.UtxoSpendingProof{SpendingInputIdx: 0, OpRetOutputIdx: 0},
+			BtcTxProof: btcProof(),
 		}
 	}
 	transferConfirm := func() *rtypes.ConfirmTx {
 		return &rtypes.ConfirmTx{
 			ActionType: rtypes.TyTransferAction, TxHash: transferHash, TxBlockHeight: 1, TxIndex: 0,
-			UtxoProof: &rtypes.UtxoSpendingProof{
-				SpendingTx: buf.Bytes(), SpendingInputIdx: 1, OpRetOutputIdx: 2, OpRetOutputPkScript: transferCommit,
-			},
+			UtxoProof:  &rtypes.UtxoSpendingProof{SpendingInputIdx: 1, OpRetOutputIdx: 2},
+			BtcTxProof: btcProof(),
 		}
 	}
 

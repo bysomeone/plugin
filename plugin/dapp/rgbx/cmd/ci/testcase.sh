@@ -28,6 +28,12 @@ function testcase_entry() {
     # 没有扫集，P2WSH 充值地址就是"钱进得去、出不来"：钱停在用户各自的 P2WSH 上，
     # 而提现只能花主池的 BTC。
     scenario_user_deposit_sweep
+
+    # ---- 上游 native asset 场景（合并 upstream 时保留）：纯 chain33 原生资产 mint
+    # + btcMintSpend 的 OP_RETURN 承诺确认。放最后：它覆盖的是**链上原生资产**这条
+    # 与 BTC 桥充值不同的路径，失败不影响前面已验过的过桥用例；合并确认路径
+    # （checkConfirm 改以 merkle 认证过的交易为准）后需要它来证明旧路径没被改坏。
+    scenario_native_asset_mint
 }
 
 # 供 scripts/btc_test.sh 顶层分组调用（当前未启用）。

@@ -15,7 +15,7 @@ ACTION=""
 PROJECT=""
 if [ "$#" -gt 0 ]; then
     case "${1}" in
-    run | up | down | reset | init | config | test)
+    run | up | down | reset | init | config | test | native | all)
         ACTION="${1}"
         PROJECT="${2:-rgbx-ci}"
         ;;
@@ -410,7 +410,9 @@ function wait_cli_ready() {
     local retries=120
     local i
     for ((i = 0; i < retries; i++)); do
-        if ${cli} block last_header >/dev/null 2>&1; then
+        # chain33-cli 在 RPC 失败时退出码为 0，必须校验输出内容（有效 JSON 且含 height），
+        # 否则节点未就绪也会被误判为就绪，导致后续查询在 RPC 未监听时失败
+        if ${cli} block last_header 2>/dev/null | jq -e '.height != null' >/dev/null 2>&1; then
             return 0
         fi
         sleep 1
@@ -467,7 +469,9 @@ function tx_wait() {
     local retries=20
     local i
     for ((i = 0; i < retries; i++)); do
-        if ${cli} tx query_hash -s "${tx_hash}" >/dev/null 2>&1; then
+        # chain33-cli 在 RPC 失败时退出码为 0，必须校验输出内容；
+        # 未上链 tx 的 GetTxByHashes 返回 {"txs":[null]}，须过滤掉 null 再判断非空
+        if ${cli} tx query_hash -s "${tx_hash}" 2>/dev/null | jq -e '.txs? | map(select(. != null)) | length > 0' >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.5
@@ -504,7 +508,7 @@ function query_xbtc_balance() {
 function wait_xbtc_balance_not_less_than() {
     local addr="$1"
     local expected="$2"
-    local retries="${3:-30}"
+    local retries="${3:-120}"
     local i
     for ((i = 0; i < retries; i++)); do
         local balance
@@ -621,9 +625,12 @@ function wait_no_withdraw_pending_for_user() {
     fi
     for ((i = 0; i < retries; i++)); do
         local pend_hashes
-        pend_hashes=$(${MAIN_CLI} rgbx listPendingTxByFrom -f "${from_addr}" |
-            jq -r '[.pendingList[]? | select(.actionType == 106) | .txHash | ascii_downcase]')
-        cnt=$(echo "${pend_hashes}" | jq 'length')
+        # set -e + pipefail 下 RPC 未就绪时 jq 会失败并中止脚本，须用 || 兜底成空列表
+        pend_hashes=$(${MAIN_CLI} rgbx listPendingTxByFrom -f "${from_addr}" 2>/dev/null |
+            jq -r '[.pendingList[]? | select(.actionType == 106) | .txHash | ascii_downcase]' 2>/dev/null) || pend_hashes="[]"
+        [ -n "${pend_hashes}" ] || pend_hashes="[]"
+        cnt=$(echo "${pend_hashes}" | jq 'length' 2>/dev/null) || cnt=0
+        cnt=${cnt:-0}
         if [ -n "${want_hash}" ]; then
             if echo "${pend_hashes}" | jq -e --arg h "${want_hash}" 'index($h) != null' >/dev/null; then
                 seen=1
@@ -935,16 +942,19 @@ function wait_para_nodegroup_ready() {
 
 function ensure_btc_crosschain_prerequisite() {
     log_step "check BTC cross-chain prerequisite only (no mint bootstrap)"
-    set +e
     local info
+    set +e
     info=$(${MAIN_CLI} rgbx getCrossChainInfo -s "${MINT_SYMBOL}" 2>/dev/null)
     local rc=$?
     set -e
-    if [ "${rc}" -ne 0 ]; then
+    # 双保险：既看退出码（chain33 PR#1373 之后 CLI 会在 RPC 失败时非零退出），
+    # 也校验输出内容 —— 更老的 CLI 在 RPC 失败时退出码仍为 0，只看 rc 会误判为"就绪"。
+    if [ "${rc}" -ne 0 ] ||
+        ! echo "${info}" | jq -e '(.assetSymbol // "") != ""' >/dev/null 2>&1; then
         fail "BTC cross-chain info not ready; please pre-configure rgbx BTC asset and cross-chain metadata before running this CI"
     fi
     local symbol
-    symbol=$(echo "${info}" | jq -r '.assetSymbol // empty')
+    symbol=$(echo "${info}" | jq -r '.assetSymbol')
     if [ -z "${symbol}" ]; then
         fail "BTC cross-chain info missing; this test does not create asset via mint"
     fi
@@ -952,21 +962,24 @@ function ensure_btc_crosschain_prerequisite() {
 
 function wait_auto_dkg_commit() {
     log_step "wait auto DKG commit by neutrino+tss"
+    # 慢环境（neutrino+tss 协同提交）偶发超过 60s。本分支场景更多、单套环境更重，
+    # 取两侧较大的值（180 次 × 2s）。
     local retries=180
     local i
+    local info
     for ((i = 0; i < retries; i++)); do
         set +e
         local info
         info=$(${MAIN_CLI} rgbx getCrossChainInfo -s "${MINT_SYMBOL}" 2>/dev/null)
         local rc=$?
         set -e
-        if [ "${rc}" -eq 0 ]; then
+        # 双保险：退出码 + 输出内容（老 CLI 在 RPC 失败时退出码仍为 0）
+        if [ "${rc}" -eq 0 ] &&
+            echo "${info}" | jq -e '(.tssAddress // "") != ""' >/dev/null 2>&1; then
             local tss_addr
-            tss_addr=$(echo "${info}" | jq -r '.tssAddress // empty')
-            if [ -n "${tss_addr}" ]; then
-                log_step "auto DKG done, tssAddress=${tss_addr}"
-                return 0
-            fi
+            tss_addr=$(echo "${info}" | jq -r '.tssAddress')
+            log_step "auto DKG done, tssAddress=${tss_addr}"
+            return 0
         fi
         sleep 1
     done
@@ -979,6 +992,110 @@ function scenario_para_health() {
     ${PARA2_CLI} net is_sync >/dev/null
     ${PARA3_CLI} net is_sync >/dev/null
     ${PARA4_CLI} net is_sync >/dev/null
+}
+
+function scenario_native_asset_mint() {
+    log_step "scenario: native asset mint with btc spending confirm"
+
+    # 1. Get a mature coinbase UTXO
+    local utxo
+    utxo=$(build_mature_coinbase_utxo)
+    assert_non_empty "${utxo}" "native mint funding utxo empty"
+
+    local utxo_txid
+    local utxo_vout
+    local utxo_amount
+    local utxo_pkscript
+    utxo_txid=$(echo "${utxo}" | cut -d: -f1)
+    utxo_vout=$(echo "${utxo}" | cut -d: -f2)
+    utxo_amount=$(echo "${utxo}" | cut -d: -f3)
+    utxo_pkscript=$(echo "${utxo}" | cut -d: -f4)
+    assert_non_empty "${utxo_txid}" "native mint utxo txid empty"
+    assert_non_empty "${utxo_pkscript}" "native mint utxo pkscript empty"
+
+    # genesis_out format for mint: hash:index:pkScript
+    local genesis_out="${utxo_txid}:${utxo_vout}:${utxo_pkscript}"
+
+    # Verify chain33 is producing blocks before mint
+    local pre_height
+    pre_height=$(${MAIN_CLI} block last_header | jq '.height')
+    log_step "chain33 height before mint: ${pre_height}"
+
+    # 2. Mint a native asset on chain33 with the genesis UTXO
+    local mint_hash
+    local mint_rc
+    local mint_stdout
+    mint_stdout=$(${MAIN_CLI} send rgbx mint -s NATIVE1 -a 10000 -o "${genesis_out}" -m "6e6174697665316d657461" -k "${GENESIS_KEY}" 2>/tmp/mint_stderr.$$)
+    mint_rc=$?
+    mint_hash="${mint_stdout}"
+    if [ ${mint_rc} -ne 0 ] || [ -z "${mint_hash}" ] || [ ${#mint_hash} -lt 64 ]; then
+        log_step "mint send stderr: $(head -5 /tmp/mint_stderr.$$ 2>/dev/null)"
+        rm -f /tmp/mint_stderr.$$
+        fail "native mint send failed, rc=${mint_rc}, hash=${mint_hash}"
+    fi
+    rm -f /tmp/mint_stderr.$$
+
+    # Wait for mint tx to be confirmed on chain33
+    # send command already waits for the tx to be committed in a block
+    local post_height
+    post_height=$(${MAIN_CLI} block last_header | jq '.height')
+    log_step "mint tx hash: ${mint_hash}, height after mint: ${post_height}"
+
+    # 3. Get the full mint tx hash from chain33 for OP_RETURN commitment
+    # The send output gives us the chain33 tx hash hex (may contain 0x prefix)
+    local mint_tx_hash_hex="${mint_hash}"
+    mint_tx_hash_hex="${mint_tx_hash_hex#0x}"
+
+    # 4. Construct, sign, and broadcast BTC spending transaction using btcMintSpend
+    local fee=1000
+    local spend_amount=$((utxo_amount - fee))
+    if [ "${spend_amount}" -le 0 ]; then
+        fail "native mint insufficient utxo amount=${utxo_amount}, fee=${fee}"
+    fi
+
+    local spend_txid
+    spend_txid=$(compose_cmd exec -T main /root/chain33-cli rgbx btcMintSpend \
+        --net "${BTC_NETWORK}" \
+        --rpcHost "${BTC_RPC_ADDR}" \
+        --rpcUser "${BTCD_RPC_USER}" \
+        --rpcPass "${BTCD_RPC_PASS}" \
+        --disableTLS=false \
+        --rpcCertFile "${BTCD_RPC_CERT_IN_CONTAINER}" \
+        --wif "${BTC_FUNDING_WIF}" \
+        --utxo "${utxo}" \
+        --destAddress "${BTCD_MINING_ADDR}" \
+        --opReturnData "${mint_tx_hash_hex}" \
+        --fee "${fee}")
+    assert_non_empty "${spend_txid}" "native mint btcMintSpend failed"
+
+    # Mine BTC blocks for confirmations (neutrino uses blockConfirmations=1)
+    mine_btcd_blocks 2
+
+    # 5. Wait for the neutrino service to detect the UTXO spend and submit a confirm tx
+    log_step "wait for neutrino to confirm native asset mint (NATIVE1)"
+    local retries=60
+    local i
+    for ((i = 0; i < retries; i++)); do
+        set +e
+        local asset_info
+        asset_info=$(${MAIN_CLI} rgbx getAsset -s NATIVE1 2>/dev/null)
+        local rc=$?
+        set -e
+        if [ "${rc}" -eq 0 ]; then
+            local symbol
+            symbol=$(echo "${asset_info}" | jq -r '.symbol // empty')
+            if [ "${symbol}" = "NATIVE1" ]; then
+                local total_amount
+                total_amount=$(echo "${asset_info}" | jq -r '.totalAmount // 0')
+                log_step "native asset NATIVE1 created, totalAmount=${total_amount}"
+                return 0
+            fi
+        fi
+        mine_btcd_blocks 1
+        sleep 2
+    done
+
+    fail "native asset NATIVE1 not created after timeout"
 }
 
 function ensure_btcd_network_consistency() {
@@ -1017,6 +1134,19 @@ function run_tests() {
     # 旧 BTC 功能用例已屏蔽（函数定义在 scripts/btc_test.sh，入口见 testcase.sh）。
     source "${ROOT_DIR}/testcase.sh"
     testcase_entry
+}
+
+function run_native_tests() {
+    ensure_btcd_network_consistency
+    prepare_btcd_mining_identity
+    wait_btcd_ready
+    scenario_para_health
+    setup_para_nodegroup_on_main
+    wait_auto_dkg_commit
+
+    # Mine BTC blocks so build_mature_coinbase_utxo can find a mature coinbase
+    mine_btcd_blocks 101
+    scenario_native_asset_mint
 }
 
 function print_logs_hint() {
@@ -1062,6 +1192,15 @@ function do_reset() {
 
 case "${ACTION}" in
 run)
+    do_run_all
+    ;;
+native)
+    do_up_only
+    run_native_tests
+    print_logs_hint
+    ;;
+all)
+    # `all` 与 `run` 等价：run_tests 已包含 scenario_native_asset_mint
     do_run_all
     ;;
 up)
