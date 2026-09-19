@@ -80,6 +80,21 @@ const (
 	// cggmp 包装器已给 refresh 单独设了 5min 默认值（F4 硬化），这里显式再给一次：
 	// 它是**本桥的**运维上限（超时 ⇒ 本轮失败 ⇒ 重试），不跟着包装器默认值漂移。
 	tssRefreshTimeout = 5 * time.Minute
+
+	// tssDKGTimeout DKG（含 PPK 交换）阶段的超时。
+	//
+	// 与 refresh 同源的问题，但此前**只给 refresh 打了补丁**：DKG 比 refresh 更重
+	// （同样要现生成 Paillier 密钥，还多出分片分发/承诺/证明若干轮），却被留在
+	// cggmp 包装器的 30s 默认值上。2026-09-19 的 E2E 实测复现：4 个 para 节点
+	// 同时开始 DKG，全部在 ~36s 处以 "tss listener context done: context deadline
+	// exceeded" 失败 —— 正是本常量上方那句注释预言的"必炸"。
+	//
+	// 取 2min 而不是 refresh 那样的 5min，是为了配合 harness 的等待窗口：
+	// wait_auto_dkg_commit 最多等 6min（180×2s）才判定 DKG 超时，而 DKG 失败后
+	// 还要 sleep 1min 再重试（见 initTssService 的重试循环）—— 2min 的运维上限
+	// 留得下"超时一次 + 重试一次"仍能落在 6min 窗口内；5min 则第一次超时就吃满窗口。
+	// 同时它相对实测需求（~36s）仍有 3 倍以上余量，正常路径根本不会碰到它。
+	tssDKGTimeout = 2 * time.Minute
 )
 
 // refreshRecord refresh 落盘的记录 = 结果本身 + 它对应的 DKG rid。
@@ -296,7 +311,9 @@ func (t *tssService) init() {
 	var err error
 	for {
 		// peers 必须包含本节点，且各节点用同一份列表；threshold 由配置给定。
-		dkgResult, err = cggmp.ProcessDKG(t.cfg.Peers, t.cfg.Threshold, t.cfg.Rank, dkgSessionName)
+		// 显式给 DKG 超时（理由见 tssDKGTimeout 的注释）。
+		dkgResult, err = cggmp.ProcessDKG(t.cfg.Peers, t.cfg.Threshold, t.cfg.Rank, dkgSessionName,
+			cggmp.WithTimeout(tssDKGTimeout))
 		if err == nil {
 			break
 		}
