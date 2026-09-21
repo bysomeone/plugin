@@ -1,6 +1,6 @@
 //! RGB sidecar gRPC server (tonic).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bitcoin::Network;
 use rgb_sidecar::config::Config;
@@ -41,6 +41,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Dev default = test key 0x11... (E2E key); production MUST set the real TSS pubkey.
         .unwrap_or_else(|| "034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa".to_string());
     let grpc_listen = env_or("RGB_SIDECAR_LISTEN", "0.0.0.0:50061");
+    // Contracts this deployment declares (file, because a genesis consignment is ~12 KB of hex).
+    // Unset/empty = none. Read failures abort the start here, and adoption failures abort it in
+    // `RgbEngine::open` — a bad declaration must never look like "the asset is missing".
+    let contracts = match std::env::var("RGB_SIDECAR_CONTRACTS") {
+        Ok(path) if !path.trim().is_empty() => {
+            let decls = rgb_sidecar::config::load_contract_declarations(Path::new(path.trim()))?;
+            println!("RGB_SIDECAR_CONTRACTS: {} contract(s) declared", decls.len());
+            decls
+        }
+        _ => Vec::new(),
+    };
 
     let cfg = Config {
         data_dir,
@@ -51,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         network,
         tss_pubkey_hex,
         grpc_listen: grpc_listen.clone(),
+        contracts,
     };
     let engine = RgbEngine::open(cfg)?;
     let service = RgbSidecarService::new(engine);

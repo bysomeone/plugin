@@ -281,7 +281,7 @@ impl RgbEngine {
             local_anchors: local_anchors.clone(),
         };
 
-        Ok(Self {
+        let mut engine = Self {
             cfg,
             stock,
             ledger,
@@ -296,7 +296,11 @@ impl RgbEngine {
             resolver,
             pending_withdrawals: HashMap::new(),
             local_anchors,
-        })
+        };
+        // Declared contracts are part of startup, not of the first request that needs them: a
+        // declaration that does not hold up must fail the start (see the method).
+        engine.apply_declared_contracts()?;
+        Ok(engine)
     }
 
     pub fn save(&mut self) -> Result<()> {
@@ -645,14 +649,33 @@ impl RgbEngine {
     /// `symbol` is this sidecar's own name for the asset (the gRPC `asset_symbol`); the rest of
     /// the record is read from the contract itself, so the caller cannot misdescribe it.
     ///
+    /// `expected_asset_id`, when given, is the contract id the caller *declared* — a deployment
+    /// states which contract it means, and the bytes must be that contract. Comparing them is
+    /// what turns "the wrong consignment got mounted / the config drifted" into a startup
+    /// failure instead of a silently wrong asset.
+    ///
     /// Writes **no** seal: see the section comment above.
-    pub fn adopt_contract(&mut self, genesis_bytes: &[u8], symbol: &str) -> Result<AssetRec> {
+    pub fn adopt_contract(
+        &mut self,
+        genesis_bytes: &[u8],
+        symbol: &str,
+        expected_asset_id: Option<&str>,
+    ) -> Result<AssetRec> {
         if symbol.is_empty() {
             return Err(anyhow!("adopt_contract: empty symbol"));
         }
         let consignment = contract_from_bytes(genesis_bytes)?;
         let contract_id = consignment.contract_id();
         let asset_id = contract_id.to_string();
+        if let Some(expected) = expected_asset_id {
+            if expected != asset_id {
+                return Err(PermanentError(format!(
+                    "the declared assetId {expected} is not the contract in the consignment \
+                     ({asset_id})"
+                ))
+                .into());
+            }
+        }
 
         // One contract ⇔ one sidecar symbol. Both directions are refused explicitly: silently
         // re-pointing a symbol would strand every seal and receive already recorded under it,
@@ -781,9 +804,34 @@ impl RgbEngine {
         // bridge does not hold) must leave the sidecar untouched instead of registering a
         // contract it can never fund, or a seal nobody can spend.
         let owned = self.verify_genesis_seal_owned(genesis_utxo)?;
-        let asset = self.adopt_contract(&genesis_bytes, symbol)?;
+        let asset = self.adopt_contract(&genesis_bytes, symbol, None)?;
         self.claim_genesis_seal(&asset, owned, issued_supply as i64)?;
         Ok(asset)
+    }
+
+    /// Adopt every contract this deployment declared (`Config::contracts`). Runs once, as part
+    /// of `open`, so a running sidecar always knows the contracts it was configured with.
+    ///
+    /// A declaration that does not hold up **fails the start**: the alternative — starting
+    /// anyway — turns a configuration mistake (stale consignment, mismatched assetId, unreadable
+    /// mounted file) into "the asset is simply not there", which is exactly the failure mode
+    /// that gets misdiagnosed as a bridge bug.
+    fn apply_declared_contracts(&mut self) -> Result<()> {
+        // Taken (not cloned): the declarations are applied once and `self.cfg` is then free.
+        for decl in std::mem::take(&mut self.cfg.contracts) {
+            let bytes = decl
+                .genesis_bytes()
+                .map_err(|e| anyhow!("declared contract {}: {e:#}", decl.symbol))?;
+            self.adopt_contract(&bytes, &decl.symbol, Some(&decl.asset_id))
+                .map_err(|e| {
+                    anyhow!(
+                        "declared contract {} (assetId {}): {e:#}",
+                        decl.symbol,
+                        decl.asset_id
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     /// A genesis outpoint the TSS wallet is known to hold, together with its BTC value.
@@ -1950,6 +1998,7 @@ mod sweep_tests {
             network: Network::Regtest,
             tss_pubkey_hex: VECTOR_TSS_PUB.into(),
             grpc_listen: "0.0.0.0:0".into(),
+            contracts: Vec::new(),
         })
         .unwrap()
     }
