@@ -53,7 +53,7 @@
 **实测配置**（E2E）：para1 official `rank=0`、para2–4 validator `rank=1`、`threshold=3`。
 
 **「谁必须参与」由什么决定**：alice 的校验只检查**参与方个数 ≥ threshold** ——
-`crypto/birkhoffinterpolation/birkhoffinterpolation.go:188` 的 `ensureRankAndOrder`：
+`getamis/alice@v1.0.7` 的 `crypto/birkhoffinterpolation/birkhoffinterpolation.go:188`（**在 alice 依赖里，不在 chain33 检出里**，要看得去 `$(go env GOMODCACHE)/github.com/getamis/alice@v1.0.7/`）的 `ensureRankAndOrder`：
 
 ```go
 if uint32(bks.Len()) < threshold {
