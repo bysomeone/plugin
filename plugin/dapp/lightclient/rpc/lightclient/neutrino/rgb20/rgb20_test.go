@@ -36,9 +36,19 @@ func validValidation(synced uint64) *pb.ConsignmentValidation {
 	return &pb.ConsignmentValidation{
 		Valid:        true,
 		Amount:       1000,
+		AssetId:      mockSidecarAssetID, // 侧车校验的 consignment 属于哪个合约（充值路径强校验它，见 mockSidecarAssetID）
 		SyncedHeight: synced,
 	}
 }
+
+// mockSidecarAssetID 假侧车为 symbol RGB20_USDT 结算出来的 asset_id
+// （mock.go 的 CreateReceive：fmt.Sprintf("rgb:asset-%s", req.AssetSymbol)，而本仓 fixture 都没配
+// sidecarSymbol ⇒ 取的就是 chain33 侧 symbol）。
+//
+// 充值路径现在**强校验** consignment 的 asset_id == contracts.assetId（任务 #58，fail-closed）：凡是
+// 会走到结算/铸造的 fixture 都必须把 assetId 配成这个值，否则一笔充值都进不来 —— 这也正是"配置漏了"
+// 在真实部署里的形态。
+const mockSidecarAssetID = "rgb:asset-RGB20_USDT"
 
 // buildTestPSBT 构造一个含 1 输入 2 输出的未签 PSBT。
 func buildTestPSBT(t *testing.T) []byte {
@@ -345,7 +355,9 @@ func newTestAdapter(t *testing.T, mock *MockSidecar, bridge Chain33Bridge) (*Ada
 		SidecarAddr: sock,
 		Precision:   6,
 		Contracts: []Contract{
-			{Symbol: "RGB20_USDT", Precision: 6, MinDeposit: 100, MinWithdraw: 100},
+			// assetId 与假侧车结算出来的 asset_id 一致（见 mockSidecarAssetID）：充值路径强校验
+			// 合约身份，fixture 也必须像一份配好的部署那样声明它。
+			{Symbol: "RGB20_USDT", AssetID: mockSidecarAssetID, Precision: 6, MinDeposit: 100, MinWithdraw: 100},
 		},
 		ChangeAddress: "bcrt1qxxxx",
 		// 与生产一致：头链保留深度 B 取 blockConfirmations（生产配置默认为 6）。

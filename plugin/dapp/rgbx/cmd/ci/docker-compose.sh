@@ -109,6 +109,16 @@ SWEEP_DEPOSIT_AMOUNT_SATS="${SWEEP_DEPOSIT_AMOUNT_SATS:-3000000}"
 # 侧车镜像在 Docker 内构建（源码目录里的 Dockerfile，宿主 macOS 二进制无法进 Linux 容器）。
 RGB20_SYMBOL="${RGB20_SYMBOL:-RGB20_USDT}"
 RGB20_SIDECAR_SYMBOL="${RGB20_SIDECAR_SYMBOL:-USDT}"
+# RGB20 合约 id（`[[rpc.sub.light.neutrino.rgb20.contracts]].assetId`）。
+#
+# 合约是**运行期现发**的（run_rgb20_env 里的 issue_usdt），所以这里只能是空占位：toml 先渲染出
+# `assetId=""`，等发行完、拿到真实合约 id 后由 apply_rgb20_asset_id_and_restart 回填并重启光客户端。
+#
+# 为什么必须回填：桥的充值路径**强校验** consignment 的 asset_id == contracts.assetId（任务 #58，
+# fail-closed），漏配不是"少校验一层"而是**所有充值被拒**（提现不受影响）。
+# 症状反查（这一步没生效时）：充值场景卡在余额不涨，para1 日志出现
+#   deposit asset contract mismatch: contract assetId not configured: symbol=RGB20_USDT declares no assetId ...
+RGB20_ASSET_ID="${RGB20_ASSET_ID:-}"
 RGB20_SIDECAR_ADDR="${RGB20_SIDECAR_ADDR:-rgb-sidecar:50061}"
 RGB20_SIDECAR_TEST_ADDR="${RGB20_SIDECAR_TEST_ADDR:-127.0.0.1:50064}"
 RGB20_PRECISION="${RGB20_PRECISION:-6}"
@@ -169,6 +179,10 @@ function config_main() {
     perl -i -pe 's/^whitelist=.*/whitelist=["*"]/' "${main_cfg}"
     perl -i -pe 's/^isLevelFee=.*/isLevelFee=false/' "${main_cfg}"
 
+    # 合约身份（#58）：这里**故意没有** rgb20 contracts 块 —— main 只跑 lightclient **执行器**
+    # （上面的 [exec.sub.lightclient]）与 rgbx 执行器，不跑 [rpc.sub.light] 光客户端/桥
+    # （chain33.test.toml 里没有任何 neutrino/relay 配置），所以 `contracts.assetId` 这条校验在 main
+    # 上无处生效。跑桥的是 para1-4，配置写在 config_para_file 里（那里才是需要 assetId 的地方）。
     if ! grep -q '^\[exec.sub.rgbx\]' "${main_cfg}" 2>/dev/null; then
         cat >>"${main_cfg}" <<EOF
 
@@ -291,6 +305,9 @@ testSignPsbt=true
 symbol="${RGB20_SYMBOL}"
 sidecarSymbol="${RGB20_SIDECAR_SYMBOL}"
 precision=${RGB20_PRECISION}
+# 合约身份（#58）：充值路径强校验 consignment 的 asset_id == 这个值，空值 = 拒收所有充值。
+# 空占位是**故意**的：合约运行期才发行，发行后由 apply_rgb20_asset_id_and_restart 回填。
+assetId="${RGB20_ASSET_ID}"
 EOF
 }
 
@@ -764,6 +781,24 @@ function rewrite_tss_peers_only() {
     done
 }
 
+# rewrite_rgb20_asset_id_only 把**运行期发行出来的**合约 id 回填进 4 个 para toml 的 contracts 块。
+#
+# 只改 contracts 块里那一行（`^assetId=`），不动别的字段；**4 个 para 都要改** —— 每个签名节点都用它做
+# 独立校验（ValidateDepositConsignment 的合约身份检查），只配官方节点会让阈值签名根本凑不齐。
+# 该行由 config_para_file 渲染（初始为空占位），这里只做替换；找不到就说明 toml 是旧版生成的，
+# 直接失败（否则会静默留下一份 assetId 为空、把所有充值都拒掉的配置）。
+function rewrite_rgb20_asset_id_only() {
+    local asset_id="$1"
+    assert_non_empty "${asset_id}" "rgb20 asset id empty"
+    local file
+    for file in chain33.para1.toml chain33.para2.toml chain33.para3.toml chain33.para4.toml; do
+        if ! grep -q '^assetId=' "${ROOT_DIR}/${file}" 2>/dev/null; then
+            fail "${file} has no 'assetId=' line in the rgb20 contracts block; regenerate the para tomls (init_env) before injecting the contract id"
+        fi
+        perl -i -pe "s|^assetId=.*|assetId=\"${asset_id}\"|" "${ROOT_DIR}/${file}"
+    done
+}
+
 function copy_para_toml_into_container() {
     local svc="$1"
     local f="chain33.${svc}.toml"
@@ -781,6 +816,31 @@ function restart_para_nodes_with_new_toml() {
     done
     compose_cmd restart para1 para2 para3 para4
     sleep 3
+}
+
+# apply_rgb20_asset_id_and_restart 合约身份（#58）的 E2E 接线：回填 assetId → 推进容器 → 重启 para1-4
+# → 等 CLI + 重新解锁账户。
+#
+# 为什么必须整组重启：桥在**启动时**读配置（neutrino client.initRgb20Adapter 把 contracts 映射进
+# rgb20.Config），没有热加载；而 asset_id 只有合约发行之后才存在。所以只能"发行 → 回填 → 重启光客户端"，
+# 与 init 阶段"改 TSS peers 后只重启 para"是同一套路（见 restart_para_nodes_with_new_toml）。
+#
+# 重启后要补的两件事（与 run_tests 里 init 阶段那次重启完全一致）：
+#   ① 等 4 个 para 的 CLI 就绪；
+#   ② 重新解锁钱包 + 重新 import AUTH 账户（para 重启后钱包上锁，TSS 拿不到 commit 私钥）。
+# 第三步（等桥的 rgb20 HTTP 就绪）由调用方接着 wait_bridge_signing_ready：重启后桥要重跑启动流程，
+# 而它的 rgb20 HTTP 在 dkgCompleted 之前不服务（DKG 结果与 refresh 材料都在 neutrino.db 里，重启通常
+# 不必重算；但**不等**就等于把"桥还没起来"当成"桥坏了"——本 harness 踩过这个假失败）。
+function apply_rgb20_asset_id_and_restart() {
+    local asset_id="$1"
+    log_step "rgb20 contract identity: inject contracts.assetId=${asset_id} into para1-4 and restart the light clients"
+    rewrite_rgb20_asset_id_only "${asset_id}"
+    restart_para_nodes_with_new_toml
+    wait_cli_ready "${PARA1_CLI}"
+    wait_cli_ready "${PARA2_CLI}"
+    wait_cli_ready "${PARA3_CLI}"
+    wait_cli_ready "${PARA4_CLI}"
+    prepare_para_accounts
 }
 
 function apply_dynamic_tss_peers_and_restart() {

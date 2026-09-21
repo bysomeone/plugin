@@ -22,6 +22,12 @@ import (
 // 单独一个错误值，是为了让日志/告警一眼能看出是"合约身份不符"，而不是混进通用的校验失败里。
 var errAssetContractMismatch = errors.New("deposit asset contract mismatch")
 
+// errAssetIdUnconfigured 合约身份校验的另一种形态：不是"合约不符"，而是**配置缺口** —— 该 symbol 的
+// `contracts.assetId` 没配，因此无从比对。单独一个错误值，让运维能分清"配置漏了"与"有人拿假合约来充"
+// （两者的处置完全不同）。它同时被 errAssetContractMismatch 包住：对调用方而言都是"这笔充值的合约身份
+// 不可信 ⇒ 拒绝"。
+var errAssetIdUnconfigured = errors.New("contract assetId not configured")
+
 // DepositRequest 充值请求（用户经桥 HTTP API 发起）。
 type DepositRequest struct {
 	RequestID   string // 桥侧请求 ID
@@ -391,9 +397,10 @@ func isDepositRetryNote(err error) bool {
 // 调用点都是"钱要动"的边界：结算落账前（onSettledTransfer）、提交铸造前（submitSignedDeposit）、
 // 签名节点签 C 之前（ValidateDepositConsignment）。
 //
-// 未配置 `contracts.assetId` 时无从比对：**这是配置缺口、不是"已验证"**，因此每次进程生命周期内按
-// symbol 记一条 WARN（含配置键名）后放行 —— 与既有 fail-closed 门控的区别在于：这里没有任何可信判据
-// 可用，硬拒等于让所有未配置该字段的部署一封到底（含 E2E/regtest），所以降级为"显式告警 + 放行"。
+// **fail-closed**：`contracts.assetId` 没配时不是"跳过校验"，而是拒绝这笔充值（errAssetIdUnconfigured）
+// —— "配置缺失 ⇒ 校验自动失效"正是要防的失败模式（那时任何同 ticker 的假合约都能铸出真资产）。
+// 代价与恢复：配置缺口期间**所有**充值被拒（提现不受影响），修法就是给配置补上 assetId 再重启；
+// 已落盘的签名产物不会丢，补好配置后下一轮轮询直接重发（见 submitDeposit 的"先落盘、再提交"）。
 func (a *Adapter) verifyAssetContract(symbol, assetID string) error {
 	contract, ok := a.reg.Get(symbol)
 	if !ok {
@@ -402,13 +409,10 @@ func (a *Adapter) verifyAssetContract(symbol, assetID string) error {
 	want := strings.TrimSpace(contract.AssetID)
 	got := strings.TrimSpace(assetID)
 	if want == "" {
-		if a.depositNotes.allow("assetid-unset:" + symbol) {
-			log.Warn("deposit asset identity is NOT verified: the contract registered for this symbol declares "+
-				"no assetId, so a consignment that settled for a different contract with the same ticker "+
-				"cannot be told apart (set rgb20.contracts.assetId to the rgb: contract id to enable the check)",
-				"symbol", symbol, "sidecarReportedAssetId", got)
-		}
-		return nil
+		return fmt.Errorf("%w: %w: symbol=%s declares no assetId, so the consignment's contract identity "+
+			"cannot be verified (set rgb20.contracts.assetId to the rgb: contract id; the deposit is "+
+			"refused until then — this is a config gap, not a contract mismatch)",
+			errAssetContractMismatch, errAssetIdUnconfigured, symbol)
 	}
 	if got == "" || !strings.EqualFold(got, want) {
 		return fmt.Errorf("%w: symbol=%s configuredAssetId=%q sidecarReportedAssetId=%q "+

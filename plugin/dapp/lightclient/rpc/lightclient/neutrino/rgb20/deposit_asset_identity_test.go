@@ -25,9 +25,13 @@ import (
  *  ③ 签名节点（签 C 之前的独立校验）同样拒 —— 铸造必须带 threshold sig，这一关绕不过去。
  *  相符时一律放行（见 AcceptsConsignmentForTheRegisteredContract 与既有用例）。
  *
- * 注意既有 fixture 的合约都**没有配 assetId**，走的是"未配置 ⇒ 无从比对、告警放行"那条路
- * （见 TestVerifyAssetContract_UnconfiguredAssetIdIsUnverified）；下面这些用例显式配上 assetId，
- * 让校验真的生效。
+ * 配置缺口的形态（`contracts.assetId` 没配）也是**拒绝**，且与"合约不符"用不同的错误值区分
+ * （见 TestVerifyAssetContract_UnconfiguredAssetIdIsRejected / ...BlocksMintBeforeSigning）。
+ *
+ * 注意既有 fixture 的合约都**没有配 assetId**，所以既有用例在提交/签名路径上本就走不到（它们直接驱动
+ * submitDeposit 的那几个用例都自己 seed 了 seal，且用的是配了 assetId 的适配器 —— 见 newDepositTestAdapter
+ * 之外的本文件 fixture）；真实 E2E 的 assetId 由 harness 在发行后注入（见 rgbx/cmd/ci 的
+ * apply_rgb20_asset_id_and_restart）。
  */
 
 const (
@@ -35,9 +39,6 @@ const (
 	testRegisteredAssetID = "rgb:registered-usdt"
 	// testForeignAssetID 另一个同 ticker 的合约 id（伪造方）。
 	testForeignAssetID = "rgb:foreign-usdt"
-	// testMockSidecarAssetID 假侧车为 symbol RGB20_USDT 结算出来的 asset_id
-	// （mock.go 的 CreateReceive：fmt.Sprintf("rgb:asset-%s", req.AssetSymbol)，且未配 sidecarSymbol）。
-	testMockSidecarAssetID = "rgb:asset-RGB20_USDT"
 )
 
 // newAssetIdentityTestAdapter 造一个**配了 assetId** 的适配器（连假侧车、起后台协程，与 newTestAdapter 同构）。
@@ -68,13 +69,20 @@ func newAssetIdentityTestAdapter(t *testing.T, mock *MockSidecar, bridge Chain33
 // newAssetIdentitySubmitAdapter 只造适配器 + 注入桥接（不连侧车、不起后台协程）：直接驱动 submitDeposit。
 func newAssetIdentitySubmitAdapter(t *testing.T, bridge Chain33Bridge, assetID string) *Adapter {
 	t.Helper()
+	return newAssetIdentitySubmitAdapterWithStore(t, bridge, assetID, NewMemStore())
+}
+
+// newAssetIdentitySubmitAdapterWithStore 同上，但复用调用方的 store —— "改配置 + 重启后同一份本地状态
+// 能续跑"这类用例需要跨适配器实例共享 receive/seal/签名产物（重启=新适配器读同一份 store）。
+func newAssetIdentitySubmitAdapterWithStore(t *testing.T, bridge Chain33Bridge, assetID string, store KVStore) *Adapter {
+	t.Helper()
 	adapter, err := NewAdapter(Config{
 		SidecarAddr: "test-no-sidecar",
 		Contracts: []Contract{
 			{Symbol: "RGB20_USDT", AssetID: assetID, Precision: 6, MinDeposit: 100, MinWithdraw: 100},
 		},
 		HeaderRelayConfirmations: uint32(testHeaderConfs),
-	}, NewMemStore())
+	}, store)
 	require.NoError(t, err)
 	adapter.SetBridge(bridge)
 	return adapter
@@ -165,7 +173,7 @@ func TestDepositAssetIdentity_RejectsForeignContractAtSettlement(t *testing.T) {
 func TestDepositAssetIdentity_AcceptsConsignmentForTheRegisteredContract(t *testing.T) {
 	bridge := &fakeBridge{}
 	mock := NewMockSidecar()
-	adapter, cleanup := newAssetIdentityTestAdapter(t, mock, bridge, testMockSidecarAssetID)
+	adapter, cleanup := newAssetIdentityTestAdapter(t, mock, bridge, mockSidecarAssetID)
 	defer cleanup()
 
 	rec, err := adapter.DepositFlow(context.Background(), &DepositRequest{
@@ -268,21 +276,59 @@ func TestDepositAssetIdentity_SigningNodeRejectsForeignContract(t *testing.T) {
 	require.NoError(t, adapter.ValidateDepositConsignment(payload))
 }
 
-// TestVerifyAssetContract_UnconfiguredAssetIdIsUnverified 未配置 `contracts.assetId` 时无从比对：
-// 记一条 WARN 后放行。**这是配置缺口，不是"已验证"** —— 该行为被显式钉在这里，将来若改成 fail-closed，
-// 这个用例会红，改的时候必须是有意为之（同时要给 E2E/regtest 的配置补上 assetId）。
-func TestVerifyAssetContract_UnconfiguredAssetIdIsUnverified(t *testing.T) {
+// TestVerifyAssetContract_UnconfiguredAssetIdIsRejected **配置缺口也必须拒绝**（fail-closed）：
+// `contracts.assetId` 没配就没有任何可比对的判据，若此时放行，任何同 ticker 的假合约都能铸出真资产
+// —— "配置缺失 ⇒ 校验自动失效"正是要防的失败模式。
+//
+// 错误值分两层：errAssetContractMismatch（合约身份不可信，统一口径）+ errAssetIdUnconfigured
+// （具体是"配置漏了"，不是"有人拿假合约来充"），运维据此决定是改配置还是查攻击。
+// 恢复方式：补上 assetId 再重启即可（已落盘的签名产物不丢，见 submitDeposit 的"先落盘、再提交"）。
+func TestVerifyAssetContract_UnconfiguredAssetIdIsRejected(t *testing.T) {
 	adapter := newAssetIdentitySubmitAdapter(t, &fakeBridge{}, "")
-	require.NoError(t, adapter.verifyAssetContract("RGB20_USDT", testForeignAssetID),
-		"未配置 assetId 时没有可比对的判据，只能降级放行")
+	err := adapter.verifyAssetContract("RGB20_USDT", testForeignAssetID)
+	require.Error(t, err, "未配置 assetId 时不得放行（fail-closed）")
+	require.True(t, errors.Is(err, errAssetContractMismatch), "应归入合约身份不可信, got %v", err)
+	require.True(t, errors.Is(err, errAssetIdUnconfigured), "应能看出是配置缺口, got %v", err)
+	require.Contains(t, err.Error(), "no assetId",
+		"错误里要说清是「该 symbol 未配置 assetId」(配置缺口), got %v", err)
 
-	// 但 symbol 未注册、以及"配了 assetId / 侧车报空"这类**有判据**的情形仍然拒绝。
-	err := adapter.verifyAssetContract("RGB20_UNKNOWN", testForeignAssetID)
+	// symbol 未注册同样拒绝（但那是另一类：配置里没有这个合约）。
+	err = adapter.verifyAssetContract("RGB20_UNKNOWN", testForeignAssetID)
 	require.True(t, errors.Is(err, errAssetContractMismatch))
+	require.False(t, errors.Is(err, errAssetIdUnconfigured), "未注册 symbol 不属「配置缺口」这一类")
 
+	// 配了 assetId 时：侧车报空 / 报别的合约都要拒，相符才放行。
 	mismatch := newAssetIdentitySubmitAdapter(t, &fakeBridge{}, testRegisteredAssetID)
 	require.Error(t, mismatch.verifyAssetContract("RGB20_USDT", ""), "侧车报空 asset_id 时不得放行")
+	require.Error(t, mismatch.verifyAssetContract("RGB20_USDT", testForeignAssetID))
 	require.NoError(t, mismatch.verifyAssetContract("RGB20_USDT", testRegisteredAssetID))
 	require.NoError(t, mismatch.verifyAssetContract("RGB20_USDT", testRegisteredAssetID+"\n"),
 		"两侧应做去空白比对（配置里带换行不该让所有充值都失败）")
+}
+
+// TestDepositAssetIdentity_UnconfiguredAssetIdBlocksMintBeforeSigning 配置缺口下的端到端形态：
+// 充值在**签名之前**就被拒（不白花一轮 CGGMP），本地状态停在 settled —— **停摆但不丢钱**；
+// 补上 assetId（等价于改配置 + 重启）后，同一份本地状态直接续跑、一次铸造成功。
+func TestDepositAssetIdentity_UnconfiguredAssetIdBlocksMintBeforeSigning(t *testing.T) {
+	store := NewMemStore()
+	bridge := &fakeBridge{}
+	adapter := newAssetIdentitySubmitAdapterWithStore(t, bridge, "", store)
+	rec := seedSettledReceiveWithAsset(t, adapter, "recv-config-gap", testDepositTxid, 1000, testRegisteredAssetID)
+	bridge.setDepth(testRequiredBest+10, testRgbxConfs)
+
+	err := adapter.submitDeposit(rec)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errAssetIdUnconfigured), "应明确指出是配置缺口, got %v", err)
+	require.Equal(t, 0, bridge.signCallCount(), "配置缺口不得驱动签名轮次")
+	require.Equal(t, 0, bridge.submitCallCount(), "配置缺口不得提交铸造")
+	require.Equal(t, 0, adapter.depositSigs.Len(), "配置缺口不得落盘签名产物")
+	require.Equal(t, ReceiveStatusSettled, mustReceiveStatus(t, adapter, rec.ReceiveID),
+		"记录停在 settled（钱没丢），补上配置后可续跑")
+
+	// 补上 assetId：同一份 store（同一份本地状态）直接续跑、一次铸造成功。
+	fixed := newAssetIdentitySubmitAdapterWithStore(t, bridge, testRegisteredAssetID, store)
+	require.NoError(t, fixed.submitDeposit(rec))
+	require.Equal(t, 1, bridge.signCallCount())
+	require.Equal(t, 1, bridge.submitCallCount())
+	require.Equal(t, ReceiveStatusMinted, mustReceiveStatus(t, fixed, rec.ReceiveID))
 }

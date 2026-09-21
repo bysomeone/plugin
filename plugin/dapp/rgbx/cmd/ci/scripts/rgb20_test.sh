@@ -240,10 +240,36 @@ function run_rgb20_env() {
     echo "${issue_out}" | tail -15
     echo "${issue_out}" | grep -q "ISSUE-DONE" || fail "issue_usdt did not complete"
 
+    # 这个驱动必须由 docker-compose.sh 那套 harness 提供辅助函数（本函数依赖 config_para_file 渲染出的
+    # `assetId=` 占位行 + apply_rgb20_asset_id_and_restart）。若辅助来自别的（旧）文件——例如
+    # build/ci 下几个 source ./harness_lib.sh 的临时驱动——这里明确报出来，而不是让下一行的
+    # `apply_rgb20_asset_id_and_restart: command not found` 去误导排查。
+    if ! declare -F apply_rgb20_asset_id_and_restart >/dev/null; then
+        fail "apply_rgb20_asset_id_and_restart undefined: this driver did not source the harness that injects contracts.assetId (use './docker-compose.sh run'; a scratch driver sourcing a stale harness_lib.sh must be retargeted)"
+    fi
+
+    # 合约身份（#58）：把**刚发行出来的**合约 id 回填进 4 个 para 的 `contracts.assetId` 并重启光客户端。
+    #
+    # 取值只认侧车产物：issue_usdt 打印的 `issued <SYM> asset_id=rgb:...`（engine.issue_asset 的返回值）。
+    # 不要在这里拼字符串 —— 合约 id 的来源只能是侧车自己算出来的那个（配置串了/字节过期了都要当场失败）。
+    #
+    # 不做这一步的症状（供反查）：桥的充值路径强校验合约身份且 **fail-closed**，配不出 assetId 时
+    # **每一笔充值都被拒**（提现不受影响）—— 充值场景卡在余额不涨，para1 日志里是
+    #   deposit asset contract mismatch: contract assetId not configured: symbol=RGB20_USDT declares no assetId ...
+    # 或（配了但配错）... configuredAssetId="..." sidecarReportedAssetId="..."。
+    local rgb20_asset_id
+    rgb20_asset_id=$(echo "${issue_out}" | sed -n 's/^issued [^ ]* asset_id=\(.*\)$/\1/p' | head -1 | tr -d '\r')
+    assert_non_empty "${rgb20_asset_id}" \
+        "cannot read the issued asset id from the issue_usdt output ('issued <SYM> asset_id='); the bridge rejects every deposit until contracts.assetId is configured"
+    log_step "rgb20 issued contract asset_id=${rgb20_asset_id}"
+    export RGB20_ASSET_ID="${rgb20_asset_id}"
+
     compose_cmd up -d rgb-sidecar
     wait_rgb20_sidecar_grpc
+    # 侧车先起来，再重启 para：重启后的桥会立刻连侧车（连不上也能自愈重试，但少一个失败窗口）。
+    apply_rgb20_asset_id_and_restart "${rgb20_asset_id}"
     wait_bridge_signing_ready
-    log_step "RGB20 env done: sidecar up (GG18 pubkey)"
+    log_step "RGB20 env done: sidecar up (GG18 pubkey), contracts.assetId=${RGB20_ASSET_ID}"
 }
 
 # =====================================================================
