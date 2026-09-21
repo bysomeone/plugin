@@ -65,6 +65,15 @@ if uint32(bks.Len()) < threshold {
 
 > ⚠️ 这与「权重 0 表示必须参与」的说法**不一致**。那可能是早期 GG18 版本、或另一份设计稿的语义 —— 需要单独核实后才能写进备份方案，此处不下结论。
 
-**能否动态变更（改门限 / 加节点）**：协议层**支持**。`ProcessRefresh`（alice 的 resharing）可在**保持公钥不变**的前提下更换参与方集合与门限，正是「动态加入新节点」所需的机制。**但是** plugin 侧目前只在 DKG 流程里调用 refresh，**没有**把「增删节点后重新分享」做成运维入口 —— 要用得单独做。
+**改门限与加节点是两件不同的事，走的是两套协议**（此前本文件把两者混为一谈，已订正）：
+
+- **改门限（同一组人）**：走 CGGMP 的 `refresh`（`getamis/alice@v1.0.7` 的 `crypto/tss/ecdsa/cggmp/refresh`）。我们已经在用（每次签名前强制跑一轮，见 `tss.go:573-590`），但调用时传的是**配置里同一份** `Peers`/`Threshold`，即「原地换 share」。之所以不能靠它加人：`NewRefresh(oldShare, …)` 要求每个参与者提供**自己的旧份额** —— 新节点没有旧份额，构造不出来。
+- **加节点**：走的是**另一个包** `crypto/tss/ecdsa/addshare`（`newpeer` + `oldpeer`）—— `newpeer.NewAddShare(peerManager, pubkey, threshold, newPeerRank, listener)` **不需要旧 share**，`oldpeer.NewAddShare(…, share, bks, newPeerID, …)` 由老节点用自己的旧份额 + 当前 Birkhoff 参数参与。它在 **Birkhoff 参数（bks）** 这一层工作，与 CGGMP 同源，因此是**方案无关**的加节点协议。（GG18 另有专属的 `gg18/reshare`。）
+
+**我们的状态**：chain33 与 plugin 对 `addshare` 的引用是 **0** —— **底层有、我们没接**。所以「加节点」不是"底层做不到"，而是**没接线**。
+
+> ⚠️ **但接上能不能直接跑，尚未验证**：`addshare` 是方案无关层，其产出能否**直接喂给 CGGMP 的 sign**（CGGMP 签名还需 partialPubKey 等材料）我**没有验证**，此处不下结论。要确定得像 E14/#55 那样上**可执行探针**：在 regtest 上加第 5 个节点跑一轮 addshare，再用新集合签一笔。
+
+**对上线的含义不变**：这件事牵扯密钥生命周期（改错了直接锁死资金），**上线前不做**。但理由从"底层不支持"更正为"底层支持、我们没接、且接线后需实测"。
 
 **对备份方案的直接含义**：在门限语义完全确认前，按**最保守假设**设计 —— 任意份额丢失都可能致命，因此每个节点各自独立备份，且**不放在同一处**。
