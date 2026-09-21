@@ -12,6 +12,16 @@ import (
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 )
 
+// errAssetContractMismatch 充值路径上的**合约身份不符**：consignment 结算出来的资产不是配置里该 symbol
+// 声明的那个合约。
+//
+// 攻击形态（任务 #58）：另造一个 ticker 也注册成 "USDT" 的合约，把它的 consignment 当作"一笔 USDT 充值"
+// 交付给桥。桥若只看 symbol（金额/收款 seal/付款交易 SPV 都是真的），链上就会按 symbol 铸出**真** USDT。
+// 因此每一条充值路径都必须核对合约身份，且核对的是 asset_id（合约 id）而不是 symbol（symbol 可重名）。
+//
+// 单独一个错误值，是为了让日志/告警一眼能看出是"合约身份不符"，而不是混进通用的校验失败里。
+var errAssetContractMismatch = errors.New("deposit asset contract mismatch")
+
 // DepositRequest 充值请求（用户经桥 HTTP API 发起）。
 type DepositRequest struct {
 	RequestID   string // 桥侧请求 ID
@@ -157,6 +167,12 @@ func (a *Adapter) onSettledTransfer(t *pb.TransferState) error {
 		return nil
 	}
 	if rec.Status != ReceiveStatusSettled {
+		// 合约身份（#58）：侧车报的 asset_id 必须是配置里该 symbol 声明的合约。放在**落账之前**——
+		// 不属于本合约的 consignment 连 Settle 都不该做、收款 seal 也不该登记（登记就成了 pending-mint，
+		// 下一步就是被铸造）。
+		if err := a.verifyAssetContract(rec.AssetSymbol, t.AssetId); err != nil {
+			return err
+		}
 		// 首次归因：记录付款交易与打开的收款 seal。
 		seal := FormatOutpoint(t.Txid, t.Vout)
 		if err := a.receives.Settle(t.ReceiveId, t.Txid, t.Vout, seal); err != nil {
@@ -211,6 +227,10 @@ func (a *Adapter) submitDeposit(rec *ReceiveRecord) error {
 	}
 	if a.bridge == nil {
 		return fmt.Errorf("chain33 bridge not set")
+	}
+	// 合约身份（#58）：本地登记的合约身份不对就到此为止 —— 省掉下面一整轮 CGGMP 签名。
+	if err := a.verifyReceiveContract(rec); err != nil {
+		return err
 	}
 
 	// 1) 已有签名产物：只重发。
@@ -296,6 +316,11 @@ func (a *Adapter) submitSignedDeposit(rec *ReceiveRecord, art *SignedDepositArti
 	if art == nil || art.Deposit == nil {
 		return fmt.Errorf("invalid signed deposit artifact for receive %s", rec.ReceiveID)
 	}
+	// 合约身份（#58）：**提交铸造前的最后一关**。任何走到铸造的路径都必经此处 —— 包括"已签产物只重发"
+	// 的重试路径（它不做任何侧车调用），所以后续新增/调整代码路径也绕不开这一关。
+	if err := a.verifyReceiveContract(rec); err != nil {
+		return err
+	}
 	// 产物先持久化：为的是重启后还能只重发；真丢了也只是重签一轮，不影响正确性。
 	if err := a.depositSigs.Put(art); err != nil {
 		return a.persistArtifactFailed(rec, err)
@@ -352,6 +377,59 @@ var errDepositGateUnavailable = errors.New("deposit depth gate unavailable")
 func isDepositRetryNote(err error) bool {
 	return errors.Is(err, errDepositDepthPending) ||
 		errors.Is(err, errDepositGateUnavailable)
+}
+
+// --- 充值合约身份（#58）：settled/validated 的 asset_id 必须等于配置里该 symbol 声明的合约 ---
+
+// verifyAssetContract 核对一笔充值携带的 asset_id 就是配置里该 symbol 声明的合约（`contracts.assetId`）。
+//
+// 两侧判据：
+//
+//	symbol  = 本地 receive 的 AssetSymbol（建 receive 时已按 Registry 校验过，不是攻击者新填的值）
+//	assetID = 侧车结算/校验结果里的 asset_id（consignment 的真实合约 id）
+//
+// 调用点都是"钱要动"的边界：结算落账前（onSettledTransfer）、提交铸造前（submitSignedDeposit）、
+// 签名节点签 C 之前（ValidateDepositConsignment）。
+//
+// 未配置 `contracts.assetId` 时无从比对：**这是配置缺口、不是"已验证"**，因此每次进程生命周期内按
+// symbol 记一条 WARN（含配置键名）后放行 —— 与既有 fail-closed 门控的区别在于：这里没有任何可信判据
+// 可用，硬拒等于让所有未配置该字段的部署一封到底（含 E2E/regtest），所以降级为"显式告警 + 放行"。
+func (a *Adapter) verifyAssetContract(symbol, assetID string) error {
+	contract, ok := a.reg.Get(symbol)
+	if !ok {
+		return fmt.Errorf("%w: asset not registered: %q", errAssetContractMismatch, symbol)
+	}
+	want := strings.TrimSpace(contract.AssetID)
+	got := strings.TrimSpace(assetID)
+	if want == "" {
+		if a.depositNotes.allow("assetid-unset:" + symbol) {
+			log.Warn("deposit asset identity is NOT verified: the contract registered for this symbol declares "+
+				"no assetId, so a consignment that settled for a different contract with the same ticker "+
+				"cannot be told apart (set rgb20.contracts.assetId to the rgb: contract id to enable the check)",
+				"symbol", symbol, "sidecarReportedAssetId", got)
+		}
+		return nil
+	}
+	if got == "" || !strings.EqualFold(got, want) {
+		return fmt.Errorf("%w: symbol=%s configuredAssetId=%q sidecarReportedAssetId=%q "+
+			"(the consignment belongs to a different contract than the one registered for this symbol)",
+			errAssetContractMismatch, symbol, want, got)
+	}
+	return nil
+}
+
+// verifyReceiveContract 用**本地落账的事实**（receive 结算时登记的那枚 seal 的 asset_id）核对合约身份，
+// 供提交铸造前调用。已签产物只重发这条重试路径不做任何侧车调用，但同样要过这里。
+func (a *Adapter) verifyReceiveContract(rec *ReceiveRecord) error {
+	if rec == nil {
+		return fmt.Errorf("%w: nil receive record", errAssetContractMismatch)
+	}
+	seal, ok := a.seals.Get(rec.Seal)
+	if !ok {
+		return fmt.Errorf("%w: receive %s has no local seal record (seal=%q), cannot verify its contract identity",
+			errAssetContractMismatch, rec.ReceiveID, rec.Seal)
+	}
+	return a.verifyAssetContract(rec.AssetSymbol, seal.AssetID)
 }
 
 // requiredSubmitHeight 本地 depth 门控的阈值：中继本地 best 达到该高度才允许提交一份高度为
@@ -515,6 +593,18 @@ func (a *Adapter) ValidateDepositConsignment(payload *DepositSignPayload) error 
 	}
 	if !v.Valid {
 		return fmt.Errorf("consignment invalid: %s", v.ErrorMessage)
+	}
+	// 合约身份（#58）：consignment 必须属于配置里该 symbol 声明的合约。
+	//
+	// 这一关在**每个签名节点上各自独立执行**：链上按 symbol 铸造资产的前提是那份 DepositAsset 带一枚
+	// threshold sig，任一签名节点在这里拒绝就签不出来 —— 所以协调者侧（以及将来新增的任何提交路径）
+	// 都绕不过这一关，这是"即使代码路径变化也不被绕过"的那一层。
+	identitySymbol := payload.Deposit.AssetSymbol
+	if rec != nil {
+		identitySymbol = rec.AssetSymbol
+	}
+	if err := a.verifyAssetContract(identitySymbol, v.AssetId); err != nil {
+		return err
 	}
 	// 金额匹配（侧车返回的 consignment 金额）
 	if v.Amount != payload.Deposit.Amount {
