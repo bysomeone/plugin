@@ -33,6 +33,15 @@
 | **B2** | 侧车 `/data`（`ledger.json` + `stock/`） | RGB 是**客户端验证**，资产状态链上查不出来 ⇒ 侧车状态**不可从链重建** |
 | **B3** | 每节点中继本地库（`neutrino.db` 的 `rgb20-*` / `rgbx-*` bucket） | 业务台账；**多数可自愈或重建**，但 `rgb20-receive` 是 consignment 原文的全仓唯一留存 ⇒ 单独列为必须 |
 | **B4** | 主链（`main`）自己的 `datadir` | `main` 在 compose 里**只有 1 个节点**：它是 `CrossChainInfo` / 已铸供应量 / 操作台账的**唯一持有者** |
+| **B5** | 每节点的 **libp2p 身份私钥**（`system/p2p/dht/addrbook.go` 的 `privkey` 记录，落在节点 datadir 的 addrbook 库里） | TSS 认的身份就是 **libp2p peer id**，且由传输层认证（`cggmp/errors.go:16` 的 `errMissingPeerID`）。**只恢复 share、不恢复这个私钥 ⇒ 节点回来时 peer id 变了，组内不认它**，恢复就不是"换台机器"而是"换了个成员"。详见下方 §2.1 |
+
+**§2.1 为什么 B5 必须进清单（2026-09-21 补，源于"换机器要不要重新组网"的讨论）**
+
+TSS 协议层一切寻址都用 peer id：`pm.SelfID()` / `pm.PeerIDs()`（`cggmp/api.go:105/131`），消息里带的 peer id 由**传输层认证**（不是发送方自称）。所以：
+
+- **换机器 = 无损**，只要同时恢复两样：**(a) TSS share**（B1）与 **(b) libp2p 身份私钥**（B5）。peer id 由私钥派生（`addrbook.go:122-142`），私钥不变则 peer id 不变 ⇒ 对 TSS 而言**组网配置根本没变**（同一批 ID、同一份 bks、同样的份额），不需要任何重新组网动作。
+- **只恢复 (a)、丢了 (b) ⇒ 节点回来是个新成员**，旧组不认它，得走加节点/重组流程（见 `LAUNCH_READINESS.md` 的 addshare 一节）。
+- ⇒ **备份清单把这两样按同一等级对待**：它们是"恢复一个节点"的两个必需件，缺一不可。
 
 **风险分级一句话**：B1 丢 = 完蛋（资金锁死，不可逆）；B2 丢 = 完蛋（资产认知与 consignment 消失，
 不可逆）；B3 丢 = 麻烦（可自愈 + 需重扫，服务降级）；B4 丢 = **完蛋**（生产与 CI 同为单主节点，`main-data` 是主链唯一样本）。
