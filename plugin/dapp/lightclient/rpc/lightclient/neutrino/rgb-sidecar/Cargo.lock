@@ -1689,6 +1689,7 @@ dependencies = [
  "bitcoin",
  "electrum-client",
  "flate2",
+ "nonasync",
  "prost",
  "rand 0.9.5",
  "rgb-consensus",

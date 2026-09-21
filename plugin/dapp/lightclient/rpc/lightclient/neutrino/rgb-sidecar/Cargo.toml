@@ -27,6 +27,11 @@ amplify = "=4.8.1"
 # for a codec whose ratio, measured on a real consignment, is within 7% of zstd/lz4/xz.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
+# Direct dependency because the sidecar implements its persistence traits: `Stock::load` takes any
+# `PersistenceProvider<MemStash/MemState/MemIndex>`, which is how the stock's writes get made atomic
+# (see src/store.rs). Same version rgb-ops already resolves, so the lockfile gains only this edge.
+nonasync = "0.1.3"
+
 # gRPC server
 tonic = "0.14"
 tonic-prost = "0.14"

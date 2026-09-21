@@ -302,11 +302,11 @@ impl BtcWallet {
                 })
                 .collect(),
         };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, serde_json::to_vec_pretty(&file)?)
-            .map_err(|e| anyhow!("write user scripts {}: {e}", path.display()))
+        // Atomic like the rest of the sidecar's state (tmp → fsync → rename): losing this registry
+        // to a torn write means losing the `witnessScript` of every address already handed out,
+        // i.e. BTC that can never be spent again — the same class of loss as losing the Stock.
+        crate::ledger::write_atomic(path, &serde_json::to_vec_pretty(&file)?)
+            .map_err(|e| anyhow!("write user scripts {}: {e:#}", path.display()))
     }
 
     // ------------------------------------------------------------------

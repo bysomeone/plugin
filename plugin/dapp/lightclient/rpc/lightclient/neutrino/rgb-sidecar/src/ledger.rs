@@ -309,7 +309,12 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
-    let tmp = path.with_extension("json.tmp");
+    // `<name>.tmp` *appended* to the full name (not `with_extension`, which would rewrite the
+    // extension: `stash.dat` would stage as `stash.json.tmp`).
+    let tmp = match path.file_name() {
+        Some(name) => path.with_file_name(format!("{}.tmp", name.to_string_lossy())),
+        None => path.with_extension("tmp"),
+    };
     {
         let mut f = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(bytes)

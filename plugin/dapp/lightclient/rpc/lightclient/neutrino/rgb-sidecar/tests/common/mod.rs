@@ -20,6 +20,7 @@ use bitcoin::{
 use rgb_sidecar::config::Config;
 use rgb_sidecar::engine::RgbEngine;
 use serde_json::{json, Value};
+use std::path::PathBuf;
 
 // =====================================================================
 // Mock btcd JSON-RPC node
@@ -251,6 +252,15 @@ pub fn engine_config(data_dir: &std::path::Path, rpc: &str, tss_pubkey: &str) ->
 
 pub fn open_engine(data_dir: &std::path::Path, rpc: &str, tss_pubkey: &str) -> Result<RgbEngine> {
     RgbEngine::open(engine_config(data_dir, rpc, tss_pubkey))
+}
+
+/// A declarations file (`RGB_SIDECAR_CONTRACTS`), written next to the test's data dirs.
+pub fn declarations_file(name: &str, contracts: serde_json::Value) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rgb-sidecar-decls-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create declarations dir");
+    let path = dir.join("contracts.json");
+    std::fs::write(&path, json!({ "contracts": contracts }).to_string()).expect("write declarations");
+    path
 }
 
 pub fn data_dir(name: &str) -> std::path::PathBuf {
