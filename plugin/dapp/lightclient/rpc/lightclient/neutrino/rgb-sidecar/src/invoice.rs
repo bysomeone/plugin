@@ -82,11 +82,22 @@ pub fn consignment_to_bytes<const TRANSFER: bool>(c: &Consignment<TRANSFER>) -> 
 }
 
 pub fn consignment_from_bytes(bytes: &[u8]) -> Result<Consignment<true>> {
+    deserialize_consignment::<true>(bytes)
+}
+
+/// Parse a **genesis** (non-transfer) contract consignment — the form an issuer publishes so
+/// that somebody else can adopt the contract. [`consignment_from_bytes`] only accepts the
+/// transfer form, so adoption needs its own entry point.
+pub fn contract_from_bytes(bytes: &[u8]) -> Result<Consignment<false>> {
+    deserialize_consignment::<false>(bytes)
+}
+
+fn deserialize_consignment<const TRANSFER: bool>(bytes: &[u8]) -> Result<Consignment<TRANSFER>> {
     use amplify::confinement::{Confined, U24};
     use strict_encoding::StrictDeserialize;
     let confined: Confined<Vec<u8>, 0, U24> = Confined::try_from(bytes.to_vec())
         .map_err(|e| anyhow!("consignment too large: {e}"))?;
-    Consignment::<true>::from_strict_serialized::<U24>(confined)
+    Consignment::<TRANSFER>::from_strict_serialized::<U24>(confined)
         .map_err(|e| anyhow!("deserialize consignment: {e}"))
 }
 

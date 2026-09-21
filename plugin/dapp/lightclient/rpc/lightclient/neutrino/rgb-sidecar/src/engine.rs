@@ -23,20 +23,22 @@ use rgbcore::validation::{
 };
 use rgbcore::vm::WitnessOrd;
 use rgbcore::{ChainNet, ContractId, Opout, TxoSeal, Txid};
-use rgbstd::containers::{Consignment, ConsignmentExt, Fascia};
-use rgbstd::contract::{AllocatedState, ContractBuilder, IssuerWrapper, TransitionBuilder};
+use rgbstd::containers::{Consignment, ConsignmentExt, Fascia, ValidContract};
+use rgbstd::contract::{AllocatedState, ContractBuilder, ContractData, IssuerWrapper, TransitionBuilder};
 use rgbstd::invoice::Amount;
 use rgbstd::persistence::fs::FsBinStore;
-use rgbstd::persistence::{ContractStateRead, Stock};
+use rgbstd::persistence::{ContractStateRead, MemContract, Stock};
 use rgbstd::stl::{AssetSpec, ContractTerms, RicardianContract};
 use rgbstd::txout::{BlindSeal, CloseMethod, TxPtr};
 use rgbstd::{Identity, OutputSeal};
 use schemata::InflatableFungibleAsset;
+use strict_types::StrictVal;
 
 use crate::build_store::{key_digest, BuildStore, Pruned};
 use crate::config::Config;
 use crate::invoice::{
-    consignment_from_bytes, consignment_to_bytes, network_to_chainnet, parse_invoice,
+    consignment_from_bytes, consignment_to_bytes, contract_from_bytes, network_to_chainnet,
+    parse_invoice,
 };
 use crate::ledger::{AssetRec, FinalizedWithdrawalRec, Ledger, ReceiveRec, RecordedWithdrawal};
 use crate::rpc::BtcdRpc;
@@ -184,6 +186,12 @@ struct PendingWithdrawal {
     /// Kept until `finalize_withdrawal` so the transition can be merged into the Stock once the
     /// withdrawal is signed (and therefore certain to be broadcast).
     pub fascia: Fascia,
+}
+
+/// A genesis outpoint the TSS wallet holds (see [`RgbEngine::verify_genesis_seal_owned`]).
+struct OwnedSeal {
+    outpoint: OutPoint,
+    btc_value: u64,
 }
 
 /// Result of a finalized withdrawal, kept so a repeated `finalize_withdrawal` is a no-op
@@ -618,8 +626,98 @@ impl RgbEngine {
     }
 
     // ===================================================================
-    // Asset issuance (out-of-band bootstrap; not part of the gRPC contract)
+    // Contract adoption + asset issuance
+    //
+    // A contract enters this sidecar in exactly one way: `adopt_contract`, fed with the
+    // contract's **genesis consignment**. Issuance below goes through the same door — it
+    // builds a contract, exports those very bytes and adopts them, so a contract this bridge
+    // issued is learned exactly like one Tether issued. There is no privileged shortcut.
+    //
+    // Adopting is about *knowledge only*: it never writes a seal. The genesis seal of an
+    // adopted contract belongs to its issuer (an outpoint this bridge has never owned), so
+    // recording it would count somebody else's balance as ours. Balance is claimed separately
+    // and only by the issuer path, which proves the outpoint against the TSS wallet first.
     // ===================================================================
+
+    /// Adopt an externally produced contract from its genesis consignment bytes: parse →
+    /// validate → import into the Stock → register the asset under `symbol`.
+    ///
+    /// `symbol` is this sidecar's own name for the asset (the gRPC `asset_symbol`); the rest of
+    /// the record is read from the contract itself, so the caller cannot misdescribe it.
+    ///
+    /// Writes **no** seal: see the section comment above.
+    pub fn adopt_contract(&mut self, genesis_bytes: &[u8], symbol: &str) -> Result<AssetRec> {
+        if symbol.is_empty() {
+            return Err(anyhow!("adopt_contract: empty symbol"));
+        }
+        let consignment = contract_from_bytes(genesis_bytes)?;
+        let contract_id = consignment.contract_id();
+        let asset_id = contract_id.to_string();
+
+        // One contract ⇔ one sidecar symbol. Both directions are refused explicitly: silently
+        // re-pointing a symbol would strand every seal and receive already recorded under it,
+        // and mapping one contract to two symbols would split the same balance in two.
+        for existing in self.ledger.assets.values() {
+            if existing.symbol == symbol && existing.asset_id == asset_id {
+                return Ok(existing.clone()); // idempotent re-adopt of the very same contract
+            }
+            if existing.symbol == symbol {
+                return Err(PermanentError(format!(
+                    "symbol {symbol} is already registered for contract {} (refusing to re-point it \
+                     at {asset_id})",
+                    existing.asset_id
+                ))
+                .into());
+            }
+            if existing.asset_id == asset_id {
+                return Err(PermanentError(format!(
+                    "contract {asset_id} is already registered as {} (one contract, one symbol)",
+                    existing.symbol
+                ))
+                .into());
+            }
+        }
+
+        let config = self.validation_config();
+        let valid = consignment
+            .validate(&self.resolver, &config)
+            .map_err(|e| anyhow!("genesis consignment invalid: {e}"))?;
+        // Read what the contract says about itself *before* handing it to the Stock (the call
+        // borrows it). Best effort: a schema without the standard `spec` global is still adopted,
+        // it just cannot describe its own ticker/precision.
+        let described = describe_contract(&valid);
+        let resolver = BtcdResolver {
+            rpc: self.rpc.clone(),
+            chain_net: self.chain_net,
+            local_anchors: self.local_anchors.clone(),
+        };
+        self.stock
+            .import_contract(valid, resolver)
+            .map_err(|e| anyhow!("import contract: {e:?}"))?;
+
+        let asset = AssetRec {
+            asset_id,
+            symbol: symbol.to_string(),
+            schema: described.schema,
+            precision: described.precision,
+            issued_supply: described.issued_supply,
+            // Exactly the bytes we were handed: this is what a later Stock rebuild re-imports.
+            genesis_consignment_hex: hex_encode(genesis_bytes),
+        };
+        self.ledger.upsert_asset(asset.clone());
+        self.save()?;
+        Ok(asset)
+    }
+
+    /// The RGB validation context. NOTE: the trusted typesystem is still the IFA one, so an
+    /// adopted contract whose schema pulls in types outside that set fails validation here.
+    fn validation_config(&self) -> ValidationConfig {
+        ValidationConfig {
+            chain_net: self.chain_net,
+            trusted_typesystem: InflatableFungibleAsset::types(),
+            ..Default::default()
+        }
+    }
 
     /// Issue an RGB20 (IFA) fungible asset. The genesis seal is a real TSS UTXO.
     pub fn issue_asset(
@@ -637,6 +735,11 @@ impl RgbEngine {
     }
 
     /// Issue an asset at an explicit genesis outpoint (used by E2E / tests).
+    ///
+    /// Issuance = build + export + adopt: the contract is exported to the very genesis
+    /// consignment an outside issuer would hand us, and then adopted through the one public
+    /// door. The only thing that stays issuer-specific is the *balance*: the genesis UTXO is
+    /// ours here, so `claim_genesis_seal` claims it (and proves it against the TSS wallet).
     pub fn issue_asset_at(
         &mut self,
         symbol: &str,
@@ -668,50 +771,62 @@ impl RgbEngine {
         .add_fungible_state("assetOwner", genesis_seal, Amount::from(issued_supply))?;
 
         let valid_contract = builder.issue_contract()?;
-        let asset_id = valid_contract.contract_id();
+        // The published artifact: a genesis consignment, the same bytes an external issuer
+        // would publish and the same bytes we then adopt (and record for a Stock rebuild).
         let contract: rgbstd::containers::Contract =
             valid_contract.clone().into_consignment().into_contract();
         let genesis_bytes = consignment_to_bytes(&contract)?;
-        let resolver = BtcdResolver {
-            rpc: self.rpc.clone(),
-            chain_net,
-            local_anchors: self.local_anchors.clone(),
-        };
-        self.stock
-            .import_contract(valid_contract, resolver)
-            .map_err(|e| anyhow!("import contract: {e:?}"))?;
 
-        let asset = AssetRec {
-            asset_id: asset_id.to_string(),
-            symbol: symbol.to_string(),
-            schema: "IFA/RGB20".to_string(),
-            precision,
-            issued_supply: issued_supply as i64,
-            genesis_consignment_hex: bitcoin::hex::DisplayHex::to_hex_string(
-                &genesis_bytes,
-                bitcoin::hex::Case::Lower,
-            ),
-        };
-        let btc_value = self
+        // Ownership comes FIRST, and it is a pure check: a refused issuance (an outpoint this
+        // bridge does not hold) must leave the sidecar untouched instead of registering a
+        // contract it can never fund, or a seal nobody can spend.
+        let owned = self.verify_genesis_seal_owned(genesis_utxo)?;
+        let asset = self.adopt_contract(&genesis_bytes, symbol)?;
+        self.claim_genesis_seal(&asset, owned, issued_supply as i64)?;
+        Ok(asset)
+    }
+
+    /// A genesis outpoint the TSS wallet is known to hold, together with its BTC value.
+    ///
+    /// Only [`Self::verify_genesis_seal_owned`] builds one, so [`Self::claim_genesis_seal`] cannot
+    /// be reached without the ownership check having run.
+    fn verify_genesis_seal_owned(&mut self, outpoint: OutPoint) -> Result<OwnedSeal> {
+        self.wallet.sync()?;
+        let utxo = self
             .wallet
             .list_unspent()
             .into_iter()
-            .find(|u| u.outpoint == genesis_utxo)
-            .map(|u| u.value)
-            .unwrap_or(0);
+            .find(|u| u.outpoint == outpoint)
+            .ok_or_else(|| {
+                anyhow!(
+                    "genesis outpoint {outpoint} is not a TSS wallet UTXO: refusing to register it \
+                     as this bridge's balance (an external contract's genesis seal is its issuer's, \
+                     not ours)"
+                )
+            })?;
+        Ok(OwnedSeal { outpoint, btc_value: utxo.value })
+    }
+
+    /// Claim the genesis seal of a contract **this bridge issued itself**: register it as a
+    /// minted seal so the issued supply shows up in the balance.
+    ///
+    /// This is the counterpart of [`Self::adopt_contract`] never writing a seal, and the only
+    /// place a genesis seal can enter the ledger. The [`OwnedSeal`] argument is what makes that
+    /// safe: an adopted contract's genesis seal is its issuer's UTXO, never ours, so it can never
+    /// be passed here — nor claimed by mistake.
+    fn claim_genesis_seal(&mut self, asset: &AssetRec, owned: OwnedSeal, amount: i64) -> Result<()> {
         self.ledger.upsert_seal(SealTxOut {
-            outpoint: format!("{genesis_utxo}"),
-            asset_id: asset_id.to_string(),
-            asset_symbol: symbol.to_string(),
-            amount: issued_supply as i64,
-            btc_value: btc_value as i64,
+            outpoint: format!("{}", owned.outpoint),
+            asset_id: asset.asset_id.clone(),
+            asset_symbol: asset.symbol.clone(),
+            amount,
+            btc_value: owned.btc_value as i64,
             maturity_height: self.synced_height() as u32,
             status: SealStatus::Minted,
             secret_seal_hex: None,
         });
-        self.ledger.upsert_asset(asset.clone());
         self.save()?;
-        Ok(asset)
+        Ok(())
     }
 
     fn pick_genesis_utxo(&mut self) -> Result<OutPoint> {
@@ -771,11 +886,7 @@ impl RgbEngine {
     /// Deterministic consignment validation (no wallet / private-key state).
     pub fn validate_consignment(&mut self, bytes: &[u8]) -> Result<ConsignmentInspection> {
         let consignment = consignment_from_bytes(bytes)?;
-        let config = ValidationConfig {
-            chain_net: self.chain_net,
-            trusted_typesystem: InflatableFungibleAsset::types(),
-            ..Default::default()
-        };
+        let config = self.validation_config();
         let mut inspection = self.inspect(&consignment);
         match consignment.validate(&self.resolver, &config) {
             Ok(_) => inspection.valid = true,
@@ -796,11 +907,7 @@ impl RgbEngine {
         receive_id_hint: Option<&str>,
     ) -> Result<ReceiveRec> {
         let consignment = consignment_from_bytes(bytes)?;
-        let config = ValidationConfig {
-            chain_net: self.chain_net,
-            trusted_typesystem: InflatableFungibleAsset::types(),
-            ..Default::default()
-        };
+        let config = self.validation_config();
         let inspection = self.inspect(&consignment);
         let valid = consignment
             .clone()
@@ -1690,6 +1797,55 @@ fn precision_of(p: u8) -> Result<Precision> {
         8 => Ok(Precision::CentiMicro),
         _ => Err(anyhow!("unsupported precision {p} (supported: 0, 2, 8)")),
     }
+}
+
+/// What a contract says about itself, read off its own genesis state (see [`describe_contract`]).
+struct ContractSelfDescription {
+    /// The schema's own name, e.g. `InflatableFungibleAsset`.
+    schema: String,
+    precision: u8,
+    issued_supply: i64,
+}
+
+/// Read a contract's self-description from its genesis state.
+///
+/// Deliberately *not* taken from the caller: whoever adopts a contract should not be able to
+/// misdescribe it, and the same code path has to serve a contract we issued ourselves and one
+/// somebody else did. Best effort by design — a schema without the standard `spec` global is
+/// still adoptable, it just cannot report its precision (`0`), because refusing the contract
+/// over a missing descriptive field would be worse than reporting an imprecise one.
+fn describe_contract(contract: &ValidContract) -> ContractSelfDescription {
+    let data = contract.contract_data();
+    let precision = global_by_name(&data, "spec")
+        .map(|v| AssetSpec::from_strict_val_unchecked(&v).precision.decimals())
+        .unwrap_or(0);
+    // The genesis fungible allocation *is* the issued supply for an IFA contract (issue builds
+    // exactly one assignment of `issuedSupply`), and it needs no schema-specific field name.
+    let issued_supply = data
+        .state
+        .fungible_all()
+        .map(|a| Amount::from(a.state).value() as i64)
+        .sum();
+    ContractSelfDescription {
+        schema: data.schema.name.to_string(),
+        precision,
+        issued_supply,
+    }
+}
+
+/// A global-state value by its field name, or `None` when the contract's schema does not declare
+/// that field. `ContractData::global` panics on an unknown name, and an outside issuer's schema
+/// is not ours to trust, so the name is checked against the schema first.
+fn global_by_name(data: &ContractData<MemContract>, name: &'static str) -> Option<StrictVal> {
+    let declared = data
+        .schema
+        .global_types
+        .iter()
+        .any(|(_, details)| details.name.as_str() == name);
+    if !declared {
+        return None;
+    }
+    data.global(name).next()
 }
 
 fn rand_hex(n: usize) -> String {
