@@ -39,6 +39,16 @@ fn err(e: anyhow::Error) -> Status {
     }
 }
 
+/// The wire view of a registered asset.
+fn asset_info(a: crate::ledger::AssetRec) -> AssetInfo {
+    AssetInfo {
+        asset_id: a.asset_id,
+        asset_symbol: a.symbol,
+        schema: a.schema,
+        precision: a.precision as u32,
+    }
+}
+
 /// Wire form of a PSBT (C3).
 ///
 /// The per-input **scriptCode rides inside these bytes**: `build_transfer` writes each input's own
@@ -210,17 +220,23 @@ impl RgbSidecar for RgbSidecarService {
         _request: Request<ListAssetsRequest>,
     ) -> Result<Response<ListAssetsResponse>, Status> {
         let engine = self.engine.lock().await;
-        let assets = engine
-            .list_assets()
-            .into_iter()
-            .map(|a| AssetInfo {
-                asset_id: a.asset_id,
-                asset_symbol: a.symbol,
-                schema: a.schema,
-                precision: a.precision as u32,
-            })
-            .collect();
+        let assets = engine.list_assets().into_iter().map(asset_info).collect();
         Ok(Response::new(ListAssetsResponse { assets }))
+    }
+
+    async fn adopt_contract(
+        &self,
+        request: Request<AdoptContractRequest>,
+    ) -> Result<Response<AdoptContractResponse>, Status> {
+        let req = request.into_inner();
+        let mut engine = self.engine.lock().await;
+        // Empty string = "no expectation declared"; the same RPC serves a caller that only has
+        // the bytes and a caller that knows which contract it means.
+        let expected = (!req.expected_asset_id.is_empty()).then_some(req.expected_asset_id.as_str());
+        let asset = engine
+            .adopt_contract(&req.genesis_consignment, &req.symbol, expected)
+            .map_err(err)?;
+        Ok(Response::new(AdoptContractResponse { asset: Some(asset_info(asset)) }))
     }
 
     async fn build_withdrawal(

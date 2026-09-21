@@ -233,8 +233,10 @@ pub fn funding_tx(script: &ScriptBuf, value: u64, marker: u32) -> (Transaction, 
     (tx, outpoint)
 }
 
-pub fn open_engine(data_dir: &std::path::Path, rpc: &str, tss_pubkey: &str) -> Result<RgbEngine> {
-    RgbEngine::open(Config {
+/// The config every integration test points at the mock node; callers may set `contracts` on it
+/// before handing it to [`RgbEngine::open`].
+pub fn engine_config(data_dir: &std::path::Path, rpc: &str, tss_pubkey: &str) -> Config {
+    Config {
         data_dir: data_dir.to_path_buf(),
         btc_rpc_host: rpc.to_string(),
         btc_rpc_user: "root".into(),
@@ -243,7 +245,12 @@ pub fn open_engine(data_dir: &std::path::Path, rpc: &str, tss_pubkey: &str) -> R
         network: Network::Regtest,
         tss_pubkey_hex: tss_pubkey.to_string(),
         grpc_listen: "127.0.0.1:0".into(),
-    })
+        contracts: Vec::new(),
+    }
+}
+
+pub fn open_engine(data_dir: &std::path::Path, rpc: &str, tss_pubkey: &str) -> Result<RgbEngine> {
+    RgbEngine::open(engine_config(data_dir, rpc, tss_pubkey))
 }
 
 pub fn data_dir(name: &str) -> std::path::PathBuf {

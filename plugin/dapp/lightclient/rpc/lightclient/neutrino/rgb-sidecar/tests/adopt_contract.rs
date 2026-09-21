@@ -16,8 +16,12 @@ mod common;
 
 use anyhow::Result;
 use bitcoin::hex::FromHex;
-use common::{data_dir, funding_tx, open_engine, pubkey_hex, p2wpkh, start_mock_btcd};
+use common::{data_dir, engine_config, funding_tx, open_engine, pubkey_hex, p2wpkh, start_mock_btcd};
+use rgb_sidecar::config::load_contract_declarations;
+use rgb_sidecar::engine::RgbEngine;
 use rgbcore::ContractId;
+use serde_json::json;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 const TSS_SECRET: [u8; 32] = [0x11; 32];
@@ -50,7 +54,7 @@ fn a_published_genesis_is_adopted_by_a_fresh_engine_without_a_balance() -> Resul
     assert!(adopter.ledger.assets.is_empty(), "adopter must start with no assets");
     assert!(adopter.list_seals(SYMBOL).is_empty(), "adopter must start with no seals");
 
-    let adopted = adopter.adopt_contract(&genesis_bytes, SYMBOL)?;
+    let adopted = adopter.adopt_contract(&genesis_bytes, SYMBOL, None)?;
 
     // (a) the asset is known, and identical to what the issuer published
     assert_eq!(adopted.asset_id, published.asset_id, "adopted contract id");
@@ -86,11 +90,11 @@ fn a_published_genesis_is_adopted_by_a_fresh_engine_without_a_balance() -> Resul
         .expect("the adopted contract must be usable for a transfer");
 
     // ---- adoption is idempotent, and one contract maps to exactly one symbol ----
-    let again = adopter.adopt_contract(&genesis_bytes, SYMBOL)?;
+    let again = adopter.adopt_contract(&genesis_bytes, SYMBOL, None)?;
     assert_eq!(again.asset_id, adopted.asset_id, "re-adopting the same contract is a no-op");
     assert_eq!(adopter.ledger.assets.len(), 1, "re-adopting must not duplicate the record");
 
-    let same_contract_other_symbol = adopter.adopt_contract(&genesis_bytes, "USDT-COPY");
+    let same_contract_other_symbol = adopter.adopt_contract(&genesis_bytes, "USDT-COPY", None);
     assert!(
         same_contract_other_symbol.is_err(),
         "one contract must not be split across two sidecar symbols"
@@ -107,7 +111,7 @@ fn a_published_genesis_is_adopted_by_a_fresh_engine_without_a_balance() -> Resul
     let other = issuer.issue_asset_at("FAKEUSDT", "Not Tether", 8, 1, other_outpoint)?;
     assert_ne!(other.asset_id, adopted.asset_id, "the two issuances must be different contracts");
     let other_bytes = Vec::<u8>::from_hex(&other.genesis_consignment_hex)?;
-    let stolen = adopter.adopt_contract(&other_bytes, SYMBOL);
+    let stolen = adopter.adopt_contract(&other_bytes, SYMBOL, None);
     assert!(stolen.is_err(), "another contract must not take a symbol already in use");
     assert!(
         format!("{:#}", stolen.unwrap_err()).contains("already registered"),
@@ -160,6 +164,136 @@ fn claiming_a_genesis_seal_the_wallet_does_not_hold_is_refused() -> Result<()> {
     let issued = engine.issue_asset_at(SYMBOL, "Tether USD", 8, ISSUED as u64, own_outpoint)?;
     assert!(!issued.asset_id.is_empty());
     assert_eq!(engine.get_balance(SYMBOL), (ISSUED, 0));
+
+    Ok(())
+}
+
+/// A declarations file (`RGB_SIDECAR_CONTRACTS`), written next to the test's data dirs.
+fn declarations_file(name: &str, contracts: serde_json::Value) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("rgb-sidecar-decls-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create declarations dir");
+    let path = dir.join("contracts.json");
+    std::fs::write(&path, json!({ "contracts": contracts }).to_string()).expect("write declarations");
+    path
+}
+
+/// Batch 2a: the contract is declared in configuration, and **startup** adopts it. A declared
+/// contract that does not hold up must fail the start — degrading to "the asset is not there"
+/// would disguise a deployment mistake as a bridge bug.
+#[test]
+fn a_declared_contract_is_adopted_at_startup() -> Result<()> {
+    let (rpc, chain) = start_mock_btcd();
+    let tss_pubkey = pubkey_hex(&TSS_SECRET);
+    let (_tss_addr, tss_script) = p2wpkh(&TSS_SECRET);
+    let (genesis_funding, genesis_outpoint) = funding_tx(&tss_script, GENESIS_BTC, 1);
+    chain.lock().unwrap().add_tx(genesis_funding);
+
+    // The issuer publishes a contract…
+    let mut issuer = open_engine(&data_dir("decl-issuer"), &rpc, &tss_pubkey)?;
+    let published = issuer.issue_asset_at(SYMBOL, "Tether USD", 8, ISSUED as u64, genesis_outpoint)?;
+
+    // …and the deployment declares it (the shape `RGB_SIDECAR_CONTRACTS` points at).
+    let decl_path = declarations_file(
+        "good",
+        json!([{
+            "symbol": SYMBOL,
+            "assetId": published.asset_id,
+            "genesisConsignment": published.genesis_consignment_hex,
+        }]),
+    );
+
+    let dir = data_dir("decl-sidecar");
+    let deploy = |dir: &std::path::Path| -> Result<RgbEngine> {
+        let mut cfg = engine_config(dir, &rpc, &tss_pubkey);
+        cfg.contracts = load_contract_declarations(&decl_path)?;
+        RgbEngine::open(cfg)
+    };
+
+    let adopter = deploy(&dir)?;
+    assert_eq!(
+        adopter.ledger.asset(SYMBOL).map(|a| a.asset_id.clone()),
+        Some(published.asset_id.clone()),
+        "a declared contract must be adopted during startup"
+    );
+    assert_eq!(adopter.get_balance(SYMBOL), (0, 0), "adoption still grants no balance");
+    assert!(adopter.list_seals(SYMBOL).is_empty(), "adoption still writes no seal");
+    adopter
+        .stock
+        .transition_builder(ContractId::from_str(&published.asset_id)?, "transfer")
+        .expect("the declared contract must be usable in the Stock");
+    drop(adopter);
+
+    // A restart re-applies the same declaration: it must be a no-op, not an error (this is what
+    // every production restart does).
+    let restarted = deploy(&dir)?;
+    assert_eq!(restarted.get_balance(SYMBOL), (0, 0));
+    assert_eq!(restarted.ledger.assets.len(), 1, "a restart must not duplicate the asset");
+
+    Ok(())
+}
+
+/// The tamper case: the bytes are one contract, the declaration names another. That is the
+/// mistake a deployment actually makes (a stale file, a swapped mount, a copy-paste between
+/// entries) and it must stop the start, naming both sides.
+#[test]
+fn a_tampered_declaration_fails_the_start() -> Result<()> {
+    let (rpc, chain) = start_mock_btcd();
+    let tss_pubkey = pubkey_hex(&TSS_SECRET);
+    let (_tss_addr, tss_script) = p2wpkh(&TSS_SECRET);
+    let (f1, op1) = funding_tx(&tss_script, GENESIS_BTC, 1);
+    let (f2, op2) = funding_tx(&tss_script, GENESIS_BTC, 2);
+    {
+        let mut c = chain.lock().unwrap();
+        c.add_tx(f1);
+        c.add_tx(f2);
+    }
+
+    let mut issuer = open_engine(&data_dir("tamper-issuer"), &rpc, &tss_pubkey)?;
+    let mine = issuer.issue_asset_at(SYMBOL, "Tether USD", 8, ISSUED as u64, op1)?;
+    let other = issuer.issue_asset_at("OTHER", "Other USD", 8, 1, op2)?;
+    assert_ne!(mine.asset_id, other.asset_id);
+
+    // (1) mismatched assetId: our consignment, but declared as the other contract.
+    let mismatch = declarations_file(
+        "mismatch",
+        json!([{
+            "symbol": SYMBOL,
+            "assetId": other.asset_id,
+            "genesisConsignment": mine.genesis_consignment_hex,
+        }]),
+    );
+    let mut cfg = engine_config(&data_dir("tamper-mismatch"), &rpc, &tss_pubkey);
+    cfg.contracts = load_contract_declarations(&mismatch)?;
+    let err = match RgbEngine::open(cfg) {
+        Ok(_) => panic!("a declaration that names another contract must fail the start"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("declared contract USDT"), "must name the declaration: {msg}");
+    assert!(
+        msg.contains("is not the contract in the consignment"),
+        "must say the bytes are not that contract: {msg}"
+    );
+    assert!(msg.contains(&other.asset_id) && msg.contains(&mine.asset_id), "must show both ids: {msg}");
+
+    // (2) the mounted hex file is missing: also a start failure, not an empty asset list.
+    let missing = declarations_file(
+        "missing-file",
+        json!([{
+            "symbol": SYMBOL,
+            "assetId": mine.asset_id,
+            "genesisConsignmentFile": "/nonexistent/usdt.genesis.hex",
+        }]),
+    );
+    let mut cfg = engine_config(&data_dir("tamper-missing"), &rpc, &tss_pubkey);
+    cfg.contracts = load_contract_declarations(&missing)?;
+    let err = match RgbEngine::open(cfg) {
+        Ok(_) => panic!("an unreadable consignment file must fail the start"),
+        Err(e) => e,
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("read genesisConsignmentFile"), "got: {msg}");
+    assert!(msg.contains("declared contract USDT"), "got: {msg}");
 
     Ok(())
 }

@@ -19,6 +19,8 @@ service RgbSidecar {
   rpc ListSeals(ListSealsRequest) returns (ListSealsResponse);
   rpc GetBalance(GetBalanceRequest) returns (Balance);
   rpc ListAssets(ListAssetsRequest) returns (ListAssetsResponse);
+  // ---- 合约接入（adopt）----
+  rpc AdoptContract(AdoptContractRequest) returns (AdoptContractResponse);
   // ---- 提现 ----
   rpc BuildWithdrawal(BuildWithdrawalRequest) returns (BuildWithdrawalResponse);
   rpc FinalizeWithdrawal(FinalizeWithdrawalRequest) returns (FinalizeWithdrawalResponse);
@@ -134,6 +136,29 @@ message AssetInfo {
 }
 message ListAssetsResponse {
   repeated AssetInfo assets = 1;
+}
+
+// ================= 合约接入（adopt）=================
+//
+// 一个合约进入侧车只有这一条门：投喂它的 **genesis consignment**，侧车解析 → 校验 → 入 Stock →
+// 登记资产。（发行不走 RPC：它是"造合约 + 导出 genesis consignment + adopt 自己产物"的离线步骤，
+// 见 issue_usdt / engine.issue_asset_at。）
+//
+// **adopt 不写任何 seal。** genesis seal 属于发行方——对 Tether 的合约而言那是侧车从未持有过的
+// outpoint——记成自己的余额就把他人的钱算成了桥的钱。余额只能来自充值（或发行方对自己 UTXO 的显式
+// claim）。
+//
+// 契约是增量的：新增方法 + 新增消息，不动任何既有字段编号与语义 —— 单侧旧实现只在调用时拿到
+// UNIMPLEMENTED，不会静默按旧语义跑。
+message AdoptContractRequest {
+  string symbol = 1;                   // 侧车/桥使用的资产符号（其它 RPC 的 asset_symbol）
+  bytes genesis_consignment = 2;       // 该合约的 genesis consignment（严格序列化字节）
+  // 调用方**期望**的合约 id（rgb:...）。非空时必须与 consignment 里的合约一致 —— 部署时把
+  // "我声明的合约"与"我拿到的字节"对起来，配置串了/字节过期了就当场失败，而不是静默接错资产。
+  string expected_asset_id = 3;
+}
+message AdoptContractResponse {
+  AssetInfo asset = 1;
 }
 
 // ================= 提现 =================

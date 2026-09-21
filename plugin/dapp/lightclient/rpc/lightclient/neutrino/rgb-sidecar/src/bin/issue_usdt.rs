@@ -159,6 +159,7 @@ async fn main() -> Result<()> {
         network: Network::Regtest,
         tss_pubkey_hex: tss_pubkey_hex.clone(),
         grpc_listen: "0.0.0.0:0".into(),
+        contracts: Vec::new(),
     };
     let rpc = Arc::new(BtcdRpc::connect(
         &btc_host,

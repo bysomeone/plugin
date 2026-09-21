@@ -122,6 +122,7 @@ async fn main() -> Result<()> {
         network: Network::Regtest,
         tss_pubkey_hex,
         grpc_listen: "0.0.0.0:0".into(),
+        contracts: Vec::new(),
     };
     let mut engine = RgbEngine::open(cfg)?;
 
