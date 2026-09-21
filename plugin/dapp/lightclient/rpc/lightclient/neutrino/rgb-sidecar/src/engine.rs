@@ -26,7 +26,6 @@ use rgbcore::{ChainNet, ContractId, Opout, TxoSeal, Txid};
 use rgbstd::containers::{Consignment, ConsignmentExt, Fascia, ValidContract};
 use rgbstd::contract::{AllocatedState, ContractBuilder, ContractData, IssuerWrapper, TransitionBuilder};
 use rgbstd::invoice::Amount;
-use rgbstd::persistence::fs::FsBinStore;
 use rgbstd::persistence::{ContractStateRead, MemContract, Stock};
 use rgbstd::stl::{AssetSpec, ContractTerms, RicardianContract};
 use rgbstd::txout::{BlindSeal, CloseMethod, TxPtr};
@@ -42,6 +41,7 @@ use crate::invoice::{
 };
 use crate::ledger::{AssetRec, FinalizedWithdrawalRec, Ledger, ReceiveRec, RecordedWithdrawal};
 use crate::rpc::BtcdRpc;
+use crate::store::{AtomicFsBinStore, StockDirState};
 use crate::types::{recv_status, SealStatus, SealTxOut};
 use crate::wallet::{BtcWallet, WalletUtxo};
 
@@ -210,6 +210,9 @@ pub struct RgbEngine {
     /// 上一次跑归档裁剪的时间（节流：裁剪要列目录，不该跟着 `sync()` 每次都跑）。
     last_prune: Option<std::time::Instant>,
     wallet: BtcWallet,
+    /// The store the `Stock` writes through, kept so a write failure can be reported at the
+    /// engine's persistence boundaries ([`Self::save`]) — see `store::AtomicFsBinStore`.
+    stock_store: AtomicFsBinStore,
     rpc: Arc<BtcdRpc>,
     chain_net: ChainNet,
     tss_script: ScriptBuf,
@@ -226,15 +229,27 @@ impl RgbEngine {
         std::fs::create_dir_all(&cfg.data_dir)?;
         std::fs::create_dir_all(&cfg.stock_dir())?;
 
-        let store = FsBinStore::new(cfg.stock_dir())?;
-        let stock = match Stock::load(store.clone(), true) {
-            Ok(s) => s,
-            Err(_) => {
+        // The RGB consensus state is the one thing that cannot be recomputed (see store.rs): a
+        // torn file must abort the start, and only a genuinely empty directory may be read as
+        // "nothing here yet". Anything in between — a corrupt file, a partial restore — is an
+        // error, and the error carries the file, its size and the reason.
+        let store = AtomicFsBinStore::open(&cfg.stock_dir())
+            .map_err(|e| anyhow!("open stock dir {}: {e}", cfg.stock_dir().display()))?;
+        let stock = match store.state().map_err(|e| anyhow!("{e}"))? {
+            StockDirState::Fresh => {
                 let mut s = Stock::in_memory();
-                s.make_persistent(store, true)
-                    .map_err(|e| anyhow!("make stock persistent: {e:?}"))?;
+                s.make_persistent(store.clone(), true)
+                    .map_err(|e| anyhow!("initialise stock in {}: {e}", cfg.stock_dir().display()))?;
                 s
             }
+            StockDirState::Initialized => Stock::load(store.clone(), true).map_err(|e| {
+                anyhow!(
+                    "load RGB stock from {}: {e} — refusing to start (an empty RGB state next to \
+                     a populated ledger is how a lost or half-restored Stock turns into a bridge \
+                     that silently cannot spend what it thinks it holds)",
+                    cfg.stock_dir().display()
+                )
+            })?,
         };
 
         let mut ledger = Ledger::load(&cfg.ledger_path())?;
@@ -284,6 +299,7 @@ impl RgbEngine {
         let mut engine = Self {
             cfg,
             stock,
+            stock_store: store.clone(),
             ledger,
             builds,
             build_retain_confirmations: build_retain_confirmations_from_env(),
@@ -298,8 +314,16 @@ impl RgbEngine {
             local_anchors,
         };
         // Declared contracts are part of startup, not of the first request that needs them: a
-        // declaration that does not hold up must fail the start (see the method).
+        // declaration that does not hold up must fail the start (see the method). They run before
+        // the consistency check below on purpose — re-adopting is how a ledger whose Stock was lost
+        // gets repaired, so a deployment that declares its contracts can heal itself.
         engine.apply_declared_contracts()?;
+        // A contract adopted during startup whose write failed must not be reported as a healthy
+        // start: the next restart would not find it.
+        if let Some(e) = engine.stock_store.take_write_failure() {
+            return Err(anyhow!("the RGB stock could not be persisted during startup: {e}"));
+        }
+        engine.verify_stock_matches_ledger()?;
         Ok(engine)
     }
 
@@ -307,6 +331,15 @@ impl RgbEngine {
         self.stock
             .store()
             .map_err(|e| anyhow!("stock store: {e:?}"))?;
+        // The stock store records a failed write instead of raising it (rgb-ops turns an error
+        // inside its transactions into `rollback_transaction()`, i.e. a panic — see store.rs).
+        // Reported here, *before* the ledger is written: if the RGB state could not be persisted,
+        // the ledger must not move ahead of it.
+        if let Some(e) = self.stock_store.take_write_failure() {
+            return Err(anyhow!(
+                "the RGB stock could not be persisted, refusing to advance the ledger: {e}"
+            ));
+        }
         self.ledger.save(&self.cfg.ledger_path())?;
         Ok(())
     }
@@ -680,43 +713,42 @@ impl RgbEngine {
         // One contract ⇔ one sidecar symbol. Both directions are refused explicitly: silently
         // re-pointing a symbol would strand every seal and receive already recorded under it,
         // and mapping one contract to two symbols would split the same balance in two.
-        for existing in self.ledger.assets.values() {
-            if existing.symbol == symbol && existing.asset_id == asset_id {
-                return Ok(existing.clone()); // idempotent re-adopt of the very same contract
+        //
+        // (Decided with short immutable borrows and acted on afterwards, because the idempotent
+        // case below needs to mutate the Stock.)
+        let already = self
+            .ledger
+            .assets
+            .values()
+            .find(|a| a.symbol == symbol && a.asset_id == asset_id)
+            .cloned();
+        if let Some(existing) = already {
+            // Idempotent re-adopt — but not a no-op: the ledger knowing an asset does not mean the
+            // Stock holds its contract. A ledger that outlived its Stock (a restore that brought
+            // back `ledger.json` only) is repaired right here, from the genesis consignment the
+            // caller handed us.
+            if !self.stock_has_contract(contract_id) {
+                self.import_genesis(consignment)?;
             }
-            if existing.symbol == symbol {
-                return Err(PermanentError(format!(
-                    "symbol {symbol} is already registered for contract {} (refusing to re-point it \
-                     at {asset_id})",
-                    existing.asset_id
-                ))
-                .into());
-            }
-            if existing.asset_id == asset_id {
-                return Err(PermanentError(format!(
-                    "contract {asset_id} is already registered as {} (one contract, one symbol)",
-                    existing.symbol
-                ))
-                .into());
-            }
+            return Ok(existing);
+        }
+        if let Some(clash) = self.ledger.assets.values().find(|a| a.symbol == symbol) {
+            return Err(PermanentError(format!(
+                "symbol {symbol} is already registered for contract {} (refusing to re-point it \
+                 at {asset_id})",
+                clash.asset_id
+            ))
+            .into());
+        }
+        if let Some(clash) = self.ledger.assets.values().find(|a| a.asset_id == asset_id) {
+            return Err(PermanentError(format!(
+                "contract {asset_id} is already registered as {} (one contract, one symbol)",
+                clash.symbol
+            ))
+            .into());
         }
 
-        let config = self.validation_config();
-        let valid = consignment
-            .validate(&self.resolver, &config)
-            .map_err(|e| anyhow!("genesis consignment invalid: {e}"))?;
-        // Read what the contract says about itself *before* handing it to the Stock (the call
-        // borrows it). Best effort: a schema without the standard `spec` global is still adopted,
-        // it just cannot describe its own ticker/precision.
-        let described = describe_contract(&valid);
-        let resolver = BtcdResolver {
-            rpc: self.rpc.clone(),
-            chain_net: self.chain_net,
-            local_anchors: self.local_anchors.clone(),
-        };
-        self.stock
-            .import_contract(valid, resolver)
-            .map_err(|e| anyhow!("import contract: {e:?}"))?;
+        let described = self.import_genesis(consignment)?;
 
         let asset = AssetRec {
             asset_id,
@@ -730,6 +762,77 @@ impl RgbEngine {
         self.ledger.upsert_asset(asset.clone());
         self.save()?;
         Ok(asset)
+    }
+
+    /// Validate a genesis consignment and put the contract into the Stock (and only that — no
+    /// ledger record, no seal: see [`Self::adopt_contract`] and [`Self::claim_genesis_seal`]).
+    ///
+    /// Returns what the contract says about itself, read before the Stock takes ownership of it.
+    fn import_genesis(
+        &mut self,
+        consignment: Consignment<false>,
+    ) -> Result<ContractSelfDescription> {
+        let config = self.validation_config();
+        let valid = consignment
+            .validate(&self.resolver, &config)
+            .map_err(|e| anyhow!("genesis consignment invalid: {e}"))?;
+        // Best effort: a schema without the standard `spec` global is still adopted, it just cannot
+        // describe its own ticker/precision.
+        let described = describe_contract(&valid);
+        let resolver = BtcdResolver {
+            rpc: self.rpc.clone(),
+            chain_net: self.chain_net,
+            local_anchors: self.local_anchors.clone(),
+        };
+        self.stock
+            .import_contract(valid, resolver)
+            .map_err(|e| anyhow!("import contract: {e:?}"))?;
+        Ok(described)
+    }
+
+    /// Whether the Stock holds this contract (its genesis/state), i.e. whether anything can be
+    /// spent or received for it. The ledger's `assets` and the Stock are two files that a restore
+    /// can separate, which is what the two callers of this check are about.
+    fn stock_has_contract(&self, contract_id: ContractId) -> bool {
+        self.stock.contract_state(contract_id).is_ok()
+    }
+
+    /// Every asset the ledger carries must also be a contract the Stock holds.
+    ///
+    /// Checked at startup, and it **fails the start** rather than warning. The two files are
+    /// written independently, so a backup/restore (or a disk-level rollback) can bring back a
+    /// `ledger.json` that lists an asset whose RGB state is gone. Nothing detects that today: the
+    /// sidecar comes up, reports a balance built from seals it can never spend, accepts deposits it
+    /// cannot settle, and fails — much later, far from the cause, with errors about outpoints and
+    /// transitions that read like consensus bugs. A warning would leave the bridge serving a lie,
+    /// so the only honest options are "stop" or "repair", and repair is the job of
+    /// `adopt_contract` (see `open`): a deployment that declares its contracts heals itself before
+    /// this check runs. For an asset nobody declares, the operator gets this error and a decision
+    /// to make, which is where that decision belongs.
+    fn verify_stock_matches_ledger(&self) -> Result<()> {
+        for asset in self.ledger.assets.values() {
+            let contract_id = ContractId::from_str(&asset.asset_id).map_err(|e| {
+                anyhow!(
+                    "ledger asset {} has an unparsable contract id {:?}: {e}",
+                    asset.symbol,
+                    asset.asset_id
+                )
+            })?;
+            if !self.stock_has_contract(contract_id) {
+                return Err(anyhow!(
+                    "ledger asset {} ({}) is not in the RGB stock ({}): the sidecar state is \
+                     inconsistent — a partial restore, or a stock lost/rolled back while \
+                     ledger.json survived. Refusing to start: every deposit and withdrawal for \
+                     this asset would fail later, nowhere near this cause. Restore a consistent \
+                     backup, or declare the contract so it is re-adopted from its genesis \
+                     consignment (see RGB_SIDECAR_CONTRACTS).",
+                    asset.symbol,
+                    asset.asset_id,
+                    self.cfg.stock_dir().display()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The RGB validation context. NOTE: the trusted typesystem is still the IFA one, so an

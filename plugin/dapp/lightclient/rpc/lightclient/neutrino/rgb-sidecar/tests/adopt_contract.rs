@@ -16,12 +16,14 @@ mod common;
 
 use anyhow::Result;
 use bitcoin::hex::FromHex;
-use common::{data_dir, engine_config, funding_tx, open_engine, pubkey_hex, p2wpkh, start_mock_btcd};
+use common::{
+    data_dir, declarations_file, engine_config, funding_tx, open_engine, pubkey_hex, p2wpkh,
+    start_mock_btcd,
+};
 use rgb_sidecar::config::load_contract_declarations;
 use rgb_sidecar::engine::RgbEngine;
 use rgbcore::ContractId;
 use serde_json::json;
-use std::path::PathBuf;
 use std::str::FromStr;
 
 const TSS_SECRET: [u8; 32] = [0x11; 32];
@@ -166,15 +168,6 @@ fn claiming_a_genesis_seal_the_wallet_does_not_hold_is_refused() -> Result<()> {
     assert_eq!(engine.get_balance(SYMBOL), (ISSUED, 0));
 
     Ok(())
-}
-
-/// A declarations file (`RGB_SIDECAR_CONTRACTS`), written next to the test's data dirs.
-fn declarations_file(name: &str, contracts: serde_json::Value) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rgb-sidecar-decls-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create declarations dir");
-    let path = dir.join("contracts.json");
-    std::fs::write(&path, json!({ "contracts": contracts }).to_string()).expect("write declarations");
-    path
 }
 
 /// Batch 2a: the contract is declared in configuration, and **startup** adopts it. A declared

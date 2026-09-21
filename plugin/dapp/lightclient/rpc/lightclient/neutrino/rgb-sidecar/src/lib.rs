@@ -16,6 +16,7 @@ pub mod invoice;
 pub mod ledger;
 pub mod rpc;
 pub mod service;
+pub mod store;
 pub mod test_sim;
 pub mod types;
 pub mod wallet;
