@@ -240,6 +240,18 @@ function config_para_file() {
     perl -i -pe 's/^enable=.*/enable=true/' "${path}"
     perl -i -pe 's/^waitPid=.*/waitPid=false/' "${path}"
 
+    # 账户钱包从 /root/parawallet 挪进 datadir 卷（[wallet] dbPath 默认 "parawallet"）。
+    #
+    # 为什么：这个钱包持有 authAccount（AUTH_ADDRn）的私钥，而它是**节点身份**级的东西 ——
+    # para 共识的签名钥就来自它（chain33 para 的 commitMsgClient.fetchPriKey →
+    # ExecWalletFunc("wallet", "DumpPrivkey", authAccount)），TSS 的 CommitDKG 提交也用同一把钥。
+    # 放在卷外有两个毛病：① 冷备只打卷 ⇒ 它不在备份集里（丢 key = 该节点再也无法以自己注册在链上的
+    # 地址签名，参考 B5 那一类"不在 datadir 卷里的关键状态"）；② 它在容器可写层 ⇒ 容器一旦重建就丢。
+    # 挪进卷里两个问题一起解决，备份/恢复演练（scripts/backup_test.sh）也就能真的覆盖它。
+    perl -i -pe 's|^dbPath="parawallet"|dbPath="paradatadir/parawallet"|' "${path}"
+    grep -q '^dbPath="paradatadir/parawallet"' "${path}" ||
+        fail "${file}: para wallet dbPath not relocated (chain33.para.toml changed?); expected dbPath=\"paradatadir/parawallet\""
+
     # 用户 BTC 充值地址发放 HTTP（P2WSH C2）。只有官方节点（para1）跑真正的 BTC 桥
     # （btc wallet + 充值 watch 集），也只有它需要"按需 import 用户充值脚本"这个入口；
     # 非官方节点开了也没有钱包可发行（请求会 503），只是多一个空转的监听，故这里关掉。
