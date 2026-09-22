@@ -1065,33 +1065,82 @@ impl RgbEngine {
             .validate(&self.resolver, &config)
             .map_err(|e| anyhow!("consignment invalid: {e}"))?;
 
+        // ⚠️ The hint **narrows** which receive this consignment is for; it must never *skip* the
+        // checking. The Go bridge always sends one (`rgb20/deposit.go:111`), so the un-hinted search
+        // below never runs in production — anything only the search verified was, in practice,
+        // verified nowhere. That was exactly the shape of the bug here: a hinted receive in
+        // WAITING_COUNTERPARTY was taken as the candidate on its status alone, with no comparison
+        // against what the consignment actually delivers. A consignment carrying a different asset,
+        // or a different amount, settled whatever receive was named — and `mark_settled` then wrote
+        // the *delivered* asset and amount into that receive.
+        //
+        // So: every path below compares the consignment against the receive, and a hint that does
+        // not line up is an error rather than a silent fall-through to some other receive (which
+        // would misattribute the consignment instead of rejecting it).
+        let corresponds = |r: &ReceiveRec| {
+            r.asset_id == inspection.asset_id && r.amount_requested == inspection.recipient_amount
+        };
+
+        let hinted = match receive_id_hint {
+            None => None,
+            Some(h) => Some(
+                self.ledger
+                    .receive(h)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("receive_id_hint names unknown receive {h}"))?,
+            ),
+        };
+
         // Idempotent re-settle: the Go bridge uploads the consignment AFTER the test-sim already
         // settled the receive. Return the existing settled record instead of erroring so the bridge
-        // has a consistent view and can proceed to pollTransfers -> submitDeposit.
-        if let Some(h) = receive_id_hint {
-            if let Some(r) = self.ledger.receive(h) {
-                if r.status == recv_status::SETTLED {
-                    return Ok(r.clone());
+        // has a consistent view and can proceed to pollTransfers -> submitDeposit. Only for a
+        // consignment that actually corresponds to that receive — otherwise this is an unrelated
+        // consignment claiming to have settled it.
+        if let Some(r) = &hinted {
+            if r.status == recv_status::SETTLED {
+                if !corresponds(r) {
+                    return Err(anyhow!(
+                        "consignment does not correspond to already-settled receive {}: consignment asset={} amount={}, receive asset={} amount_requested={} settled_amount={}",
+                        r.receive_id,
+                        inspection.asset_id,
+                        inspection.recipient_amount,
+                        r.asset_id,
+                        r.amount_requested,
+                        r.settled_amount
+                    ));
                 }
+                return Ok(r.clone());
+            }
+            // A dead receive (failed/timeout) cannot be settled by any consignment; say so instead
+            // of falling through, which would settle a *different* receive using this hint.
+            if r.status != recv_status::WAITING_COUNTERPARTY {
+                return Err(anyhow!(
+                    "hinted receive {} is in status {} and cannot be settled by a consignment",
+                    r.receive_id,
+                    r.status
+                ));
+            }
+            if !corresponds(r) {
+                return Err(anyhow!(
+                    "consignment does not correspond to hinted receive {}: consignment asset={} amount={}, receive asset={} amount_requested={}",
+                    r.receive_id,
+                    inspection.asset_id,
+                    inspection.recipient_amount,
+                    r.asset_id,
+                    r.amount_requested
+                ));
             }
         }
 
-        let mut candidate = receive_id_hint
-            .and_then(|h| self.ledger.receive(h))
-            .filter(|r| r.status == recv_status::WAITING_COUNTERPARTY)
-            .cloned();
-        if candidate.is_none() {
-            candidate = self
+        let candidate = match &hinted {
+            Some(r) => Some(r.clone()),
+            None => self
                 .ledger
                 .receives
                 .values()
-                .find(|r| {
-                    r.status == recv_status::WAITING_COUNTERPARTY
-                        && r.asset_id == inspection.asset_id
-                        && r.amount_requested == inspection.recipient_amount
-                })
-                .cloned();
-        }
+                .find(|r| r.status == recv_status::WAITING_COUNTERPARTY && corresponds(r))
+                .cloned(),
+        };
         let rec = candidate.ok_or_else(|| {
             anyhow!(
                 "no pending receive matches asset {} amount {}",
