@@ -50,6 +50,22 @@ export COMPOSE_PROJECT_NAME="${PROJECT}"
 # 都放在 docker-compose-rgb20.yml。这样基础文件改动最小，避免与其他分支冲突。
 export COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml:docker-compose-rgb20.yml}"
 
+# 镜像架构：默认跟随**宿主**（见 docker-compose.yml 顶部注释的完整理由）。
+#
+# 关键点：chain33 二进制由 `make build_ci` 按宿主架构编出（Makefile:37-44 的 GOARCH=$(go env
+# GOARCH) / Linux 分支直接 go build），所以**镜像架构必须与它一致**——不能靠改 build_ci 去迁就
+# 镜像，那会把原生 arm64 弄坏。写死 amd64 的后果是 M1 上"amd64 镜像里装着 arm64 二进制"，
+# 靠宿主 binfmt 才跑得起来，且容器里其余一切（shell、btcd、electrs 的 Rust 构建）都在被 QEMU
+# 翻译的 x86-64 环境里，实测把这轮 E2E 拖到 25 分钟。
+# amd64 宿主（含 GitHub Actions runner）推导结果仍是 linux/amd64，行为与改动前逐字相同；
+# 需要强制某个架构时显式设 RGBX_CI_PLATFORM。
+case "$(uname -m)" in
+    arm64|aarch64) _rgbx_host_platform="linux/arm64" ;;
+    x86_64|amd64)  _rgbx_host_platform="linux/amd64" ;;
+    *)             _rgbx_host_platform="linux/amd64" ;;
+esac
+export RGBX_CI_PLATFORM="${RGBX_CI_PLATFORM:-${_rgbx_host_platform}}"
+
 if command -v docker-compose >/dev/null 2>&1; then
     COMPOSE_BIN="docker-compose"
 elif docker compose version >/dev/null 2>&1; then
