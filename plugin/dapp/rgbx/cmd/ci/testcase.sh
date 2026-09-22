@@ -10,6 +10,7 @@
 
 source "${ROOT_DIR}/scripts/btc_test.sh"
 source "${ROOT_DIR}/scripts/rgb20_test.sh"
+source "${ROOT_DIR}/scripts/backup_test.sh"
 
 function testcase_entry() {
     # ---- 旧 BTC 功能用例（Phase 5 屏蔽，保留函数定义；如需启用去掉注释）----
@@ -43,6 +44,12 @@ function testcase_entry() {
     # 依赖 scenario_native_asset_mint 导出的 NATIVE_MINT_TX_HASH（在它成功分支里赋值）。
     # 放最后：它需要一笔"已经确认结算过"的 mint，且失败不该吞掉前面已验过的用例结果。
     scenario_duplicate_confirm_rejected "${NATIVE_MINT_TX_HASH}"
+
+    # ---- 备份/恢复演练（#30 / BACKUP_RECOVERY.md G8）：备 → 真的销毁 → 还原 → 充值 + 提现 ----
+    # 放在**整个入口的最后**：它会销毁并还原 main/para1-4/侧车的全部数据（含主链、TSS share、
+    # libp2p 身份私钥、侧车账本），失败时环境停在"已销毁"态 —— 那会盖掉后面所有用例的结果，
+    # 所以它必须是最后一个。跳过方式：RGBX_BACKUP_DRILL=0。
+    run_backup_drill_all
 }
 
 # 供 scripts/btc_test.sh 顶层分组调用（当前未启用）。

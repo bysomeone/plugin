@@ -309,8 +309,18 @@ function wait_bridge_signing_ready() {
 # RGB20 充值 E2E
 # =====================================================================
 
+# scenario_rgb20_deposit [request_id] [amount]
+#
+# request_id 默认 rgb20-dep-1；**同一进程里第二次调用必须换一个**——CreateReceive 按 requestId
+# 幂等，复用同一个 id 拿到的是上一轮那个 receive（可能已 settled），于是场景看着"跑到了 user_pay"，
+# 实际在给一个旧 receive 重付款，失败信息会指向别处（余额/psbt），排查成本很高。
+# 冷备演练就是在同一个进程里第二次调它，故显式传 drill 专用的 id（见 backup_test.sh）。
+# amount 默认 RGB20_DEPOSIT_AMOUNT；同样给演练留了压额度的口子（付款方是桥自己的 seal，
+# 可支配额度受"备份那一刻账本还剩多少 minted seal"限制）。
 function scenario_rgb20_deposit() {
-    log_step "scenario: RGB20 deposit (user pay -> sidecar settle -> TSS deposit sign -> chain33 mint)"
+    local request_id="${1:-rgb20-dep-1}"
+    local deposit_amount="${2:-${RGB20_DEPOSIT_AMOUNT}}"
+    log_step "scenario: RGB20 deposit (user pay -> sidecar settle -> TSS deposit sign -> chain33 mint) requestId=${request_id} amount=${deposit_amount}"
     local before
     before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
 
@@ -318,7 +328,7 @@ function scenario_rgb20_deposit() {
     local rec_json
     rec_json=$(curl -s -X POST http://127.0.0.1:17000/rgbx/v1/deposit \
         -H 'Content-Type: application/json' \
-        -d "{\"requestId\":\"rgb20-dep-1\",\"assetSymbol\":\"${RGB20_SYMBOL}\",\"amount\":${RGB20_DEPOSIT_AMOUNT},\"chain33Addr\":\"${USER_MAIN_ADDR}\"}")
+        -d "{\"requestId\":\"${request_id}\",\"assetSymbol\":\"${RGB20_SYMBOL}\",\"amount\":${deposit_amount},\"chain33Addr\":\"${USER_MAIN_ADDR}\"}")
     local receive_id invoice
     receive_id=$(echo "${rec_json}" | jq -r '.data.receiveId // empty')
     invoice=$(echo "${rec_json}" | jq -r '.data.invoice // empty')
