@@ -296,6 +296,13 @@ function drill_ledger_fingerprint() {
     echo "${json}" | jq -r '"assets=" + ((.assets // {}) | keys | join(",")) + " seals=" + ((.seals // {}) | length | tostring) + " spendable=" + (([.seals[]? | select((.status | ascii_downcase) != "consumed") | .amount] | add // 0) | tostring)'
 }
 
+# display 口径的余额（"0.0004"）→ 最小单位整数（40000）。
+# 换算系数 1e8 是 chain33 侧的统一口径：withdraw 的 -a 也是 display 口径，rgb20_withdraw_once
+# 里用 amount/100000000 反算就能对上；同一笔账在账本指纹里显示为 spendable=40000。
+function drill_balance_min_units() {
+    awk -v b="${1}" 'BEGIN{printf "%d", b * 100000000}'
+}
+
 # 账本里**真正花得出去**的额度：只有 status=minted 的 seal 能被 select_seals 选中
 # （rgb-sidecar/src/ledger.rs:248-270，条件是 `s.status == SealStatus::Minted`）。
 #
@@ -485,7 +492,22 @@ function scenario_cold_backup_restore() {
 
     # 提现腿：不依赖桥的 minted 余额（用户在 chain33 侧销毁、桥从 BTC 主池付款），所以它是
     # **无条件**的可用性证明——恢复后的桥真的还能签名、还能对外付款。
-    rgb20_withdraw_once "${RGB20_WITHDRAW_AMOUNT}" "post-restore"
+    #
+    # 但金额必须跟着**还原后的实际余额**走。用户余额是主套件充值/提现循环的残余（实测 0.0004
+    # = 40000 最小单位），而默认 RGB20_WITHDRAW_AMOUNT=500000 比它大 12 倍 —— 直接用默认值
+    # 必然 ErrInsufficientBalance，看起来像"还原后不能提现"，实则是金额选错了。
+    # 取一半，给销毁/手续费留空间。
+    local bal_units withdraw_after
+    bal_units=$(drill_balance_min_units "${balance_after}")
+    if [ "${bal_units}" -lt 2 ] 2>/dev/null; then
+        fail "restored balance too small to withdraw (${balance_after} = ${bal_units} min units): a restored-but-empty balance cannot be told apart from a failed restore here — check the before/after balance assertion above first"
+    fi
+    withdraw_after=$(( bal_units / 2 ))
+    if [ "${withdraw_after}" -gt "${RGB20_WITHDRAW_AMOUNT}" ]; then
+        withdraw_after="${RGB20_WITHDRAW_AMOUNT}"
+    fi
+    log_step "post-restore withdraw amount: ${withdraw_after} min units (restored balance ${balance_after} = ${bal_units} min units; cap ${RGB20_WITHDRAW_AMOUNT})"
+    rgb20_withdraw_once "${withdraw_after}" "post-restore"
 
     log_step "cold backup/restore drill PASSED: state restored byte-for-byte and the bridge still mints+burns"
     log_step "artifact kept at ${package} (harness output dir; not a deliverable — the durable copy is off-host)"
