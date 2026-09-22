@@ -4,6 +4,8 @@
 //! drives the E2E **without touching `proto/rgb_sidecar.proto`**:
 //!   - `POST /sim/user_pay`          build an UNSIGNED transfer (bridge USDT -> receive invoice)
 //!   - `POST /sim/user_pay_submit`   broadcast a TSS-signed PSBT + provide consignment (settle)
+//!   - `POST /sim/provide_consignment`  provide a consignment with no broadcast (drives the
+//!                                  attribution path and its refusals on their own)
 //!   - `POST /sim/user_invoice`      create a user-side RGB invoice (withdraw E2E)
 //!   - `GET  /sim/status`            debug status (assets / balance / seal count)
 //!
@@ -72,6 +74,17 @@ pub trait SimulateExt {
         consignment_hex: &str,
         receive_id: &str,
     ) -> Result<SimPayResult>;
+    /// Provide a consignment directly, broadcasting nothing.
+    ///
+    /// `simulate_user_pay_submit` broadcasts first, so it cannot re-present an
+    /// **already-broadcast** consignment to a different receive — the retry dies in `broadcast`
+    /// before the attribution logic is reached, and a test asserting on the refusal would be
+    /// asserting on the wrong error. This entry point exists for exactly that negative case.
+    fn simulate_provide_consignment(
+        &mut self,
+        consignment_hex: &str,
+        receive_id: &str,
+    ) -> Result<(String, String)>;
     fn build_user_invoice(&mut self, asset_symbol: &str, amount: i64) -> Result<String>;
 }
 
@@ -149,6 +162,16 @@ impl SimulateExt for RgbEngine {
             status: rec.status,
             txid: txid.to_string(),
         })
+    }
+
+    fn simulate_provide_consignment(
+        &mut self,
+        consignment_hex: &str,
+        receive_id: &str,
+    ) -> Result<(String, String)> {
+        let rec = self.provide_consignment(&hex_decode(consignment_hex), Some(receive_id))?;
+        self.sync()?;
+        Ok((rec.receive_id, rec.status))
     }
 
     fn build_user_invoice(&mut self, asset_symbol: &str, amount: i64) -> Result<String> {
@@ -323,6 +346,23 @@ async fn handle(buf: &[u8], engine: Arc<Mutex<RgbEngine>>) -> Vec<u8> {
                         "consignment": hex_encode(&out.consignment),
                         "txid": out.txid.to_string(),
                         "symbol": out.symbol,
+                    }))
+                    .unwrap_or_default(),
+                ),
+                Err(e) => http_error(500, &format!("{e:#}")),
+            }
+        }
+        ("POST", "/sim/provide_consignment") => {
+            let req: serde_json::Value = serde_json::from_str(&body_str).unwrap_or(serde_json::json!({}));
+            let cons_hex = req["consignment"].as_str().unwrap_or("");
+            let receive_id = req["receive_id"].as_str().unwrap_or("");
+            if cons_hex.is_empty() || receive_id.is_empty() {
+                return http_error(400, "consignment, receive_id required");
+            }
+            match eng.simulate_provide_consignment(cons_hex, receive_id) {
+                Ok((rid, status)) => http_response(
+                    &serde_json::to_vec(&serde_json::json!({
+                        "receive_id": rid, "status": status,
                     }))
                     .unwrap_or_default(),
                 ),

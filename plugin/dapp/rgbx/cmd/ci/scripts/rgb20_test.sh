@@ -389,6 +389,70 @@ function scenario_rgb20_deposit() {
         fail "deposit first attribution used a stale receive record: $(echo "${deposit_logs}" | grep -m1 'empty txid')"
     fi
     log_step "RGB20 deposit: first attribution succeeded without retry (no empty txid)"
+
+    # 供 E16 负例复用：这笔已 settle 的 consignment 与它对应的 receive。
+    # 复用而不是再造一笔，是为了**不额外消耗流动性** —— 付款方是桥自己的 seal（见文件头）。
+    RGB20_SETTLED_CONSIGNMENT="${cons_hex}"
+    RGB20_SETTLED_RECEIVE_ID="${receive_id}"
+}
+
+# E16 · consignment 必须与它被指到的 receive 对应（hint 是**缩小范围**，不是**跳过校验**）
+#
+# 为什么必须测它：Go 桥**总是**带 receive_id_hint（rgb20/deposit.go:111），所以
+# provide_consignment 里"按 asset+amount 搜索"那条分支在生产里从不执行 —— 校验只能落在 hint
+# 这条路上。修之前 hint 路径只看 status，于是**任何**一笔合法 consignment 都能结算掉被点名的
+# receive，而 mark_settled 会把 consignment **实际交付的** asset/amount 写进那条 receive。
+#
+# 负例不额外消耗流动性：拿上面那笔已 settle 的 consignment（对应 receive R1 / 金额 A），
+# 去结算一条**金额不同**的新 receive R2。修之前会成功并结掉 R2；现在必须被拒。
+#
+# 走 /sim/provide_consignment 而不是 /sim/user_pay_submit：后者**先广播**再结算
+# （test_sim.rs 的 simulate_user_pay_submit），拿同一笔已上链的 psbt 再提交会死在广播上，
+# 断言到的就不是这条校验了。
+function scenario_rgb20_consignment_hint_mismatch() {
+    log_step "scenario: a consignment must correspond to the receive it is hinted at (E16)"
+    assert_non_empty "${RGB20_SETTLED_CONSIGNMENT}" \
+        "E16 needs the settled consignment from scenario_rgb20_deposit (run it first)"
+    assert_non_empty "${RGB20_SETTLED_RECEIVE_ID}" \
+        "E16 needs the settled receive id from scenario_rgb20_deposit"
+
+    # R2：资产相同、金额不同（+1 最小单位即足以判别）。
+    local other_amount=$(( RGB20_DEPOSIT_AMOUNT + 1 ))
+    local rec2 receive2
+    rec2=$(curl -s -X POST http://127.0.0.1:17000/rgbx/v1/deposit \
+        -H 'Content-Type: application/json' \
+        -d "{\"requestId\":\"rgb20-hint-mismatch\",\"assetSymbol\":\"${RGB20_SYMBOL}\",\"amount\":${other_amount},\"chain33Addr\":\"${USER_MAIN_ADDR}\"}")
+    receive2=$(echo "${rec2}" | jq -r '.data.receiveId // empty')
+    assert_non_empty "${receive2}" "E16 could not create the second receive: ${rec2}"
+    log_step "  R1=${RGB20_SETTLED_RECEIVE_ID} (settled, amount=${RGB20_DEPOSIT_AMOUNT}) -> R2=${receive2} (waiting, amount=${other_amount})"
+
+    # 拿"对应 R1 的 consignment"去结算 R2。
+    local out
+    out=$(curl -s -X POST http://127.0.0.1:50064/sim/provide_consignment \
+        -H 'Content-Type: application/json' \
+        -d "{\"consignment\":\"${RGB20_SETTLED_CONSIGNMENT}\",\"receive_id\":\"${receive2}\"}")
+
+    # 必须是"与 hint 指定的 receive 不对应"，而不是"找不到匹配的 pending receive" ——
+    # 后者说明实现把 hint 丢在一边、退回了那条（生产里不执行的）搜索分支，等于校验没生效。
+    if echo "${out}" | grep -q 'no pending receive matches'; then
+        fail "E16: the hint was ignored and the code fell through to the un-hinted search — the asset/amount check did not run on the hinted receive (response: ${out})"
+    fi
+    if ! echo "${out}" | grep -q 'does not correspond to hinted receive'; then
+        fail "E16: a consignment for ${RGB20_DEPOSIT_AMOUNT} settled a receive asking for ${other_amount} — expected a refusal naming the hinted receive, got: ${out}"
+    fi
+    echo "${out}" | grep -q "${receive2}" ||
+        fail "E16: refusal does not name the hinted receive ${receive2}: ${out}"
+
+    # 正对照：同一笔 consignment 配**它自己的** receive，应当幂等返回 settled。
+    # 没有这一条，上面的"被拒"可能只是端点坏了或永远报错 —— 那样断言就没有判别力。
+    local ok
+    ok=$(curl -s -X POST http://127.0.0.1:50064/sim/provide_consignment \
+        -H 'Content-Type: application/json' \
+        -d "{\"consignment\":\"${RGB20_SETTLED_CONSIGNMENT}\",\"receive_id\":\"${RGB20_SETTLED_RECEIVE_ID}\"}")
+    echo "${ok}" | grep -q '"status":"settled"' ||
+        fail "E16 positive control failed: the same consignment with its own receive must settle idempotently, got: ${ok}"
+
+    log_step "PASS: E16 consignment/receive mismatch refused (hint checked, not bypassed); positive control OK"
 }
 
 # =====================================================================
@@ -931,6 +995,9 @@ function run_rgb20_all() {
     run_rgb20_env
     run_rgb20_sidecar_genesis_withdraw_probe
     scenario_rgb20_deposit
+    # E16 紧跟充值场景：它复用那笔已 settle 的 consignment 与 receive（不额外消耗流动性），
+    # 且断言的是充值刚走过的同一条归属路径。
+    scenario_rgb20_consignment_hint_mismatch
     scenario_rgb20_withdraw
     scenario_rgb20_two_withdrawals
     scenario_rgb20_truncation_withdraw
