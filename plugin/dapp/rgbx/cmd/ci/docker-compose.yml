@@ -1,6 +1,14 @@
+# 镜像架构：跟随宿主，由 docker-compose.sh 按 uname -m 推导成 RGBX_CI_PLATFORM（可显式覆盖）。
+#
+# 不要在这里写死 linux/amd64。chain33 二进制是 `make build_ci` 按 `go env GOARCH` 编出来的
+# （Makefile:37-44），在 M1 上是 linux/arm64；写死 amd64 会让镜像架构与镜像里的二进制不符 ——
+# 之所以还能跑，是靠宿主 binfmt 把静态 arm64 ELF 接走，代价是容器里其余一切（shell、btcd、
+# electrs 的 Rust 构建）全走 QEMU 翻译，本地实测把这轮 E2E 拖到 25 分钟。Docker Desktop 也会
+# 对这个镜像挂 "image may have poor performance ... via emulation" 警告。
+# amd64 宿主（含 GitHub Actions runner）上推导结果仍是 linux/amd64，行为不变。
 services:
   main:
-    platform: linux/amd64
+    platform: ${RGBX_CI_PLATFORM:-linux/amd64}
     build:
       context: .
     environment:
@@ -13,7 +21,7 @@ services:
       - main-data:/root/datadir
 
   para1:
-    platform: linux/amd64
+    platform: ${RGBX_CI_PLATFORM:-linux/amd64}
     build:
       context: .
     environment:
@@ -35,7 +43,7 @@ services:
       - "17001:17001"
 
   para2:
-    platform: linux/amd64
+    platform: ${RGBX_CI_PLATFORM:-linux/amd64}
     build:
       context: .
     environment:
@@ -48,7 +56,7 @@ services:
       - para2-data:/root/paradatadir
 
   para3:
-    platform: linux/amd64
+    platform: ${RGBX_CI_PLATFORM:-linux/amd64}
     build:
       context: .
     environment:
@@ -61,7 +69,7 @@ services:
       - para3-data:/root/paradatadir
 
   para4:
-    platform: linux/amd64
+    platform: ${RGBX_CI_PLATFORM:-linux/amd64}
     build:
       context: .
     environment:
@@ -74,7 +82,7 @@ services:
       - para4-data:/root/paradatadir
 
   btcd:
-    platform: linux/amd64
+    platform: ${RGBX_CI_PLATFORM:-linux/amd64}
     # RPC TLS cert auto-gen uses os.Hostname(); must match Docker DNS name "btcd"
     # so para/lightclient can dial btcd:18443 without SAN mismatch.
     hostname: btcd
