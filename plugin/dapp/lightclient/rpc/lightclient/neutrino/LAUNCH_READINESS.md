@@ -72,7 +72,16 @@ if uint32(bks.Len()) < threshold {
 
 **我们的状态**：chain33 与 plugin 对 `addshare` 的引用是 **0** —— **底层有、我们没接**。所以「加节点」不是"底层做不到"，而是**没接线**。
 
-> ⚠️ **但接上能不能直接跑，尚未验证**：`addshare` 是方案无关层，其产出能否**直接喂给 CGGMP 的 sign**（CGGMP 签名还需 partialPubKey 等材料）我**没有验证**，此处不下结论。要确定得像 E14/#55 那样上**可执行探针**：在 regtest 上加第 5 个节点跑一轮 addshare，再用新集合签一笔。
+**接线可行性与所需改法（2026-09-22 已查实）**
+
+- **产出物**：两个 `Result` **同构**（`addshare/{newpeer,oldpeer}/addshare.go:34-39`）：`{PartialPublicKeys, PublicKey, Share, Bks}`。老节点的 share 不变（底层多项式没动，addshare 只是给新节点算一个新增值点），Bks 只**多一项**新 bk。
+- **不能直接喂 CGGMP sign**：`cggmp/sign/sign.go:40` 除上述之外还要 **`paillierKey`（本节点 Paillier 私钥）** 与 **`ped`（全体 Pedersen 参数）**，而 `ped` 不是可选项（`round_1.go:124,150` 与 `round_3/4` 直接解引用 ⇒ 缺项即 nil deref；我们的 wrapper 已挡这一条，见 `system/crypto/tss/cggmp/result.go:248` 的 `validateSignMaterial`）。
+- **但能直接喂 GG18 sign** —— 这是**库自带集成测试实测**的：`gg18/integration/tss_test.go` 的 Step 5（:168-241）跑 newpeer+oldpeer addshare 并把 share/bks 写回，Step 6（:243-248）用新集合继续签名（`-ginkgo.focus='3 of \(0,0,0\)$'` 通过）。⇒ addshare 的 (share, bks) 在 Birkhoff 层**本来就是合法签名输入**，缺的纯粹是 CGGMP 额外那两样。
+- **正解：`addshare → refresh → sign`**（**不重跑 DKG，群公钥不变**）。refresh 就是 CGGMP 的 Paillier/Pedersen provisioning 阶段，且它接受**任意内部自洽的旧状态**作输入（`refresh/round_3.go:202,225-236`）。三处断言的是同一个 `ValidatePublicKey`（DKG `dkg/3_result_handler.go:110`、refresh `refresh/round_3.go:233`、addshare `newpeer/addshare_test.go:143`）。
+- **落到我们这边**：用 addshare 结果**重建一个 `DKGResult`**（`PubX/PubY/Rid` 沿用，`Share/Bks/PartialPubKeys` 换掉），再原样调现有的 `cggmp.ProcessRefresh` → `ProcessSign`。**两个 wrapper 都不用改** —— 已核：`ProcessRefresh(peers, threshold, dkgRes *DKGResult, …)`（`api.go:147`），而 `aliceResult()`（`result.go:105-116`）正是从 `DKGResult` 取 `Share`/`Bks`/`Rid`/公钥，另加 `validatePartialPubKeys`。**真正要新写的是 addshare 本身的接线**（newpeer/oldpeer + 消息通道），两仓引用数确实为 0。
+- **两条硬约束**：① `newPeerRank` 必须 **< threshold**（求和是 `for i := newrank; i < threshold`，`birkhoffinterpolation.go:251`；rank ≥ threshold 时系数恒 0、新 share=0，端点自校验会**报错**而非静默）；② Bks **有两份** —— 库里的那份与我们的 `selectSignerCombination`/`validateSignerCombination`（`tss.go:668/694`）读的那份，重建 `DKGResult` 时**要一起换**。新节点 rank 建议 **0**。
+
+> ⚠️ **仍未实测的部分**：`addshare → refresh → sign` 的**完整串联**没跑过 —— **库没有这条测试**，上面是从入参契约 + 三处同一断言推得的，不是实测。上线前应补一条可执行探针（在 regtest 上加第 5 个节点，走完 addshare→refresh 后用新集合签一笔）。
 
 **对上线的含义不变**：这件事牵扯密钥生命周期（改错了直接锁死资金），**上线前不做**。但理由从"底层不支持"更正为"底层支持、我们没接、且接线后需实测"。
 
