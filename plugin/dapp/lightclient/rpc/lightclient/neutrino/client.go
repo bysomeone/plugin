@@ -214,11 +214,20 @@ func (n *neutrinoClient) Start() {
 	if n.rgb20 != nil {
 		go func() {
 			n.waitUntilDone("rgb20 connect", func() bool {
-				if err := n.rgb20.Connect(n.ctx); err != nil {
-					log.Debug("Start rgb20 connect retry", "err", err)
-					return false
+				err := n.rgb20.Connect(n.ctx)
+				if err == nil {
+					return true
 				}
-				return true
+				if errors.Is(err, rgb20.ErrContractPrecisionMismatch) {
+					// 配置声明的精度与合约自述的精度对不上（或合约根本没声明精度）——**静态分歧**，
+					// 重试多少次也不会变。金额换算的精度只能来自合约（见 rgb20.VerifyContractPrecisions），
+					// 按一个错的值换算会让金额整体差 10^n 倍且全程静默，所以这里与 TSS share 自检同一取向，
+					// fail-closed 拒绝启动，而不是带着一个会算错钱的桥继续跑。
+					log.Error("Start rgb20 contract precision check failed, refuse to start", "err", err)
+					panic(err)
+				}
+				log.Debug("Start rgb20 connect retry", "err", err)
+				return false
 			}, time.Second*3)
 			log.Info("Start rgb20 sidecar connected")
 		}()

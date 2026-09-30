@@ -40,7 +40,19 @@ pub struct AssetRec {
     pub asset_id: String,
     pub symbol: String,
     pub schema: String,
-    pub precision: u8,
+    /// The precision the **contract** declares, or `None` when it declares none.
+    ///
+    /// `None` is not `0`: `0` is a real precision (indivisible), `None` is "the contract's schema
+    /// has no `spec` global". The distinction is persisted (and travels over the wire as
+    /// [`crate::service::PRECISION_UNKNOWN`]) because everything that scales a user-facing decimal
+    /// amount by `10^precision` must be able to tell "the issuer said 0" from "nobody said
+    /// anything" — the second case must fail closed, not round to a guess.
+    ///
+    /// A record written before this field was optional carries `precision: 0`, which serde reads
+    /// back as `Some(0)`; such a ledger belongs to a deployment whose contract does state its
+    /// precision, and the bridge's startup check reports the disagreement by value.
+    #[serde(default)]
+    pub precision: Option<u8>,
     pub issued_supply: i64,
     /// Hex of the serialized genesis contract consignment (so the contract can be
     /// re-imported if the Stock is rebuilt).
@@ -442,8 +454,7 @@ mod tests {
 
     /// A record written before O3 (no `seal_set_digest`) must still load — `serde(default)`.
     #[test]
-    fn finalized_record_without_digest_still_loads() {
-        let dir = temp_dir("oldfin");
+    fn finalized_record_without_digest_still_loads() {        let dir = temp_dir("oldfin");
         let path = dir.join("ledger.json");
         fs::create_dir_all(&dir).unwrap();
         let node = serde_json::json!({
@@ -457,6 +468,62 @@ mod tests {
         let rec = l.finalized_withdrawals.get("aa").unwrap();
         assert_eq!(rec.seal_set_digest, None);
         assert_eq!(rec.change_outpoint.as_deref(), Some("aa:2"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn asset(precision_field: &str) -> serde_json::Value {
+        serde_json::json!({
+            "asset_id": "rgb:test", "symbol": "USDT", "schema": "InflatableFungibleAsset",
+            "issued_supply": 1, "genesis_consignment_hex": "00",
+            "precision": serde_json::from_str::<serde_json::Value>(precision_field).unwrap(),
+        })
+    }
+
+    /// The precision must survive a restart **without being rounded**: it is the only thing that
+    /// tells a later amount conversion how to scale, and `None` (the contract declares nothing) is
+    /// not the same as `Some(0)` (an indivisible asset).
+    #[test]
+    fn asset_precision_round_trips_unknown_distinct_from_zero() {
+        let dir = temp_dir("assetprec");
+        let path = dir.join("ledger.json");
+        fs::create_dir_all(&dir).unwrap();
+        for (field, want) in [("null", None), ("0", Some(0)), ("6", Some(6)), ("8", Some(8))] {
+            let node = serde_json::json!({
+                "assets": {"USDT": asset(field)}, "seals": {}, "receives": {},
+                "settled_by_outpoint": {}, "finalized_withdrawals": {}
+            });
+            fs::write(&path, serde_json::to_vec_pretty(&node).unwrap()).unwrap();
+            let l = Ledger::load(&path).unwrap();
+            assert_eq!(
+                l.assets.get("USDT").map(|a| a.precision),
+                Some(want),
+                "precision field {field} must read back as {want:?} (and be written back as such)"
+            );
+            // And it must be *written* the same way (a restart must not change the meaning).
+            let l2 = Ledger::load(&path).unwrap();
+            assert_eq!(l2.assets.get("USDT").map(|a| a.precision), Some(want));
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A ledger written before `precision` became optional has a plain `"precision": 0`, which
+    /// reads back as `Some(0)` — *not* as "unknown". The bridge's startup check then reports the
+    /// disagreement by value (config vs 0) instead of quietly treating the asset as unverifiable.
+    #[test]
+    fn a_legacy_zero_precision_is_known_zero_not_unknown() {
+        let dir = temp_dir("legacyprec");
+        let path = dir.join("ledger.json");
+        fs::create_dir_all(&dir).unwrap();
+        let node = serde_json::json!({
+            "assets": {"USDT": {
+                "asset_id": "rgb:test", "symbol": "USDT", "schema": "InflatableFungibleAsset",
+                "precision": 0, "issued_supply": 1, "genesis_consignment_hex": "00"
+            }},
+            "seals": {}, "receives": {}, "settled_by_outpoint": {}, "finalized_withdrawals": {}
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&node).unwrap()).unwrap();
+        let l = Ledger::load(&path).unwrap();
+        assert_eq!(l.assets.get("USDT").map(|a| a.precision), Some(Some(0)));
         let _ = fs::remove_dir_all(&dir);
     }
 }

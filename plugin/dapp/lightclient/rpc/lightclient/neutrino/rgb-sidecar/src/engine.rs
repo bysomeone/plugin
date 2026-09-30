@@ -750,6 +750,21 @@ impl RgbEngine {
 
         let described = self.import_genesis(consignment)?;
 
+        // "Adoptable, but it must be loud": a contract that does not state its precision is still
+        // adopted (refusing it over a missing descriptive field would be worse — the same
+        // reasoning as `describe_contract`), but the sidecar says so here, and the bridge refuses
+        // to serve the asset instead of scaling amounts by a number nobody stated. The warning
+        // fires on every adopt of such a contract, including the one at startup.
+        if described.precision.is_none() {
+            eprintln!(
+                "WARNING: contract {asset_id} (symbol {symbol}) does not declare its precision \
+                 (its schema has no `spec` global): adopted, but its amounts have no scale. The \
+                 asset is reported with precision=unknown, and the bridge refuses to start for it \
+                 until the deployment's rgb20.contracts[].precision is reconciled with the \
+                 contract -- amounts must never be scaled by a guess."
+            );
+        }
+
         let asset = AssetRec {
             asset_id,
             symbol: symbol.to_string(),
@@ -2003,7 +2018,14 @@ fn precision_of(p: u8) -> Result<Precision> {
 struct ContractSelfDescription {
     /// The schema's own name, e.g. `InflatableFungibleAsset`.
     schema: String,
-    precision: u8,
+    /// The contract's own precision, or `None` when it does not declare one.
+    ///
+    /// **`None` is not `0`.** `0` is a real precision (an indivisible asset); `None` means the
+    /// contract's schema has no `spec` global, so the contract has said nothing about how its
+    /// amounts are scaled. Collapsing the two (as this code used to, via `unwrap_or(0)`) makes
+    /// "we don't know" indistinguishable from "the issuer told us it is indivisible" — and the
+    /// bridge then scales a user's decimal input by a number nobody ever stated.
+    precision: Option<u8>,
     issued_supply: i64,
 }
 
@@ -2012,13 +2034,15 @@ struct ContractSelfDescription {
 /// Deliberately *not* taken from the caller: whoever adopts a contract should not be able to
 /// misdescribe it, and the same code path has to serve a contract we issued ourselves and one
 /// somebody else did. Best effort by design — a schema without the standard `spec` global is
-/// still adoptable, it just cannot report its precision (`0`), because refusing the contract
-/// over a missing descriptive field would be worse than reporting an imprecise one.
+/// still adoptable, because refusing a contract over a missing descriptive field would be worse
+/// than accepting it. But "accepted" is not "silent": the missing precision comes back as `None`,
+/// [`RgbEngine::adopt_contract`] warns about it, and it is reported over the wire as
+/// [`crate::service::PRECISION_UNKNOWN`] so the bridge can refuse to serve the asset rather than
+/// guess its scale (see `CONFIG.md` §4.4.3).
 fn describe_contract(contract: &ValidContract) -> ContractSelfDescription {
     let data = contract.contract_data();
     let precision = global_by_name(&data, "spec")
-        .map(|v| AssetSpec::from_strict_val_unchecked(&v).precision.decimals())
-        .unwrap_or(0);
+        .map(|v| AssetSpec::from_strict_val_unchecked(&v).precision.decimals());
     // The genesis fungible allocation *is* the issued supply for an IFA contract (issue builds
     // exactly one assignment of `issuedSupply`), and it needs no schema-specific field name.
     let issued_supply = data

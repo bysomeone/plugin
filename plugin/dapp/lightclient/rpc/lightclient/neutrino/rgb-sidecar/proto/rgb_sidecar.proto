@@ -132,6 +132,11 @@ message AssetInfo {
   string asset_id = 1;                 // rgb:...
   string asset_symbol = 2;
   string schema = 3;                   // RGB20/IFA 等
+  // 资产的小数位。**未知用 4294967295（u32::MAX / math.MaxUint32）表示**，它与 0 必须可区分：
+  // 0 是真实精度（不可分割资产），"未知"表示合约的 schema 没有 `spec` global、从未声明过精度。
+  // proto3 的 uint32 没有 presence（缺省与显式 0 同字节），所以只能用精度空间之外的哨兵值承载
+  // "未知"。两侧的常量名：Rust `rgb_sidecar::service::PRECISION_UNKNOWN`、Go `rgb20.PrecisionUnknown`；
+  // 桥对未知精度 **fail-closed**（拒绝启动，不按猜测换算金额），见 CONFIG.md §4.4.3。
   uint32 precision = 4;
 }
 message ListAssetsResponse {

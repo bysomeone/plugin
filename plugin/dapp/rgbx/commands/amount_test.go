@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"testing"
 
+	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/stretchr/testify/require"
 )
 
@@ -109,7 +110,7 @@ func Test_parseDecimalAmount_NoOffByOne_Sweep(t *testing.T) {
 		}
 
 		// 新实现
-		got, err := parseDecimalAmount(arg, withdrawAmountDecimals)
+		got, err := parseDecimalAmount(arg, btcWithdrawDecimals)
 		require.NoError(t, err, "arg=%q", arg)
 		if got != i {
 			exactLost++
@@ -127,7 +128,7 @@ func Test_parseDecimalAmount_NoOffByOne_Sweep(t *testing.T) {
 // 下表每个值在旧实现（float64 相乘 + int64 截断）下都会少 1（0.00060000 -> 59999、
 // 0.00000003 -> 2），精确换算必须给出原值。
 func Test_WithdrawAmount_TruncationProneValues(t *testing.T) {
-	require.Equal(t, 8, withdrawAmountDecimals)
+	require.Equal(t, 8, btcWithdrawDecimals)
 	prone := map[string]int64{
 		"0.00060000":        60000,
 		"0.00000003":        3,
@@ -144,13 +145,13 @@ func Test_WithdrawAmount_TruncationProneValues(t *testing.T) {
 		require.NotEqual(t, want, int64(f*math.Pow(10, 8)),
 			"arg=%q: old float path was already exact; pick a truncation-prone value", arg)
 
-		got, err := parseDecimalAmount(arg, withdrawAmountDecimals)
+		got, err := parseDecimalAmount(arg, btcWithdrawDecimals)
 		require.NoError(t, err, "arg=%q", arg)
 		require.Equal(t, want, got, "arg=%q", arg)
 	}
 
 	// 带空格的非法输入必须报错，而不是被当成 0.0006。
-	_, err := parseDecimalAmount("0.0006 0000", withdrawAmountDecimals)
+	_, err := parseDecimalAmount("0.0006 0000", btcWithdrawDecimals)
 	require.Error(t, err)
 }
 
@@ -162,7 +163,7 @@ func Test_WithdrawCmd_AmountFlagIsExact(t *testing.T) {
 
 	argv, err := cmd.Flags().GetString("amount")
 	require.NoError(t, err, "amount flag must be a string flag")
-	amount, err := parseDecimalAmount(argv, withdrawAmountDecimals)
+	amount, err := parseDecimalAmount(argv, btcWithdrawDecimals)
 	require.NoError(t, err)
 	require.Equal(t, int64(60000), amount)
 
@@ -170,7 +171,7 @@ func Test_WithdrawCmd_AmountFlagIsExact(t *testing.T) {
 	require.NoError(t, cmd.Flags().Set("amount", "0.00060000"))
 	argv, err = cmd.Flags().GetString("amount")
 	require.NoError(t, err)
-	amount, err = parseDecimalAmount(argv, withdrawAmountDecimals)
+	amount, err = parseDecimalAmount(argv, btcWithdrawDecimals)
 	require.NoError(t, err)
 	require.Equal(t, int64(60000), amount)
 }
@@ -179,4 +180,107 @@ func Test_pow10(t *testing.T) {
 	for n := 0; n <= 8; n++ {
 		require.Equal(t, int64(math.Pow(10, float64(n))), pow10(n))
 	}
+}
+
+// resolveWithdrawDecimals 的每一档都必须有出处；**没有出处就报错**，绝不回落成 8。
+// 这一组测试钉住的正是"静默 10^n 倍金额错误"那个缺口。
+func Test_resolveWithdrawDecimals(t *testing.T) {
+	const usdt = "RGB20_USDT" // 桥接符号（rtypes.IsRgb20Symbol）
+
+	t.Run("显式精度优先于一切", func(t *testing.T) {
+		// 即便链上有资产记录且精度不同，也以显式声明为准（调用方读的是合约）。
+		got, err := resolveWithdrawDecimals(usdt, 6, "RGB20_USDT", 8)
+		require.NoError(t, err)
+		require.Equal(t, 6, got)
+	})
+
+	t.Run("BTC 固定 8 位小数", func(t *testing.T) {
+		for _, s := range []string{"BTC", "btc", "Btc"} {
+			got, err := resolveWithdrawDecimals(s, -1, "", 0)
+			require.NoError(t, err, "symbol=%s", s)
+			require.Equal(t, 8, got)
+		}
+	})
+
+	t.Run("非 8 精度的链上资产按其自身精度换算", func(t *testing.T) {
+		got, err := resolveWithdrawDecimals("MYTOKEN", -1, "MYTOKEN", 6)
+		require.NoError(t, err)
+		require.Equal(t, 6, got, "精度 6 必须照用，不能取 8")
+	})
+
+	t.Run("精度 0 的链上资产是合法的", func(t *testing.T) {
+		got, err := resolveWithdrawDecimals("NFTLIKE", -1, "NFTLIKE", 0)
+		require.NoError(t, err)
+		require.Equal(t, 0, got)
+	})
+
+	t.Run("桥接的 RGB20 资产没给 -p 就拒绝", func(t *testing.T) {
+		err := func() error { _, e := resolveWithdrawDecimals(usdt, -1, "", 0); return e }()
+		require.Error(t, err, "must not silently assume 8")
+		require.Contains(t, err.Error(), "RGB20")
+		require.Contains(t, err.Error(), "-p/--precision")
+		// 即使链上碰巧有一条该符号的资产记录也不能信：桥接符号的口径只在合约里。
+		_, err = resolveWithdrawDecimals(usdt, -1, "RGB20_USDT", 8)
+		require.Error(t, err, "a chain record must not be trusted for a bridged symbol")
+	})
+
+	t.Run("既没 -p 也没链上记录时拒绝", func(t *testing.T) {
+		_, err := resolveWithdrawDecimals("UNKNOWN", -1, "", 0)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "UNKNOWN")
+	})
+
+	t.Run("超出链上口径的精度拒绝", func(t *testing.T) {
+		_, err := resolveWithdrawDecimals("WEIRD", -1, "WEIRD", rtypes.MaxPrecision+1)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "above the maximum")
+
+		_, err = resolveWithdrawDecimals("WEIRD", rtypes.MaxPrecision+1, "", 0)
+		require.Error(t, err)
+	})
+
+	t.Run("显式精度上界", func(t *testing.T) {
+		got, err := resolveWithdrawDecimals("X", rtypes.MaxPrecision, "", 0)
+		require.NoError(t, err)
+		require.Equal(t, int(rtypes.MaxPrecision), got)
+	})
+}
+
+// 端到端口径：精度 6 的资产，-a 1.5 必须换算成 1_500_000 个最小单位（而不是 1.5e8）。
+func Test_resolveWithdrawDecimals_DrivesTheConversion(t *testing.T) {
+	decimals, err := resolveWithdrawDecimals("RGB20_USDT", 6, "", 0)
+	require.NoError(t, err)
+
+	amount, err := parseDecimalAmount("1.5", decimals)
+	require.NoError(t, err)
+	require.Equal(t, int64(1_500_000), amount, "精度 6 下 1.5 个 USDT = 1.5e6 最小单位")
+
+	// 同一串在 8 位口径下是 1.5e8 —— 相差 100 倍，这正是"静默算错钱"的形态。
+	amount8, err := parseDecimalAmount("1.5", btcWithdrawDecimals)
+	require.NoError(t, err)
+	require.Equal(t, int64(150_000_000), amount8)
+	require.Equal(t, int64(100), amount8/amount)
+
+	// 超出精度的输入必须报错，而不是静默截断成另一个金额。
+	_, err = parseDecimalAmount("1.5000001", decimals)
+	require.Error(t, err)
+}
+
+// withdraw 命令的精度 flag 必须存在、默认 -1（"未指定"），且不与其他 flag 的简写冲突
+// （`-a/-f/-d/-s/-p`；`send` 是 DisableFlagParsing 的手工解析，`-k` 由它自己摘掉）。
+func Test_WithdrawCmd_PrecisionFlag(t *testing.T) {
+	cmd := withdrawAssetCMD()
+	require.NotNil(t, cmd.Flags().Lookup("precision"))
+	p := cmd.Flags().ShorthandLookup("p")
+	require.NotNil(t, p, "-p 是 harness 与运维要用的简写")
+	require.Equal(t, "precision", p.Name)
+
+	got, err := cmd.Flags().GetInt32("precision")
+	require.NoError(t, err)
+	require.Equal(t, int32(-1), got, "默认必须是 -1：0 是合法精度，不能拿它当'未指定'")
+
+	require.NoError(t, cmd.Flags().Set("precision", "6"))
+	got, err = cmd.Flags().GetInt32("precision")
+	require.NoError(t, err)
+	require.Equal(t, int32(6), got)
 }

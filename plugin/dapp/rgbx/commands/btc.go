@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/33cn/chain33/types"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
@@ -654,6 +655,11 @@ func withdrawAssetFlags(cmd *cobra.Command) {
 	cmd.Flags().Int64P("feeRate", "f", 1, "btc fee rate (sat/vbyte)")
 	cmd.Flags().StringP("destinationAddr", "d", "", "btc destination address")
 	cmd.Flags().StringP("assetSymbol", "s", rtypes.BTCSymbol, "cross-chain asset symbol")
+	// -a 的十进制口径（小数位数）。不填时按资产自己声明的精度走（BTC=8、链上资产记录=它自己的
+	// 精度）；桥接的 RGB20 资产**必须**显式给出 —— 那个值只存在于合约里，CLI 读不到，猜错就是
+	// 10^n 倍的静默金额错误（见 resolveWithdrawDecimals）。
+	cmd.Flags().Int32P("precision", "p", -1,
+		"decimal places of the asset's amounts (required for bridged RGB20 assets; default: the asset's own precision)")
 	markRequired(cmd, "amount", "feeRate", "destinationAddr")
 }
 
@@ -662,8 +668,21 @@ func withdrawAsset(cmd *cobra.Command, _ []string) {
 	feeRate, _ := cmd.Flags().GetInt64("feeRate")
 	destAddr, _ := cmd.Flags().GetString("destinationAddr")
 	symbol, _ := cmd.Flags().GetString("assetSymbol")
+	precisionFlag, _ := cmd.Flags().GetInt32("precision")
 
-	amount, err := parseDecimalAmount(amountStr, withdrawAmountDecimals)
+	// 只有在需要"问链上"的时候才查：BTC 固定 8、RGB20 查了也查不到（桥接符号链上没有资产记录），
+	// 显式给了 -p 就更不用查。多一次 RPC 不多，但没必要把"查不到"和"没查"混在一起。
+	chainAsset := &rtypes.RgbxAsset{}
+	if precisionFlag < 0 && !strings.EqualFold(symbol, rtypes.BTCSymbol) && !rtypes.IsRgb20Symbol(symbol) {
+		sendQueryRPC(cmd, "GetAsset", &types.ReqString{Data: symbol}, chainAsset, true)
+	}
+
+	decimals, err := resolveWithdrawDecimals(symbol, precisionFlag, chainAsset.GetSymbol(), chainAsset.GetPrecision())
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "%v\n", err)
+		return
+	}
+	amount, err := parseDecimalAmount(amountStr, decimals)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "%v\n", err)
 		return

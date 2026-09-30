@@ -61,7 +61,7 @@ fn a_published_genesis_is_adopted_by_a_fresh_engine_without_a_balance() -> Resul
     // (a) the asset is known, and identical to what the issuer published
     assert_eq!(adopted.asset_id, published.asset_id, "adopted contract id");
     assert_eq!(adopted.symbol, SYMBOL);
-    assert_eq!(adopted.precision, 8, "precision read from the contract itself");
+    assert_eq!(adopted.precision, Some(8), "precision read from the contract itself");
     assert_eq!(adopted.issued_supply, ISSUED, "genesis allocation read from the contract");
     assert_eq!(
         adopted.schema, "InflatableFungibleAsset",
@@ -287,6 +287,78 @@ fn a_tampered_declaration_fails_the_start() -> Result<()> {
     let msg = format!("{err:#}");
     assert!(msg.contains("read genesisConsignmentFile"), "got: {msg}");
     assert!(msg.contains("declared contract USDT"), "got: {msg}");
+
+    Ok(())
+}
+
+/// Precision is a property of the contract, and adoption must carry it through **verbatim**.
+///
+/// The bug this pins: the sidecar used to read a missing `spec` global as precision `0`, and the
+/// bridge never read the value at all (it scaled every decimal amount by a hard-coded `1e8`). An
+/// asset whose contract declares 6 decimals therefore moved in units 100× off, silently. Here the
+/// contract declares 6 (the real USDT case) and nothing on the way in may round it to 8 or to 0.
+///
+/// The contract is built by hand rather than via `issue_asset_at` because the sidecar's own
+/// issuance only offers 0/2/8 — an *external* issuer may declare anything RGB supports, which is
+/// exactly the case adoption has to get right.
+#[test]
+fn a_non_default_precision_is_carried_through_adoption() -> Result<()> {
+    use bitcoin::hashes::Hash;
+    use rgbinvoice::Precision;
+    use rgbstd::contract::{ContractBuilder, IssuerWrapper};
+    use rgbstd::invoice::Amount;
+    use rgbstd::stl::{AssetSpec, ContractTerms, RicardianContract};
+    use rgbstd::txout::BlindSeal;
+    use rgbstd::Identity;
+    use schemata::InflatableFungibleAsset;
+
+    let (rpc, chain) = start_mock_btcd();
+    let tss_pubkey = pubkey_hex(&TSS_SECRET);
+    let (_tss_addr, tss_script) = p2wpkh(&TSS_SECRET);
+    let (genesis_funding, genesis_outpoint) = funding_tx(&tss_script, GENESIS_BTC, 7);
+    chain.lock().unwrap().add_tx(genesis_funding);
+
+    let (_issuer_addr, issuer_script) = p2wpkh(&[0x33; 32]);
+    let (issuer_funding, issuer_outpoint) = funding_tx(&issuer_script, GENESIS_BTC, 8);
+    chain.lock().unwrap().add_tx(issuer_funding);
+
+    // ---- an outside issuer publishes a genesis consignment at precision 6 ----
+    let spec = AssetSpec::with(SYMBOL, "Tether USD", Precision::Micro, None)?;
+    let terms = ContractTerms { text: RicardianContract::default(), media: None };
+    let genesis_seal = BlindSeal::<bitcoin::Txid>::new_random(
+        issuer_outpoint.txid,
+        issuer_outpoint.vout,
+    );
+    let builder = ContractBuilder::with(
+        Identity::default(),
+        InflatableFungibleAsset::schema(),
+        InflatableFungibleAsset::types(),
+        InflatableFungibleAsset::scripts(),
+        rgb_sidecar::invoice::network_to_chainnet(bitcoin::Network::Regtest),
+    )
+    .add_global_state("spec", spec)?
+    .add_global_state("terms", terms)?
+    .add_global_state("issuedSupply", Amount::from(ISSUED as u64))?
+    .add_global_state("maxSupply", Amount::from(ISSUED as u64))?
+    .add_fungible_state("assetOwner", genesis_seal, Amount::from(ISSUED as u64))?;
+    let contract: rgbstd::containers::Contract =
+        builder.issue_contract()?.into_consignment().into_contract();
+    let genesis_bytes = rgb_sidecar::invoice::consignment_to_bytes(&contract)?;
+
+    // ---- a sidecar adopts it: the declared precision must come back, unrounded ----
+    let mut engine = open_engine(&data_dir("adopt-precision-6"), &rpc, &tss_pubkey)?;
+    let adopted = engine.adopt_contract(&genesis_bytes, SYMBOL, None)?;
+    assert_eq!(
+        adopted.precision,
+        Some(6),
+        "the contract's own precision must be adopted verbatim (6, the real USDT case)"
+    );
+    assert_ne!(adopted.precision, Some(8), "precision must not be rounded to the old 1e8 hardcode");
+    assert_ne!(adopted.precision, Some(0), "a declared precision must not collapse to indivisible");
+    assert_ne!(adopted.precision, None, "a contract that DOES declare its precision is not unknown");
+
+    // The same value is what the wire carries (a None would become the unknown sentinel).
+    assert_eq!(adopted.precision.map(u32::from), Some(6));
 
     Ok(())
 }

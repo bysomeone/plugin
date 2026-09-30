@@ -474,9 +474,11 @@ function rgb20_withdraw_once() {
         -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${amount}}" | jq -r '.invoice // empty')
     assert_non_empty "${user_invoice}" "rgb20 user invoice empty (${label})"
 
-    # 2. chain33 发起提现（destinationAddr=invoice；CLI 硬编码 *1e8，反算 -a 口径）
+    # 2. chain33 发起提现（destinationAddr=invoice；-a 口径 = 1e8，反算）
+    #    -p 是**必须**的：桥接符号（RGB20_*）的精度只在合约里，CLI 读不到，因此 CLI 拒绝对它猜
+    #    （见 rgbx/commands 的 resolveWithdrawDecimals）。这里传的就是合约发行时的精度。
     amt=$(awk "BEGIN{printf \"%.8f\", ${amount}/100000000}")
-    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
+    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -p "${RGB20_PRECISION}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
     assert_length "${withdraw_hash}" 66 "rgb20 withdraw tx hash (${label})"
 
     # 3. 等桥确认销毁（本轮这笔 pending 清除 = rgbx Confirm 已提交）
@@ -648,8 +650,9 @@ function scenario_rgb20_truncation_withdraw() {
     assert_non_empty "${user_invoice}" "rgb20 truncation user invoice empty"
 
     # 2. chain33 发起提现（-a 口径 = min units / 1e8；旧实现下 ${RGB20_TRUNCATION_WITHDRAW_AMOUNT} 会少 1）
+    #    -p 传合约精度（桥接符号 CLI 不猜，见 rgbx/commands 的 resolveWithdrawDecimals）。
     amt=$(awk "BEGIN{printf \"%.8f\", ${RGB20_TRUNCATION_WITHDRAW_AMOUNT}/100000000}")
-    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
+    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -p "${RGB20_PRECISION}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
     assert_length "${withdraw_hash}" 66 "rgb20 truncation withdraw tx hash"
 
     # 3. 断言 burn 额（链上 pending）== invoice 额。浮点截断时这里是 59999。
