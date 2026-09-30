@@ -1,6 +1,9 @@
 # BTC 跨链演示环境 · 部署与对接手册
 
-> 交付分支：`demo/btc-crosschain`。读者：需要把整套 BTC 跨链系统跑起来、并对接前端做演示的工程师。
+> **代码仓库**：https://github.com/bysomeone/plugin （公开 fork，无需额外授权）
+> **交付分支**：`demo/btc-crosschain`
+>
+> 读者：需要把整套 BTC 跨链系统跑起来、并对接前端做演示的工程师。
 
 ## 一、这是什么
 
