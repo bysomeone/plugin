@@ -228,6 +228,10 @@ func TestRgbx_Exec_Deposit(t *testing.T) {
 	cfg := types.NewChain33Config(types.GetDefaultCfgstring())
 	api.On("GetConfig").Return(cfg)
 	r.SetStateDB(state)
+	// 执行器按**链上登记的类别**决定门禁分支，所以这条跨链资产必须先有记录（真实链上由
+	// CommitDKG 建；缺失一律 fail-closed）。
+	setCrossChainInfoForTest(t, state, "btc", rtypes.CrossChainAssetBtc, rtypes.BTCChainPrecision,
+		newP2WSHDepositFixture(t, frozenVectorA).tssPub)
 
 	// S2 起 Exec_Deposit 是 fail-closed 的：解析不出规范 txid（空/非规范证明）就整笔失败，
 	// 而不是"铸了资产但不写台账"（后者会让供应量少算，把合法的后续提现挡在退出闸门外）。

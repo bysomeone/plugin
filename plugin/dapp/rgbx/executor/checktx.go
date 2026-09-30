@@ -15,6 +15,8 @@ import (
 
 var (
 	ErrInvalidSymbolLength              = errors.New("invalid asset symbol length")
+	ErrInvalidAssetKind                 = errors.New("invalid cross chain asset kind")
+	ErrCrossChainPrecisionAlreadySet    = errors.New("cross chain asset precision already set")
 	ErrInvalidAssetAmount               = errors.New("invalid asset amount")
 	ErrInvalidMetaHashLength            = errors.New("invalid meta hash length")
 	ErrNilGenesisOut                    = errors.New("nil genesis output")
@@ -143,6 +145,8 @@ func (r *rgbx) CheckTx(tx *types.Transaction, index int) error {
 		err = r.checkDeposit(txHash, action.GetDeposit())
 	case rtypes.TyWithdrawAsset:
 		err = r.checkWithdraw(tx.From(), txHash, action.GetWithdraw())
+	case rtypes.TyCrossChainMetaAction:
+		err = r.checkCrossChainMeta(txHash, tx.From(), action.GetCrossChainMeta())
 	case rtypes.TyConfirmAction:
 		err = r.checkConfirm(tx.From(), txHash, action.GetConfirm())
 	default:
@@ -286,6 +290,19 @@ func (r *rgbx) checkCommitDKG(txHash, fromAddr string, commitDKG *rtypes.CommitD
 		elog.Error("checkCommitDKG invalid symbol charset", "txHash", txHash, "symbol", symbol)
 		return ErrInvalidAssetSymbol
 	}
+	// 资产类别与精度在建记录时就要落定，且两者必须配套（见 checkCrossChainAssetMeta）：
+	// 类别决定该符号之后所有充值/提现走哪条门禁分支，精度是前端/CLI 换算金额的唯一依据。
+	kind := rtypes.CrossChainAssetKind(commitDKG.GetAssetKind())
+	if !kind.Valid() {
+		elog.Error("checkCommitDKG invalid asset kind", "txHash", txHash, "symbol", symbol,
+			"assetKind", commitDKG.GetAssetKind())
+		return ErrInvalidAssetKind
+	}
+	if err := checkCommitDKGPrecision(kind, commitDKG.GetPrecision()); err != nil {
+		elog.Error("checkCommitDKG invalid precision", "txHash", txHash, "symbol", symbol,
+			"assetKind", kind.String(), "precision", commitDKG.GetPrecision(), "err", err)
+		return err
+	}
 	pkScript, err := r.decodeBtcAddressScript(commitDKG.GetDkgAddress())
 	if err != nil || !bytes.Equal(pkScript, commitDKG.GetPkScript()) {
 		elog.Error("checkCommitDKG decode btc address script", "txHash", txHash,
@@ -332,13 +349,101 @@ func (r *rgbx) checkCommitDKG(txHash, fromAddr string, commitDKG *rtypes.CommitD
 	return nil
 }
 
+// checkCommitDKGPrecision 校验 CommitDKG 里声明的精度与该资产类别是否配套。
+//
+// 两个类别对精度的可取值完全不同，理由都是"当时并不知道别的值"：
+//   - BTC 类：恒为 BTCChainPrecision（8）。它是 BTC 最小单位的协议定义，不依赖任何外部读数，
+//     所以不允许提交者填别的值（否则前端按错的口径换算，静默差 10^n 倍）。
+//   - RGB20 类：**只能是 PrecisionUnknown**。真实精度只能来自合约，而合约在 DKG 提交时往往
+//     还没发行 / 还没被侧车采纳（"连侧车"与"等 DKG"是启动路径上两条独立的 goroutine），
+//     所以不允许在这里猜；真实值由桥核对出合约精度后经 crossChainAssetMeta 一次性回填
+//     （见 checkCrossChainMeta）。
+func checkCommitDKGPrecision(kind rtypes.CrossChainAssetKind, precision uint32) error {
+	switch kind {
+	case rtypes.CrossChainAssetBtc:
+		if precision != rtypes.BTCChainPrecision {
+			return ErrInvalidAssetPrecision
+		}
+	case rtypes.CrossChainAssetRgb20:
+		if precision != rtypes.PrecisionUnknown {
+			return ErrInvalidAssetPrecision
+		}
+	default:
+		return ErrInvalidAssetKind
+	}
+	return nil
+}
+
+// checkCrossChainMeta 跨链资产精度回填（crossChainAssetMeta）的链上校验。
+//
+// 为什么需要这条动作、而不是靠二次 CommitDKG 补写：CommitDKG 的语义是"每个 symbol 只提交一次"
+// （组公钥不可替换，重复提交一律 ErrDuplicateDKGCommit），精度又不可能随首次提交带来（见
+// checkCommitDKGPrecision）。回填是**一次性**的：只在记录还是 PrecisionUnknown 时接受，
+// 或者幂等地重复提交同一个值；已经回填过别的值一律拒绝（后写覆盖前写会让"链上精度"失去意义）。
+//
+// 提交者受与 CommitDKG 相同的 guardian 白名单约束：精度在链上无法自证（没有预言机、也不该有），
+// 只能由受信集合提交 —— 否则任何人都能把某个资产的精度改成别的值，让前端/CLI 静默算错金额。
+func (r *rgbx) checkCrossChainMeta(txHash, fromAddr string, meta *rtypes.CrossChainAssetMeta) error {
+	symbol := meta.GetAssetSymbol()
+	if !isValidSymbolCharset(symbol) {
+		elog.Error("checkCrossChainMeta invalid symbol charset", "txHash", txHash, "symbol", symbol)
+		return ErrInvalidAssetSymbol
+	}
+	precision := meta.GetPrecision()
+	if !rtypes.IsKnownPrecision(precision) || precision > rtypes.MaxPrecision {
+		elog.Error("checkCrossChainMeta invalid precision", "txHash", txHash, "symbol", symbol,
+			"precision", precision, "maxPrecision", rtypes.MaxPrecision)
+		return ErrInvalidAssetPrecision
+	}
+	guardianAddrs, err := r.getGuardianNodeAddress(rgbxCfg.GuardianParachainTitle)
+	if err != nil {
+		elog.Error("checkCrossChainMeta getGuardianNodeAddress", "txHash", txHash, "symbol", symbol, "err", err)
+		return ErrGetGuardianNodeAddress
+	}
+	if !strings.Contains(guardianAddrs, fromAddr) {
+		elog.Error("checkCrossChainMeta invalid committer", "txHash", txHash, "symbol", symbol, "fromAddr", fromAddr)
+		return ErrInvalidGuardianCommitter
+	}
+	info, err := r.getCrossChainInfo(symbol)
+	if err != nil {
+		elog.Error("checkCrossChainMeta getCrossChainInfo", "txHash", txHash, "symbol", symbol, "err", err)
+		return ErrGetCrossChainInfo
+	}
+	// 只有 RGB20 类的精度需要回填（BTC 类建记录时就是链上常量），类别对不上说明这条记录的
+	// 类别登记与提交者理解不一致，拒绝而不是照写。
+	if !rtypes.IsRgb20CrossChainAsset(info) {
+		elog.Error("checkCrossChainMeta asset is not an rgb20 asset", "txHash", txHash, "symbol", symbol,
+			"assetKind", info.GetAssetKind())
+		return ErrInvalidAssetKind
+	}
+	switch {
+	case info.GetPrecision() == rtypes.PrecisionUnknown:
+		// 首次回填。
+	case info.GetPrecision() == precision:
+		// 幂等重发（多个 guardian 各自核对后都会提交一次）。
+	default:
+		elog.Error("checkCrossChainMeta precision already backfilled with another value", "txHash", txHash,
+			"symbol", symbol, "onChainPrecision", info.GetPrecision(), "submittedPrecision", precision)
+		return ErrCrossChainPrecisionAlreadySet
+	}
+	return nil
+}
+
 func (r *rgbx) checkWithdraw(fromAddr, txHash string, withdraw *rtypes.WithdrawAsset) error {
 
 	symbol := ensureCrossChainSymbol(withdraw.GetAssetSymbol())
 
+	// 走哪条分支看**链上登记的资产类别**（不再看 symbol 字面量）：类别未知 / 记录缺失都
+	// fail-closed（早拒比事后卡住好，而且拿错类别会把 RGB20 提现按 BTC 地址解码处理）。
+	info, err := r.getCrossChainInfo(withdraw.GetAssetSymbol())
+	if err != nil {
+		elog.Error("checkWithdraw getCrossChainInfo", "txHash", txHash, "symbol", withdraw.GetAssetSymbol(), "err", err)
+		return ErrGetCrossChainInfo
+	}
+
 	// RGB20 分支：destinationAddr 是用户 RGB 钱包 invoice（非 BTC 地址），跳过地址解码；
 	// 金额下限按 token 最小单位口径，不套用 BTC dust（546 sat）。
-	if rtypes.IsRgb20Symbol(withdraw.GetAssetSymbol()) {
+	if rtypes.IsRgb20CrossChainAsset(info) {
 		if withdraw.GetAmount() < minRgb20WithdrawAmount {
 			elog.Error("checkWithdraw rgb20 amount", "txHash", txHash, "amount", withdraw.GetAmount())
 			return ErrInvalidWithdrawAmount
@@ -383,13 +488,8 @@ func (r *rgbx) checkWithdraw(fromAddr, txHash string, withdraw *rtypes.WithdrawA
 	//
 	// tssPub 取自链上 CrossChainInfo（fail-closed：读不到 / 没带 pubkey 都拒 —— 同一份信息
 	// 在提现确认（validateWithdrawTxContent）那里也是必需的，早拒比事后卡住好）。
-	// 注意用**原始** symbol 查：CrossChainInfo 的 key 是 formatSymbol(raw)（"btc" → "BTC"），
+	// 注意 info 用**原始** symbol 查：CrossChainInfo 的 key 是 formatSymbol(raw)（"btc" → "BTC"），
 	// 而上面的 symbol 已经过 ensureCrossChainSymbol（"btc" → "XBTC"）—— 用后者查不到。
-	info, err := r.getCrossChainInfo(withdraw.GetAssetSymbol())
-	if err != nil {
-		elog.Error("checkWithdraw getCrossChainInfo", "txHash", txHash, "symbol", withdraw.GetAssetSymbol(), "err", err)
-		return ErrGetCrossChainInfo
-	}
 	tssPub, err := rtypes.ParseDepositTssPubKey(info.GetPubkey())
 	if err != nil {
 		elog.Error("checkWithdraw invalid tss pubkey", "txHash", txHash, "symbol", symbol,
@@ -470,14 +570,16 @@ func (r *rgbx) checkDeposit(txHash string, deposit *rtypes.DepositAsset) error {
 		elog.Error("checkDeposit validate btc tx proof", "txHash", txHash, "btcProof", btcProof2String(deposit.GetTxProof()), "err", err)
 		return err
 	}
+	// 走哪条分支看**链上登记的资产类别**（见 types.CrossChainAssetKind），不再看 symbol 字面量：
+	// 类别未知 / 记录缺失都 fail-closed。
+	info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
+	if err != nil {
+		elog.Error("checkDeposit getCrossChainInfo", "txHash", txHash, "symbol", deposit.GetAssetSymbol(), "err", err)
+		return ErrGetCrossChainInfo
+	}
 	// RGB20 分支：跳过链上 OP_RETURN 承诺与链上金额校验（RGB 金额在 consignment 内，由侧车验证），
 	// 改验 TSS 阈值签名 thresholdSig（btcec 直验 C=sha256(Encode(DepositAsset{thresholdSig:nil}))）。
-	if rtypes.IsRgb20Symbol(deposit.GetAssetSymbol()) {
-		info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
-		if err != nil {
-			elog.Error("checkDeposit rgb20 getCrossChainInfo", "txHash", txHash, "symbol", deposit.GetAssetSymbol(), "err", err)
-			return ErrGetCrossChainInfo
-		}
+	if rtypes.IsRgb20CrossChainAsset(info) {
 		if err := verifyThresholdSig(info.GetPubkey(), deposit); err != nil {
 			elog.Error("checkDeposit rgb20 verifyThresholdSig", "txHash", txHash, "symbol", deposit.GetAssetSymbol(), "err", err)
 			return err

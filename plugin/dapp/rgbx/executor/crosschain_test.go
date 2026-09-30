@@ -36,6 +36,26 @@ type kvSetOnly interface {
 	Set(key, value []byte) error
 }
 
+// setCrossChainInfoForTest 写入一条**已登记**的跨链资产记录。
+//
+// 类别与精度在真实链上由两条交易分别落定（CommitDKG 登记类别、crossChainMeta 回填精度），
+// 测试里直接写最终形态即可。注意 pubkey 必须给合法值：执行器读它派生充值脚本 / 验 thresholdSig，
+// 不给就会在别的判据上先失败，把用例断言的焦点带偏。
+func setCrossChainInfoForTest(t *testing.T, state kvSetter, symbol string,
+	kind rtypes.CrossChainAssetKind, precision uint32, pubkey []byte) {
+	t.Helper()
+	info := &rtypes.CrossChainInfo{
+		AssetSymbol:   formatSymbol(symbol),
+		WrappedSymbol: formatCrossChainSymbol(symbol),
+		TssAddress:    "tb1qtestdkgaddress",
+		PkScript:      []byte{0x00, 0x14, 0x01, 0x02, 0x03},
+		Pubkey:        pubkey,
+		AssetKind:     uint32(kind),
+		Precision:     precision,
+	}
+	require.NoError(t, state.Set(formatCrossChainInfoKey(symbol), types.Encode(info)))
+}
+
 func applyLocalKV(t *testing.T, localDB kvSetOnly, kvs []*types.KeyValue) {
 	for _, kv := range kvs {
 		if localDB == nil || kv.Value == nil {
@@ -55,6 +75,9 @@ func TestCrossChainDepositWithdrawConfirmExec(t *testing.T) {
 	r.SetAPI(api)
 	r.SetStateDB(state)
 	r.SetLocalDB(local)
+	// 跨链资产必须先登记（真实链上由 CommitDKG 建）：执行器要靠它的类别决定充值/提现走哪条分支。
+	setCrossChainInfoForTest(t, state, "btc", rtypes.CrossChainAssetBtc, rtypes.BTCChainPrecision,
+		newP2WSHDepositFixture(t, frozenVectorA).tssPub)
 
 	userAddr, userPriv := util.Genaddress()
 

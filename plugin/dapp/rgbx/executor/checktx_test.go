@@ -611,10 +611,15 @@ func Test_checkWithdraw(t *testing.T) {
 	api.On("GetConfig").Return(testCfg)
 	api.On("Query", ltypes.LightclientX, "GetBtcNetName", mock.Anything).Return(&types.ReplyString{Data: "testnet3"}, nil)
 	r.SetStateDB(state)
-	// E15-a 之后 checkWithdraw 需要 tssPub（判"目标是不是发起人自己的充值脚本"），
-	// 因此 CrossChainInfo 必须带 pubkey（无 pubkey ⇒ ErrInvalidCrossChainInfo，见专用用例）。
+	// checkWithdraw 需要链上那条记录：既能取 tssPub（E15-a 判"目标是不是发起人自己的充值脚本"），
+	// 也要靠它登记**资产类别**决定走哪条门禁分支（BTC 类按 P2WSH 派生脚本判定）。两者都缺 ⇒ 早拒。
 	infoWithPub := func() *rtypes.CrossChainInfo {
-		return &rtypes.CrossChainInfo{AssetSymbol: "BTC", Pubkey: newP2WSHDepositFixture(t, frozenVectorA).tssPub}
+		return &rtypes.CrossChainInfo{
+			AssetSymbol: "BTC",
+			Pubkey:      newP2WSHDepositFixture(t, frozenVectorA).tssPub,
+			AssetKind:   uint32(rtypes.CrossChainAssetBtc),
+			Precision:   rtypes.BTCChainPrecision,
+		}
 	}
 	require.Nil(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(infoWithPub())))
 	// checkWithdraw 现在使用 newAccount(withdraw.GetAssetSymbol())，即 newAccount("btc")
@@ -625,15 +630,16 @@ func Test_checkWithdraw(t *testing.T) {
 	require.Nil(t, err)
 
 	for idx, tc := range tcArr {
-		if idx == 1 {
-			require.Nil(t, state.Delete(formatCrossChainInfoKey("btc")))
-		}
-		if idx == 2 {
-			require.Nil(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(infoWithPub())))
-		}
 		value.Withdraw = tc.action.(*rtypes.WithdrawAsset)
 		testCheck(t, r, tx, action, tc.expectErr, idx)
 	}
+
+	// 记录缺失 / 类别未知时 fail-closed：读不出类别就不能决定走哪条分支。
+	require.Nil(t, state.Delete(formatCrossChainInfoKey("btc")))
+	value.Withdraw = &rtypes.WithdrawAsset{
+		AssetSymbol: "btc", Amount: minBtcWithdrawAmount, DestinationAddr: validDest, FeeRate: 1,
+	}
+	testCheck(t, r, tx, action, ErrGetCrossChainInfo, len(tcArr))
 }
 
 // Test_checkWithdraw_depositScriptGuard E15-a：**只拒"提现目标 = 发起人自己的充值脚本"**，
@@ -839,6 +845,33 @@ func Test_checkCommitDKG(t *testing.T) {
 			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk, Pubkey: validPub,
 		}},
 	}
+	// 这些用例都是 BTC 类资产（AssetKind 零值就是 BTC 类），精度是协议常量：链上强制的配套关系，
+	// 与"缺 pubkey / 地址公钥不配套"一样属于载荷本身必须成立的前提。
+	for _, tc := range tcArr {
+		tc.action.(*rtypes.CommitDKG).Precision = rtypes.BTCChainPrecision
+	}
+	// 类别与精度的配套关系（checkCommitDKGPrecision）：类别非法 / 精度与类别不配套一律拒。
+	// 这三条在 CHECK 的最前面，不受 guardian / 记录是否存在的 mock 影响。
+	tcArr = append(tcArr,
+		&testCase{expectErr: ErrInvalidAssetKind, action: &rtypes.CommitDKG{
+			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk, Pubkey: validPub,
+			AssetKind: uint32(rtypes.CrossChainAssetRgb20) + 9, Precision: rtypes.BTCChainPrecision,
+		}},
+		&testCase{expectErr: ErrInvalidAssetPrecision, action: &rtypes.CommitDKG{
+			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk, Pubkey: validPub,
+			AssetKind: uint32(rtypes.CrossChainAssetBtc), Precision: 6,
+		}},
+		&testCase{expectErr: ErrInvalidAssetPrecision, action: &rtypes.CommitDKG{
+			// RGB20 类在 DKG 提交时合约精度还未知，**只能是**"尚未回填"哨兵：
+			// 这里写 8 就是"猜了一个值"，链上拒（真实值由 crossChainMeta 回填）。
+			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk, Pubkey: validPub,
+			AssetKind: uint32(rtypes.CrossChainAssetRgb20), Precision: 8,
+		}},
+		&testCase{expectErr: nil, action: &rtypes.CommitDKG{
+			AssetSymbol: "btc", DkgAddress: dkgAddr, PkScript: validPk, Pubkey: validPub,
+			AssetKind: uint32(rtypes.CrossChainAssetRgb20), Precision: rtypes.PrecisionUnknown,
+		}},
+	)
 
 	dir, state, _ := util.CreateTestDB()
 	defer util.CloseTestDB(dir, state)

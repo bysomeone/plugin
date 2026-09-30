@@ -544,9 +544,8 @@ func newTestSignerService(t *testing.T) (*tssService, *rgb20.MockSidecar, *rgb20
 	t.Cleanup(cleanup)
 	adapter, err := rgb20.NewAdapter(rgb20.Config{
 		SidecarAddr: sock,
-		Precision:   6,
 		Contracts: []rgb20.Contract{
-			{Symbol: "RGB20_USDT", Precision: 6, MinDeposit: 100, MinWithdraw: 100},
+			{Symbol: "RGB20_USDT", MinDeposit: 100, MinWithdraw: 100},
 		},
 		ChangeAddress: "bcrt1qxxxx",
 	}, rgb20.NewMemStore())

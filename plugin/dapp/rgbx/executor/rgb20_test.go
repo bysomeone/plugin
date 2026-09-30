@@ -166,6 +166,10 @@ func Test_checkCommitDKG_rgb20_pubkey(t *testing.T) {
 				DkgAddress:  waddr.String(),
 				PkScript:    tc.pkScript,
 				Pubkey:      tc.pubkey,
+				// RGB20 类资产：类别随建记录一起登记；精度此时**只能是**"尚未回填"哨兵
+				// （真实值来自合约，由桥核对后经 crossChainMeta 回填）。
+				AssetKind: uint32(rtypes.CrossChainAssetRgb20),
+				Precision: rtypes.PrecisionUnknown,
 			}
 			tx.Payload = types.Encode(action)
 			err := r.CheckTx(tx, 0)
@@ -219,10 +223,9 @@ func Test_checkDeposit_rgb20_thresholdSig(t *testing.T) {
 		&ltypes.BtcHeader{Hash: "hash1", Height: 100, MerkleRoot: txid.String()}, nil)
 	r.SetAPI(api)
 	r.SetStateDB(state)
-	require.Nil(t, state.Set(formatCrossChainInfoKey(rtypes.RGB20USDTSymbol), types.Encode(&rtypes.CrossChainInfo{
-		AssetSymbol: rtypes.RGB20USDTSymbol,
-		Pubkey:      pub,
-	})))
+	// 链上登记的类别是 RGB20，充值才走 thresholdSig 门禁分支（不再按符号字面量判断）。
+	setCrossChainInfoForTest(t, state, rtypes.RGB20USDTSymbol, rtypes.CrossChainAssetRgb20,
+		rtypes.MaxPrecision, pub)
 
 	// RGB20 分支：SPV 通过 + thresholdSig 验签通过，CheckTx 返回 nil。
 	value.Deposit = dep

@@ -93,7 +93,7 @@ func Test_AdapterLive_DepositFlow(t *testing.T) {
 	adapter, err := NewAdapter(Config{
 		SidecarAddr: addr,
 		Contracts: []Contract{
-			{Symbol: "RGB20_USDT", SidecarSymbol: "USDT", Precision: 8},
+			{Symbol: "RGB20_USDT", SidecarSymbol: "USDT"},
 		},
 	}, NewMemStore())
 	require.NoError(t, err)

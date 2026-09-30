@@ -45,14 +45,13 @@ const (
 func newAssetIdentityTestAdapter(t *testing.T, mock *MockSidecar, bridge Chain33Bridge, assetID string) (*Adapter, func()) {
 	t.Helper()
 	// 假侧车要报告这个合约（精度与配置一致），否则 Connect 的精度核对会拒掉连接
-	// （见 VerifyContractPrecisions）——这与真实部署一样：配置声明的合约必须侧车认识。
+	// （见 ContractPrecisions）——这与真实部署一样：注册的合约必须侧车认识且声明了精度。
 	seedMockAsset(mock, assetID, 6)
 	sock, cleanup := StartTestSidecar(t, mock)
 	adapter, err := NewAdapter(Config{
 		SidecarAddr: sock,
-		Precision:   6,
 		Contracts: []Contract{
-			{Symbol: "RGB20_USDT", AssetID: assetID, Precision: 6, MinDeposit: 100, MinWithdraw: 100},
+			{Symbol: "RGB20_USDT", AssetID: assetID, MinDeposit: 100, MinWithdraw: 100},
 		},
 		ChangeAddress:            "bcrt1qxxxx",
 		HeaderRelayConfirmations: 6,
@@ -82,7 +81,7 @@ func newAssetIdentitySubmitAdapterWithStore(t *testing.T, bridge Chain33Bridge, 
 	adapter, err := NewAdapter(Config{
 		SidecarAddr: "test-no-sidecar",
 		Contracts: []Contract{
-			{Symbol: "RGB20_USDT", AssetID: assetID, Precision: 6, MinDeposit: 100, MinWithdraw: 100},
+			{Symbol: "RGB20_USDT", AssetID: assetID, MinDeposit: 100, MinWithdraw: 100},
 		},
 		HeaderRelayConfirmations: uint32(testHeaderConfs),
 	}, store)

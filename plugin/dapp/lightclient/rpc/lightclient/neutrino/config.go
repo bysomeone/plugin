@@ -111,8 +111,6 @@ type rgb20Config struct {
 	ConsignmentListen string `json:"consignmentListen"`
 	// Contracts RGB20 资产合约列表。
 	Contracts []rgb20Contract `json:"contracts"`
-	// Precision 默认精度（RGB20 USDT 为 6）。
-	Precision uint32 `json:"precision"`
 	// ChangeAddress 提现找零地址（TSS P2WPKH 地址）；留空则由 TSS 地址自动填充。
 	ChangeAddress string `json:"changeAddress"`
 	// TestSignPsbt 是否允许"无提现上下文的 PSBT 签名"（E2E 的 sign-psbt 测试端点用）。
@@ -122,11 +120,15 @@ type rgb20Config struct {
 }
 
 // rgb20Contract RGB20 资产合约注册项。
+//
+// 注意这里**没有** precision：精度不是配置项，而是合约的声明（侧车 ListAssets 报出来的
+// `AssetInfo.precision`）。桥在侧车连上后读它、写进链上的跨链资产记录（crossChainInfo.precision），
+// 供前端 / CLI 读；配置再声明一份只会带来"两边不一致时按谁算"的静默分歧（旧版就是这样：
+// 配置默认 6、合约发行 8，全程无人比对）。
 type rgb20Contract struct {
 	Symbol        string `json:"symbol"`        // chain33 侧资产符号，如 RGB20_USDT
 	SidecarSymbol string `json:"sidecarSymbol"` // 侧车发行资产符号，如 USDT（空则回退 Symbol）
 	AssetID       string `json:"assetId"`       // rgb:...
-	Precision     uint32 `json:"precision"`     // 小数位
 	MinDeposit    int64  `json:"minDeposit"`    // 最小充值（最小单位）
 	MinWithdraw   int64  `json:"minWithdraw"`   // 最小提现（最小单位）
 }

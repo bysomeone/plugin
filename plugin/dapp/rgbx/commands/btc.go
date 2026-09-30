@@ -535,7 +535,41 @@ func commitDKGFlags(cmd *cobra.Command) {
 	// （P2WSH 充值地址 = f(userID, pubkey)，执行器要靠它重建充值脚本），所以这里直接
 	// 在 CLI 侧挡住，别让用户提交一份注定被拒的交易。
 	cmd.Flags().StringP("pubkey", "k", "", "tss group pubkey, 33-byte compressed hex (from rgbx getCrossChainInfo); an optional 0x prefix is accepted")
+	// 资产类别是链上登记项（决定充值/提现走哪条门禁分支），必须随建记录一起提交；不填时按符号
+	// 推断（BTC → btc，其余 → rgb20），与桥的推断口径一致（neutrino 的 isRgb20Asset）。
+	// 精度不需要参数：BTC 类恒为 8，RGB20 类**只能是**"尚未回填"哨兵（真实值由桥核对出合约精度后
+	// 经 crossChainMeta 回填），两者都由链上 checkCommitDKG 强制，填别的值只会换来一份被拒的交易。
+	cmd.Flags().String("assetKind", "", "cross chain asset kind: btc | rgb20 (default: btc for BTC, rgb20 otherwise)")
 	markRequired(cmd, "dkgAddress", "pkScript", "pubkey")
+}
+
+// parseCrossChainAssetKind 解析 --assetKind（空则按符号推断：BTC 类还是 RGB20 类）。
+//
+// 按符号推断只是**默认值**，不是判定：判定一律看链上登记的类别（types.IsRgb20CrossChainAsset）。
+func parseCrossChainAssetKind(flagValue, symbol string) (rtypes.CrossChainAssetKind, error) {
+	switch strings.ToLower(strings.TrimSpace(flagValue)) {
+	case "":
+		if strings.EqualFold(symbol, rtypes.BTCSymbol) {
+			return rtypes.CrossChainAssetBtc, nil
+		}
+		return rtypes.CrossChainAssetRgb20, nil
+	case "btc":
+		return rtypes.CrossChainAssetBtc, nil
+	case "rgb20":
+		return rtypes.CrossChainAssetRgb20, nil
+	default:
+		return 0, fmt.Errorf("invalid assetKind %q: use btc or rgb20", flagValue)
+	}
+}
+
+// commitDKGPrecisionFor 按类别给出该类别**唯一合法**的精度：
+// BTC 类是协议常量 8；RGB20 类在 DKG 提交时未知（合约还没被侧车核对），只能是哨兵。
+// 与链上 checkCommitDKGPrecision 同一口径（改一处必须改另一处）。
+func commitDKGPrecisionFor(kind rtypes.CrossChainAssetKind) uint32 {
+	if kind == rtypes.CrossChainAssetBtc {
+		return rtypes.BTCChainPrecision
+	}
+	return rtypes.PrecisionUnknown
 }
 
 func commitDKG(cmd *cobra.Command, _ []string) {
@@ -543,6 +577,13 @@ func commitDKG(cmd *cobra.Command, _ []string) {
 	dkgAddress, _ := cmd.Flags().GetString("dkgAddress")
 	pkScriptHex, _ := cmd.Flags().GetString("pkScript")
 	pubkeyHex, _ := cmd.Flags().GetString("pubkey")
+	assetKindFlag, _ := cmd.Flags().GetString("assetKind")
+
+	assetKind, err := parseCrossChainAssetKind(assetKindFlag, symbol)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "%v\n", err)
+		return
+	}
 
 	pkScript, err := decodeHexAuto(pkScriptHex)
 	if err != nil {
@@ -574,6 +615,8 @@ func commitDKG(cmd *cobra.Command, _ []string) {
 		DkgAddress:  dkgAddress,
 		PkScript:    pkScript,
 		Pubkey:      normalized,
+		AssetKind:   uint32(assetKind),
+		Precision:   commitDKGPrecisionFor(assetKind),
 	})
 }
 
@@ -655,11 +698,9 @@ func withdrawAssetFlags(cmd *cobra.Command) {
 	cmd.Flags().Int64P("feeRate", "f", 1, "btc fee rate (sat/vbyte)")
 	cmd.Flags().StringP("destinationAddr", "d", "", "btc destination address")
 	cmd.Flags().StringP("assetSymbol", "s", rtypes.BTCSymbol, "cross-chain asset symbol")
-	// -a 的十进制口径（小数位数）。不填时按资产自己声明的精度走（BTC=8、链上资产记录=它自己的
-	// 精度）；桥接的 RGB20 资产**必须**显式给出 —— 那个值只存在于合约里，CLI 读不到，猜错就是
-	// 10^n 倍的静默金额错误（见 resolveWithdrawDecimals）。
-	cmd.Flags().Int32P("precision", "p", -1,
-		"decimal places of the asset's amounts (required for bridged RGB20 assets; default: the asset's own precision)")
+	// 注意这里**没有** -p/--precision：-a 的十进制口径一律从链上读（跨链资产读 crossChainInfo、
+	// 本地铸造资产读资产记录，见 resolveWithdrawDecimals）。手填精度的入口被删掉，因为它是
+	// "填错就静默差 10^n 倍"的那类接口，而链上现在已经记着桥核对过的值。
 	markRequired(cmd, "amount", "feeRate", "destinationAddr")
 }
 
@@ -668,16 +709,29 @@ func withdrawAsset(cmd *cobra.Command, _ []string) {
 	feeRate, _ := cmd.Flags().GetInt64("feeRate")
 	destAddr, _ := cmd.Flags().GetString("destinationAddr")
 	symbol, _ := cmd.Flags().GetString("assetSymbol")
-	precisionFlag, _ := cmd.Flags().GetInt32("precision")
 
-	// 只有在需要"问链上"的时候才查：BTC 固定 8、RGB20 查了也查不到（桥接符号链上没有资产记录），
-	// 显式给了 -p 就更不用查。多一次 RPC 不多，但没必要把"查不到"和"没查"混在一起。
+	// 精度从链上读，两处只能有一处：跨链资产（BTC / RGB20）在 crossChainInfo 上，
+	// 本地发行/铸造的资产在 rgbxAsset 上。先查跨链记录，没有才回落到资产记录 ——
+	// 跨链符号不可能有 rgbxAsset 记录（充值铸造不写它，checkMint 也拒绝跨链符号）。
+	//
+	// 两次查询都走**静默**版本：本命令的 stdout 是 tx 哈希（脚本与用户都按它取值），
+	// 内部查询把 JSON 混进 stdout 会让调用方把成功当成失败。
+	crossChain := &rtypes.CrossChainInfo{}
+	if err := sendQueryRPCSilent(cmd, "GetCrossChainInfo", &types.ReqString{Data: symbol}, crossChain); err != nil && !isRecordNotFound(err) {
+		_, _ = fmt.Fprintf(os.Stderr, "cannot read the asset's cross chain record from the node: %v\n", err)
+		return
+	}
 	chainAsset := &rtypes.RgbxAsset{}
-	if precisionFlag < 0 && !strings.EqualFold(symbol, rtypes.BTCSymbol) && !rtypes.IsRgb20Symbol(symbol) {
-		sendQueryRPC(cmd, "GetAsset", &types.ReqString{Data: symbol}, chainAsset, true)
+	if crossChainInfoAbsent(crossChain) {
+		// 没有跨链记录不代表"查询失败"：本地铸造的资产本来就只有资产记录，两侧都没有时由
+		// resolveWithdrawDecimals 给出可操作的报错（而不是在这里按查询故障提前退出）。
+		if err := sendQueryRPCSilent(cmd, "GetAsset", &types.ReqString{Data: symbol}, chainAsset); err != nil && !isRecordNotFound(err) {
+			_, _ = fmt.Fprintf(os.Stderr, "cannot read the asset's record from the node: %v\n", err)
+			return
+		}
 	}
 
-	decimals, err := resolveWithdrawDecimals(symbol, precisionFlag, chainAsset.GetSymbol(), chainAsset.GetPrecision())
+	decimals, err := resolveWithdrawDecimals(symbol, crossChain, chainAsset)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "%v\n", err)
 		return

@@ -182,73 +182,103 @@ func Test_pow10(t *testing.T) {
 	}
 }
 
+// 构造查询结果的小工具：链上跨链记录（tssAddress 非空 = 记录存在）与本地资产记录。
+func chainCrossChainInfo(kind rtypes.CrossChainAssetKind, precision uint32) *rtypes.CrossChainInfo {
+	return &rtypes.CrossChainInfo{
+		AssetSymbol: "RGB20_USDT",
+		TssAddress:  "bcrt1qexample",
+		AssetKind:   uint32(kind),
+		Precision:   precision,
+	}
+}
+
+func chainAssetRecord(symbol string, precision uint32) *rtypes.RgbxAsset {
+	return &rtypes.RgbxAsset{Symbol: symbol, Precision: precision}
+}
+
 // resolveWithdrawDecimals 的每一档都必须有出处；**没有出处就报错**，绝不回落成 8。
 // 这一组测试钉住的正是"静默 10^n 倍金额错误"那个缺口。
 func Test_resolveWithdrawDecimals(t *testing.T) {
-	const usdt = "RGB20_USDT" // 桥接符号（rtypes.IsRgb20Symbol）
+	const usdt = "RGB20_USDT"
 
-	t.Run("显式精度优先于一切", func(t *testing.T) {
-		// 即便链上有资产记录且精度不同，也以显式声明为准（调用方读的是合约）。
-		got, err := resolveWithdrawDecimals(usdt, 6, "RGB20_USDT", 8)
+	t.Run("桥接资产的精度取自链上跨链记录", func(t *testing.T) {
+		got, err := resolveWithdrawDecimals(usdt, chainCrossChainInfo(rtypes.CrossChainAssetRgb20, 6), &rtypes.RgbxAsset{})
 		require.NoError(t, err)
-		require.Equal(t, 6, got)
+		require.Equal(t, 6, got, "精度 6 必须照用，不能取 8")
 	})
 
-	t.Run("BTC 固定 8 位小数", func(t *testing.T) {
+	t.Run("BTC 类跨链记录的精度也取自链上", func(t *testing.T) {
+		got, err := resolveWithdrawDecimals("BTC", chainCrossChainInfo(rtypes.CrossChainAssetBtc, rtypes.BTCChainPrecision), &rtypes.RgbxAsset{})
+		require.NoError(t, err)
+		require.Equal(t, 8, got)
+	})
+
+	t.Run("BTC 且链上还没有跨链记录时回落协议常量 8", func(t *testing.T) {
 		for _, s := range []string{"BTC", "btc", "Btc"} {
-			got, err := resolveWithdrawDecimals(s, -1, "", 0)
+			got, err := resolveWithdrawDecimals(s, &rtypes.CrossChainInfo{}, &rtypes.RgbxAsset{})
 			require.NoError(t, err, "symbol=%s", s)
 			require.Equal(t, 8, got)
 		}
 	})
 
-	t.Run("非 8 精度的链上资产按其自身精度换算", func(t *testing.T) {
-		got, err := resolveWithdrawDecimals("MYTOKEN", -1, "MYTOKEN", 6)
+	t.Run("本地铸造资产按其链上资产记录的精度换算", func(t *testing.T) {
+		got, err := resolveWithdrawDecimals("MYTOKEN", &rtypes.CrossChainInfo{}, chainAssetRecord("MYTOKEN", 6))
 		require.NoError(t, err)
-		require.Equal(t, 6, got, "精度 6 必须照用，不能取 8")
+		require.Equal(t, 6, got)
 	})
 
-	t.Run("精度 0 的链上资产是合法的", func(t *testing.T) {
-		got, err := resolveWithdrawDecimals("NFTLIKE", -1, "NFTLIKE", 0)
+	t.Run("精度 0 的资产是合法的", func(t *testing.T) {
+		got, err := resolveWithdrawDecimals("NFTLIKE", &rtypes.CrossChainInfo{}, chainAssetRecord("NFTLIKE", 0))
+		require.NoError(t, err)
+		require.Equal(t, 0, got)
+		got, err = resolveWithdrawDecimals("NFTLIKE", chainCrossChainInfo(rtypes.CrossChainAssetRgb20, 0), &rtypes.RgbxAsset{})
 		require.NoError(t, err)
 		require.Equal(t, 0, got)
 	})
 
-	t.Run("桥接的 RGB20 资产没给 -p 就拒绝", func(t *testing.T) {
-		err := func() error { _, e := resolveWithdrawDecimals(usdt, -1, "", 0); return e }()
-		require.Error(t, err, "must not silently assume 8")
-		require.Contains(t, err.Error(), "RGB20")
-		require.Contains(t, err.Error(), "-p/--precision")
-		// 即使链上碰巧有一条该符号的资产记录也不能信：桥接符号的口径只在合约里。
-		_, err = resolveWithdrawDecimals(usdt, -1, "RGB20_USDT", 8)
-		require.Error(t, err, "a chain record must not be trusted for a bridged symbol")
+	t.Run("链上精度尚未回填时拒绝（不猜）", func(t *testing.T) {
+		_, err := resolveWithdrawDecimals(usdt,
+			chainCrossChainInfo(rtypes.CrossChainAssetRgb20, rtypes.PrecisionUnknown), &rtypes.RgbxAsset{})
+		require.Error(t, err, "must not silently assume 8 while the bridge has not backfilled the precision")
+		require.Contains(t, err.Error(), "not recorded its precision on chain yet")
 	})
 
-	t.Run("既没 -p 也没链上记录时拒绝", func(t *testing.T) {
-		_, err := resolveWithdrawDecimals("UNKNOWN", -1, "", 0)
+	t.Run("既没有跨链记录也没有资产记录时拒绝", func(t *testing.T) {
+		_, err := resolveWithdrawDecimals("UNKNOWN", &rtypes.CrossChainInfo{}, &rtypes.RgbxAsset{})
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "UNKNOWN")
 	})
 
 	t.Run("超出链上口径的精度拒绝", func(t *testing.T) {
-		_, err := resolveWithdrawDecimals("WEIRD", -1, "WEIRD", rtypes.MaxPrecision+1)
+		_, err := resolveWithdrawDecimals("WEIRD", &rtypes.CrossChainInfo{},
+			chainAssetRecord("WEIRD", rtypes.MaxPrecision+1))
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "above the maximum")
 
-		_, err = resolveWithdrawDecimals("WEIRD", rtypes.MaxPrecision+1, "", 0)
+		_, err = resolveWithdrawDecimals("WEIRD",
+			chainCrossChainInfo(rtypes.CrossChainAssetRgb20, rtypes.MaxPrecision+1), &rtypes.RgbxAsset{})
 		require.Error(t, err)
+		require.Contains(t, err.Error(), "above the maximum")
 	})
 
-	t.Run("显式精度上界", func(t *testing.T) {
-		got, err := resolveWithdrawDecimals("X", rtypes.MaxPrecision, "", 0)
+	t.Run("链上类别未知时拒绝（而不是按 BTC 处理）", func(t *testing.T) {
+		_, err := resolveWithdrawDecimals(usdt, chainCrossChainInfo(rtypes.CrossChainAssetKind(9), 6), &rtypes.RgbxAsset{})
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "unknown cross chain asset kind")
+	})
+
+	t.Run("跨链记录优先于资产记录", func(t *testing.T) {
+		got, err := resolveWithdrawDecimals(usdt,
+			chainCrossChainInfo(rtypes.CrossChainAssetRgb20, 6), chainAssetRecord(usdt, 8))
 		require.NoError(t, err)
-		require.Equal(t, int(rtypes.MaxPrecision), got)
+		require.Equal(t, 6, got, "跨链资产的精度在 crossChainInfo 上，资产记录（若有）不得覆盖它")
 	})
 }
 
 // 端到端口径：精度 6 的资产，-a 1.5 必须换算成 1_500_000 个最小单位（而不是 1.5e8）。
 func Test_resolveWithdrawDecimals_DrivesTheConversion(t *testing.T) {
-	decimals, err := resolveWithdrawDecimals("RGB20_USDT", 6, "", 0)
+	decimals, err := resolveWithdrawDecimals("RGB20_USDT",
+		chainCrossChainInfo(rtypes.CrossChainAssetRgb20, 6), &rtypes.RgbxAsset{})
 	require.NoError(t, err)
 
 	amount, err := parseDecimalAmount("1.5", decimals)
@@ -266,21 +296,20 @@ func Test_resolveWithdrawDecimals_DrivesTheConversion(t *testing.T) {
 	require.Error(t, err)
 }
 
-// withdraw 命令的精度 flag 必须存在、默认 -1（"未指定"），且不与其他 flag 的简写冲突
-// （`-a/-f/-d/-s/-p`；`send` 是 DisableFlagParsing 的手工解析，`-k` 由它自己摘掉）。
-func Test_WithdrawCmd_PrecisionFlag(t *testing.T) {
+// withdraw 命令**没有** -p/--precision：精度一律从链上读。
+// （旧接口要求调用方手填桥接资产的精度，那正是"填错就静默差 10^n 倍"的入口。）
+func Test_WithdrawCmd_HasNoPrecisionFlag(t *testing.T) {
 	cmd := withdrawAssetCMD()
-	require.NotNil(t, cmd.Flags().Lookup("precision"))
-	p := cmd.Flags().ShorthandLookup("p")
-	require.NotNil(t, p, "-p 是 harness 与运维要用的简写")
-	require.Equal(t, "precision", p.Name)
+	require.Nil(t, cmd.Flags().Lookup("precision"), "精度已从链上读，不该再有手填入口")
+	require.Nil(t, cmd.Flags().ShorthandLookup("p"), "-p 不复存在，简写不冲突")
+	require.NotEmpty(t, cmd.Flags().Lookup("assetSymbol"))
+}
 
-	got, err := cmd.Flags().GetInt32("precision")
-	require.NoError(t, err)
-	require.Equal(t, int32(-1), got, "默认必须是 -1：0 是合法精度，不能拿它当'未指定'")
-
-	require.NoError(t, cmd.Flags().Set("precision", "6"))
-	got, err = cmd.Flags().GetInt32("precision")
-	require.NoError(t, err)
-	require.Equal(t, int32(6), got)
+// 端到端：CLI 查到的链上记录（两处互斥）驱动口径选择。
+func Test_resolveWithdrawDecimals_FromQueriedRecords(t *testing.T) {
+	// withdrawAsset 的查询口径：先查跨链记录；没有才查资产记录。
+	t.Run("查不到跨链记录时查资产记录", func(t *testing.T) {
+		require.True(t, crossChainInfoAbsent(&rtypes.CrossChainInfo{}))
+		require.False(t, crossChainInfoAbsent(chainCrossChainInfo(rtypes.CrossChainAssetBtc, 8)))
+	})
 }

@@ -45,6 +45,10 @@ func newOperationLedgerFixture(t *testing.T) *operationLedgerFixture {
 	f.r = newRgbx().(*rgbx)
 	f.r.SetAPI(api)
 	f.r.SetStateDB(state)
+	// 真实链上必然有这条记录：桥提交 DKG 后才有跨链资产，之后充值/提现才有意义
+	// （执行器按**登记的类别**决定门禁分支，记录缺失一律 fail-closed）。
+	setCrossChainInfoForTest(t, state, "btc", rtypes.CrossChainAssetBtc, rtypes.BTCChainPrecision,
+		newP2WSHDepositFixture(t, frozenVectorA).tssPub)
 	return f
 }
 
@@ -440,6 +444,9 @@ func Test_CheckTx_withdrawConfirmRequiresLedger(t *testing.T) {
 
 	burnTxHash := []byte("ledger-gate-burn")
 	withdraw := &rtypes.WithdrawAsset{AssetSymbol: rtypes.RGB20USDTSymbol, Amount: 100}
+	// 类别上链后，走 RGB20 分支这件事由链上记录决定，所以先登记该资产。
+	setCrossChainInfoForTest(t, state, rtypes.RGB20USDTSymbol, rtypes.CrossChainAssetRgb20,
+		rtypes.MaxPrecision, newP2WSHDepositFixture(t, frozenVectorA).tssPub)
 	// RGB20 分支：链上跳过 OP_RETURN 承诺与金额校验，判据只剩台账这一层，正好用来测接线。
 	require.NoError(t, state.Set(formatPayloadKey(burnTxHash), types.Encode(withdraw)))
 	require.NoError(t, local.Set(formatPendingTxKey(3, 0), types.Encode(&rtypes.PendingTx{

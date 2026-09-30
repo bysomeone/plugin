@@ -57,6 +57,11 @@ func (r *rgbx) Exec_CommitDKG(commit *rtypes.CommitDKG, tx *types.Transaction, i
 			// RGB20 分支（BL-1）：TSS 组公钥，供 checkDeposit/Exec_Deposit 验 thresholdSig。
 			// 同一 (symbol,address) 的所有 CommitDKG 必须提交相同 pubkey。
 			Pubkey: commit.GetPubkey(),
+			// 类别与精度都是**载荷里带来**的链上登记事实（checkCommitDKG 已校验配套关系：
+			// BTC 类只能 8、RGB20 类只能是"尚未回填"哨兵）。前端 / CLI / 执行器之后一律读它们，
+			// 不再按符号字面量猜类别、也不再要求调用方手填精度。
+			AssetKind: commit.GetAssetKind(),
+			Precision: commit.GetPrecision(),
 		}
 		receipt.KV = append(receipt.KV, &types.KeyValue{
 			Key:   formatCrossChainInfoKey(symbol),
@@ -68,18 +73,76 @@ func (r *rgbx) Exec_CommitDKG(commit *rtypes.CommitDKG, tx *types.Transaction, i
 
 }
 
+// Exec_CrossChainMeta 把已核对过的合约精度回填到链上 CrossChainInfo（发行后回填路径）。
+//
+// 语义是**一次性**的：只在记录还是 PrecisionUnknown（DKG 提交时未知）时写入，或者幂等地重复
+// 提交同一个值；已回填成别的值由 checkCrossChainMeta 拒绝。写入随回执 KV 生效，回滚时随
+// statedb 一起回滚（与 CommitDKG 建记录同一机制）。
+//
+// 为什么精度必须来自载荷（而不是 Exec 里去读桥的侧车/配置）：Exec 会在每个节点上重跑，读本地
+// 服务会让"区块是否合法"依赖各节点本地状态（同一区块在不同节点上算出不同结果）。载荷里的值由
+// guardian 提交、经 CheckTx 与历史状态校验，节点之间只有共识状态作为判据。
+func (r *rgbx) Exec_CrossChainMeta(meta *rtypes.CrossChainAssetMeta, tx *types.Transaction, index int) (*types.Receipt, error) {
+	receipt := &types.Receipt{Ty: types.ExecOk}
+	txHash := hex.EncodeToString(tx.Hash())
+	// 防御性复验（CheckTx 已验，这里防止绕过 CheckTx 直接 Exec）：提交者必须是 guardian。
+	guardianAddrs, err := r.getGuardianNodeAddress(rgbxCfg.GuardianParachainTitle)
+	if err != nil {
+		elog.Error("Exec_CrossChainMeta getGuardianNodeAddress", "txHash", txHash, "err", err)
+		return nil, ErrGetGuardianNodeAddress
+	}
+	if !strings.Contains(guardianAddrs, tx.From()) {
+		elog.Error("Exec_CrossChainMeta invalid committer", "txHash", txHash, "fromAddr", tx.From())
+		return nil, ErrInvalidGuardianCommitter
+	}
+	info, err := r.getCrossChainInfo(meta.GetAssetSymbol())
+	if err != nil {
+		elog.Error("Exec_CrossChainMeta getCrossChainInfo", "txHash", txHash,
+			"symbol", meta.GetAssetSymbol(), "err", err)
+		return nil, ErrGetCrossChainInfo
+	}
+	if !rtypes.IsRgb20CrossChainAsset(info) {
+		elog.Error("Exec_CrossChainMeta asset is not an rgb20 asset", "txHash", txHash,
+			"symbol", meta.GetAssetSymbol(), "assetKind", info.GetAssetKind())
+		return nil, ErrInvalidAssetKind
+	}
+	switch {
+	case info.GetPrecision() == rtypes.PrecisionUnknown:
+	case info.GetPrecision() == meta.GetPrecision():
+	default:
+		elog.Error("Exec_CrossChainMeta precision already backfilled with another value", "txHash", txHash,
+			"symbol", meta.GetAssetSymbol(), "onChainPrecision", info.GetPrecision(),
+			"submittedPrecision", meta.GetPrecision())
+		return nil, ErrCrossChainPrecisionAlreadySet
+	}
+	info.Precision = meta.GetPrecision()
+	receipt.KV = append(receipt.KV, &types.KeyValue{
+		Key:   formatCrossChainInfoKey(info.GetAssetSymbol()),
+		Value: types.Encode(info),
+	})
+	// 回执日志：链上"精度是什么时候、被谁写成了什么"，按区块可查（KV 只留最终状态）。
+	receipt.Logs = append(receipt.Logs, &types.ReceiptLog{
+		Ty:  rtypes.TyCrossChainMetaLog,
+		Log: types.Encode(meta),
+	})
+	elog.Info("Exec_CrossChainMeta precision backfilled", "txHash", txHash,
+		"symbol", info.GetAssetSymbol(), "precision", info.GetPrecision())
+	return receipt, nil
+}
+
 func (r *rgbx) Exec_Deposit(deposit *rtypes.DepositAsset, tx *types.Transaction, index int) (*types.Receipt, error) {
 
 	receipt := &types.Receipt{Ty: types.ExecOk}
 	txHash := tx.Hash()
 	symbol := ensureCrossChainSymbol(deposit.GetAssetSymbol())
+	// 类别取**链上登记**值（不再看 symbol 字面量）。
+	info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
+	if err != nil {
+		elog.Error("Exec_Deposit getCrossChainInfo", "txHash", hex.EncodeToString(txHash), "symbol", symbol, "err", err)
+		return nil, ErrGetCrossChainInfo
+	}
 	// RGB20 分支：防御性复验 thresholdSig（CheckTx 已验，这里防止绕过 CheckTx 直接 Exec）。
-	if rtypes.IsRgb20Symbol(deposit.GetAssetSymbol()) {
-		info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
-		if err != nil {
-			elog.Error("Exec_Deposit getCrossChainInfo", "txHash", hex.EncodeToString(txHash), "symbol", symbol, "err", err)
-			return nil, ErrGetCrossChainInfo
-		}
+	if rtypes.IsRgb20CrossChainAsset(info) {
 		if err := verifyThresholdSig(info.GetPubkey(), deposit); err != nil {
 			elog.Error("Exec_Deposit verifyThresholdSig", "txHash", hex.EncodeToString(txHash), "symbol", symbol, "err", err)
 			return nil, err

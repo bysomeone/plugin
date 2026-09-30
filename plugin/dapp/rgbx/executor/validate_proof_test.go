@@ -541,6 +541,10 @@ func Test_checkWithdrawConfirm_burnReplayGuard(t *testing.T) {
 	r.SetStateDB(state)
 	r.SetLocalDB(local)
 
+	// 链上登记该 RGB20 资产（类别决定 checkWithdrawConfirm 走 RGB20 门禁分支）。
+	setCrossChainInfoForTest(t, state, rtypes.RGB20USDTSymbol, rtypes.CrossChainAssetRgb20,
+		rtypes.MaxPrecision, newP2WSHDepositFixture(t, frozenVectorA).tssPub)
+
 	burnA := []byte("burnA")
 	burnB := []byte("burnB")
 	withdraw := &rtypes.WithdrawAsset{AssetSymbol: rtypes.RGB20USDTSymbol, Amount: 100}

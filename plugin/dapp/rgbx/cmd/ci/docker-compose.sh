@@ -137,19 +137,16 @@ RGB20_SIDECAR_SYMBOL="${RGB20_SIDECAR_SYMBOL:-USDT}"
 RGB20_ASSET_ID="${RGB20_ASSET_ID:-}"
 RGB20_SIDECAR_ADDR="${RGB20_SIDECAR_ADDR:-rgb-sidecar:50061}"
 RGB20_SIDECAR_TEST_ADDR="${RGB20_SIDECAR_TEST_ADDR:-127.0.0.1:50064}"
-# RGB20 资产精度（`rgb20.contracts[].precision` 与 `rgb20.precision` 都取它）。
+# RGB20 资产精度：**不是配置项**，是 issue_usdt 发行出来的合约自述精度（本 harness 里写死 8，
+# engine.issue_asset 的入参）。它在这里只作为**断言期望值**与 `-a` 的换算口径。
 #
-# **它必须等于合约自己声明的精度**，否则桥会拒绝启动：启动时（侧车连上后）桥会拿
-# `contracts[].precision` 与侧车报告的合约精度逐条比对，不一致 / 合约没声明精度 / 侧车不认识该合约
-# 一律 fail-closed 拒绝启动（金额按错的精度换算会整体差 10^n 倍且全程静默，见 CONFIG.md §4.4.3）。
-# 症状反查：para1-4 起来即退出（panic），日志形如
-#   rgb20 contract precision mismatch: ... configured precision=6 but the contract declares precision=8
-# （那一对数字正是本仓改动前的形态：配置默认 6、issue_usdt 发行 8，两边从不比对。）#
-# 当前的合约由 run_rgb20_env 的 issue_usdt 发行，**它写死 precision=8**（engine.issue_asset 的
-# 入参）—— 所以这里的默认值也必须是 8。E2E harness 的 `-a` 口径同样是 1e8
-# （rgb20_test.sh 的 amt=min_units/1e8），两侧本来就是同一口径。
-# 想把 E2E 挪到精度 6（真实 USDT 的口径）以覆盖"精度 ≠ 8"的整条链路，要同时改三处：
-# issue_usdt 的 8、这里的默认值、以及 rgb20_test.sh 里的 /1e8 → /1e6（含 withdraw 的 -p）。
+# 桥侧不再有 `rgb20.precision` / `contracts[].precision`：精度由桥从侧车读合约（sidecar ListAssets），
+# 核对通过后写进链上的 crossChainInfo.precision —— 前端 / CLI 一律从链上读，不再手填。
+# 因此这里的值只用来：
+#   ① run_rgb20_env 断言"链上回填的精度 == 合约精度"（见 assert_on_chain_precision）；
+#   ② rgb20_test.sh 把 min units 换算成十进制 `-a`（amt=min_units/1e8）。
+# 想把 E2E 挪到精度 6（真实 USDT 的口径）以覆盖"精度 ≠ 8"的整条链路，要同时改两处：
+# issue_usdt 的 8、以及 rgb20_test.sh 里的 /1e8 → /1e6（`-a` 的口径现在从链上读，无需再传参）。
 RGB20_PRECISION="${RGB20_PRECISION:-8}"
 # RGB 链收敛到单 btcd：sidecar/issue_usdt/test-sim 的 RPC 指向 btcd（TLS，凭据 root/1314，
 # cert=/btcd/rpc.cert）。RGB_BITCOIND_RPC 为 host:port（无 scheme），scheme 由 cert 是否设置决定。
@@ -336,7 +333,7 @@ rank=${rank}
 [rpc.sub.light.neutrino.rgb20]
 sidecarAddr="${RGB20_SIDECAR_ADDR}"
 consignmentListen="0.0.0.0:17000"
-precision=${RGB20_PRECISION}
+# 注意这里**没有** precision：精度不是配置，是合约声明的值（桥从侧车读、核对后回填上链）。
 # testSignPsbt 打开 E2E 的 sign-psbt 测试端点（用 TSS 组签任意 PSBT，模拟用户付款）。
 # 该能力等于"用组私钥签任意内容"，签名节点无从核对 ⇒ 生产环境必须为 false（默认关闭），
 # 这里只为 E2E/regtest 打开。
@@ -345,7 +342,7 @@ testSignPsbt=true
 [[rpc.sub.light.neutrino.rgb20.contracts]]
 symbol="${RGB20_SYMBOL}"
 sidecarSymbol="${RGB20_SIDECAR_SYMBOL}"
-precision=${RGB20_PRECISION}
+# 精度同样不在这里：合约注册项只声明"哪个链上符号对应哪个合约"（assetId）与金额下限。
 # 合约身份（#58）：充值路径强校验 consignment 的 asset_id == 这个值，空值 = 拒收所有充值。
 # 空占位是**故意**的：合约运行期才发行，发行后由 apply_rgb20_asset_id_and_restart 回填。
 assetId="${RGB20_ASSET_ID}"

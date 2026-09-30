@@ -12,6 +12,7 @@ message RgbxAction {
         commitDKG     commitDKG = 5;
         depositAsset  deposit   = 6;
         withdrawAsset withdraw  = 7;
+        crossChainAssetMeta crossChainMeta = 8;
     }
 }
 
@@ -85,6 +86,13 @@ message commitDKG {
     bytes  pkScript    = 3;
     // TSS 组公钥（压缩 secp256k1），RGB20 分支 checkCommitDKG 校验 hash160(pubkey)==pkScript[2:]（BL-1）
     bytes  pubkey      = 4;
+    // 资产类别（跨链资产的链上登记类目，见 types.CrossChainAssetKind）：
+    // 决定充值/提现走哪条门禁分支，**不再**由 symbol 字面量推断。
+    uint32 assetKind   = 5;
+    // 精度（小数位）。BTC 类资产恒为 rtypes.BTCChainPrecision（checkCommitDKG 强制）；
+    // RGB20 类在 DKG 提交时**未知**（合约还没发行/侧车还没核对），必须传
+    // rtypes.PrecisionUnknown，由发行后回填（crossChainAssetMeta）写入真实值。
+    uint32 precision   = 6;
 }
 
 message depositAsset {
@@ -113,6 +121,26 @@ message crossChainInfo {
     bytes  pkScript      = 4;
     // TSS 组公钥（压缩 secp256k1），RGB20 分支验 thresholdSig 用（BL-1）
     bytes  pubkey        = 5;
+    // 资产类别（链上登记的类目，由 CommitDKG 写入，见 types.CrossChainAssetKind）。
+    uint32 assetKind     = 6;
+    // 精度（小数位）：前端 / CLI 换算金额的**唯一**依据，不再要求调用方手填。
+    // BTC 类由 CommitDKG 写死 8；RGB20 类在 CommitDKG 时是 types.PrecisionUnknown，
+    // 由桥在核对出合约声明的精度后经 crossChainAssetMeta 回填（回填前读取方必须拒绝换算）。
+    uint32 precision     = 7;
+}
+
+// crossChainAssetMeta 跨链资产元数据回填（发行后回填路径）。
+//
+// 为什么需要它：RGB20 资产的精度只能来自合约，而合约在 DKG 提交时往往还没发行 / 还没被侧车
+// 采纳（连侧车与等 DKG 是两条独立的启动路径），因此精度不可能随首次 CommitDKG 一起落链；
+// 而 CommitDKG 的语义是"每个 symbol 只提交一次"（组公钥不可换，重复提交一律被拒），不能靠
+// 二次 CommitDKG 补写。所以精度走这条**一次性回填**动作：桥在侧车报告出合约精度、并与链上
+// 记录逐项比对通过之后提交它；链上只接受"从未回填过"（precision == PrecisionUnknown）或
+// "回填成同一个值"（幂等重发）两种情况，一旦写入即不可改写。
+message crossChainAssetMeta {
+
+    string assetSymbol = 1;
+    uint32 precision   = 2;
 }
 
 message pendingTx {
