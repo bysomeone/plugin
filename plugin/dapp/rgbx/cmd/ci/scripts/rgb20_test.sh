@@ -996,6 +996,15 @@ function scenario_btc_header_guard_armed() {
 
 function run_rgb20_all() {
     run_rgb20_env
+    run_rgb20_scenarios
+}
+
+# 只跑 RGB20 的**场景**（不含环境准备）。
+#
+# 拆出来是为了 BTC-only 演示模式（RGBX_BTC_ONLY=1）：那一档跳过这批断言，但 run_rgb20_env
+# 必须照跑 —— 它里面还有 BTC 也依赖的环境准备（segwit 激活 / DKG 等待 / TSS 注资 / 起侧车），
+# 整段跳掉会让 E6(b) 报"主链头链还没提交过头"。
+function run_rgb20_scenarios() {
     run_rgb20_sidecar_genesis_withdraw_probe
     scenario_rgb20_deposit
     # E16 紧跟充值场景：它复用那笔已 settle 的 consignment 与 receive（不额外消耗流动性），

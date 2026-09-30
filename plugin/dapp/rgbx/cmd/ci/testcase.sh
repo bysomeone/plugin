@@ -19,7 +19,19 @@ function testcase_entry() {
     # run_btc_functional_all
 
     # ---- RGB20 全部：env + 充值 + 提现 + sidecar smoke ----
-    run_rgb20_all
+    #
+    # BTC-only 演示模式（RGBX_BTC_ONLY=1）：跳过 RGB20 的场景断言，但**环境准备照跑** ——
+    # run_rgb20_env 里还有 BTC 也依赖的东西（segwit 激活 / DKG 等待 / TSS 注资 / 起侧车），
+    # 整段跳掉会让下面的 E6(b) 报"主链头链还没提交过头"（实测）。
+    # 备份演练也跳过：它的提现腿走的是 RGB20。
+    # 剩下的（头链护栏 / P2WSH 充值 / 扫集 / native mint / E14 负例）就是 BTC 那条轨道。
+    if [ "${RGBX_BTC_ONLY}" = "1" ]; then
+        log_step "BTC-only mode: RGB20 env runs as usual, RGB20 scenarios skipped"
+        run_rgb20_env
+        export RGBX_BACKUP_DRILL=0
+    else
+        run_rgb20_all
+    fi
 
     # ---- E6(b)：BTC 头查询的共识权威校验必须"武装 + 在活跃路径上服务" ----
     # 放在 RGB20 之后：本场景直接查主链头链（lightcli btc last/header），要求头链已提交。
@@ -33,6 +45,15 @@ function testcase_entry() {
     # 没有扫集，P2WSH 充值地址就是"钱进得去、出不来"：钱停在用户各自的 P2WSH 上，
     # 而提现只能花主池的 BTC。
     scenario_user_deposit_sweep
+
+    # ---- BTC-only 演示模式：把被屏蔽的两条也启用 ----
+    # 两条都属于 run_btc_functional_all 那批（Phase 5 起屏蔽，旧断言针对 P2WPKH 时代），
+    # 但演示都要用：链上流转（用户之间转 XBTC）与提现回 BTC。这里单点启用。
+    # 放在扫集之后：提现花的是主池的 BTC，而扫集刚把用户充值归集回主池。
+    if [ "${RGBX_BTC_ONLY}" = "1" ]; then
+        scenario_user_transfer_crosschain_asset
+        scenario_user_withdraw_auto_confirm
+    fi
 
     # ---- 上游 native asset 场景（合并 upstream 时保留）：纯 chain33 原生资产 mint
     # + btcMintSpend 的 OP_RETURN 承诺确认。放最后：它覆盖的是**链上原生资产**这条

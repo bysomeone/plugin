@@ -123,6 +123,15 @@ SWEEP_DEPOSIT_AMOUNT_SATS="${SWEEP_DEPOSIT_AMOUNT_SATS:-3000000}"
 # ===== RGB20 (Phase 5) =====
 # RGB20 链全走 compose 内部网络：rgb-bitcoind(rgb 链) + rgb-electrs(索引) + rgb-sidecar(gRPC 50061 + test-sim 50064)。
 # 侧车镜像在 Docker 内构建（源码目录里的 Dockerfile，宿主 macOS 二进制无法进 Linux 容器）。
+# BTC-only 演示模式：只跑 BTC 跨链那条轨道，跳过 RGB20/USDT 那批**场景断言**。
+#
+# 注意**不能**顺带跳过 RGB20 的环境准备（run_rgb20_env）：那一段里还有 BTC 也依赖的东西 ——
+# segwit 激活、DKG 等待、给 TSS 注资、起侧车。实测整段跳掉会让 BTC 场景也挂：E6(b) 报
+# "主链头链还没提交过头（本场景必须跑在 run_rgb20_env 之后）"。所以 env 与 scenarios 拆成两段，
+# 只摘后者。
+#
+# **演示分支（demo/btc-crosschain）默认打开**；想跑完整套件就 RGBX_BTC_ONLY=0。主线上默认 0。
+RGBX_BTC_ONLY="${RGBX_BTC_ONLY:-1}"
 RGB20_SYMBOL="${RGB20_SYMBOL:-RGB20_USDT}"
 RGB20_SIDECAR_SYMBOL="${RGB20_SIDECAR_SYMBOL:-USDT}"
 # RGB20 合约 id（`[[rpc.sub.light.neutrino.rgb20.contracts]].assetId`）。
