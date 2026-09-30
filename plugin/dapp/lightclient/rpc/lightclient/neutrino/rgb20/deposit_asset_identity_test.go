@@ -44,6 +44,9 @@ const (
 // newAssetIdentityTestAdapter 造一个**配了 assetId** 的适配器（连假侧车、起后台协程，与 newTestAdapter 同构）。
 func newAssetIdentityTestAdapter(t *testing.T, mock *MockSidecar, bridge Chain33Bridge, assetID string) (*Adapter, func()) {
 	t.Helper()
+	// 假侧车要报告这个合约（精度与配置一致），否则 Connect 的精度核对会拒掉连接
+	// （见 VerifyContractPrecisions）——这与真实部署一样：配置声明的合约必须侧车认识。
+	seedMockAsset(mock, assetID, 6)
 	sock, cleanup := StartTestSidecar(t, mock)
 	adapter, err := NewAdapter(Config{
 		SidecarAddr: sock,

@@ -23,12 +23,16 @@ type MockSidecar struct {
 	transfers      map[string]*pb.TransferState // receive_id -> 状态
 	seals          map[string]*pb.SealInfo
 	// 可配置行为
-	ValidateResp    []*pb.ConsignmentValidation // 依次返回；耗尽后返回 valid=false
-	BuildResp       *pb.BuildWithdrawalResponse
-	BuildErr        error // 非空则 BuildWithdrawal 返回该错误（驱动不可恢复失败路径）
-	FinalizeResp    *pb.FinalizeWithdrawalResponse
-	ParseResp       *pb.ParseBtcTxResponse
-	ListSealsErr    error // 非空则 ListSeals 返回该错误（驱动 fail-closed 降级路径）
+	ValidateResp []*pb.ConsignmentValidation // 依次返回；耗尽后返回 valid=false
+	BuildResp    *pb.BuildWithdrawalResponse
+	BuildErr     error // 非空则 BuildWithdrawal 返回该错误（驱动不可恢复失败路径）
+	FinalizeResp *pb.FinalizeWithdrawalResponse
+	ParseResp    *pb.ParseBtcTxResponse
+	ListSealsErr error // 非空则 ListSeals 返回该错误（驱动 fail-closed 降级路径）
+	// ListAssetsErr 非空则 ListAssets 返回该错误（驱动"精度核对时侧车查询失败"这条可重试路径）。
+	ListAssetsErr error
+	// Assets ListAssets 返回的资产（精度核对读它；默认空 = 侧车不认识任何合约）。
+	Assets          []*pb.AssetInfo
 	CreateReceiveFn func(ctx context.Context, req *pb.CreateReceiveRequest) (*pb.ReceiveData, error)
 	OnProvide       func(ctx context.Context, req *pb.ProvideConsignmentRequest) (*pb.TransferState, error)
 	SidecarAddr     string // 提供给 BuildWithdrawal 的找零地址（TSS 地址）
@@ -51,6 +55,20 @@ func NewMockSidecar() *MockSidecar {
 		transfers: make(map[string]*pb.TransferState),
 		seals:     make(map[string]*pb.SealInfo),
 	}
+}
+
+// seedMockAsset 让假侧车把某个合约"报出来"（ListAssets 的返回项）。
+//
+// 凡是要走到 `Adapter.Connect` 的 fixture 都必须调它：Connect 现在会核对"配置里的 precision ==
+// 合约自述的 precision"（见 VerifyContractPrecisions），假侧车默认不报任何合约，等于"这份部署声明的
+// 合约侧车根本不认识"，连接会被拒。
+func seedMockAsset(mock *MockSidecar, assetID string, precision uint32) {
+	mock.Assets = append(mock.Assets, &pb.AssetInfo{
+		AssetId:     assetID,
+		AssetSymbol: "USDT",
+		Schema:      "InflatableFungibleAsset",
+		Precision:   precision,
+	})
 }
 
 // StartTestSidecar 在临时 unix socket 上启动假侧车 gRPC 服务，返回 socket 路径与清理函数。
@@ -160,7 +178,16 @@ func (m *MockSidecar) GetBalance(_ context.Context, _ *pb.GetBalanceRequest) (*p
 }
 
 func (m *MockSidecar) ListAssets(_ context.Context, _ *pb.ListAssetsRequest) (*pb.ListAssetsResponse, error) {
-	return &pb.ListAssetsResponse{}, nil
+	if m.ListAssetsErr != nil {
+		return nil, m.ListAssetsErr
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := &pb.ListAssetsResponse{}
+	for _, a := range m.Assets {
+		out.Assets = append(out.Assets, proto.Clone(a).(*pb.AssetInfo))
+	}
+	return out, nil
 }
 
 func (m *MockSidecar) BuildWithdrawal(_ context.Context, req *pb.BuildWithdrawalRequest) (*pb.BuildWithdrawalResponse, error) {

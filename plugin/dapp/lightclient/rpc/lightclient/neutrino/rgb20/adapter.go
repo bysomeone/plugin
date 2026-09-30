@@ -268,6 +268,12 @@ func NewAdapter(cfg Config, store KVStore) (*Adapter, error) {
 }
 
 // Connect 建立侧车 gRPC 连接（unix socket 优先）。所有节点都需要（签名节点只读校验）。
+//
+// 连接成功后**立刻核对合约精度**（见 VerifyContractPrecisions），只有核对通过才把连接挂上：
+// 于是 `IsConnected()`（提现/充值轮询等所有业务的入口）成立时，精度一定已经核对过 —— 否则会存在
+// 一个"业务已经在动钱、精度还没核对"的窗口。核对发现的**静态分歧**（配置与合约对不上、合约没声明
+// 精度、侧车不认识该合约）以 ErrContractPrecisionMismatch 返回，由调用方 fail-closed 拒绝启动；
+// 其余错误（侧车暂时连不上/查询失败）返回普通 error，调用方按可重试处理。
 func (a *Adapter) Connect(ctx context.Context) error {
 	if a.sidecar.Load() != nil {
 		return nil
@@ -280,6 +286,15 @@ func (a *Adapter) Connect(ctx context.Context) error {
 		return err
 	}
 	a.sidecar.Store(sc)
+	if err := a.VerifyContractPrecisions(ctx); err != nil {
+		// 核对没过就把连接摘掉：`IsConnected()` 的语义必须是"连上**且已核对**"，否则所有
+		// 以它为入口的业务（提现/充值轮询）会在这段窗口里动钱。摘掉之后调用方要么重试
+		// （暂时性失败），要么 fail-closed 拒绝启动（静态分歧，见 ErrContractPrecisionMismatch）。
+		a.sidecar.CompareAndSwap(sc, nil)
+		return err
+	}
+	log.Info("Connect rgb20 sidecar connected, contract precisions verified",
+		"contracts", len(a.cfg.Contracts))
 	return nil
 }
 

@@ -137,7 +137,20 @@ RGB20_SIDECAR_SYMBOL="${RGB20_SIDECAR_SYMBOL:-USDT}"
 RGB20_ASSET_ID="${RGB20_ASSET_ID:-}"
 RGB20_SIDECAR_ADDR="${RGB20_SIDECAR_ADDR:-rgb-sidecar:50061}"
 RGB20_SIDECAR_TEST_ADDR="${RGB20_SIDECAR_TEST_ADDR:-127.0.0.1:50064}"
-RGB20_PRECISION="${RGB20_PRECISION:-6}"
+# RGB20 资产精度（`rgb20.contracts[].precision` 与 `rgb20.precision` 都取它）。
+#
+# **它必须等于合约自己声明的精度**，否则桥会拒绝启动：启动时（侧车连上后）桥会拿
+# `contracts[].precision` 与侧车报告的合约精度逐条比对，不一致 / 合约没声明精度 / 侧车不认识该合约
+# 一律 fail-closed 拒绝启动（金额按错的精度换算会整体差 10^n 倍且全程静默，见 CONFIG.md §4.4.3）。
+# 症状反查：para1-4 起来即退出（panic），日志形如
+#   rgb20 contract precision mismatch: ... configured precision=6 but the contract declares precision=8
+# （那一对数字正是本仓改动前的形态：配置默认 6、issue_usdt 发行 8，两边从不比对。）#
+# 当前的合约由 run_rgb20_env 的 issue_usdt 发行，**它写死 precision=8**（engine.issue_asset 的
+# 入参）—— 所以这里的默认值也必须是 8。E2E harness 的 `-a` 口径同样是 1e8
+# （rgb20_test.sh 的 amt=min_units/1e8），两侧本来就是同一口径。
+# 想把 E2E 挪到精度 6（真实 USDT 的口径）以覆盖"精度 ≠ 8"的整条链路，要同时改三处：
+# issue_usdt 的 8、这里的默认值、以及 rgb20_test.sh 里的 /1e8 → /1e6（含 withdraw 的 -p）。
+RGB20_PRECISION="${RGB20_PRECISION:-8}"
 # RGB 链收敛到单 btcd：sidecar/issue_usdt/test-sim 的 RPC 指向 btcd（TLS，凭据 root/1314，
 # cert=/btcd/rpc.cert）。RGB_BITCOIND_RPC 为 host:port（无 scheme），scheme 由 cert 是否设置决定。
 RGB20_BITCOIND_RPC="${RGB20_BITCOIND_RPC:-btcd:18443}"
