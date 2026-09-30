@@ -22,6 +22,8 @@ const (
 	TyCommitDKGAction
 	TyDepositAsset
 	TyWithdrawAsset
+	// TyCrossChainMetaAction 跨链资产元数据回填（精度），见 proto 的 crossChainAssetMeta。
+	TyCrossChainMetaAction
 
 	NameMintAction      = "Mint"
 	NameTransferAction  = "Transfer"
@@ -31,6 +33,8 @@ const (
 	// 例如 oneof deposit -> 此处为 "Deposit"，不能为 "DepositAsset"。
 	NameDepositAssetAction  = "Deposit"
 	NameWithdrawAssetAction = "Withdraw"
+	// NameCrossChainMetaAction 对应 oneof 字段 crossChainMeta。
+	NameCrossChainMetaAction = "CrossChainMeta"
 )
 
 // log类型id值
@@ -41,12 +45,16 @@ const (
 	TyCommitDKGLog
 	TyDepositAssetLog
 	TyWithdrawAssetLog
+	// TyCrossChainMetaLog 跨链资产元数据回填（精度）的回执日志。
+	TyCrossChainMetaLog
 
 	NameAssetLog         = "AssetLog"
 	NamePendingTxLog     = "PendingTxLog"
 	NameCommitDKGLog     = "CommitDKGLog"
 	NameDepositAssetLog  = "DepositAssetLog"
 	NameWithdrawAssetLog = "WithdrawAssetLog"
+	// NameCrossChainMetaLog 回执里记录"哪个符号的精度被回填成了什么"，便于按区块核对链上值。
+	NameCrossChainMetaLog = "CrossChainMetaLog"
 )
 
 var (
@@ -60,12 +68,16 @@ var (
 		NameCommitDKGAction:     TyCommitDKGAction,
 		NameDepositAssetAction:  TyDepositAsset,
 		NameWithdrawAssetAction: TyWithdrawAsset,
+
+		NameCrossChainMetaAction: TyCrossChainMetaAction,
 	}
 	//定义log的id和具体log类型及名称，填入具体自定义log类型
 	logMap = map[int64]*types.LogInfo{
 		TyAssetLog:     {Ty: reflect.TypeOf(RgbxAsset{}), Name: NameAssetLog},
 		TyPendingTxLog: {Ty: reflect.TypeOf(PendingTx{}), Name: NamePendingTxLog},
 		TyCommitDKGLog: {Ty: reflect.TypeOf(types.ReqAddrs{}), Name: NameCommitDKGLog},
+		// 回填日志带的是载荷（symbol + precision），比"只留一条 KV"更适合按区块核对链上精度。
+		TyCrossChainMetaLog: {Ty: reflect.TypeOf(CrossChainAssetMeta{}), Name: NameCrossChainMetaLog},
 	}
 )
 
@@ -128,6 +140,8 @@ func GetActionName(ty int32) string {
 		return NameDepositAssetAction
 	case TyWithdrawAsset:
 		return NameWithdrawAssetAction
+	case TyCrossChainMetaAction:
+		return NameCrossChainMetaAction
 	default:
 		return "unknownAction"
 	}

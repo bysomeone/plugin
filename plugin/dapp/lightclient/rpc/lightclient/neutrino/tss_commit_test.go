@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/33cn/plugin/plugin/dapp/lightclient/rpc/lightclient/neutrino/rgb20"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcutil"
@@ -59,7 +60,10 @@ func newTestTssService(t *testing.T) *tssService {
 	require.NoError(t, err)
 	pkScript, err := txscript.PayToAddrScript(addr)
 	require.NoError(t, err)
-	return &tssService{tssPublicKey: pub, tssAddress: addr, pkScript: pkScript}
+	// client 必须给出：载荷里要写上该资产的**类别**与**精度**，类别来自本节点的合约注册表
+	// （没有 rgb20 配置 ⇒ 一切符号都是 BTC 类）。
+	return &tssService{tssPublicKey: pub, tssAddress: addr, pkScript: pkScript,
+		client: &neutrinoClient{}}
 }
 
 // TestBuildCommitDKGPayload_acceptedByChainGate 桥组装的 BTC CommitDKG 载荷必须过链上公钥判据。
@@ -72,6 +76,9 @@ func TestBuildCommitDKGPayload_acceptedByChainGate(t *testing.T) {
 	assert.Equal(t, 33, len(payload.GetPubkey()), "必须是 33 字节压缩公钥")
 	assert.Equal(t, svc.tssPublicKey.SerializeCompressed(), payload.GetPubkey())
 	require.NoError(t, chainCommitDKGPubkeyGate(payload), "带 pubkey 的载荷必须被链上接受")
+	// 类别与精度随建记录一起上链：BTC 类是协议常量 8（链上 checkCommitDKG 强制同一个值）。
+	assert.Equal(t, uint32(rtypes.CrossChainAssetBtc), payload.GetAssetKind())
+	assert.Equal(t, rtypes.BTCChainPrecision, payload.GetPrecision())
 
 	// 反向：不带 pubkey（改动前的形态）被链上拒 —— 这正是 E2E 里"卡在提交 CommitDKG"的原因。
 	withoutPubkey := &rtypes.CommitDKG{
@@ -90,6 +97,18 @@ func TestBuildCommitDKGPayload_acceptedByChainGate(t *testing.T) {
 		PkScript:    payload.GetPkScript(),
 		Pubkey:      uncompressed,
 	}), rtypes.ErrInvalidTssPubKey)
+
+	// 注册为 RGB20 合约的符号要按 RGB20 类提交，且精度是**"尚未回填"哨兵**：
+	// 合约精度此刻（DKG 提交时）还没被侧车核对出来，链上不允许猜一个值（真实值由
+	// ensureCrossChainAssetPrecisions 在侧车连上后回填）。
+	svcRgb20 := newTestTssService(t)
+	adapter := newTestRgb20Adapter(t)
+	adapter.Registry().Register(&rgb20.Contract{Symbol: rtypes.RGB20USDTSymbol, SidecarSymbol: "USDT"})
+	svcRgb20.client.rgb20 = adapter
+	rgbPayload := svcRgb20.buildCommitDKGPayload(rtypes.RGB20USDTSymbol)
+	require.NotNil(t, rgbPayload)
+	assert.Equal(t, uint32(rtypes.CrossChainAssetRgb20), rgbPayload.GetAssetKind())
+	assert.Equal(t, rtypes.PrecisionUnknown, rgbPayload.GetPrecision())
 
 	// 反向：公钥与 pkScript 不配套（另一个 DKG 结果）也被拒。
 	otherPriv, _ := btcec.PrivKeyFromBytes([]byte{0x42})

@@ -19,9 +19,9 @@ type Config struct {
 	// ChangeAddress 提现找零地址（TSS P2WPKH 地址）。
 	ChangeAddress string
 	// Contracts 注册的 RGB20 资产合约。
+	//
+	// 这里**没有**默认精度：精度不是配置，而是合约自己的声明（见 ContractPrecisions）。
 	Contracts []Contract
-	// Precision 默认精度（若合约未指定，RGB20 USDT 为 6）。
-	Precision uint32
 	// MinConfirmations 充值铸造所需 BTC 确认数（默认与桥的 blockConfirmations 对齐）。
 	MinConfirmations uint32
 	// HeaderRelayConfirmations 中继提交头链时**保留的确认深度** B
@@ -45,11 +45,12 @@ type Config struct {
 }
 
 // Contract 一个 RGB20 资产的合约注册项。
+//
+// 精度不在这里：它是合约声明的事实（ContractPrecisions 从侧车读），不是可以手填的配置。
 type Contract struct {
 	Symbol        string `json:"symbol"`        // chain33 侧资产符号，如 RGB20_USDT（Registry 索引键）
 	SidecarSymbol string `json:"sidecarSymbol"` // 侧车发行资产符号，如 USDT；空则回退 Symbol
 	AssetID       string `json:"assetId"`       // rgb:...
-	Precision     uint32 `json:"precision"`     // 资产小数位
 	MinDeposit    int64  `json:"minDeposit"`    // 最小充值（最小单位）
 	MinWithdraw   int64  `json:"minWithdraw"`   // 最小提现（最小单位）
 }
@@ -197,6 +198,10 @@ type RGB20Adapter interface {
 	IsConnected() bool
 	// Sidecar 返回底层侧车客户端（用于签名节点只读校验）。
 	Sidecar() *Sidecar
+	// ContractPrecisions 返回每个已注册合约**声明**的精度（chain33 侧符号为键），
+	// 合约没声明精度 / 侧车不认识它时以 ErrContractPrecisionUnusable 拒绝。
+	// 调用方（neutrino 主包）拿它与链上 crossChainInfo.precision 比对，并把值回填上链。
+	ContractPrecisions(ctx context.Context) (map[string]uint32, error)
 	// IsKnownRgbTxid 判断 txid 是否为已知 RGB 交易（充值收款 / 提现交易），
 	// btcwallet.analyzeTransaction 分类排除用。
 	IsKnownRgbTxid(txid string) bool
@@ -269,11 +274,15 @@ func NewAdapter(cfg Config, store KVStore) (*Adapter, error) {
 
 // Connect 建立侧车 gRPC 连接（unix socket 优先）。所有节点都需要（签名节点只读校验）。
 //
-// 连接成功后**立刻核对合约精度**（见 VerifyContractPrecisions），只有核对通过才把连接挂上：
-// 于是 `IsConnected()`（提现/充值轮询等所有业务的入口）成立时，精度一定已经核对过 —— 否则会存在
-// 一个"业务已经在动钱、精度还没核对"的窗口。核对发现的**静态分歧**（配置与合约对不上、合约没声明
-// 精度、侧车不认识该合约）以 ErrContractPrecisionMismatch 返回，由调用方 fail-closed 拒绝启动；
+// 连接成功后**立刻读一次合约精度**（见 ContractPrecisions）并校验其可用性，只有通过才把连接挂上：
+// 于是 `IsConnected()`（提现/充值轮询等所有业务的入口）成立时，合约精度一定已经读过并可用 ——
+// 否则会存在一个"业务已经在动钱、精度还没核对"的窗口。合约侧的**静态分歧**（合约没声明精度、
+// 侧车不认识该合约）以 ErrContractPrecisionUnusable 返回，由调用方 fail-closed 拒绝启动；
 // 其余错误（侧车暂时连不上/查询失败）返回普通 error，调用方按可重试处理。
+//
+// 注意这里只做**本地**判定（精度是否存在、是否在链上口径内）。与链上记录是否一致由
+// neutrino 包在侧车连上之后单独做（见 ensureCrossChainAssetPrecisions）—— 那一步要用到主链，
+// 不属于本适配器的职责。
 func (a *Adapter) Connect(ctx context.Context) error {
 	if a.sidecar.Load() != nil {
 		return nil
@@ -286,15 +295,16 @@ func (a *Adapter) Connect(ctx context.Context) error {
 		return err
 	}
 	a.sidecar.Store(sc)
-	if err := a.VerifyContractPrecisions(ctx); err != nil {
-		// 核对没过就把连接摘掉：`IsConnected()` 的语义必须是"连上**且已核对**"，否则所有
+	precisions, err := a.ContractPrecisions(ctx)
+	if err != nil {
+		// 核对没过就把连接摘掉：`IsConnected()` 的语义必须是"连上**且精度已核对**"，否则所有
 		// 以它为入口的业务（提现/充值轮询）会在这段窗口里动钱。摘掉之后调用方要么重试
-		// （暂时性失败），要么 fail-closed 拒绝启动（静态分歧，见 ErrContractPrecisionMismatch）。
+		// （暂时性失败），要么 fail-closed 拒绝启动（静态分歧，见 ErrContractPrecisionUnusable）。
 		a.sidecar.CompareAndSwap(sc, nil)
 		return err
 	}
 	log.Info("Connect rgb20 sidecar connected, contract precisions verified",
-		"contracts", len(a.cfg.Contracts))
+		"contracts", len(a.cfg.Contracts), "withDeclaredPrecision", len(precisions))
 	return nil
 }
 

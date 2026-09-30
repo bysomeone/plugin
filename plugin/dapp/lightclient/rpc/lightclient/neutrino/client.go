@@ -161,7 +161,6 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 	rgbCfg := rgb20.Config{
 		SidecarAddr:       n.cfg.Rgb20.SidecarAddr,
 		ConsignmentListen: n.cfg.Rgb20.ConsignmentListen,
-		Precision:         n.cfg.Rgb20.Precision,
 		ChangeAddress:     n.cfg.Rgb20.ChangeAddress,
 		MinConfirmations:  n.cfg.BlockConfirmations,
 		// 无上下文的测试签名（E2E 的 sign-psbt 端点）：按配置透传，默认关闭。
@@ -175,7 +174,6 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 			Symbol:        c.Symbol,
 			SidecarSymbol: c.SidecarSymbol,
 			AssetID:       c.AssetID,
-			Precision:     c.Precision,
 			MinDeposit:    c.MinDeposit,
 			MinWithdraw:   c.MinWithdraw,
 		})
@@ -218,11 +216,12 @@ func (n *neutrinoClient) Start() {
 				if err == nil {
 					return true
 				}
-				if errors.Is(err, rgb20.ErrContractPrecisionMismatch) {
-					// 配置声明的精度与合约自述的精度对不上（或合约根本没声明精度）——**静态分歧**，
-					// 重试多少次也不会变。金额换算的精度只能来自合约（见 rgb20.VerifyContractPrecisions），
-					// 按一个错的值换算会让金额整体差 10^n 倍且全程静默，所以这里与 TSS share 自检同一取向，
-					// fail-closed 拒绝启动，而不是带着一个会算错钱的桥继续跑。
+				if errors.Is(err, rgb20.ErrContractPrecisionUnusable) {
+					// 合约没有可用的精度声明（没声明 / 超出链上口径 / 侧车不认识这个合约）——
+					// **静态分歧**，重试多少次也不会变。金额换算的精度只能来自合约
+					// （见 rgb20.ContractPrecisions），按一个错的值换算会让金额整体差 10^n 倍且
+					// 全程静默，所以这里与 TSS share 自检同一取向，fail-closed 拒绝启动，
+					// 而不是带着一个会算错钱的桥继续跑。
 					log.Error("Start rgb20 contract precision check failed, refuse to start", "err", err)
 					panic(err)
 				}
@@ -230,6 +229,9 @@ func (n *neutrinoClient) Start() {
 				return false
 			}, time.Second*3)
 			log.Info("Start rgb20 sidecar connected")
+			// 侧车连上之后把合约精度与链上记录对齐（必要时回填上链），不一致则拒绝启动。
+			// 放在这里而不是 Connect 里：它要用主链（查询 + 提交），而适配器只面向侧车。
+			n.ensureCrossChainAssetPrecisions()
 		}()
 	}
 	// 跨节点 watch 集补齐（C4）：**每个节点**都下发自己那份登记并接收侧车持有的并集 ——

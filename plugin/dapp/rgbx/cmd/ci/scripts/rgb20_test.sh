@@ -269,7 +269,12 @@ function run_rgb20_env() {
     # 侧车先起来，再重启 para：重启后的桥会立刻连侧车（连不上也能自愈重试，但少一个失败窗口）。
     apply_rgb20_asset_id_and_restart "${rgb20_asset_id}"
     wait_bridge_signing_ready
-    log_step "RGB20 env done: sidecar up (GG18 pubkey), contracts.assetId=${RGB20_ASSET_ID}"
+    # 精度上链的端到端断言（本次改动的核心）：BTC 类是协议常量 8（随 CommitDKG），RGB20 类是
+    # 合约声明的 8（桥核对后经 crossChainMeta 回填）。回填要等重启后的桥重新连上侧车，故给足重试。
+    assert_on_chain_precision "${MINT_SYMBOL}" 0 8
+    assert_on_chain_precision "${RGB20_SYMBOL}" 1 "${RGB20_PRECISION}"
+    log_step "RGB20 env done: sidecar up (GG18 pubkey), contracts.assetId=${RGB20_ASSET_ID}, " \
+        "on-chain precision: ${MINT_SYMBOL}=8 (BTC kind), ${RGB20_SYMBOL}=${RGB20_PRECISION} (RGB20 kind)"
 }
 
 # =====================================================================
@@ -303,6 +308,32 @@ function wait_bridge_signing_ready() {
         sleep 1
     done
     fail "bridge rgb20 HTTP not ready after 300s (CGGMP refresh stuck? check the para1 log for 'ensureRefresh')"
+}
+
+# assert_on_chain_precision 链上资产的**类别 + 精度**断言（本次改动的端到端判据）。
+#
+# 为什么必须断言链上那份：前端与 CLI 换算金额的唯一依据就是 crossChainInfo 上的这两个字段
+# （precision 决定 `-a` 的小数位，assetKind 决定充值/提现走哪条门禁分支）。它们是"搬上链"的
+# 产物，只在桥的内存里对不算数 —— 只有 `getCrossChainInfo` 查得到才算真的落链。
+#
+# 两条来源不同，都要覆盖：
+#   - BTC 类：精度是协议常量 8，随 CommitDKG 一起落链；
+#   - RGB20 类：精度来自**合约**（issue_usdt 发行时声明），由桥在侧车核对出合约精度后经
+#     crossChainMeta 一次性回填 —— 不落链的话，调用方只能手填精度（旧行为，填错静默差 10^n 倍）。
+function assert_on_chain_precision() {
+    local symbol="$1" want_kind="$2" want_precision="$3" retries="${4:-60}"
+    local i info kind precision
+    for ((i = 0; i < retries; i++)); do
+        info=$(${MAIN_CLI} rgbx getCrossChainInfo -s "${symbol}" 2>/dev/null) || true
+        kind=$(echo "${info}" | jq -r '.assetKind // empty' 2>/dev/null) || true
+        precision=$(echo "${info}" | jq -r '.precision // empty' 2>/dev/null) || true
+        if [ "${kind}" = "${want_kind}" ] && [ "${precision}" = "${want_precision}" ]; then
+            log_step "on-chain asset registration OK: symbol=${symbol} assetKind=${kind} precision=${precision}"
+            return 0
+        fi
+        sleep 1
+    done
+    fail "on-chain asset registration mismatch: symbol=${symbol} want assetKind=${want_kind} precision=${want_precision}, got assetKind=${kind:-<empty>} precision=${precision:-<empty>} (the bridge records a bridged asset's kind at DKG commit and its precision after verifying the contract; the CLI and the frontend read them from here)"
 }
 
 # =====================================================================
@@ -474,11 +505,12 @@ function rgb20_withdraw_once() {
         -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${amount}}" | jq -r '.invoice // empty')
     assert_non_empty "${user_invoice}" "rgb20 user invoice empty (${label})"
 
-    # 2. chain33 发起提现（destinationAddr=invoice；-a 口径 = 1e8，反算）
-    #    -p 是**必须**的：桥接符号（RGB20_*）的精度只在合约里，CLI 读不到，因此 CLI 拒绝对它猜
-    #    （见 rgbx/commands 的 resolveWithdrawDecimals）。这里传的就是合约发行时的精度。
+    # 2. chain33 发起提现（destinationAddr=invoice）
+    #    **没有 -p**：-a 的小数位由 CLI 从链上读（跨链资产读 crossChainInfo.precision —— 桥已经把
+    #    核对过的合约精度回填在那，见 resolveWithdrawDecimals）。这里 amt 按 1e8 口径反算，正说明
+    #    链上那份精度就是 8（若链上回填错，这里会因金额超精度而失败，而不是静默换一个金额）。
     amt=$(awk "BEGIN{printf \"%.8f\", ${amount}/100000000}")
-    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -p "${RGB20_PRECISION}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
+    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
     assert_length "${withdraw_hash}" 66 "rgb20 withdraw tx hash (${label})"
 
     # 3. 等桥确认销毁（本轮这笔 pending 清除 = rgbx Confirm 已提交）
@@ -650,9 +682,9 @@ function scenario_rgb20_truncation_withdraw() {
     assert_non_empty "${user_invoice}" "rgb20 truncation user invoice empty"
 
     # 2. chain33 发起提现（-a 口径 = min units / 1e8；旧实现下 ${RGB20_TRUNCATION_WITHDRAW_AMOUNT} 会少 1）
-    #    -p 传合约精度（桥接符号 CLI 不猜，见 rgbx/commands 的 resolveWithdrawDecimals）。
+    #    没有 -p：精度从链上读（见 resolveWithdrawDecimals）。
     amt=$(awk "BEGIN{printf \"%.8f\", ${RGB20_TRUNCATION_WITHDRAW_AMOUNT}/100000000}")
-    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -p "${RGB20_PRECISION}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
+    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
     assert_length "${withdraw_hash}" 66 "rgb20 truncation withdraw tx hash"
 
     # 3. 断言 burn 额（链上 pending）== invoice 额。浮点截断时这里是 59999。

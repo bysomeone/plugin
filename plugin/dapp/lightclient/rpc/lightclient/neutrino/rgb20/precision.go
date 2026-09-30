@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 
@@ -23,47 +22,52 @@ import (
 // （`u32::MAX`），`proto/rgb_sidecar.proto` 的 `AssetInfo.precision` 也写明了。改一个就必须同时
 // 改另一个；`TestPrecisionUnknownCannotCollideWithARealPrecision` 把"哨兵在精度空间之外"这条
 // 钉住，若哪天 RGB 的精度上限越过它，测试会失败，而不是某个合约静静被当成"未知"。
-const PrecisionUnknown uint32 = math.MaxUint32
-
-// ErrContractPrecisionMismatch 表示"配置声明的精度"与"合约自述的精度"对不上（或合约根本没声明）。
 //
-// 单独一个错误类型是为了让调用方（neutrino 的启动流程）能把它与"侧车暂时连不上/查询失败"这类
-// 可重试错误区分开：前者是静态的配置/合约分歧，重试一万次也不会变，必须**拒绝启动**；后者等下一次
-// 重试即可。策略留在调用方，机制留在这里。
-var ErrContractPrecisionMismatch = errors.New("rgb20 contract precision mismatch")
+// 同一个值也是**链上**"精度尚未回填"的哨兵（rtypes.PrecisionUnknown，由本常量指向它）：
+// 桥把侧车读到的真实精度写进链上记录之前，链上记录就是这个值。
+const PrecisionUnknown uint32 = rtypes.PrecisionUnknown
 
-// VerifyContractPrecisions 核对每个已注册合约：**侧车报告的合约精度必须存在、合法，且等于配置里
-// 声明的 `contracts[].precision`**。
+// ErrContractPrecisionUnusable 表示侧车报告的合约精度**不可用于换算金额**：合约没声明精度、
+// 声明了一个超出链上口径的值（含别的哨兵），或侧车根本不认识这个已注册的 assetId。
 //
-// 为什么必须在启动时做、且必须 fail-closed：金额换算（用户输入的十进制金额 → 链上最小单位）依赖
-// 精度，而精度只能来自合约。配错一个数（或合约没声明）时，换算会整体差 10^(8-p) 倍，且**全程静默**
-// —— 用户以为在提 1 USDT，实际烧掉的是 100 USDT 对应的最小单位。这与 #58 的合约身份校验同一取向：
+// 单独一个错误类型是为了让调用方（neutrino 的启动流程）能把它与"侧车暂时连不上 / 查询失败"这类
+// 可重试错误区分开：前者是静态分歧（换来换去也不会变），必须**拒绝启动**；后者等下一次重试即可。
+// 策略留在调用方，机制留在这里。
+var ErrContractPrecisionUnusable = errors.New("rgb20 contract precision unusable")
+
+// ContractPrecisions 读取每个已注册合约的**合约声明精度**（侧车 ListAssets），并逐个校验它可用。
+//
+// 返回 symbol → 精度（chain33 侧资产符号为键，与链上 crossChainInfo 的键同一口径）。
+//
+// 为什么放在启动路径上、且必须 fail-closed：金额换算（用户输入的十进制金额 → 最小单位）依赖精度，
+// 而精度只能来自合约。配错（或合约没声明）时换算会整体差 10^(8-p) 倍，且**全程静默** ——
+// 用户以为在提 1 USDT，实际烧掉的是 100 USDT 对应的最小单位。这与 #58 的合约身份校验同一取向：
 // 宁可拒服务，不要静默算错钱。
 //
-// 判定（全部不通过即拒绝）：
+// 判定（任何一条不通过即拒绝，错误包 ErrContractPrecisionUnusable）：
 //   - `contracts[].assetId` **为空**：跳过并 WARN。空 assetId 等于"身份还没配"，此时无从确定是哪个
 //     合约，且充值路径早已对空 assetId fail-closed（见 verifyAssetContract）——启动期再拒一次只会
 //     让"先起节点、后回填 assetId"的部署（E2E 就是这么做的）起不来。
-//   - 侧车里查不到该 assetId 的合约：拒绝。配置声明了一个侧车不认识的合约，没有任何东西能证明精度。
+//   - 侧车里查不到该 assetId 的合约：拒绝。注册了一个侧车不认识的合约，没有任何东西能证明精度。
 //   - 精度是 PrecisionUnknown：拒绝。合约没有自述精度（schema 里没有 `spec` global），侧车照样采纳它
 //     （拒绝一个描述性字段缺失的合约比报一个不精确的更糟），但**桥不替它猜**。
 //   - 精度 > rtypes.MaxPrecision：拒绝。超出链上口径能表达的精度（含其它哨兵值），一律不认。
-//   - 精度 != contracts[].precision：拒绝。两侧都在，且不一致 —— 这就是那个静默 100 倍误差。
 //
 // 所有不通过的项会**一次性全部返回**（不是碰到第一个就返回）：运维一次就能看到所有要改的配置，
-// 而不是改一个重启一次。返回的错误都包了 ErrContractPrecisionMismatch，供调用方判类型。
-func (a *Adapter) VerifyContractPrecisions(ctx context.Context) error {
+// 而不是改一个重启一次。这是"合约精度是否可用"的**本地**判定；把它与"链上记录的精度是否相等"
+// （neutrino 包里的 ensureCrossChainAssetPrecisions）叠加起来，才是完整的启动自检。
+func (a *Adapter) ContractPrecisions(ctx context.Context) (map[string]uint32, error) {
 	if len(a.cfg.Contracts) == 0 {
-		return nil
+		return nil, nil
 	}
 	sc := a.sidecar.Load()
 	if sc == nil {
-		return fmt.Errorf("rgb20 sidecar is not connected, cannot verify contract precisions")
+		return nil, fmt.Errorf("rgb20 sidecar is not connected, cannot read contract precisions")
 	}
 	resp, err := sc.ListAssets(ctx, &pb.ListAssetsRequest{})
 	if err != nil {
-		// 暂时性失败：交给调用方重试，不当成"配置不一致"。
-		return fmt.Errorf("list sidecar assets to verify contract precisions: %w", err)
+		// 暂时性失败：交给调用方重试，不当成"合约不可用"。
+		return nil, fmt.Errorf("list sidecar assets to read contract precisions: %w", err)
 	}
 	byAssetID := make(map[string]*pb.AssetInfo, len(resp.GetAssets()))
 	for _, ai := range resp.GetAssets() {
@@ -72,13 +76,15 @@ func (a *Adapter) VerifyContractPrecisions(ctx context.Context) error {
 		}
 	}
 
+	precisions := make(map[string]uint32, len(a.cfg.Contracts))
 	var problems []string
 	for i := range a.cfg.Contracts {
 		c := a.cfg.Contracts[i]
 		wantID := strings.TrimSpace(c.AssetID)
 		if wantID == "" {
-			log.Warn("VerifyContractPrecisions: contract declares no assetId, so its precision cannot be "+
-				"verified (deposits for it are already refused by the contract identity check)",
+			log.Warn("ContractPrecisions: contract declares no assetId, so its precision cannot be "+
+				"verified or recorded on chain (deposits for it are already refused by the contract "+
+				"identity check)",
 				"symbol", c.Symbol)
 			continue
 		}
@@ -102,18 +108,15 @@ func (a *Adapter) VerifyContractPrecisions(ctx context.Context) error {
 			problems = append(problems, fmt.Sprintf(
 				"symbol=%s assetId=%s: the contract reports precision=%d, above this chain's maximum of %d",
 				c.Symbol, wantID, got, rtypes.MaxPrecision))
-		case got != c.Precision:
-			problems = append(problems, fmt.Sprintf(
-				"symbol=%s assetId=%s: configured precision=%d but the contract declares precision=%d "+
-					"(amounts would be off by 10^%d)",
-				c.Symbol, wantID, c.Precision, got, int64(c.Precision)-int64(got)))
+		default:
+			precisions[c.Symbol] = got
 		}
 	}
 	if len(problems) > 0 {
 		// 排序只为让报错稳定（配置顺序变了不影响 diff / 测试断言）。
 		sort.Strings(problems)
-		return fmt.Errorf("%w: %d contract(s) cannot be served: %s",
-			ErrContractPrecisionMismatch, len(problems), strings.Join(problems, "; "))
+		return nil, fmt.Errorf("%w: %d contract(s) cannot be served: %s",
+			ErrContractPrecisionUnusable, len(problems), strings.Join(problems, "; "))
 	}
-	return nil
+	return precisions, nil
 }

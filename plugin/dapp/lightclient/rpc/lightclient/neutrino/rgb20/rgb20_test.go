@@ -351,16 +351,15 @@ func (f *fakeBridge) TSSPkScript() []byte {
 func newTestAdapter(t *testing.T, mock *MockSidecar, bridge Chain33Bridge) (*Adapter, func()) {
 	t.Helper()
 	// 假侧车要**报告**这个合约（精度与配置一致）：Connect 会核对配置与合约的精度，
-	// 不报就等于"侧车不认识这份配置声明的合约"，连接被拒（见 VerifyContractPrecisions）。
+	// 不报就等于"侧车不认识这份配置注册的合约"，连接被拒（见 ContractPrecisions）。
 	seedMockAsset(mock, mockSidecarAssetID, 6)
 	sock, cleanup := StartTestSidecar(t, mock)
 	cfg := Config{
 		SidecarAddr: sock,
-		Precision:   6,
 		Contracts: []Contract{
 			// assetId 与假侧车结算出来的 asset_id 一致（见 mockSidecarAssetID）：充值路径强校验
 			// 合约身份，fixture 也必须像一份配好的部署那样声明它。
-			{Symbol: "RGB20_USDT", AssetID: mockSidecarAssetID, Precision: 6, MinDeposit: 100, MinWithdraw: 100},
+			{Symbol: "RGB20_USDT", AssetID: mockSidecarAssetID, MinDeposit: 100, MinWithdraw: 100},
 		},
 		ChangeAddress: "bcrt1qxxxx",
 		// 与生产一致：头链保留深度 B 取 blockConfirmations（生产配置默认为 6）。

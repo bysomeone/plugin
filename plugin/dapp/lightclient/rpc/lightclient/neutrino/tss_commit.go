@@ -43,11 +43,24 @@ const (
 //
 // 返回 nil 表示本地 DKG 结果还不完整（公钥或地址缺失），调用方跳过提交：宁可明说
 // "没提交"，也不要提交一份链上必拒（无 pubkey）或地址与公钥不配套（hash160 对不上）的载荷。
+//
+// 载荷同时登记该资产的**类别与精度**（链上 checkCommitDKG 校验两者配套）：
+//   - 类别：配置里注册为 RGB20 合约的符号 → RGB20 类，其余 → BTC 类。判定用的是配置
+//     （本节点作为 guardian 的声明），不是符号字面量 —— 链上一旦登记，所有判定都只读链上那份。
+//   - 精度：BTC 类是协议常量 8；RGB20 类**只能是"尚未回填"哨兵**，因为此刻合约可能还没发行 /
+//     侧车还没核对出它的精度（"连侧车"与"等 DKG"是两条独立路径），真实值由
+//     ensureCrossChainAssetPrecisions 在侧车连上后单独回填。
 func (t *tssService) buildCommitDKGPayload(symbol string) *rtypes.CommitDKG {
 	if t.tssPublicKey == nil || t.tssAddress == nil {
 		log.Error("buildCommitDKGPayload local dkg result incomplete, skip commitDKG",
 			"symbol", symbol, "hasPubkey", t.tssPublicKey != nil, "hasAddress", t.tssAddress != nil)
 		return nil
+	}
+	assetKind := rtypes.CrossChainAssetBtc
+	precision := rtypes.BTCChainPrecision
+	if t.client.isRgb20Asset(symbol) {
+		assetKind = rtypes.CrossChainAssetRgb20
+		precision = rtypes.PrecisionUnknown
 	}
 	payload := &rtypes.CommitDKG{
 		AssetSymbol: symbol,
@@ -55,7 +68,9 @@ func (t *tssService) buildCommitDKGPayload(symbol string) *rtypes.CommitDKG {
 		PkScript:    t.pkScript,
 		// 33 字节压缩格式（btcec.ParsePubKey 后 SerializeCompressed）：非压缩编码会让同一把钥
 		// 派生出另一个地址，checkCommitDKG 直接以 ErrInvalidDkgAddress 拒绝。
-		Pubkey: t.tssPublicKey.SerializeCompressed(),
+		Pubkey:    t.tssPublicKey.SerializeCompressed(),
+		AssetKind: uint32(assetKind),
+		Precision: precision,
 	}
 	// 本地自检：链上的两条硬判据（33 字节压缩 + hash160(pubkey)==pkScript[2:]）在这里先过一遍，
 	// 把"提交上去被拒"变成"提交前就报清楚"。

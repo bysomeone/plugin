@@ -59,9 +59,9 @@ func NewMockSidecar() *MockSidecar {
 
 // seedMockAsset 让假侧车把某个合约"报出来"（ListAssets 的返回项）。
 //
-// 凡是要走到 `Adapter.Connect` 的 fixture 都必须调它：Connect 现在会核对"配置里的 precision ==
-// 合约自述的 precision"（见 VerifyContractPrecisions），假侧车默认不报任何合约，等于"这份部署声明的
-// 合约侧车根本不认识"，连接会被拒。
+// 凡是要走到 `Adapter.Connect` 的 fixture 都必须调它：Connect 会读"合约声明的 precision"并要求
+// 它可用（见 ContractPrecisions），假侧车默认不报任何合约，等于"这份部署注册的合约侧车根本不认识"，
+// 连接会被拒。
 func seedMockAsset(mock *MockSidecar, assetID string, precision uint32) {
 	mock.Assets = append(mock.Assets, &pb.AssetInfo{
 		AssetId:     assetID,

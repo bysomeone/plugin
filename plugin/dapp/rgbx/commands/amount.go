@@ -11,60 +11,79 @@ import (
 // btcWithdrawDecimals 是 BTC 提现的 -a 口径（8 位小数）。
 //
 // 它**只对 BTC 成立**，而且成立的理由不是"历史上都这么写"：BTC 的小数位是链上口径本身
-// （chain33 的 1e8 最小单位），不是某个资产的属性，所以它可以是个常量。
-//
-// 曾经这个常量被当成**所有**资产的提现口径（`withdrawAmountDecimals`），于是精度 6 的 RGB20
-// 资产（如 USDT）会被按 1e8 换算：用户输入 1，链上得到 1e8 个最小单位 = 100 个 USDT 的量，
-// 且全程静默。资产的口径只能来自资产自己（链上资产记录 / 合约 / 显式声明），见
-// resolveWithdrawDecimals。
+// （chain33 的 1e8 最小单位），不是某个资产的属性，所以它可以是个常量。链上那侧的同一个值由
+// rtypes.BTCChainPrecision 定义（checkCommitDKG 强制 BTC 类资产的精度只能是它），两边不可能
+// 对不上 —— 因此"链上还没有该资产的跨链记录"时回落到这个常量是安全的，不是猜测。
 const btcWithdrawDecimals = 8
+
+// crossChainInfoAbsent 判断节点是否**没有**该符号的跨链资产记录。
+//
+// 判据落在记录内容上：执行器的 Query_GetCrossChainInfo 对不存在的 symbol 返回空结构体 +
+// nil error（既有契约），所以"查得到"与"链上有"是两件事。
+func crossChainInfoAbsent(info *rtypes.CrossChainInfo) bool {
+	return info.GetTssAddress() == "" && len(info.GetPubkey()) == 0
+}
 
 // resolveWithdrawDecimals 决定 withdraw 的 -a 十进制口径（最小单位 = 10^decimals）。
 //
+// 精度**只从链上读**：调用方（withdrawAsset）已按符号把两种链上记录查了出来，
+// 这里只做选择与校验，不猜、也没有 `-p` 这种"让人填一个数"的入口。
+//
 // 选择顺序，每一档都有出处；**没有出处就报错，绝不回落成 8**：
 //
-//  1. 显式 `-p/--precision`：调用方声明（对桥接资产，这个值就是合约声明的精度）；
-//  2. BTC：见 btcWithdrawDecimals（固定 8，合法且无需询问）；
-//  3. 链上该资产的记录：本地发行/铸造的 rgbx 资产，精度由发行方在 MintAsset 里声明
-//     （chainSymbol 非空表示节点认识这个资产，chainPrecision 是它的精度）；
+//  1. 跨链资产记录（crossChainInfo）：桥接资产（BTC 类 / RGB20 类）的精度在这里。类别与精度由
+//     桥在 CommitDKG 时登记（BTC 类固定 8），RGB20 类的精度由桥核对出合约声明的值后回填
+//     （见 executor/crosschain.go 的 Exec_CrossChainMeta）。回填尚未发生（哨兵值）时报错 ——
+//     那说明桥还没核对出这个资产的合约精度，此时的正确行为是不服务，而不是挑一个数；
+//  2. 本地发行/铸造资产的记录（rgbxAsset）：精度由发行方在 MintAsset 里声明；
+//  3. BTC 且链上还没有跨链记录（DKG 尚未提交）：见 btcWithdrawDecimals（协议常量）；
 //  4. 以上都没有 → 报错。
 //
-// 为什么 3 之前要先挡掉 RGB20：桥接符号（`rtypes.IsRgb20Symbol`）的资产记录**不由充值铸造写**
-// （见 executor/crosschain.go 的 Exec_Deposit：只动账户余额，不写 RgbxAsset），链上口径无从查证；
-// 而它的真实口径是**合约**的精度，CLI 看不到合约。这时唯一诚实的做法是要调用方给出 `-p`，而不是
-// 挑一个数。
+// 为什么以前需要 `-p`、现在不需要了：桥接符号的资产记录**不由充值铸造写**
+// （executor/crosschain.go 的 Exec_Deposit 只动账户余额，不写 RgbxAsset），链上查不到口径，
+// 而它的真实口径在合约里、CLI 又看不到合约 —— 于是只能要求调用方手填。现在桥把核对过的合约精度
+// 写进了链上的跨链资产记录，CLI 读得到，手填那个入口（连同它带来的"填错就静默差 10^n 倍"）
+// 随之删掉。
 //
 // 链上记录的精度也必须 <= rtypes.MaxPrecision：超过链上口径能表达的范围（或干脆是个哨兵值）时
 // 拒绝，而不是交给 parseDecimalAmount 去截断。
-func resolveWithdrawDecimals(symbol string, flagPrecision int32, chainSymbol string, chainPrecision uint32) (int, error) {
-	if flagPrecision >= 0 {
-		if flagPrecision > int32(rtypes.MaxPrecision) {
-			return 0, fmt.Errorf("invalid precision %d: must be in [0, %d]", flagPrecision, rtypes.MaxPrecision)
+func resolveWithdrawDecimals(symbol string, crossChain *rtypes.CrossChainInfo, asset *rtypes.RgbxAsset) (int, error) {
+	if !crossChainInfoAbsent(crossChain) {
+		kind := rtypes.CrossChainAssetKind(crossChain.GetAssetKind())
+		if !kind.Valid() {
+			return 0, fmt.Errorf("asset %s is registered on chain with an unknown cross chain asset kind "+
+				"(%d): cannot tell how its amounts are scaled; this node's rgbx executor is probably "+
+				"older than the chain state", symbol, crossChain.GetAssetKind())
 		}
-		return int(flagPrecision), nil
+		precision := crossChain.GetPrecision()
+		if !rtypes.IsKnownPrecision(precision) {
+			return 0, fmt.Errorf("cannot determine the amount scale of %s: the bridge has not recorded its "+
+				"precision on chain yet (crossChainInfo.precision is the \"not backfilled\" sentinel). For an "+
+				"RGB20 asset the bridge backfills the precision of its contract automatically once the sidecar "+
+				"has verified it; retry once the bridge is up and the contract is issued. Refusing to assume a "+
+				"scale: the amount would be off by 10^n and nothing downstream would notice", symbol)
+		}
+		if precision > rtypes.MaxPrecision {
+			return 0, fmt.Errorf("asset %s declares precision %d on chain, above the maximum %d",
+				symbol, precision, rtypes.MaxPrecision)
+		}
+		return int(precision), nil
+	}
+	if asset.GetSymbol() != "" {
+		if asset.GetPrecision() > rtypes.MaxPrecision {
+			return 0, fmt.Errorf("asset %s declares precision %d on chain, above the maximum %d",
+				symbol, asset.GetPrecision(), rtypes.MaxPrecision)
+		}
+		return int(asset.GetPrecision()), nil
 	}
 	if strings.EqualFold(symbol, rtypes.BTCSymbol) {
 		return btcWithdrawDecimals, nil
 	}
-	if rtypes.IsRgb20Symbol(symbol) {
-		return 0, fmt.Errorf("cannot determine the amount scale of %s: it is a bridged RGB20 asset, whose "+
-			"precision is declared by its RGB contract (chain33 keeps no asset record for a bridged symbol, "+
-			"so it cannot be read from here). Pass -p/--precision <n> with the precision the contract "+
-			"declares (the bridge's rgb20.contracts[].precision, which the bridge checks against the "+
-			"contract at startup). Refusing to assume 8: the amount would be off by 10^n and nothing "+
-			"downstream would notice", symbol)
-	}
-	if chainSymbol != "" {
-		if chainPrecision > rtypes.MaxPrecision {
-			return 0, fmt.Errorf("asset %s declares precision %d on chain, above the maximum %d",
-				symbol, chainPrecision, rtypes.MaxPrecision)
-		}
-		return int(chainPrecision), nil
-	}
-	return 0, fmt.Errorf("cannot determine the precision of asset %q: the node returned no asset record for it "+
-		"(or the query to the node failed), and none was given. Pass -p/--precision <n> stating how many "+
-		"decimal places the asset's amounts carry; the conversion of -a into minimum units has no correct "+
-		"default", symbol)
+	return 0, fmt.Errorf("cannot determine the precision of asset %q: the node returned no cross chain record "+
+		"and no asset record for it (or the queries to the node failed). A bridged asset's precision is "+
+		"recorded on chain by the bridge (crossChainInfo.precision), a locally minted asset's precision is "+
+		"declared at mint time; if neither exists, the conversion of -a into minimum units has no correct "+
+		"default (is this node on the same chain as the asset, and has the bridge committed its DKG?)", symbol)
 }
 
 // parseDecimalAmount 把十进制字符串精确换算为最小单位整数，全程定点运算，不经过 float64。

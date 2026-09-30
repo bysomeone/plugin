@@ -82,8 +82,15 @@ func (r *rgbx) checkWithdrawConfirm(txHash, confirmHash string, confirm *rtypes.
 			"btcProof", btcProof2String(confirm.GetBtcTxProof()), "err", err)
 		return err
 	}
+	// 走哪条分支看**链上登记的资产类别**（不再看 symbol 字面量）；记录缺失 fail-closed。
+	info, err := r.getCrossChainInfo(pendingTx.GetAssetSymbol())
+	if err != nil {
+		elog.Error("checkWithdrawConfirm getCrossChainInfo", "txHash", txHash, "confirmHash", confirmHash,
+			"symbol", pendingTx.GetAssetSymbol(), "err", err)
+		return ErrGetCrossChainInfo
+	}
 	// RGB20 分支：跳过链上 OP_RETURN 承诺与链上金额校验（H4：提现 correlation 走 txid↔pending 映射）。
-	if !rtypes.IsRgb20Symbol(pendingTx.GetAssetSymbol()) {
+	if !rtypes.IsRgb20CrossChainAsset(info) {
 		if !hasWithdrawCommitment(btcTx, confirm.GetTxHash()) {
 			elog.Error("checkWithdrawConfirm commitment mismatch", "txHash", txHash, "confirmHash", confirmHash,
 				"btcProof", btcProof2String(confirm.GetBtcTxProof()))
@@ -137,7 +144,8 @@ func (r *rgbx) deriveDepositPkScript(txHash, symbol, depositAddr string) ([]byte
 	return pkScript, nil
 }
 
-// validateDepositTxContent 链上金额校验（非 RGB20）：累加"等于该用户 P2WSH program"的输出，
+// validateDepositTxContent 链上金额校验（**只被 BTC 类别分支调用**，见 checkDeposit 的类别分叉：
+// RGB20 的金额在 consignment 内，由 thresholdSig 门禁）：累加"等于该用户 P2WSH program"的输出，
 // 要求总和**恰好等于**申报金额。
 //
 // 两个错误码分得开，便于运维/桥侧区分"地址不对"与"金额不对"：
@@ -148,10 +156,6 @@ func (r *rgbx) deriveDepositPkScript(txHash, symbol, depositAddr string) ([]byte
 // 允许一笔 tx 同时给多个用户的 P2WSH 付款：各用户各自索赔时只累加自己那份（各自
 // deposit.GetAmount() 必须与自己那段相等），互不影响。
 func (r *rgbx) validateDepositTxContent(txHash string, deposit *rtypes.DepositAsset, btcTx *wire.MsgTx) error {
-	// RGB20 分支：全跳过链上金额（RGB 金额在 consignment 内）。
-	if rtypes.IsRgb20Symbol(deposit.GetAssetSymbol()) {
-		return nil
-	}
 	expectPkScript, err := r.deriveDepositPkScript(txHash, deposit.GetAssetSymbol(), deposit.GetDepositAddress())
 	if err != nil {
 		return err
@@ -183,10 +187,7 @@ func (r *rgbx) validateWithdrawTxContent(txHash string, pendingTx *rtypes.Pendin
 	if pendingTx == nil {
 		return ErrPendingTxNotExist
 	}
-	// RGB20 分支：全跳过链上金额。
-	if rtypes.IsRgb20Symbol(pendingTx.GetAssetSymbol()) {
-		return nil
-	}
+	// 只被 BTC 分支调用（RGB20 的提现金额在链下，见 checkWithdrawConfirm 的类别分叉）。
 	info, err := r.getCrossChainInfo(pendingTx.GetAssetSymbol())
 	if err != nil {
 		elog.Error("validateWithdrawTxContent getCrossChainInfo", "txHash", txHash, "symbol", pendingTx.GetAssetSymbol(), "err", err)

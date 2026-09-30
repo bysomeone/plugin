@@ -41,7 +41,7 @@ func newDepositTestAdapter(t *testing.T, bridge Chain33Bridge, store KVStore) *A
 	adapter, err := NewAdapter(Config{
 		SidecarAddr: "test-no-sidecar", Contracts: []Contract{
 			// assetId 与 seedSettledReceive 登记的 seal 一致（合约身份强校验，见 mockSidecarAssetID）。
-			{Symbol: "RGB20_USDT", AssetID: mockSidecarAssetID, Precision: 6, MinDeposit: 100, MinWithdraw: 100},
+			{Symbol: "RGB20_USDT", AssetID: mockSidecarAssetID, MinDeposit: 100, MinWithdraw: 100},
 		},
 		HeaderRelayConfirmations: uint32(testHeaderConfs),
 	}, store)

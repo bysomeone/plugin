@@ -590,8 +590,12 @@ func (n *neutrinoClient) getPendingTxBlockIndex(txHash []byte) *rtypes.TxBlockIn
 }
 
 // isRgb20Asset 判断资产符号是否为已注册的 RGB20 资产。
+//
+// 这是**桥侧的分类输入**（本节点作为 guardian 的声明：配置里注册为 RGB20 合约的符号就是 RGB20 类），
+// 它只在 CommitDKG 组装载荷时用一次；链上一旦登记，之后所有判定都读链上那份
+// （types.IsRgb20CrossChainAsset），不再回头看符号或本节点的配置。
 func (n *neutrinoClient) isRgb20Asset(symbol string) bool {
-	return n.rgb20 != nil && n.rgb20.Registry().IsRegistered(symbol)
+	return n != nil && n.rgb20 != nil && n.rgb20.Registry().IsRegistered(symbol)
 }
 
 // processRgb20Withdraw 将 RGB20 提现 pending 交易路由到 rgb20 适配器（Phase 4 接线）。

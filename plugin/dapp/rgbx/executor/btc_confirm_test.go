@@ -323,6 +323,9 @@ func Test_checkWithdrawConfirm_btcConfirmations(t *testing.T) {
 	require.Equal(t, ErrInvalidBtcProofCommitment, f.r.checkWithdrawConfirm("tx", "confirm", confirm, pending))
 
 	// RGB20 分支（跳过承诺/金额校验）：深度不足必须被拒 —— 这是 B8 对提现路径的净效果。
+	// 走哪条分支看**链上登记的资产类别**，所以先登记这条 RGB20 资产。
+	setCrossChainInfoForTest(t, f.state, rtypes.RGB20USDTSymbol, rtypes.CrossChainAssetRgb20,
+		rtypes.MaxPrecision, f.user.tssPub)
 	rgb20 := &rtypes.ConfirmTx{TxHash: burnTxHash, BtcTxProof: f.deposit(f.raw).TxProof}
 	rgb20Pending := &rtypes.PendingTx{AssetSymbol: rtypes.RGB20USDTSymbol, Amount: 1}
 	// S2：RGB20 分支的结算前置台账（payload + burn 记录 + 已铸造供应量；链上由
