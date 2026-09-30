@@ -8,10 +8,64 @@ import (
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 )
 
-// 提现额的最小单位口径固定为 1e8（BTC 的 8 位小数）。RGB20 资产也走同一个入口
-// （见 plugin/dapp/rgbx/cmd/ci/scripts/rgb20_test.sh：「-a 口径 *1e8 = min units」），
-// 所以这里不能用资产自身的 precision 代替。
-const withdrawAmountDecimals = 8
+// btcWithdrawDecimals 是 BTC 提现的 -a 口径（8 位小数）。
+//
+// 它**只对 BTC 成立**，而且成立的理由不是"历史上都这么写"：BTC 的小数位是链上口径本身
+// （chain33 的 1e8 最小单位），不是某个资产的属性，所以它可以是个常量。
+//
+// 曾经这个常量被当成**所有**资产的提现口径（`withdrawAmountDecimals`），于是精度 6 的 RGB20
+// 资产（如 USDT）会被按 1e8 换算：用户输入 1，链上得到 1e8 个最小单位 = 100 个 USDT 的量，
+// 且全程静默。资产的口径只能来自资产自己（链上资产记录 / 合约 / 显式声明），见
+// resolveWithdrawDecimals。
+const btcWithdrawDecimals = 8
+
+// resolveWithdrawDecimals 决定 withdraw 的 -a 十进制口径（最小单位 = 10^decimals）。
+//
+// 选择顺序，每一档都有出处；**没有出处就报错，绝不回落成 8**：
+//
+//  1. 显式 `-p/--precision`：调用方声明（对桥接资产，这个值就是合约声明的精度）；
+//  2. BTC：见 btcWithdrawDecimals（固定 8，合法且无需询问）；
+//  3. 链上该资产的记录：本地发行/铸造的 rgbx 资产，精度由发行方在 MintAsset 里声明
+//     （chainSymbol 非空表示节点认识这个资产，chainPrecision 是它的精度）；
+//  4. 以上都没有 → 报错。
+//
+// 为什么 3 之前要先挡掉 RGB20：桥接符号（`rtypes.IsRgb20Symbol`）的资产记录**不由充值铸造写**
+// （见 executor/crosschain.go 的 Exec_Deposit：只动账户余额，不写 RgbxAsset），链上口径无从查证；
+// 而它的真实口径是**合约**的精度，CLI 看不到合约。这时唯一诚实的做法是要调用方给出 `-p`，而不是
+// 挑一个数。
+//
+// 链上记录的精度也必须 <= rtypes.MaxPrecision：超过链上口径能表达的范围（或干脆是个哨兵值）时
+// 拒绝，而不是交给 parseDecimalAmount 去截断。
+func resolveWithdrawDecimals(symbol string, flagPrecision int32, chainSymbol string, chainPrecision uint32) (int, error) {
+	if flagPrecision >= 0 {
+		if flagPrecision > int32(rtypes.MaxPrecision) {
+			return 0, fmt.Errorf("invalid precision %d: must be in [0, %d]", flagPrecision, rtypes.MaxPrecision)
+		}
+		return int(flagPrecision), nil
+	}
+	if strings.EqualFold(symbol, rtypes.BTCSymbol) {
+		return btcWithdrawDecimals, nil
+	}
+	if rtypes.IsRgb20Symbol(symbol) {
+		return 0, fmt.Errorf("cannot determine the amount scale of %s: it is a bridged RGB20 asset, whose "+
+			"precision is declared by its RGB contract (chain33 keeps no asset record for a bridged symbol, "+
+			"so it cannot be read from here). Pass -p/--precision <n> with the precision the contract "+
+			"declares (the bridge's rgb20.contracts[].precision, which the bridge checks against the "+
+			"contract at startup). Refusing to assume 8: the amount would be off by 10^n and nothing "+
+			"downstream would notice", symbol)
+	}
+	if chainSymbol != "" {
+		if chainPrecision > rtypes.MaxPrecision {
+			return 0, fmt.Errorf("asset %s declares precision %d on chain, above the maximum %d",
+				symbol, chainPrecision, rtypes.MaxPrecision)
+		}
+		return int(chainPrecision), nil
+	}
+	return 0, fmt.Errorf("cannot determine the precision of asset %q: the node returned no asset record for it "+
+		"(or the query to the node failed), and none was given. Pass -p/--precision <n> stating how many "+
+		"decimal places the asset's amounts carry; the conversion of -a into minimum units has no correct "+
+		"default", symbol)
+}
 
 // parseDecimalAmount 把十进制字符串精确换算为最小单位整数，全程定点运算，不经过 float64。
 //
@@ -25,6 +79,7 @@ const withdrawAmountDecimals = 8
 // 于是桥每秒重试刷 ERROR——用户资产已 burn，却永远拿不到款。
 //
 // decimals 是小数位数：整数部分左移 decimals 位，小数部分右补零到 decimals 位。
+// 小数位数的**来源**见 resolveWithdrawDecimals（它是资产属性，不是常量）。
 // 小数位数超过 decimals 时，只有多余位全为 0 才接受；否则属于超出精度的输入，
 // 直接报错，而不是静默截断成另一个金额。
 func parseDecimalAmount(s string, decimals int) (int64, error) {

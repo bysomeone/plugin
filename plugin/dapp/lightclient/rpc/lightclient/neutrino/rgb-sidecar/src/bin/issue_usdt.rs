@@ -198,9 +198,13 @@ async fn main() -> Result<()> {
     engine.save()?;
     let assets = engine.list_assets();
     for a in &assets {
+        // `None` prints as `unknown`, never as `0`: the two mean different things and the bridge
+        // treats them differently (see `service::PRECISION_UNKNOWN`).
         println!(
             "asset: symbol={} precision={} issued={}",
-            a.symbol, a.precision, a.issued_supply
+            a.symbol,
+            a.precision.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string()),
+            a.issued_supply
         );
     }
     let seals = engine.list_seals("USDT");

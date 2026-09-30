@@ -39,13 +39,33 @@ fn err(e: anyhow::Error) -> Status {
     }
 }
 
+/// Sentinel for "this contract does not declare its precision" in `AssetInfo.precision`.
+///
+/// `AssetInfo.precision` is a proto3 `uint32`, which has **no field presence**: an omitted field
+/// and an explicit `0` are the same bytes on the wire. `0` is a legitimate precision (an
+/// indivisible asset), so absent-with-a-zero cannot be used to mean "unknown" — hence a sentinel
+/// outside the precision space. Any decimal count a real contract can declare is well below this
+/// (RGB's `Precision` tops out at `Atto` = 18, and the bridge's own `MaxPrecision` is 8), so the
+/// value cannot be mistaken for a precision.
+///
+/// **This is a shared convention, not a local one**: the Go bridge's `rgb20.PrecisionUnknown`
+/// must be the same value (`math.MaxUint32`), and `proto/rgb_sidecar.proto` documents it on
+/// `AssetInfo.precision`. `unknown_precision_cannot_collide_with_a_real_one` pins the invariant
+/// that the sentinel is outside the real range — if RGB ever grows past it, that test fails
+/// instead of a contract silently reporting "unknown".
+pub const PRECISION_UNKNOWN: u32 = u32::MAX;
+
 /// The wire view of a registered asset.
+///
+/// A `None` precision (the contract declares none — see `RgbEngine::describe_contract`) travels
+/// as [`PRECISION_UNKNOWN`], never as `0`: the bridge fails closed on the sentinel and would
+/// silently scale amounts by `10^0` on a zero.
 fn asset_info(a: crate::ledger::AssetRec) -> AssetInfo {
     AssetInfo {
         asset_id: a.asset_id,
         asset_symbol: a.symbol,
         schema: a.schema,
-        precision: a.precision as u32,
+        precision: a.precision.map(u32::from).unwrap_or(PRECISION_UNKNOWN),
     }
 }
 
@@ -372,5 +392,60 @@ impl RgbSidecar for RgbSidecarService {
             asset_id: String::new(),
             seal_output_index: if seal_output_index == u32::MAX { 0 } else { seal_output_index },
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::AssetRec;
+
+    fn asset(precision: Option<u8>) -> AssetRec {
+        AssetRec {
+            asset_id: "rgb:test-contract".to_string(),
+            symbol: "USDT".to_string(),
+            schema: "InflatableFungibleAsset".to_string(),
+            precision,
+            issued_supply: 1,
+            genesis_consignment_hex: "00".to_string(),
+        }
+    }
+
+    /// The sentinel is the whole reason "unknown" survives a proto3 `uint32` field, so it must
+    /// sit outside the precision space rather than inside it.
+    #[test]
+    fn unknown_precision_cannot_collide_with_a_real_one() {
+        // Every decimal count rgbinvoice's `Precision` can report (Indivisible .. Atto).
+        let real: Vec<u32> = (0..=18).collect();
+        assert!(
+            !real.contains(&PRECISION_UNKNOWN),
+            "PRECISION_UNKNOWN must not be a precision any contract can declare"
+        );
+        // The precisions this sidecar issues itself, and the ceiling the Go bridge accepts.
+        for issued in [0u32, 2, 8] {
+            assert_ne!(PRECISION_UNKNOWN, issued);
+        }
+        assert!(PRECISION_UNKNOWN > 8, "must be above the bridge's MaxPrecision");
+    }
+
+    /// A contract that declares a precision must report exactly that precision — the non-8 case
+    /// (a USDT at 6, say) must not be coerced to 8 or to 0 anywhere on the way out.
+    #[test]
+    fn declared_precision_is_reported_verbatim() {
+        for p in [0u8, 1, 2, 3, 6, 8, 18] {
+            assert_eq!(asset_info(asset(Some(p))).precision, u32::from(p), "precision {p}");
+        }
+    }
+
+    /// The bug this whole distinction exists for: "the contract says nothing" must not leave the
+    /// wire reporting a plausible-looking number.
+    #[test]
+    fn undeclared_precision_is_unknown_and_never_zero() {
+        let info = asset_info(asset(None));
+        assert_eq!(info.precision, PRECISION_UNKNOWN);
+        assert_ne!(info.precision, 0, "unknown must not look like an indivisible asset");
+        // And the record's other fields still travel as usual.
+        assert_eq!(info.asset_symbol, "USDT");
+        assert_eq!(info.asset_id, "rgb:test-contract");
     }
 }

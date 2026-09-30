@@ -350,6 +350,9 @@ func (f *fakeBridge) TSSPkScript() []byte {
 
 func newTestAdapter(t *testing.T, mock *MockSidecar, bridge Chain33Bridge) (*Adapter, func()) {
 	t.Helper()
+	// 假侧车要**报告**这个合约（精度与配置一致）：Connect 会核对配置与合约的精度，
+	// 不报就等于"侧车不认识这份配置声明的合约"，连接被拒（见 VerifyContractPrecisions）。
+	seedMockAsset(mock, mockSidecarAssetID, 6)
 	sock, cleanup := StartTestSidecar(t, mock)
 	cfg := Config{
 		SidecarAddr: sock,
