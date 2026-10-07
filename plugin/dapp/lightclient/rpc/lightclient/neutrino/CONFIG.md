@@ -445,8 +445,9 @@ P2WSH 充值地址上线后，用户的充值**不再进主池**（钱停在各�
 
 ### 4.4 `[rpc.sub.light.neutrino.rgb20]`
 
-RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentListen` / `contracts` / `precision` /
-`changeAddress`）见 `RGB_USDT_INTEGRATION.md`；本节只描述充值重试相关的行为。唯一的额外配置项是
+RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentListen` / `contracts` /
+`changeAddress`）见 `RGB_USDT_INTEGRATION.md`；本节描述充值重试行为（4.4.1–4.4.2）、精度落链
+（4.4.3）、链上 CLI 金额口径（4.4.4）与**提现手续费**（4.4.5）。额外的桥侧开关是
 `testSignPsbt`（默认 `false`）：打开后允许 E2E 的 `sign-psbt` 测试端点用 TSS 组签名**任意** PSBT
 （签名节点无从核对被签内容），**生产环境必须保持关闭**；`sign-psbt` 仅用于 E2E 模拟用户付款。
 本节的行为都**不需要**与主链 `[exec.sub.rgbx]` 人肉对齐：链上最小确认数 N 由中继直接查链上
@@ -542,6 +543,49 @@ RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentLi
 金额换算全程定点运算（十进制字符串 → 最小单位整数），不经过 `float64`：`0.0006` 这类值在浮点下
 会少 1 个最小单位，而链上 pending 的提现额与侧车发放额必须逐单位相等，差 1 就会被签名节点的
 核对（正确地）拒掉，让用户已 burn 的资产卡住。
+
+#### 4.4.5 提现手续费（`contracts[].withdrawFee`）
+
+**为什么收**：RGB20 提现本身就是一笔普通 BTC 交易，矿工费只能用 BTC 付，而这笔 BTC 出自桥的
+**主池** —— 不收手续费就是桥替每个提现用户垫矿工费、持续透支。手续费**不上链**（链上配置升级
+太重），由桥侧配置，前端据此提示用户。
+
+**配置**：每个合约一份，单位是**该资产的最小单位**（min units，与 §4.4.3 链上记录的精度同口径）：
+
+```toml
+[[rpc.sub.light.neutrino.rgb20.contracts]]
+symbol="RGB20_USDT"
+sidecarSymbol="USDT"
+assetId="rgb:..."
+withdrawFee=1000        # 每笔提现收 1000 个最小单位；<=0 或省略 = 不收取
+```
+
+**用户侧口径**：提现时用户自己开的 invoice 金额必须是 `提现额 − withdrawFee`（前端按配置提示）。
+侧车**不知道**手续费 —— invoice 写多少它就发多少 —— 所以这条策略只能由桥侧执守。
+
+**桥的校验**（精确相等，不做容忍区间）：该笔实际**发给用户**的资产金额必须等于
+`链上 pending 金额 − withdrawFee`，否则整笔拒绝，错误信息给出期望值、实际值、手续费与差额。
+多给 = 桥替用户垫了矿工费（本项要解决的形态），少给 = 超收用户，两个方向都拒。用精确相等而不是
+容忍区间，是因为手续费是配置的固定值、两边都是最小单位，`pending − 手续费`精确可算，容忍区间
+只会给超收/少收留口子。
+
+拒绝点在**签名与广播之前**（`rgb20.Adapter.Withdraw`）：不下发签名请求、不广播、不落 sticky 绑定。
+一处需要说清的口径：判据比对的是「构建出来的转移实际发给谁多少」，因为侧车**不把解析出的发票金额
+回传给桥**（`BuildWithdrawalResponse` 只有 psbt / input_amounts / consignment，也没有 ParseInvoice
+这类 RPC），所以到这一步 `BuildWithdrawal` 已经跑过一次（它只读、不写侧车账本，见
+`finalize_withdrawal` 才落账）。典型触发形态是前端没按手续费扣减、发票按完整提现额开 —— 此时
+"发出额 ≤ pending"的上界判据不会拦，只有这条会计较。
+
+**副作用（拒绝发生在链上锁定之后）**：用户提交 `rgbx withdraw` 时链上 `Exec_Withdraw` 已经把这笔
+金额从用户余额转进了**锁定地址**，而锁定地址出来的路目前**只有结算时 `Burn` 这一条**。因此被拒的
+这笔提现会一直躺在锁定地址里，直到「解锁」路径落地（独立任务，见 `WITHDRAW_LOCK_MODEL.md`）；
+桥**不做**自动退款，也不会换个金额放款（放款金额只有一个来源：链上 pending 与用户发票）。
+
+**跨节点一致性**：每个签名节点都用自己这份配置做同样的比对（`tssService.validateRgb20WithdrawSign`
+—— 协调者声称什么都不算数），所以各节点（连官方节点在内）的 `withdrawFee` **必须一致**，否则
+签名节点会拒掉协调者的合法提现。这与 §4.1 的 `userDepositSweep.feeRate` 是同一取向的取舍：
+`0`（未配置）= 跳过该项比对（该资产"发出额 ≤ pending"的上界判据仍然生效），而**不是**把提现全拒
+—— 节点配置缺失不该升级成桥停摆。
 
 ## 5. Bitcoin 节点关键配置项
 

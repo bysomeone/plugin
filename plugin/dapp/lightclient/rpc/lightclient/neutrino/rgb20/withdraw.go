@@ -87,6 +87,14 @@ type ValidateWithdrawRequest struct {
 	MinSyncedHeight       uint64
 	// FeeRate sat/vB：签名节点据此核对提现交易手续费在合理范围（防桥自有费输入被超收）。
 	FeeRate int64
+	// ExpectedPayout 本笔提现**应当发给用户的精确资产金额** = 链上 pending 金额 − 该资产配置的
+	// 提现手续费（见 Config.Contracts[].WithdrawFee / Adapter.ExpectedWithdrawPayout）。
+	//
+	// >0 时与「PSBT + consignment 体现的、离开桥控制的资产」**精确比对**，多给少给都拒：多给 =
+	// 桥替用户垫了手续费（本功能要解决的就是它），少给 = 超收用户。之所以用精确相等而不是容忍区间：
+	// 手续费是配置的固定值、两边都是最小单位，`pending − 手续费`精确可算，容忍区间只会给超收/少收
+	// 留口子。0 = 该资产没配手续费 ⇒ 不校验（保持旧的"只判上界"行为，见 ExpectedWithdrawPayout）。
+	ExpectedPayout int64
 	// CheckSpentSeals 选填回调：在**全部交叉核对通过之后**、用同一份已验证事实同步调用，
 	// 参数是本笔实际花掉且被 consignment 关闭的 RGB seal 集合（详见 spentSealsOf）。
 	// 签名节点用它做 sticky seal 核对（E9-B）；协调者用它取回同一集合去记账。
@@ -285,6 +293,16 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 				"withdraw state %q but no sticky seal recorded", string(state)))
 		}
 	}
+	// 提现手续费（桥侧可配置，不上链）：本笔**应当发给用户**的资产 = 链上 pending − 手续费。
+	// 先按配置把它算出来（链上 pending 连手续费都不够则直接拒），随后作为精确比对的目标下发给
+	// 校验（本节点自检 + 签名节点各自独立自检，见 ValidateWithdrawRequest.ExpectedPayout）。
+	// 注意侧车**不知道**手续费：invoice 的金额就是它发出去的金额，所以这条判据只能由桥侧执守
+	// ——正因如此才把它放在签名之前的交叉核对里，而不是"相信前端开对了发票"。
+	expectedPayout, _, err := a.ExpectedWithdrawPayout(req.AssetSymbol, req.Amount)
+	if err != nil {
+		return nil, err
+	}
+
 	// E9-A：已有 sticky 记录时把它作为 input_seals 下发，侧车按这组 seal **重放**上一次的构建
 	// （同一份未签 PSBT、同一 txid）。没有它的话，重试会按当前账本（原 seal 已 consumed、找零 seal
 	// 已 minted）重新选 seal，产出另一笔独立有效的转移——用户得两份资产、链上只结算一次。
@@ -313,6 +331,7 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 		Psbt:            rsp.Psbt,
 		Consignment:     rsp.Consignment,
 		ExpectedAmount:  req.Amount,
+		ExpectedPayout:  expectedPayout,
 		MinSyncedHeight: uint64(req.TxBlockHeight),
 		FeeRate:         req.FeeRate,
 		CheckSpentSeals: func(spentSeals []string) error {
@@ -321,6 +340,11 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 		},
 	}
 	if err := a.ValidateWithdrawPsbt(valReq); err != nil {
+		// 手续费金额不符（WithdrawPayoutMismatchError）**不**归入"不可恢复"：它取决于桥侧可改的
+		// 配置，判成不可恢复会把这条 pending 在本地落成终态、之后即便运维改对了配置也不再重试
+		// （retryRgb20Withdraw 的短路按落盘状态走）。而重试的代价很小 —— 只是重新构建一次 PSBT，
+		// 既不签名也不广播（拒绝点在校验之后、SignPsbt 之前）。用户资产的去向见
+		// WithdrawPayoutMismatchError 的注释（已锁定，等解锁路径）。
 		return nil, fmt.Errorf("validate withdrawal: %w", err)
 	}
 	// sticky-seal：持久化该笔提现绑定的 seal（重试时不可改选；已有记录必须一致，绝不覆盖）。
@@ -390,6 +414,35 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 	}, nil
 }
 
+// WithdrawPayoutMismatchError 本笔提现实际发给用户的资产金额与「链上 pending 金额 − 配置的提现
+// 手续费」不一致（见 ValidateWithdrawRequest.ExpectedPayout）。典型形态是发票按**完整提现额**开、
+// 没有扣掉手续费 —— 那正是"桥替用户垫 BTC 矿工费"的形态，必须拒。
+//
+// **副作用（拒绝发生在链上锁定之后，务必知悉）**：用户提交提现时 chain33 的 Exec_Withdraw 已经把
+// 该笔金额从用户余额转进了**锁定地址**（rgbx/executor/crosschain.go 的 accDB.Transfer(tx.From(),
+// lockAddr, amount)），而锁定地址出来的路目前**只有结算时 Burn 这一条**。因此被拒的这笔提现会一直
+// 躺在锁定地址里，直到「解锁」路径落地（独立任务，见 WITHDRAW_LOCK_MODEL.md）。桥**不做**自动退款，
+// 也不会替这笔提现换一个金额放款 —— 放款金额只有一个来源：链上 pending 与用户自己在发票里写的金额。
+type WithdrawPayoutMismatchError struct {
+	// Payout 本笔转移实际发给用户的资产金额（PSBT/consignment 里离开桥控制的资产）。
+	Payout int64
+	// Expected 应当发给用户的资产金额 = Pending − Fee。
+	Expected int64
+	// Pending 链上 pending 的提现金额（该资产最小单位）。
+	Pending int64
+	// Fee 配置的提现手续费（该资产最小单位）。
+	Fee int64
+}
+
+func (e *WithdrawPayoutMismatchError) Error() string {
+	return fmt.Sprintf(
+		"withdraw payout mismatch: this transfer pays the user %d but the configured withdrawal fee %d "+
+			"requires exactly %d out of the %d chain33 pending amount (off by %+d; "+
+			"the recipient invoice must ask for exactly %d min units, i.e. pending minus fee); "+
+			"refused before signing and before broadcast",
+		e.Payout, e.Fee, e.Expected, e.Pending, e.Payout-e.Expected, e.Expected)
+}
+
 // ValidateWithdrawPsbt 签名节点交叉核对（BL-4/HR-3，放宽版）：
 //  1. 侧车 ValidateConsignment（确定性、只读）校验 RGB 状态转移 + 金额；
 //  2. 所有 PSBT 输入的 prevout 都是 TSS 脚本（受桥控制）：closed RGB seal 之外多出的
@@ -402,6 +455,8 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 //  4. 可支配额覆盖（S1）：签名节点自己算出「可支配额」= 本笔实际动用的 seal 面额合计，
 //     核对它覆盖提现额，且发给用户的资产不超过链上 pending 提现额（防超付）；同步高度 ≥ 门槛。
 //     算不出可支配额一律拒绝（fail-closed），不采信侧车预计算出的单点数字（S1/A2）。
+//  5. 提现手续费（req.ExpectedPayout > 0 时）：发给用户的资产**精确等于** `pending − 手续费`，
+//     多给（桥垫矿工费）少给（超收）都拒，见 ValidateWithdrawRequest.ExpectedPayout。
 func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 	if a.sidecar.Load() == nil {
 		return fmt.Errorf("sidecar unavailable")
@@ -563,9 +618,21 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 	if cov.Leaving > req.ExpectedAmount {
 		return fmt.Errorf("withdraw payout exceeds pending amount: payout=%d pending=%d", cov.Leaving, req.ExpectedAmount)
 	}
-	// 被花 seal 面额（可支配额）必须覆盖提现额。本桥不收取资产手续费（只有 BTC 矿工费，
-	// 见 RGB_USDT_PRODUCT.md），BTC 侧的「桥可支配的 BTC ≥ 离开桥控制的输出 + 手续费」由
-	// 上面的手续费检查独立核对。
+	// 提现手续费（桥侧配置，见 Contract.WithdrawFee）：发给用户的资产必须**精确等于**
+	// `链上 pending − 手续费`。这条比上面的上界更严：发票按"完整提现额"开（前端没按手续费扣减）
+	// 时，Leaving == pending 不会被上界拦住，只有这里会拒 —— 而它正是"桥替用户垫矿工费"的形态。
+	if req.ExpectedPayout > 0 && cov.Leaving != req.ExpectedPayout {
+		return &WithdrawPayoutMismatchError{
+			Payout:   cov.Leaving,
+			Expected: req.ExpectedPayout,
+			Pending:  req.ExpectedAmount,
+			Fee:      req.ExpectedAmount - req.ExpectedPayout,
+		}
+	}
+	// 被花 seal 面额（可支配额）必须覆盖提现额：这里核对的是资产侧（RGB 状态守恒，被花 seal 的
+	// 面额合计 = 发给用户的 + 找零回桥的），与手续费无关。BTC 侧的「桥可支配的 BTC ≥ 离开桥控制
+	// 的输出 + 矿工费」由上面的手续费检查独立核对 —— 提现收的资产手续费是**补偿**桥垫付的那笔
+	// BTC 矿工费（见 Contract.WithdrawFee），不改变这里核对的金额关系。
 	if cov.Spendable < req.ExpectedAmount {
 		return fmt.Errorf("withdraw amount exceeds sealed balance: sealed=%d expected=%d", cov.Spendable, req.ExpectedAmount)
 	}

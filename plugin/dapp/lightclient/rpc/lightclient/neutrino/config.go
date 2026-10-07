@@ -131,6 +131,20 @@ type rgb20Contract struct {
 	AssetID       string `json:"assetId"`       // rgb:...
 	MinDeposit    int64  `json:"minDeposit"`    // 最小充值（最小单位）
 	MinWithdraw   int64  `json:"minWithdraw"`   // 最小提现（最小单位）
+	// WithdrawFee 每笔提现收取的固定手续费，单位是**该资产的最小单位**（min units），与链上记录的
+	// 该资产精度同一口径（precision 从链上 crossChainInfo 读，见 CONFIG.md §4.4.3）。
+	//
+	// 为什么要它：RGB20 提现本身就是一笔普通 BTC 交易，矿工费只能用 BTC 付，而这笔 BTC 出自桥的
+	// 主池 —— 不收手续费就是桥替每个提现用户垫矿工费。手续费**不上链**（链上配置升级太重），
+	// 由桥侧配置 + 前端据此提示用户：生成 invoice 时金额填 `提现额 − 手续费`。
+	//
+	// 桥的校验（精确相等，不留容忍区间）：该笔实际发给用户的资产必须**等于**
+	// `链上 pending 金额 − WithdrawFee`，否则拒绝构建结果（不签名、不广播），错误信息给出期望值、
+	// 实际值与差额。<=0（默认）= 不收取，也不做该金额比对（见 rgb20.Contract.WithdrawFee）。
+	//
+	// **跨节点一致性**：每个签名节点都用自己这份配置做同样的比对，所以各节点的取值必须一致
+	// （与 userDepositSweep.feeRate 同一取向），否则签名节点会拒掉协调者的合法提现。
+	WithdrawFee int64 `json:"withdrawFee"`
 }
 
 type btcRPCConfig struct {

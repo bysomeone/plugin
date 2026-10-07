@@ -53,6 +53,16 @@ type Contract struct {
 	AssetID       string `json:"assetId"`       // rgb:...
 	MinDeposit    int64  `json:"minDeposit"`    // 最小充值（最小单位）
 	MinWithdraw   int64  `json:"minWithdraw"`   // 最小提现（最小单位）
+	// WithdrawFee 每笔提现收取的固定手续费，单位是**该资产的最小单位**（与链上记录的精度同口径）。
+	//
+	// 为什么提现要收手续费：RGB20 提现本身就是一笔普通 BTC 交易，矿工费只能用 BTC 付，而这笔 BTC
+	// 出自桥的主池 —— 不收手续费就是桥替每个提现用户垫矿工费、持续透支。手续费不上链（链上配置升级
+	// 太重），由桥侧配置，前端据这个值提示用户按 `提现额 − 手续费` 生成 invoice。
+	//
+	// 它同时是校验门槛的取值来源：桥核对该笔提现实际发给用户的资产金额必须**精确等于**
+	// `链上 pending 金额 − WithdrawFee`（见 Adapter.ExpectedWithdrawPayout 与
+	// ValidateWithdrawRequest.ExpectedPayout）。<=0（默认）= 不收取，也不做该金额比对。
+	WithdrawFee int64 `json:"withdrawFee"`
 }
 
 // sidecarAssetSymbol 返回调用侧车 RPC 时使用的资产符号。
@@ -372,6 +382,40 @@ func (a *Adapter) IsSealOutpoint(outpoint string) bool {
 func (a *Adapter) ReceiveStore() *ReceiveStore { return a.receives }
 func (a *Adapter) Seals() *SealIndex           { return a.seals }
 func (a *Adapter) Registry() *Registry         { return a.reg }
+
+// WithdrawFeeFor 返回某个链上资产符号配置的提现手续费（该资产的最小单位）。
+// 未注册该符号或未配置（0）都返回 0 = 不收取、也不做金额比对。
+func (a *Adapter) WithdrawFeeFor(symbol string) int64 {
+	contract, ok := a.reg.Get(symbol)
+	if !ok {
+		return 0
+	}
+	return contract.WithdrawFee
+}
+
+// ExpectedWithdrawPayout 算出本笔提现**应当发到用户手里**的精确资产金额，即
+// `链上 pending 金额 − 该资产配置的提现手续费`（见 Contract.WithdrawFee）。
+//
+//	configured=false：该资产没有配置手续费（0 / 未注册 / 非正数）⇒ **不做**金额精确比对，
+//	  调用方保持"只判上界（发给用户的资产 ≤ pending）"的原有行为。0 = 跳过检查这一口径与
+//	  userDepositSweep.feeRate 一致：节点配置缺失不该把合法提现全拒。
+//	err != nil：链上 pending 金额连手续费都不够（应发金额 ≤ 0）⇒ 这笔提现必须被拒绝，
+//	  调用方原样上抛。
+//
+// 协调者与签名节点用**同一个**函数取值（各自读自己的配置），口径必须一致，否则签名节点会拒掉
+// 协调者的合法提现（与 sweep 的费率同一取向）。
+func (a *Adapter) ExpectedWithdrawPayout(symbol string, pendingAmount int64) (int64, bool, error) {
+	fee := a.WithdrawFeeFor(symbol)
+	if fee <= 0 {
+		return 0, false, nil
+	}
+	if pendingAmount <= fee {
+		return 0, false, fmt.Errorf(
+			"withdraw amount %d does not cover the configured withdrawal fee %d for %s",
+			pendingAmount, fee, symbol)
+	}
+	return pendingAmount - fee, true, nil
+}
 
 func (a *Adapter) Bridge() Chain33Bridge     { return a.bridge }
 func (a *Adapter) SetBridge(b Chain33Bridge) { a.bridge = b }

@@ -176,6 +176,7 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 			AssetID:       c.AssetID,
 			MinDeposit:    c.MinDeposit,
 			MinWithdraw:   c.MinWithdraw,
+			WithdrawFee:   c.WithdrawFee,
 		})
 	}
 	adapter, err := rgb20.NewAdapter(rgbCfg, rgb20.NewWalletStore(n.neutrinoCfg.Database))
