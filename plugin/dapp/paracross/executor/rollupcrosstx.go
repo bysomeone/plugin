@@ -145,7 +145,7 @@ func (a *action) rollupCrossTx(commit *pt.RollupCrossTx) (*types.Receipt, error)
 		Log: types.Encode(rollupLog),
 	})
 
-	rep, err := a.execCrossTxs(commit.GetChainTitle(), commit.GetCommitRound(), crossTxs, crossTxResults)
+	rep, err := a.execCrossTxs(commit.GetChainTitle(), commit.GetCommitRound(), newParaCrossTxs(crossTxs), crossTxResults)
 	if err != nil {
 
 		clog.Error("RollupCrossTx", "commitRound", commit.GetCommitRound(), "execCrossTxs err", err)
