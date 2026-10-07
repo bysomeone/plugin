@@ -492,17 +492,25 @@ function scenario_rgb20_consignment_hint_mismatch() {
 
 # rgb20_withdraw_once <amount_min_units> <label>：跑一遍完整提现（chain33 withdraw → 侧车
 # BuildWithdrawal → TSS 组签 → 广播 → 确认 → 链上 burn），断言 pending 清空 + 余额正确递减。
+#
+# 金额口径（两处**必须**对齐，否则桥的手续费校验会正确地拒掉它）：
+#   - chain33 提现（burn）额 = amount；
+#   - 用户发票金额 = amount − RGB20_WITHDRAW_FEE（桥核对"实际发给用户 == 链上 pending − 手续费"）。
+# 用户实收 = amount − 手续费，链上余额减少 amount（burn ≠ 实收，是这条链路的正常形态）。
 function rgb20_withdraw_once() {
     local amount="$1"
     local label="${2:-withdraw}"
-    local before after amt withdraw_hash expected
+    local before after amt withdraw_hash expected payout
 
     before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
-    # 1. 侧车 test-sim 创建用户发票（提现收款方）
+    # 1. 侧车 test-sim 创建用户发票（提现收款方）：金额按手续费扣减后的应发额
+    payout=$((amount - RGB20_WITHDRAW_FEE))
+    assert_true "$(awk "BEGIN{print (${payout} > 0)?\"true\":\"false\"}")" \
+        "rgb20 withdraw amount ${amount} does not cover the configured fee ${RGB20_WITHDRAW_FEE} (${label})"
     local user_invoice
     user_invoice=$(curl -s -X POST http://127.0.0.1:50064/sim/user_invoice \
         -H 'Content-Type: application/json' \
-        -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${amount}}" | jq -r '.invoice // empty')
+        -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${payout}}" | jq -r '.invoice // empty')
     assert_non_empty "${user_invoice}" "rgb20 user invoice empty (${label})"
 
     # 2. chain33 发起提现（destinationAddr=invoice）
@@ -625,8 +633,10 @@ function scenario_rgb20_two_withdrawals() {
     assert_non_empty "${change_seal}" "first withdrawal produced no change seal in sidecar ledger"
     assert_eq "$(comm -13 <(echo "${seals_before}") <(echo "${seals_after1}") | wc -l | tr -d ' ')" "1" \
         "expected exactly one new seal after the first withdrawal"
-    # change seal 金额 = 提现前侧车持仓 - 提现额（RGB 状态守恒：被花 seal 的面额 = 提现额 + 找零）
-    local expect_change_min_unit=$((sidecar_before - RGB20_TWO_WITHDRAW_AMOUNT))
+    # change seal 金额 = 提现前侧车持仓 - **应发额**（RGB 状态守恒：被花 seal 的面额 = 应发额 + 找零）。
+    # 注意不是减提现额：提现额是链上 burn 掉的数，而真正离开桥的是发票金额 `提现额 − 手续费`，
+    # 差额（手续费）作为找零留在桥手里 —— 找到这里正的差额就是"桥把手续费留下了"的直接证据。
+    local expect_change_min_unit=$((sidecar_before - (RGB20_TWO_WITHDRAW_AMOUNT - RGB20_WITHDRAW_FEE)))
     assert_eq "$(rgb20_ledger_seal_field "${change_seal}" amount)" "${expect_change_min_unit}" \
         "change seal amount mismatch"
     log_step "  change seal of withdrawal #1: ${change_seal} (amount=${expect_change_min_unit})"
@@ -675,10 +685,11 @@ function scenario_rgb20_truncation_withdraw() {
     before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
     started_at=$(date +%s)
 
-    # 1. 侧车 test-sim 发票：金额用精确的最小单位数
+    # 1. 侧车 test-sim 发票：金额用精确的最小单位数（应发额 = burn − 配置手续费，见 rgb20_withdraw_once
+    #    的注释：桥核对"实际发给用户 == 链上 pending − 手续费"，发票不扣手续费会被正确拒掉）
     user_invoice=$(curl -s -X POST http://127.0.0.1:50064/sim/user_invoice \
         -H 'Content-Type: application/json' \
-        -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${RGB20_TRUNCATION_WITHDRAW_AMOUNT}}" | jq -r '.invoice // empty')
+        -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":$((RGB20_TRUNCATION_WITHDRAW_AMOUNT - RGB20_WITHDRAW_FEE))}" | jq -r '.invoice // empty')
     assert_non_empty "${user_invoice}" "rgb20 truncation user invoice empty"
 
     # 2. chain33 发起提现（-a 口径 = min units / 1e8；旧实现下 ${RGB20_TRUNCATION_WITHDRAW_AMOUNT} 会少 1）
@@ -687,11 +698,12 @@ function scenario_rgb20_truncation_withdraw() {
     withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
     assert_length "${withdraw_hash}" 66 "rgb20 truncation withdraw tx hash"
 
-    # 3. 断言 burn 额（链上 pending）== invoice 额。浮点截断时这里是 59999。
+    # 3. 断言 burn 额（链上 pending）== invoice 额 + 手续费。invoice 是 burn 扣掉手续费后的应发额，
+    #    浮点截断时 burn 会变成 59999（发票随之变成 59999 − 手续费），这里就变红。
     burn_amount=$(wait_pending_withdraw_amount "${USER_MAIN_ADDR}" "${withdraw_hash}")
     assert_non_empty "${burn_amount}" "rgb20 truncation withdraw pending not found (${withdraw_hash})"
     assert_eq "${burn_amount}" "${RGB20_TRUNCATION_WITHDRAW_AMOUNT}" \
-        "chain33 burn amount != invoice amount (CLI decimal->min unit conversion lost units)"
+        "chain33 burn amount != invoice amount + withdrawFee (CLI decimal->min unit conversion lost units)"
 
     # 4. 正常完成：pending 清除 + 余额精确递减。金额不一致时桥永远不放款，这里会超时。
     wait_no_withdraw_pending_for_user "${USER_MAIN_ADDR}" "${withdraw_hash}"
@@ -710,7 +722,124 @@ function scenario_rgb20_truncation_withdraw() {
         fail "rgb20 truncation withdraw retried ${retries} times (spam); burn/payout amount mismatch?"
     fi
 
-    log_step "RGB20 truncation withdraw OK: burn == invoice == payout == ${RGB20_TRUNCATION_WITHDRAW_AMOUNT} min units (retry logs=${retries})"
+    log_step "RGB20 truncation withdraw OK: burn == ${RGB20_TRUNCATION_WITHDRAW_AMOUNT} == invoice ($((RGB20_TRUNCATION_WITHDRAW_AMOUNT - RGB20_WITHDRAW_FEE))) + fee (${RGB20_WITHDRAW_FEE}) min units (retry logs=${retries})"
+}
+
+# =====================================================================
+# 提现手续费：发票金额与「pending − 手续费」对不上必须被拒（E-fee 负例）
+# =====================================================================
+#
+# 桥按资产收一笔固定的提现手续费（桥侧配置 `rgb20.contracts[].withdrawFee`，见 CONFIG.md §4.4.5），
+# 判据是「**实际发给用户**的资产精确等于 `链上 pending − 手续费`」。本场景构造**发票没扣手续费**
+# 这个真实形态（前端没跟上配置时就是这样，也正是"桥替用户垫 BTC 矿工费"那个 bug 的形态），断言：
+#
+#   1. 桥给出明确的拒绝，信息里带期望值、实际值与差额（便于用户/前端当场看出该开多少）；
+#   2. 没有签名、也没有广播 —— 直接证据是侧车账本**没有新增 seal**（change seal 由
+#      FinalizeWithdrawal 创建，那是签名之后的一步）+ chain33 上这笔 pending 一直挂着；
+#   3. 于是这笔 burn 停在链上（资产在用户提交提现时就已被 Exec_Withdraw 转进**锁定地址**，桥不做
+#      自动退款；怎么处置见 WITHDRAW_LOCK_MODEL.md 的解锁路径）。
+#
+# ⚠️ 本场景**故意**留下一个永久 pending 并锁住用户的资产，所以它必须排在 `run_rgb20_all` 的**最后**
+# （之后的场景要么依赖余额、要么依赖"本轮只认自己那笔 pending"）。这与 harness 的既有前提一致：
+# chain33 对提现没有取消/超时路径，失败遗留的 pending 会永远留在列表里，等待函数都按 tx_hash
+# 认领自己那一笔（见 wait_no_withdraw_pending_for_user）。
+#
+# 顺带说明判据的边界（别把它读成"桥什么都没做"）：桥**会**调用一次 BuildWithdrawal —— 侧车不把
+# 解析出的发票金额回传给桥（BuildWithdrawalResponse 只有 psbt/input_amounts/consignment），
+# 所以金额只能从"构建出来的转移"里核对。拒绝点因此在构建之后、**签名与广播之前**。
+function scenario_rgb20_withdraw_fee_mismatch() {
+    log_step "scenario: a withdrawal whose invoice does not deduct the fee must be refused (E-fee negative case)"
+    assert_true "$(awk "BEGIN{print (${RGB20_WITHDRAW_FEE} > 0)?\"true\":\"false\"}")" \
+        "本场景需要非零的 RGB20_WITHDRAW_FEE（0 = 桥不做该金额比对，本场景会失去判别力）"
+
+    local amount="${RGB20_FEE_MISMATCH_WITHDRAW_AMOUNT}"
+    local expected_payout=$((amount - RGB20_WITHDRAW_FEE))
+
+    # 前置条件：桥侧（侧车账本）要拿得出这笔提现，否则失败原因会变成"余额不足"，判据就没走到。
+    local sidecar_before before amount_decimal
+    sidecar_before=$(query_rgb20_ledger_spendable)
+    assert_true "$(awk "BEGIN{print (${sidecar_before} >= ${amount})?\"true\":\"false\"}")" \
+        "rgb20 sidecar holdings too low for the fee-mismatch case: have=${sidecar_before}, need=${amount}"
+    before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
+    amount_decimal=$(awk "BEGIN{printf \"%.8f\", ${amount}/100000000}")
+    assert_true "$(awk "BEGIN{print (${before} >= ${amount_decimal})?\"true\":\"false\"}")" \
+        "rgb20 user balance too low for the fee-mismatch case: have=${before}, need=${amount_decimal}"
+
+    # 1. 发票按**完整提现额**开（手续费没扣）：桥应发的是 ${expected_payout}，实际会发 ${amount}。
+    local user_invoice
+    user_invoice=$(curl -s -X POST http://127.0.0.1:50064/sim/user_invoice \
+        -H 'Content-Type: application/json' \
+        -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${amount}}" | jq -r '.invoice // empty')
+    assert_non_empty "${user_invoice}" "rgb20 fee-mismatch user invoice empty"
+
+    # 2. chain33 发起提现（链上 burn = amount，锁定地址在此刻收到资产）
+    local seals_before started_at withdraw_hash want_hash
+    seals_before=$(rgb20_ledger_seal_outpoints)
+    # 读不到账本就无从比对"没新增 seal"（两边都空会让下面那条断言变成空转），故先判非空。
+    assert_non_empty "${seals_before}" "rgb20 ledger has no seals before the fee-mismatch case (cannot tell 'no new seal' apart from 'cannot read the ledger')"
+    started_at=$(date +%s)
+    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amount_decimal}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
+    assert_length "${withdraw_hash}" 66 "rgb20 fee-mismatch withdraw tx hash"
+    want_hash=$(echo "${withdraw_hash}" | tr 'A-Z' 'a-z')
+
+    local burn_amount
+    burn_amount=$(wait_pending_withdraw_amount "${USER_MAIN_ADDR}" "${withdraw_hash}")
+    assert_eq "${burn_amount}" "${amount}" "chain33 burn amount (fee-mismatch case)"
+
+    # 3. 桥必须给出明确拒绝。等它出现：pending 由桥每 10s 轮询一次，之后每次重试都会打这条
+    #    （CI 的重试节奏是秒级），60s 足够；超时判失败并打印日志尾部。
+    local i logs reason=""
+    for ((i = 0; i < 60; i++)); do
+        logs=$(para1_logs_since "${started_at}")
+        if echo "${logs}" | grep -q "withdraw payout mismatch"; then
+            reason=$(echo "${logs}" | grep -m1 "withdraw payout mismatch")
+            break
+        fi
+        sleep 1
+    done
+    if [ -z "${reason}" ]; then
+        fail "发票没扣手续费的提现没有被桥拒绝（未出现 'withdraw payout mismatch'）：para1 本轮日志尾部=$(para1_logs_since "${started_at}" | tail -5)"
+    fi
+    log_step "  bridge refused it: ${reason}"
+
+    # 3.1 错误信息必须说清期望多少、实际多少、差在哪（用户/前端据此知道发票该开多少）。
+    #     片段按 `WithdrawPayoutMismatchError.Error()` 的实际措辞取：
+    #     "this transfer pays the user <实发> but the configured withdrawal fee <手续费> requires
+    #      exactly <应发> out of the <链上 pending> chain33 pending amount (off by +<差额>; ...)"
+    for want in \
+        "pays the user ${amount}" \
+        "requires exactly ${expected_payout}" \
+        "out of the ${amount} chain33 pending amount" \
+        "off by +${RGB20_WITHDRAW_FEE}"; do
+        echo "${reason}" | grep -qF "${want}" ||
+            fail "拒绝信息没有说清金额（缺 '${want}'）：${reason}"
+    done
+
+    # 4. 拒绝必须早于签名与广播。直接证据：侧车账本没有新增 seal（change seal 只在 FinalizeWithdrawal
+    #    ——即签名之后——被创建），chain33 上这笔 pending 一直挂着（真广播并被确认的话它会像其它场景
+    #    那样被清掉），且 para1 日志里没有这笔的广播记录。
+    local seals_after pending_now
+    sleep 5
+    logs=$(para1_logs_since "${started_at}")
+    seals_after=$(rgb20_ledger_seal_outpoints)
+    assert_eq "${seals_after}" "${seals_before}" \
+        "被拒的提现不得产生新 seal（新 seal 意味着走到了 FinalizeWithdrawal，即签名之后）"
+    # pending 这条只是佐证（几秒内它本来也来不及走完"广播→BTC 确认→Confirm"三步），
+    # 上面两条才是"没签名、没广播"的直接证据。
+    pending_now=$(query_pending_withdraw_amount "${USER_MAIN_ADDR}" "${withdraw_hash}")
+    assert_eq "${pending_now}" "${amount}" \
+        "被拒的提现必须仍在链上 pending（佐证：真广播并确认的话它会像其它场景那样被清掉）"
+    if echo "${logs}" | grep "withdraw tracked" | grep -q "${want_hash}"; then
+        fail "被拒的提现被广播了：$(echo "${logs}" | grep "${want_hash}" | head -3)"
+    fi
+
+    # 5. 用户余额：提交提现时链上就把金额锁走了（余额已经减少），被拒不会让它回来。
+    local after
+    after=$(query_rgb20_balance "${USER_MAIN_ADDR}")
+    assert_balance "${after}" "$(awk "BEGIN{printf \"%.8f\", ${before} - ${amount_decimal}}")" \
+        "被拒的提现：资产已锁进锁定地址（余额减少），桥不做自动退款"
+
+    log_step "PASS: E-fee 发票未扣手续费的提现被拒（期望 ${expected_payout}、实际 ${amount}、额差 +${RGB20_WITHDRAW_FEE}），未签名未广播；链上那笔 burn 停在锁定地址（解锁路径见 WITHDRAW_LOCK_MODEL.md）"
 }
 
 # =====================================================================
@@ -1037,4 +1166,7 @@ function run_rgb20_all() {
     scenario_rgb20_two_withdrawals
     scenario_rgb20_truncation_withdraw
     run_rgb20_sidecar_smoke
+    # 负例排在**最后**：它故意留下一笔永久 pending 并锁住用户的资产（见该场景的注释），
+    # 不会（也不该）被后面的场景消化掉。
+    scenario_rgb20_withdraw_fee_mismatch
 }

@@ -156,6 +156,15 @@ RGB20_BITCOIND_PASS="${RGB20_BITCOIND_PASS:-${BTCD_RPC_PASS:-1314}}"
 RGB20_BITCOIND_CERT="${RGB20_BITCOIND_CERT:-/btcd/rpc.cert}"
 RGB20_DEPOSIT_AMOUNT="${RGB20_DEPOSIT_AMOUNT:-1000000}"   # 1.0 USDT (min units)
 RGB20_WITHDRAW_AMOUNT="${RGB20_WITHDRAW_AMOUNT:-500000}"  # 0.5 USDT
+# 每笔 RGB20 提现收取的固定手续费（该资产最小单位，`[[...rgb20.contracts]].withdrawFee`）。
+#
+# 提现本身是一笔普通 BTC 交易，矿工费只能用 BTC 付、由桥的主池垫付，所以桥按资产收一笔固定手续费
+# 补偿（不上链，桥侧配置）。用户侧口径：发票金额必须是 `提现额 − 手续费`（前端按配置提示），
+# 桥核对**实际发给用户的资产**是否精确等于 `链上 pending − 手续费`，不等即拒（不签名、不广播）。
+#
+# CI 用非零值（0 会让本场景失去判别力：0 = 不校验，退回"只判上界"的旧行为），但要远小于各场景的
+# 提现额（最小的一笔是 RGB20_TRUNCATION_WITHDRAW_AMOUNT），否则手续费会把应发金额算成 0 而被拒。
+RGB20_WITHDRAW_FEE="${RGB20_WITHDRAW_FEE:-1000}"                # 0.00001 USDT
 # 两连提现场景每笔金额（0.2 USDT）：两笔合计不超过上一场景提现后的剩余额（默认 0.5），
 # 第二笔必须花掉第一笔的 change seal。
 RGB20_TWO_WITHDRAW_AMOUNT="${RGB20_TWO_WITHDRAW_AMOUNT:-200000}"
@@ -163,6 +172,10 @@ RGB20_TWO_WITHDRAW_AMOUNT="${RGB20_TWO_WITHDRAW_AMOUNT:-200000}"
 # 在旧的浮点换算（int64(float64 相乘)）下会少 1（0.0006*1e8 = 59999.99999999999 -> 59999）。
 # 其余场景的金额（500000/200000）恰好精确，覆盖不到这个雷区。
 RGB20_TRUNCATION_WITHDRAW_AMOUNT="${RGB20_TRUNCATION_WITHDRAW_AMOUNT:-60000}"
+# 手续费负例（scenario_rgb20_withdraw_fee_mismatch）的提现额：发票**不扣**手续费，桥必须拒。
+# 取小值是因为它排在最后、且会永久锁住这笔资产（前序场景已 burn 掉 960000/1000000，
+# 用户余额还剩 40000），同时仍要够大以覆盖手续费、让应发额为正。
+RGB20_FEE_MISMATCH_WITHDRAW_AMOUNT="${RGB20_FEE_MISMATCH_WITHDRAW_AMOUNT:-20000}"
 BTC_WITHDRAW_FEE_RATE="${BTC_WITHDRAW_FEE_RATE:-20}"
 XBTC_TRANSFER_AMOUNT="${XBTC_TRANSFER_AMOUNT:-500000}"
 
@@ -346,6 +359,10 @@ sidecarSymbol="${RGB20_SIDECAR_SYMBOL}"
 # 合约身份（#58）：充值路径强校验 consignment 的 asset_id == 这个值，空值 = 拒收所有充值。
 # 空占位是**故意**的：合约运行期才发行，发行后由 apply_rgb20_asset_id_and_restart 回填。
 assetId="${RGB20_ASSET_ID}"
+# 提现手续费（该资产最小单位）：桥核对"实际发给用户的资产 == 链上 pending − 这个值"，
+# 不等即拒（不签名、不广播）。0 = 不收取、也不做该金额比对。4 个 para 必须同值（每个签名节点
+# 各自用自己的配置独立核对，见 CONFIG.md §4.4.5）。
+withdrawFee=${RGB20_WITHDRAW_FEE}
 EOF
 }
 
