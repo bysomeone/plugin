@@ -1714,12 +1714,30 @@ func (t *tssService) validateRgb20WithdrawSign(payload *rgb20.WithdrawSignPayloa
 	if err := checkWithdrawClaims(payload, pendingTx); err != nil {
 		return nil, err
 	}
+	// 提现手续费的应发金额：与协调者同一口径，但用**本节点自己**的配置算
+	// （`rgb20.contracts[].withdrawFee`），不采信协调者下发的任何"应发多少"声称 —— 否则等于让
+	// 签名节点替桥垫那笔手续费背书（签名节点要独立判定"这笔放款有没有少收用户的手续费"）。
+	// 未配置（0）/本节点没注册该符号 ⇒ 字段留 0，ValidateWithdrawPsbt 跳过该项比对：与
+	// sweepSignFeeRate 的"0 = 跳过检查"同一取向（节点配置缺失不该把合法提现全拒，该资产本身的
+	// 上界判据仍然生效）。
+	var expectedPayout int64
+	if t.client.rgb20 != nil {
+		payout, configured, err := t.client.rgb20.ExpectedWithdrawPayout(pendingTx.GetAssetSymbol(), pendingTx.GetAmount())
+		if err != nil {
+			// 链上 pending 连配置的手续费都不够：这笔提现按配置就不该放款，拒签。
+			return nil, fmt.Errorf("withdraw fee check: %w", err)
+		}
+		if configured {
+			expectedPayout = payout
+		}
+	}
 	var spentSeals []string
 	valReq := &rgb20.ValidateWithdrawRequest{
 		Psbt:        psbtBytes,
 		Consignment: consignment,
 		// 金额/费率/高度门槛一律取链上 pending（真值），不取 payload 的声称值。
 		ExpectedAmount:  pendingTx.GetAmount(),
+		ExpectedPayout:  expectedPayout,
 		MinSyncedHeight: uint64(pendingTx.GetTxBlockHeight()),
 		FeeRate:         pendingTx.GetFeeRate(),
 		// sticky seal 核对（E9-B）：一笔 chain33 burn 只能绑定一组 RGB seal。核对失败
