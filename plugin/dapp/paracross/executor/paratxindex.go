@@ -158,6 +158,9 @@ func getCrossTxsFromIndex(api client.QueueProtocolAPI, status *pt.ParacrossNodeS
 
 	index, err := api.GetParaTxIndex(&types.ReqParaTxIndex{Height: status.MainBlockHeight, Title: status.Title})
 	if err != nil || index == nil {
+		// TEMPORARY PROBE, drop before the pull request: Info because the nodes do not emit debug.
+		clog.Info("paracross index miss, reading the block body", "mainHeight", status.MainBlockHeight,
+			"title", status.Title, "err", err)
 		return nil, nil, false, nil
 	}
 	//索引必须来自commit指向的那个区块
@@ -197,5 +200,8 @@ func getCrossTxsFromIndex(api client.QueueProtocolAPI, status *pt.ParacrossNodeS
 		}
 		crossTxs = append(crossTxs, crossTx)
 	}
+	// TEMPORARY PROBE, drop before the pull request.
+	clog.Info("paracross index used", "mainHeight", status.MainBlockHeight, "title", status.Title,
+		"txs", len(crossTxs))
 	return crossTxs, crossRst.Bytes(), true, nil
 }
