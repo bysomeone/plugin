@@ -7,12 +7,37 @@ package executor
 import (
 	"bytes"
 	"math/big"
+	"sync/atomic"
 
 	"github.com/33cn/chain33/client"
 	"github.com/33cn/chain33/common"
 	"github.com/33cn/chain33/types"
 	pt "github.com/33cn/plugin/plugin/dapp/paracross/types"
 )
+
+// TEMPORARY PROBE, drop before the pull request.
+//
+// The first thing getCrossTxsFromIndex does is refuse commits whose anchor is below
+// ForkLoopCheckCommitTxDone, and that refusal is silent, so a node that never uses the
+// index cannot be told apart from one whose gate always fails without this line. Output
+// is bounded: the first 20 calls, every 5000th, and every call whose anchor is past the
+// fork -- those are the ones that should start using the index, so they must not be
+// sampled away.
+var probeGateAll, probeGatePast int64
+
+func probeIndexGate(api client.QueueProtocolAPI, status *pt.ParacrossNodeStatus) {
+	all := atomic.AddInt64(&probeGateAll, 1)
+	pastFork := pt.IsParaForkHeight(api.GetConfig(), status.MainBlockHeight, pt.ForkLoopCheckCommitTxDone)
+	var past int64
+	if pastFork {
+		past = atomic.AddInt64(&probeGatePast, 1)
+	}
+	if all <= 20 || all%5000 == 0 || (pastFork && past <= 50) || (pastFork && past%1000 == 0) {
+		clog.Info("paracross index gate", "n", all, "pastFork", pastFork, "pastN", past,
+			"mainHeight", status.MainBlockHeight, "paraHeight", status.Height,
+			"crossRstLen", len(status.CrossTxResult), "hashs", len(status.CrossTxHashs))
+	}
+}
 
 func init() {
 	types.RegParaTxIndexBuilder(buildParaTxIndex)
@@ -143,6 +168,7 @@ func paraCrossActionType(tx *types.Transaction) (uint32, error) {
 // done为true时结果可以直接使用, 为false时调用方需要回退到读取区块体
 // 索引缺失、不可用以及区块里没有跨链交易都通过done和空结果表达, 不返回错误
 func getCrossTxsFromIndex(api client.QueueProtocolAPI, status *pt.ParacrossNodeStatus) ([]*paraCrossTx, []byte, bool, error) {
+	probeIndexGate(api, status) // TEMPORARY PROBE, drop before the pull request.
 	//只有ForkLoopCheckCommitTxDone之后的路径才读区块体, 之前的老路径不走索引
 	if !pt.IsParaForkHeight(api.GetConfig(), status.MainBlockHeight, pt.ForkLoopCheckCommitTxDone) {
 		return nil, nil, false, nil
