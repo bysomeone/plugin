@@ -43,6 +43,46 @@ func init() {
 	types.RegParaTxIndexBuilder(buildParaTxIndex)
 }
 
+// TEMPORARY PROBE, drop before the pull request.
+//
+// getCrossTxRst decides whether a commit needs cross chain txs at all, and it decides it
+// silently: a commit classified as "nothing to do" looks exactly like a failed index read
+// from the outside, and the index is only ever consulted after that decision. This names
+// the exit that was taken together with the four inputs that decide it. Counted per exit
+// so a rare exit is still reported at least once; output is bounded otherwise.
+const (
+	probeRstBitMapVer = iota
+	probeRstDecodeErr
+	probeRstPreRbkEmpty
+	probeRstIgnoreErr
+	probeRstIgnored
+	probeRstNeed
+	probeRstExitCount
+)
+
+var (
+	probeRstExit  [probeRstExitCount]int64
+	probeRstNames = [probeRstExitCount]string{
+		"bitmapVer", "decodeErr", "preRbkEmpty", "ignoreErr", "ignored", "need",
+	}
+)
+
+func probeCrossTxRst(api client.QueueProtocolAPI, status *pt.ParacrossNodeStatus, exit int, rstLen int) {
+	n := atomic.AddInt64(&probeRstExit[exit], 1)
+	if n > 20 && n%2000 != 0 {
+		return
+	}
+	cfg := api.GetConfig()
+	heightList := types.ConfSub(cfg, pt.ParaX).GStrList("paraCrossAssetTxHeightList")
+	ignore, ignoreErr := checkIsIgnoreHeight(heightList, status)
+	clog.Info("paracross index rst exit", "n", n, "exit", probeRstNames[exit],
+		"need", exit == probeRstNeed, "paraHeight", status.Height, "mainHeight", status.MainBlockHeight,
+		"title", status.Title, "txRstLen", rstLen, "crossRstLen", len(status.CrossTxResult),
+		"bitMapVer", len(string(status.CrossTxResult)) == pt.ParaCrossStatusBitMapVerLen,
+		"pastRbkFork", cfg.IsDappFork(status.MainBlockHeight, pt.ParaX, pt.ForkParaAssetTransferRbk),
+		"listLen", len(heightList), "ignore", ignore, "ignoreErr", ignoreErr != nil)
+}
+
 // paraCrossTx 一笔平行链跨链交易
 // noAction为true时tx为nil, 表示区块索引已经确认该交易的跨链执行动作是空操作,
 // 执行方不需要交易内容就可以跳过

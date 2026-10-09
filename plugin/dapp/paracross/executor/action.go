@@ -1382,18 +1382,21 @@ func getCrossTxRst(api client.QueueProtocolAPI, status *pt.ParacrossNodeStatus) 
 	//支持带版本号的跨链交易bitmap
 	//1.如果等于0，是老版本的平行链，按老的方式处理. 2. 如果大于0等于ver，新版本且没有跨链交易，不需要处理. 3. 大于ver，说明有跨链交易按老的方式处理
 	if len(string(status.CrossTxResult)) == pt.ParaCrossStatusBitMapVerLen {
+		probeCrossTxRst(api, status, probeRstBitMapVer, 0) // TEMPORARY PROBE, drop before the pull request.
 		return nil, false, nil
 	}
 
 	rst, err = hex.DecodeString(string(status.TxResult))
 	if err != nil {
 		clog.Error("getCrossTxHashs decode rst", "CrossTxResult", string(status.TxResult), "paraHeight", status.Height)
+		probeCrossTxRst(api, status, probeRstDecodeErr, 0) // TEMPORARY PROBE, drop before the pull request.
 		return nil, false, types.ErrInvalidParam
 	}
 
 	cfg := api.GetConfig()
 	if !cfg.IsDappFork(status.MainBlockHeight, pt.ParaX, pt.ForkParaAssetTransferRbk) {
 		if len(rst) == 0 {
+			probeCrossTxRst(api, status, probeRstPreRbkEmpty, len(rst)) // TEMPORARY PROBE, drop before the pull request.
 			return nil, false, nil
 		}
 	}
@@ -1407,11 +1410,14 @@ func getCrossTxRst(api client.QueueProtocolAPI, status *pt.ParacrossNodeStatus) 
 	heightList := conf.GStrList("paraCrossAssetTxHeightList")
 	ignore, err := checkIsIgnoreHeight(heightList, status)
 	if err != nil {
+		probeCrossTxRst(api, status, probeRstIgnoreErr, len(rst)) // TEMPORARY PROBE, drop before the pull request.
 		return nil, false, err
 	}
 	if ignore {
+		probeCrossTxRst(api, status, probeRstIgnored, len(rst)) // TEMPORARY PROBE, drop before the pull request.
 		return nil, false, nil
 	}
+	probeCrossTxRst(api, status, probeRstNeed, len(rst)) // TEMPORARY PROBE, drop before the pull request.
 	return rst, true, nil
 }
 
