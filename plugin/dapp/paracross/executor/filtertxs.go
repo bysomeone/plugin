@@ -14,6 +14,10 @@ import (
 	pt "github.com/33cn/plugin/plugin/dapp/paracross/types"
 )
 
+// discardTxsConfKey flattened key of config.exec.sub.paracross.discardTxs, the same key
+// types.ConfSub(cfg, pt.ParaX).GStrList("discardTxs") resolves to.
+var discardTxsConfKey = "config.exec.sub." + pt.ParaX + ".discardTxs"
+
 // 1,如果全部是paracross的，主链成功会ExecOk，如果有一个不成功，全部回退回PACK，后面检查TyLogErr，OK意味着全部成功
 // 2,如果是paracross+other， other的是PACK，如果有一个是OK，那意味着全部OK，如果全部是PACK，检查TyLogErr
 // 3,如果是全部other，全部是PACK
@@ -82,14 +86,18 @@ func filterParaTxGroup(cfg *types.Chain33Config, tx *types.Transaction, allTxs [
 
 // FilterTxsForPara include some main tx in tx group before ForkParacrossCommitTx
 func FilterTxsForPara(cfg *types.Chain33Config, main *types.ParaTxDetail) []*types.Transaction {
-	cfgPara := types.ConfSub(cfg, pt.ParaX)
-	discardTxs := cfgPara.GStrList("discardTxs")
 	discardTxsMap := make(map[string]bool)
-	for _, v := range discardTxs {
-		if strings.HasPrefix(v, "0x") || strings.HasPrefix(v, "0X") {
-			v = v[2:]
+	// discardTxs is optional and only the para chain template sets it. Chain33Config logs
+	// "chain config <key> not found" at error level for every read of an absent key, which
+	// floods the log of a node that leaves it out, so check the key first: absent means an
+	// empty set, byte for byte what GStrList returns for a missing key.
+	if cfg.HasConf(discardTxsConfKey) {
+		for _, v := range types.ConfSub(cfg, pt.ParaX).GStrList("discardTxs") {
+			if strings.HasPrefix(v, "0x") || strings.HasPrefix(v, "0X") {
+				v = v[2:]
+			}
+			discardTxsMap[v] = true
 		}
-		discardTxsMap[v] = true
 	}
 	var txs []*types.Transaction
 	forkHeight := pt.GetDappForkHeight(cfg, pt.ForkCommitTx)

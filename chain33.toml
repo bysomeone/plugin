@@ -330,6 +330,11 @@ paraConsensusStopBlocks=30000
 #不同ignore范围高度使用"-"分割，hit高度在ignore范围内，为平行链自身的高度，不是主链高度
 #para.hit.10.50.250, para.ignore.1-100.200-300
 paraCrossAssetTxHeightList=[]
+# Tx hashes (hex, "0x" prefix allowed) the para chain filter drops when it builds its block.
+# A commit carries a result bitmap built over the para chain's own filtered list, so a node
+# that executes those commits has to be given the same list. Leave it empty unless the para
+# chain of this node sets it, otherwise the two sides disagree on the tx positions.
+discardTxs=[]
 
 [exec.sub.autonomy]
 total="16htvcBNSEA7fZhAdLJphDwQRQJaHpyHTp"
