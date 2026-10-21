@@ -134,6 +134,19 @@ func (r *rgbx) Exec_Deposit(deposit *rtypes.DepositAsset, tx *types.Transaction,
 
 	receipt := &types.Receipt{Ty: types.ExecOk}
 	txHash := tx.Hash()
+	// Defense in depth: the executor's CheckTx is only run by the mempool, so a block can
+	// carry transactions that were admitted before the config/counters changed. Re-check the
+	// pause flag and the mint window here so every node enforces the limit deterministically.
+	if err := r.checkDepositPaused(deposit); err != nil {
+		elog.Error("Exec_Deposit bridge config", "txHash", hex.EncodeToString(txHash),
+			"symbol", deposit.GetAssetSymbol(), "err", err)
+		return nil, err
+	}
+	if err := r.checkDepositMintLimit(deposit); err != nil {
+		elog.Error("Exec_Deposit bridge mint limit", "txHash", hex.EncodeToString(txHash),
+			"symbol", deposit.GetAssetSymbol(), "amount", deposit.GetAmount(), "err", err)
+		return nil, err
+	}
 	symbol := ensureCrossChainSymbol(deposit.GetAssetSymbol())
 	// 类别取**链上登记**值（不再看 symbol 字面量）。
 	info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
@@ -197,6 +210,17 @@ func (r *rgbx) Exec_Deposit(deposit *rtypes.DepositAsset, tx *types.Transaction,
 		Value: []byte("used"),
 	})
 	receipt.KV = append(receipt.KV, operationKVs...)
+	// Numeric mint limit: account the mint against the rolling window only after the mint
+	// succeeded, so the counter follows the same commit/rollback path as the minted supply.
+	mintWindowKV, err := r.depositWindowKV(deposit)
+	if err != nil {
+		elog.Error("Exec_Deposit mint window counter", "txHash", hex.EncodeToString(txHash),
+			"symbol", symbol, "amount", deposit.GetAmount(), "err", err)
+		return nil, err
+	}
+	if mintWindowKV != nil {
+		receipt.KV = append(receipt.KV, mintWindowKV)
+	}
 
 	return receipt, nil
 
@@ -205,6 +229,13 @@ func (r *rgbx) Exec_Deposit(deposit *rtypes.DepositAsset, tx *types.Transaction,
 func (r *rgbx) Exec_Withdraw(withdraw *rtypes.WithdrawAsset, tx *types.Transaction, index int) (*types.Receipt, error) {
 	receipt := &types.Receipt{Ty: types.ExecOk}
 	txHash := tx.Hash()
+	// Defense in depth: CheckTx only guards the mempool. Re-check pause/limits at execution
+	// time so several withdrawals packed into one block cannot jointly exceed the window.
+	if err := r.checkWithdrawBridgeConfig(withdraw); err != nil {
+		elog.Error("Exec_Withdraw bridge config", "txHash", hex.EncodeToString(txHash),
+			"symbol", withdraw.GetAssetSymbol(), "err", err)
+		return nil, err
+	}
 	symbol := ensureCrossChainSymbol(withdraw.GetAssetSymbol())
 	accDB, err := r.newAccount(symbol)
 	if err != nil {
@@ -235,6 +266,17 @@ func (r *rgbx) Exec_Withdraw(withdraw *rtypes.WithdrawAsset, tx *types.Transacti
 	receipt.KV = append(receipt.KV, lockReceipt.KV...)
 	receipt.Logs = append(receipt.Logs, lockReceipt.Logs...)
 	receipt.KV = append(receipt.KV, operationKVs...)
+	// Numeric withdraw limits: account the amount against the rolling window after the lock
+	// transfer succeeded. The counter is receipt KV, so a reorg rolls it back with the lock.
+	windowKV, err := r.withdrawWindowKV(withdraw)
+	if err != nil {
+		elog.Error("Exec_Withdraw window counter", "txHash", hex.EncodeToString(txHash),
+			"symbol", symbol, "amount", withdraw.GetAmount(), "err", err)
+		return nil, err
+	}
+	if windowKV != nil {
+		receipt.KV = append(receipt.KV, windowKV)
+	}
 
 	receipt.KV = append(receipt.KV, &types.KeyValue{
 		Key:   formatPayloadKey(txHash),
