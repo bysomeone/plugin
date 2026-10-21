@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"strings"
 
 	"github.com/33cn/chain33/types"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
@@ -233,6 +234,64 @@ func (r *rgbx) isOperationSettled(rec *rtypes.OperationRecord) bool {
 	}
 	value, err := r.GetStateDB().Get(formatWithdrawFinalKey(rec.GetChain33TxHash()))
 	return err == nil && bytes.Equal(value, withdrawFinalSettled)
+}
+
+// Query_GetWithdrawFinalState reports the terminal state of a withdrawal burn:
+// "" while it is still locked, "settled" after Confirm paid it out, or "released" after
+// Unlock refunded it. The payload is the burn's chain33 transaction hash in hex.
+//
+// This is a read-only view of the consensus-state key that decides both terminal paths, so it
+// answers "did the refund happen?" without trusting any bridge-side status. It is also the only
+// reader that can tell released apart from "not settled yet": OperationRecord.Settled is false
+// in both cases by design (released means the burn was refunded, never paid out).
+func (r *rgbx) Query_GetWithdrawFinalState(req *types.ReqString) (types.Message, error) {
+	burnTxHash, err := decodeBurnTxHash(req.GetData())
+	if err != nil {
+		return nil, err
+	}
+	value, err := r.GetStateDB().Get(formatWithdrawFinalKey(burnTxHash))
+	if errors.Is(err, types.ErrNotFound) {
+		return &types.ReplyString{}, nil
+	}
+	if err != nil {
+		elog.Error("Query_GetWithdrawFinalState get db", "burnTxHash", req.GetData(), "err", err)
+		return nil, err
+	}
+	return &types.ReplyString{Data: string(value)}, nil
+}
+
+// Query_GetCrossChainLockAddress returns the shared address that holds the assets of unsettled
+// withdrawals for a cross-chain asset. The payload is the chain33 asset symbol (e.g. RGB20_USDT).
+//
+// Read-only: it derives the same deterministic address the executor transfers into on Withdraw
+// and out of on Unlock. Operators (and the E2E that checks the refund) use it to observe the
+// locked balance without knowing the address derivation.
+func (r *rgbx) Query_GetCrossChainLockAddress(req *types.ReqString) (types.Message, error) {
+	if req.GetData() == "" {
+		return nil, types.ErrInvalidParam
+	}
+	symbol := ensureCrossChainSymbol(req.GetData())
+	accDB, err := r.newAccount(symbol)
+	if err != nil {
+		elog.Error("Query_GetCrossChainLockAddress newAccount", "symbol", symbol, "err", err)
+		return nil, err
+	}
+	return &types.ReplyString{Data: r.crossChainLockAddress(accDB)}, nil
+}
+
+// decodeBurnTxHash parses the hex form used by CLI/RPC callers. A "0x" prefix is tolerated
+// because the CLI prints transaction hashes that way; an empty or non-hex value is an
+// argument error, not "no such withdrawal".
+func decodeBurnTxHash(s string) ([]byte, error) {
+	s = strings.TrimPrefix(strings.TrimSpace(s), "0x")
+	if s == "" {
+		return nil, types.ErrInvalidParam
+	}
+	hash, err := hex.DecodeString(s)
+	if err != nil || len(hash) == 0 {
+		return nil, types.ErrInvalidParam
+	}
+	return hash, nil
 }
 
 func (r *rgbx) Query_ListPendingTxByFrom(req *types.ReqString) (types.Message, error) {
