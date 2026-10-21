@@ -126,6 +126,26 @@ var (
 	// payload. The refund recipient is the ledger's owner, so a mismatch means the signed message
 	// does not describe this burn.
 	ErrOperationOwnerMismatch = errors.New("operation owner mismatch")
+	// ErrInvalidBridgeConfig the bridge config snapshot is malformed: negative limits, or a
+	// global (empty symbol) record that carries per-asset numeric limits.
+	ErrInvalidBridgeConfig = errors.New("invalid bridge config")
+	// ErrBridgeConfigApplyExists an apply record with the same transaction hash already exists.
+	ErrBridgeConfigApplyExists = errors.New("bridge config apply already exists")
+	// ErrBridgeConfigApplyNotExist no apply record exists for the referenced apply id.
+	ErrBridgeConfigApplyNotExist = errors.New("bridge config apply not exist")
+	// ErrBridgeConfigNotPending the apply record is not awaiting approval (already approved).
+	ErrBridgeConfigNotPending = errors.New("bridge config apply not pending")
+	// ErrBridgeDepositPaused the governance-approved global config pauses deposits.
+	ErrBridgeDepositPaused = errors.New("bridge deposit paused")
+	// ErrBridgeWithdrawPaused the governance-approved global config pauses withdrawals.
+	ErrBridgeWithdrawPaused = errors.New("bridge withdraw paused")
+	// ErrBridgeWithdrawLimitExceeded a withdrawal exceeds maxPerTx or a rolling window limit.
+	ErrBridgeWithdrawLimitExceeded = errors.New("bridge withdraw limit exceeded")
+	// ErrBridgeMintLimitExceeded a deposit exceeds maxMintPerWindow.
+	ErrBridgeMintLimitExceeded = errors.New("bridge mint limit exceeded")
+	// ErrInvalidAbandonRequest the abandon proposal is missing its required identity
+	// (burnTxHash / owner).
+	ErrInvalidAbandonRequest = errors.New("invalid abandon request")
 )
 
 const (
@@ -163,6 +183,12 @@ func (r *rgbx) CheckTx(tx *types.Transaction, index int) error {
 		err = r.checkConfirm(tx.From(), txHash, action.GetConfirm())
 	case rtypes.TyUnlockAsset:
 		err = r.checkUnlock(txHash, action.GetUnlock())
+	case rtypes.TyBridgeConfigApply:
+		err = r.checkBridgeConfigApply(action.GetBridgeConfigApply())
+	case rtypes.TyBridgeConfigApprove:
+		err = r.checkBridgeConfigApprove(action.GetBridgeConfigApprove())
+	case rtypes.TyAbandonWithdraw:
+		err = r.checkAbandon(txHash, action.GetAbandon())
 	default:
 		err = types.ErrActionNotSupport
 
@@ -445,6 +471,14 @@ func (r *rgbx) checkCrossChainMeta(txHash, fromAddr string, meta *rtypes.CrossCh
 
 func (r *rgbx) checkWithdraw(fromAddr, txHash string, withdraw *rtypes.WithdrawAsset) error {
 
+	// Governance-approved bridge config comes first: pause and limits are cheaper than the
+	// asset/account checks and must reject regardless of how the rest of the payload looks.
+	if err := r.checkWithdrawBridgeConfig(withdraw); err != nil {
+		elog.Error("checkWithdraw bridge config", "txHash", txHash,
+			"symbol", withdraw.GetAssetSymbol(), "err", err)
+		return err
+	}
+
 	symbol := ensureCrossChainSymbol(withdraw.GetAssetSymbol())
 
 	// 走哪条分支看**链上登记的资产类别**（不再看 symbol 字面量）：类别未知 / 记录缺失都
@@ -561,9 +595,22 @@ func (r *rgbx) checkDepositDuplicate(txHash string, deposit *rtypes.DepositAsset
 }
 
 func (r *rgbx) checkDeposit(txHash string, deposit *rtypes.DepositAsset) error {
+	if err := r.checkDepositPaused(deposit); err != nil {
+		elog.Error("checkDeposit bridge config", "txHash", txHash,
+			"symbol", deposit.GetAssetSymbol(), "err", err)
+		return err
+	}
 	if deposit.GetAmount() <= 0 {
 		elog.Error("checkDeposit amount", "txHash", txHash, "amount", deposit.GetAmount())
 		return ErrInvalidDepositAmount
+	}
+	// The mint window is checked before the expensive proof validation: the limit depends
+	// only on the amount and the asset symbol, and a paused/over-limit deposit must not pay
+	// for proof verification.
+	if err := r.checkDepositMintLimit(deposit); err != nil {
+		elog.Error("checkDeposit bridge mint limit", "txHash", txHash,
+			"symbol", deposit.GetAssetSymbol(), "amount", deposit.GetAmount(), "err", err)
+		return err
 	}
 	// 充值地址必须是 chain33 地址串：它同时是 P2WSH 派生里的 userID（原样字节，见
 	// types/p2wsh_deposit.go）。UTXO 形态（<btc txid>:<idx>，旧 fromUtxo 承诺路径的遗留）

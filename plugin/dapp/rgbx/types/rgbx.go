@@ -27,6 +27,11 @@ const (
 	// TyUnlockAsset 放弃一笔尚未结算的提现，把锁定金额退回发起人（见 proto 的 unlockAsset）。
 	// 必须追加在末尾：action id 是共识判据，插入中间会改变既有 action 的编号。
 	TyUnlockAsset
+	// TyBridgeConfigApply / TyBridgeConfigApprove 桥配置的申请与生效（主链 autonomy 治理）。
+	TyBridgeConfigApply
+	TyBridgeConfigApprove
+	// TyAbandonWithdraw 业务侧放弃一笔提现（链上只存证，节点用本地白名单受理）。
+	TyAbandonWithdraw
 
 	NameMintAction      = "Mint"
 	NameTransferAction  = "Transfer"
@@ -40,6 +45,12 @@ const (
 	NameCrossChainMetaAction = "CrossChainMeta"
 	// NameUnlockAssetAction 对应 oneof 字段 unlock（不是 UnlockAsset）。
 	NameUnlockAssetAction = "Unlock"
+	// NameBridgeConfigApplyAction / NameBridgeConfigApproveAction 对应 oneof 字段
+	// bridgeConfigApply / bridgeConfigApprove。
+	NameBridgeConfigApplyAction   = "BridgeConfigApply"
+	NameBridgeConfigApproveAction = "BridgeConfigApprove"
+	// NameAbandonWithdrawAction 对应 oneof 字段 abandon（不是 AbandonWithdraw）。
+	NameAbandonWithdrawAction = "Abandon"
 )
 
 // log类型id值
@@ -54,6 +65,9 @@ const (
 	TyCrossChainMetaLog
 	// TyUnlockAssetLog 放弃提现（退回锁定金额）的回执日志。
 	TyUnlockAssetLog
+	// TyAbandonWithdrawLog 放弃提现提案（链上只存证）的回执日志。必须追加在末尾：
+	// log id 会写进回执，插在中间会改变既有 log 的编号。
+	TyAbandonWithdrawLog
 
 	NameAssetLog         = "AssetLog"
 	NamePendingTxLog     = "PendingTxLog"
@@ -64,6 +78,8 @@ const (
 	NameCrossChainMetaLog = "CrossChainMetaLog"
 	// NameUnlockAssetLog 回执里记录"哪一笔提现被放弃、退给了谁、退了多少"。
 	NameUnlockAssetLog = "UnlockAssetLog"
+	// NameAbandonWithdrawLog 回执里记录一条已被链上存证的放弃提现提案。
+	NameAbandonWithdrawLog = "AbandonWithdrawLog"
 )
 
 var (
@@ -80,6 +96,10 @@ var (
 
 		NameCrossChainMetaAction: TyCrossChainMetaAction,
 		NameUnlockAssetAction:    TyUnlockAsset,
+
+		NameBridgeConfigApplyAction:   TyBridgeConfigApply,
+		NameBridgeConfigApproveAction: TyBridgeConfigApprove,
+		NameAbandonWithdrawAction:     TyAbandonWithdraw,
 	}
 	//定义log的id和具体log类型及名称，填入具体自定义log类型
 	logMap = map[int64]*types.LogInfo{
@@ -87,8 +107,9 @@ var (
 		TyPendingTxLog: {Ty: reflect.TypeOf(PendingTx{}), Name: NamePendingTxLog},
 		TyCommitDKGLog: {Ty: reflect.TypeOf(types.ReqAddrs{}), Name: NameCommitDKGLog},
 		// 回填日志带的是载荷（symbol + precision），比"只留一条 KV"更适合按区块核对链上精度。
-		TyCrossChainMetaLog: {Ty: reflect.TypeOf(CrossChainAssetMeta{}), Name: NameCrossChainMetaLog},
-		TyUnlockAssetLog:    {Ty: reflect.TypeOf(UnlockAsset{}), Name: NameUnlockAssetLog},
+		TyCrossChainMetaLog:  {Ty: reflect.TypeOf(CrossChainAssetMeta{}), Name: NameCrossChainMetaLog},
+		TyUnlockAssetLog:     {Ty: reflect.TypeOf(UnlockAsset{}), Name: NameUnlockAssetLog},
+		TyAbandonWithdrawLog: {Ty: reflect.TypeOf(AbandonWithdrawItem{}), Name: NameAbandonWithdrawLog},
 	}
 )
 
@@ -155,6 +176,12 @@ func GetActionName(ty int32) string {
 		return NameCrossChainMetaAction
 	case TyUnlockAsset:
 		return NameUnlockAssetAction
+	case TyBridgeConfigApply:
+		return NameBridgeConfigApplyAction
+	case TyBridgeConfigApprove:
+		return NameBridgeConfigApproveAction
+	case TyAbandonWithdraw:
+		return NameAbandonWithdrawAction
 	default:
 		return "unknownAction"
 	}

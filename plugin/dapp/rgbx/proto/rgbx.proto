@@ -14,7 +14,54 @@ message RgbxAction {
         withdrawAsset withdraw  = 7;
         crossChainAssetMeta crossChainMeta = 8;
         unlockAsset   unlock    = 9;
+        bridgeConfigApply   bridgeConfigApply   = 10;
+        bridgeConfigApprove bridgeConfigApprove = 11;
+        abandonWithdraw     abandon            = 12;
     }
+}
+
+// bridgeConfigApply 桥配置变更申请（第一步）。
+//
+// 配置的权威来自同链的 autonomy 治理：本 action 只把拟生效的**完整快照**落成一条
+// 待审批记录（key = 本交易哈希），提案人再在 autonomy 提交 Item 引用它；董事会投票
+// 通过后由 bridgeConfigApprove 生效。执行器不明白名单，也不认单个地址。
+//
+// assetSymbol 为空表示全局配置：只允许 limitsEnabled / pauseDeposit / pauseWithdraw /
+// largeWithdraw* 生效，数值型上限必须为 0；非空表示该资产的数值上限。
+message bridgeConfigApply {
+    string assetSymbol = 1;
+    // 总开关：关闭时不做任何数值上限检查（暂停开关仍独立生效）。
+    bool   limitsEnabled = 2;
+    // 数值上限，单位为该资产最小单位；0 表示不限。
+    int64  maxPerTx              = 3;
+    int64  maxPerWindow1h        = 4;
+    int64  maxPerWindow24h       = 5;
+    int64  maxMintPerWindow      = 6;
+    int64  largeWithdrawThreshold = 7;
+    int64  largeWithdrawDelayBlocks = 8;
+    // 紧急制动，按方向独立；只能由治理流程改变。
+    bool   pauseDeposit  = 9;
+    bool   pauseWithdraw = 10;
+}
+
+// bridgeConfigApprove 配置生效（第二步）。执行器必须向同链 autonomy 查询
+// IsAutonomyApprovedItem(itemId, applyConfigId)，通过后才把申请里的快照写入共识状态。
+message bridgeConfigApprove {
+    string applyConfigId  = 1;
+    string autonomyItemId = 2;
+}
+
+// abandonWithdraw 放弃一笔尚未结算的提现（业务提案）。
+//
+// 链上只存证：由 tx.From() 记录提案人，平行链节点各自用**本地白名单**判断是否受理。
+// 受理后节点进入 abandoning 单向状态，用 TSS 组签名走 unlockAsset 退回台账记录的 owner。
+// 与资产无关：BTC / RGB20 都走同一条流程。
+message abandonWithdraw {
+    // 被放弃的 Withdraw（锁定）交易哈希。
+    bytes  burnTxHash = 1;
+    // 退款接收人，必须与锁定时写入的台账 owner 逐字相等（交叉校验，防止手误）。
+    string owner      = 2;
+    string reason     = 3;
 }
 
 // unlockAsset 放弃一笔尚未结算的提现：把仍锁在桥锁定地址里的金额退回给提现发起人。
@@ -198,6 +245,21 @@ message ReqListPendingTx {
 message ReqGetPendingTx {
     int64 height = 1;
     int64 index  = 2;
+}
+
+// abandonWithdrawItem 一条已上链的放弃提现提案（链上只存证）。
+message abandonWithdrawItem {
+    bytes  txHash     = 1; // 提案交易哈希
+    bytes  burnTxHash = 2;
+    string owner      = 3;
+    string reason     = 4;
+    string proposer   = 5;
+    int64  height     = 6;
+    int32  index      = 7;
+}
+
+message abandonWithdrawList {
+    repeated abandonWithdrawItem items = 1;
 }
 
 message btcCommitment {
