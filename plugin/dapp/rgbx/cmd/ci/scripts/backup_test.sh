@@ -273,6 +273,10 @@ function drill_wait_env_ready() {
     wait_cli_ready "${PARA2_CLI}"
     wait_cli_ready "${PARA3_CLI}"
     wait_cli_ready "${PARA4_CLI}"
+    # The drill compares the peer-name set before/after the restore. DHT reconnection after the
+    # restart is asynchronous: sampling immediately can miss the last peer and fail the identity
+    # assertion even though every identity key came back. Wait for convergence first.
+    wait_para_dht_discovery
     # 钱包身份先断言（此时还没有任何 seed/import 动作），再解锁 + 幂等重导入 AUTH 私钥
     # （与 init 阶段重启 para 后要做的完全一样；否则 TSS 拿不到 commit 私钥）。
     drill_assert_wallet_identity "${PARA1_CLI}" "${AUTH_ADDR1}" "para1 after restore"

@@ -2,6 +2,7 @@ package executor
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"testing"
 
@@ -258,6 +259,42 @@ func Test_rgbx_checkUnlock(t *testing.T) {
 		require.Error(t, err, "a terminal-key read failure must reject, not be treated as not-final")
 		require.False(t, errors.Is(err, types.ErrNotFound))
 	})
+
+	t.Run("empty signature rejected", func(t *testing.T) {
+		f := newUnlockFixture(t)
+		msg := proto.Clone(f.msg).(*rtypes.UnlockAsset)
+		msg.UnlockSig = nil
+		require.ErrorIs(t, f.r.checkUnlock("tx", msg), ErrInvalidThresholdSig)
+	})
+
+	t.Run("signature by a different group key rejected", func(t *testing.T) {
+		f := newUnlockFixture(t)
+		other, err := btcec.NewPrivateKey()
+		require.NoError(t, err)
+		msg := &rtypes.UnlockAsset{
+			BurnTxHash:  f.burnHash,
+			AssetSymbol: unlockTestSymbol,
+			Amount:      f.amount,
+			Owner:       f.owner,
+		}
+		msg.UnlockSig = signUnlockMsg(t, other, msg)
+		require.ErrorIs(t, f.r.checkUnlock("tx", msg), ErrInvalidThresholdSig)
+	})
+
+	t.Run("missing cross chain info rejected", func(t *testing.T) {
+		f := newUnlockFixture(t)
+		require.NoError(t, f.state.Delete(formatCrossChainInfoKey(unlockTestSymbol)))
+		require.ErrorIs(t, f.r.checkUnlock("tx", f.msg), ErrGetCrossChainInfo)
+	})
+
+	t.Run("missing ledger record rejected", func(t *testing.T) {
+		f := newUnlockFixture(t)
+		symbol := ensureCrossChainSymbol(unlockTestSymbol)
+		opID, err := rtypes.BurnOperationID(symbol, f.burnHash)
+		require.NoError(t, err)
+		require.NoError(t, f.state.Delete(formatOperationRecordKey(opID)))
+		require.ErrorIs(t, f.r.checkUnlock("tx", f.msg), ErrOperationNotExist)
+	})
 }
 
 func Test_rgbx_CheckTx_unlockDispatch(t *testing.T) {
@@ -356,6 +393,55 @@ func Test_rgbx_releasedBurnCannotBeSettled(t *testing.T) {
 	err = f.r.checkWithdrawConfirm("tx", "confirm", &rtypes.ConfirmTx{TxHash: f.burnHash},
 		&rtypes.PendingTx{AssetSymbol: unlockTestSymbol})
 	require.ErrorIs(t, err, ErrWithdrawAlreadyConfirmed)
+}
+
+// Test_rgbx_Query_GetWithdrawFinalState is the read-only view the E2E uses to assert that the
+// refund reached the chain. It must report nothing before a terminal state, then the exact
+// stored value ("settled" or "released"), and reject malformed hash input.
+func Test_rgbx_Query_GetWithdrawFinalState(t *testing.T) {
+	f := newUnlockFixture(t)
+	req := &types.ReqString{Data: hex.EncodeToString(f.burnHash)}
+
+	reply, err := f.r.Query_GetWithdrawFinalState(req)
+	require.NoError(t, err)
+	require.Empty(t, reply.(*types.ReplyString).GetData(), "a locked burn has no terminal state yet")
+
+	require.NoError(t, f.state.Set(formatWithdrawFinalKey(f.burnHash), withdrawFinalReleased))
+	reply, err = f.r.Query_GetWithdrawFinalState(req)
+	require.NoError(t, err)
+	require.Equal(t, "released", reply.(*types.ReplyString).GetData())
+
+	// The CLI renders hashes with a 0x prefix; the query tolerates it.
+	reply, err = f.r.Query_GetWithdrawFinalState(&types.ReqString{Data: "0x" + req.GetData()})
+	require.NoError(t, err)
+	require.Equal(t, "released", reply.(*types.ReplyString).GetData())
+
+	require.NoError(t, f.state.Set(formatWithdrawFinalKey(f.burnHash), withdrawFinalSettled))
+	reply, err = f.r.Query_GetWithdrawFinalState(req)
+	require.NoError(t, err)
+	require.Equal(t, "settled", reply.(*types.ReplyString).GetData())
+
+	for _, bad := range []string{"", "0x", "not-hex"} {
+		_, err = f.r.Query_GetWithdrawFinalState(&types.ReqString{Data: bad})
+		require.ErrorIs(t, err, types.ErrInvalidParam, "input %q is not a burn tx hash", bad)
+	}
+}
+
+// Test_rgbx_Query_GetCrossChainLockAddress returns the same deterministic address the executor
+// uses for locking and refunding, so the E2E can observe the locked balance.
+func Test_rgbx_Query_GetCrossChainLockAddress(t *testing.T) {
+	f := newUnlockFixture(t)
+	reply, err := f.r.Query_GetCrossChainLockAddress(&types.ReqString{Data: unlockTestSymbol})
+	require.NoError(t, err)
+
+	symbol := ensureCrossChainSymbol(unlockTestSymbol)
+	acc, err := f.r.newAccount(symbol)
+	require.NoError(t, err)
+	require.Equal(t, f.r.crossChainLockAddress(acc), reply.(*types.ReplyString).GetData())
+	require.NotEmpty(t, reply.(*types.ReplyString).GetData())
+
+	_, err = f.r.Query_GetCrossChainLockAddress(&types.ReqString{})
+	require.ErrorIs(t, err, types.ErrInvalidParam)
 }
 
 // Test_rgbx_isOperationSettled_terminalStates settled reports true, released reports false.

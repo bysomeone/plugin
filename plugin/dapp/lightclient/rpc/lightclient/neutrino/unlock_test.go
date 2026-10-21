@@ -58,6 +58,8 @@ func Test_unlockEligible(t *testing.T) {
 		wantReasoning string
 	}{
 		{"permanent unsigned", permanent, nil, true, "no signature yet"},
+		{"permanent unlock pending", permanent, withdrawStatusUnlockPending, true, "an unlock request is not a payment signature"},
+		{"permanent unlock submitted", permanent, withdrawStatusUnlockSubmitted, true, "local unlock bookkeeping is not a payment signature"},
 		{"permanent broadcasted", permanent, withdrawStatusSent, false, "payment signature exists"},
 		{"permanent confirmed", permanent, withdrawStatusConfirmed, false, "payment settled"},
 		{"transient unsigned", transient, nil, false, "retry settlement"},
@@ -110,6 +112,24 @@ func Test_newUnlockAsset(t *testing.T) {
 		_, err := newUnlockAsset(noOwner, withdraw)
 		require.ErrorContains(t, err, "empty owner")
 	})
+	t.Run("empty burn hash", func(t *testing.T) {
+		noHash := testWithdrawPending()
+		noHash.TxHash = nil
+		_, err := newUnlockAsset(noHash, withdraw)
+		require.ErrorContains(t, err, "empty burn tx hash")
+	})
+	t.Run("empty asset symbol", func(t *testing.T) {
+		noSymbol := testWithdrawPayload()
+		noSymbol.AssetSymbol = ""
+		_, err := newUnlockAsset(pending, noSymbol)
+		require.ErrorContains(t, err, "empty asset symbol")
+	})
+	t.Run("nil inputs", func(t *testing.T) {
+		_, err := newUnlockAsset(nil, withdraw)
+		require.Error(t, err)
+		_, err = newUnlockAsset(pending, nil)
+		require.Error(t, err)
+	})
 }
 
 // Test_verifyUnlockClaim 签名节点只签"链上事实"：协调者声称的 symbol/amount/owner 必须与
@@ -150,6 +170,25 @@ func Test_verifyUnlockClaim(t *testing.T) {
 		other.ActionType = rtypes.TyDepositAsset
 		require.ErrorContains(t, verifyUnlockClaim(claim, other, withdraw), "not a withdraw")
 	})
+	t.Run("burn hash mismatch", func(t *testing.T) {
+		bad := *claim
+		bad.BurnTxHash = hex.EncodeToString(bytes.Repeat([]byte{0x22}, 32))
+		require.ErrorContains(t, verifyUnlockClaim(&bad, pending, withdraw), "burn tx hash mismatch")
+	})
+	t.Run("incomplete claim", func(t *testing.T) {
+		require.ErrorContains(t, verifyUnlockClaim(nil, pending, withdraw), "incomplete unlock claim")
+		require.ErrorContains(t, verifyUnlockClaim(claim, nil, withdraw), "incomplete unlock claim")
+		require.ErrorContains(t, verifyUnlockClaim(claim, pending, nil), "incomplete unlock claim")
+	})
+}
+
+// Test_isWithdrawAlreadyFinalError the chain reports "already terminal" through a gRPC string,
+// so the coordinator must recognise the executor's fixed wording (and nothing else).
+func Test_isWithdrawAlreadyFinalError(t *testing.T) {
+	require.True(t, isWithdrawAlreadyFinalError(errors.New("withdraw already final")))
+	require.True(t, isWithdrawAlreadyFinalError(errors.New("submit: withdraw already final")))
+	require.False(t, isWithdrawAlreadyFinalError(nil))
+	require.False(t, isWithdrawAlreadyFinalError(errors.New("withdraw already confirmed")))
 }
 
 // Test_unlockDigestVerifiable 摘要口径端到端：构造消息 → rtypes.UnlockSignDigest → btcec
