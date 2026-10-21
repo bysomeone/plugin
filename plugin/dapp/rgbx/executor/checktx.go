@@ -114,6 +114,18 @@ var (
 	// ErrInsufficientMintedSupply 待销毁额度超过台账里的"已铸造 − 已销毁"（S2）。
 	// 含义：这笔提现没有对应的充值铸造记录（proof-of-mint 不成立），拒绝放款。
 	ErrInsufficientMintedSupply = errors.New("insufficient minted supply")
+	// ErrInvalidUnlockRequest the Unlock action is missing its required identity (empty burnTxHash).
+	ErrInvalidUnlockRequest = errors.New("invalid unlock request")
+	// ErrWithdrawNotExist no Withdraw payload can be read for the burn hash referenced by Unlock.
+	// Meaning: the hash does not name a withdrawal that was locked on chain (or state is unreadable).
+	ErrWithdrawNotExist = errors.New("withdraw not exist")
+	// ErrWithdrawAlreadyFinal the burn already reached a terminal state: settled (paid out through
+	// Confirm) or released (refunded through Unlock). A burn can have only one terminal state.
+	ErrWithdrawAlreadyFinal = errors.New("withdraw already final")
+	// ErrOperationOwnerMismatch the ledger record's owner differs from the owner in the Unlock
+	// payload. The refund recipient is the ledger's owner, so a mismatch means the signed message
+	// does not describe this burn.
+	ErrOperationOwnerMismatch = errors.New("operation owner mismatch")
 )
 
 const (
@@ -149,6 +161,8 @@ func (r *rgbx) CheckTx(tx *types.Transaction, index int) error {
 		err = r.checkCrossChainMeta(txHash, tx.From(), action.GetCrossChainMeta())
 	case rtypes.TyConfirmAction:
 		err = r.checkConfirm(tx.From(), txHash, action.GetConfirm())
+	case rtypes.TyUnlockAsset:
+		err = r.checkUnlock(txHash, action.GetUnlock())
 	default:
 		err = types.ErrActionNotSupport
 
@@ -713,7 +727,7 @@ func (r *rgbx) checkConfirm(fromAddr, txHash string, confirm *rtypes.ConfirmTx) 
 }
 
 // checkConfirmNotUsed E14：mint / transfer 的确认去重守卫（共识判据）。
-// 与提现侧 S3（checkWithdrawConfirm 里的 formatWithdrawUsedKey）完全对称：
+// 与提现侧 S3（checkWithdrawConfirm 里的 formatWithdrawFinalKey）完全对称：
 // 键写在合约级 statedb 上，由 Exec_Confirm 在**结算成功**时随回执 KV 写入，
 // 因此随 stateDB 一起回滚（重组重放不会误伤），且全网各节点读到的结论一致。
 //
@@ -733,4 +747,105 @@ func (r *rgbx) checkConfirmNotUsed(confirm *rtypes.ConfirmTx, txHash, confirmTxH
 		"txHash", txHash, "confirmTxHash", confirmTxHash,
 		"confirmHash", hex.EncodeToString(confirm.GetTxHash()), "err", err)
 	return alreadyConfirmed
+}
+
+// checkUnlock validates an Unlock action, which refunds the amount still locked for an
+// unsettled withdrawal burn back to that withdrawal's original owner.
+//
+// Authorization comes solely from the TSS group signature (unlockSig). tx.From() is
+// deliberately NOT checked: the submitter is irrelevant, the group signature decides.
+//
+// The refund amount and recipient are taken from the ledger record written when the
+// withdrawal was locked (Exec_Withdraw), not from the payload. The payload copies must
+// match the ledger exactly, and they are also covered by the signature digest, so one
+// signature cannot be replayed for another burn, amount, or owner.
+func (r *rgbx) checkUnlock(txHash string, unlock *rtypes.UnlockAsset) error {
+	burnTxHash := unlock.GetBurnTxHash()
+	if len(burnTxHash) == 0 {
+		elog.Error("checkUnlock empty burn tx hash", "txHash", txHash)
+		return ErrInvalidUnlockRequest
+	}
+	withdraw := &rtypes.WithdrawAsset{}
+	if err := readDB(r.GetStateDB(), formatPayloadKey(burnTxHash), withdraw); err != nil {
+		elog.Error("checkUnlock read withdraw payload", "txHash", txHash,
+			"burnTxHash", hex.EncodeToString(burnTxHash), "err", err)
+		return ErrWithdrawNotExist
+	}
+	// Byte-for-byte equality on purpose: do NOT normalize with formatSymbol. The digest binds
+	// the raw value, so normalization here would widen the set of signatures accepted for a
+	// given withdrawal.
+	if unlock.GetAssetSymbol() != withdraw.GetAssetSymbol() {
+		elog.Error("checkUnlock symbol mismatch", "txHash", txHash,
+			"burnTxHash", hex.EncodeToString(burnTxHash),
+			"unlockSymbol", unlock.GetAssetSymbol(), "withdrawSymbol", withdraw.GetAssetSymbol())
+		return ErrOperationMismatch
+	}
+	// Fail-closed: the group public key is required to verify the signature.
+	info, err := r.getCrossChainInfo(withdraw.GetAssetSymbol())
+	if err != nil {
+		elog.Error("checkUnlock getCrossChainInfo", "txHash", txHash,
+			"symbol", withdraw.GetAssetSymbol(), "err", err)
+		return ErrGetCrossChainInfo
+	}
+	symbol := ensureCrossChainSymbol(withdraw.GetAssetSymbol())
+	opID, err := rtypes.BurnOperationID(symbol, burnTxHash)
+	if err != nil {
+		elog.Error("checkUnlock derive burn operation id", "txHash", txHash,
+			"symbol", symbol, "burnTxHash", hex.EncodeToString(burnTxHash), "err", err)
+		return ErrInvalidOperationID
+	}
+	rec := &rtypes.OperationRecord{}
+	if err = readDB(r.GetStateDB(), formatOperationRecordKey(opID), rec); err != nil {
+		elog.Error("checkUnlock read operation record", "txHash", txHash, "symbol", symbol,
+			"burnTxHash", hex.EncodeToString(burnTxHash), "opID", hex.EncodeToString(opID), "err", err)
+		return ErrOperationNotExist
+	}
+	if rec.GetKind() != rtypes.OperationKindBurn || rec.GetSymbol() != formatSymbol(symbol) {
+		elog.Error("checkUnlock operation kind mismatch", "txHash", txHash, "symbol", symbol,
+			"burnTxHash", hex.EncodeToString(burnTxHash), "opID", hex.EncodeToString(opID),
+			"kind", rec.GetKind(), "recSymbol", rec.GetSymbol())
+		return ErrOperationMismatch
+	}
+	// The refund goes to the ledger's owner and for the ledger's amount: both must be covered
+	// exactly by the signed payload.
+	if rec.GetOwner() != unlock.GetOwner() {
+		elog.Error("checkUnlock owner mismatch", "txHash", txHash, "symbol", symbol,
+			"burnTxHash", hex.EncodeToString(burnTxHash), "opID", hex.EncodeToString(opID),
+			"recordOwner", rec.GetOwner(), "payloadOwner", unlock.GetOwner())
+		return ErrOperationOwnerMismatch
+	}
+	if rec.GetAmount() != unlock.GetAmount() {
+		elog.Error("checkUnlock amount mismatch", "txHash", txHash, "symbol", symbol,
+			"burnTxHash", hex.EncodeToString(burnTxHash), "opID", hex.EncodeToString(opID),
+			"recordedAmount", rec.GetAmount(), "payloadAmount", unlock.GetAmount())
+		return ErrOperationAmountMismatch
+	}
+	// Terminal state guard: either settled or released blocks the refund. A read failure other
+	// than ErrNotFound is fail-closed (do not treat "cannot read" as "not final").
+	_, err = r.GetStateDB().Get(formatWithdrawFinalKey(burnTxHash))
+	if err == nil {
+		elog.Error("checkUnlock withdraw already final", "txHash", txHash, "symbol", symbol,
+			"burnTxHash", hex.EncodeToString(burnTxHash))
+		return ErrWithdrawAlreadyFinal
+	}
+	if !errors.Is(err, types.ErrNotFound) {
+		elog.Error("checkUnlock read final key", "txHash", txHash, "symbol", symbol,
+			"burnTxHash", hex.EncodeToString(burnTxHash), "err", err)
+		return err
+	}
+	accDB, err := r.newAccount(symbol)
+	if err != nil {
+		elog.Error("checkUnlock newAccount", "txHash", txHash, "symbol", symbol, "err", err)
+		return err
+	}
+	lockAddr := r.crossChainLockAddress(accDB)
+	balance := accDB.LoadAccount(lockAddr).GetBalance()
+	if balance < rec.GetAmount() {
+		elog.Error("checkUnlock insufficient locked balance", "txHash", txHash, "symbol", symbol,
+			"burnTxHash", hex.EncodeToString(burnTxHash), "lockAddr", lockAddr,
+			"need", rec.GetAmount(), "balance", balance)
+		return types.ErrInsufficientBalance
+	}
+	// Signature verification last, matching checkDeposit: all cheap/permanent checks come first.
+	return verifyUnlockSig(info.GetPubkey(), unlock)
 }

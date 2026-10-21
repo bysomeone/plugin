@@ -216,9 +216,9 @@ func Test_rgbx_confirmWithdrawSettlement_usedKey(t *testing.T) {
 	applyStateKV(t, state, recpA.KV)
 	require.Equal(t, int64(150), acc.LoadAccount(lockAddr).GetBalance())
 
-	used, err := state.Get(formatWithdrawUsedKey(burnA))
+	used, err := state.Get(formatWithdrawFinalKey(burnA))
 	require.NoError(t, err)
-	require.Equal(t, []byte("used"), used)
+	require.Equal(t, withdrawFinalSettled, used)
 
 	// 守卫：同一 burn 被拒（明确错误码）；不同 burn 放行（继续走 SPV 校验）
 	err = r.(*rgbx).checkWithdrawConfirm("txA2", "cA2", &rtypes.ConfirmTx{TxHash: burnA}, &rtypes.PendingTx{AssetSymbol: "BTC"})
@@ -233,9 +233,9 @@ func Test_rgbx_confirmWithdrawSettlement_usedKey(t *testing.T) {
 	require.Equal(t, int64(0), acc.LoadAccount(lockAddr).GetBalance())
 
 	// 升级兼容：consumed 集合是"只增不减的拒绝条件"，未登记的历史 burn 一律不受影响
-	_, err = state.Get(formatWithdrawUsedKey(burnB))
+	_, err = state.Get(formatWithdrawFinalKey(burnB))
 	require.NoError(t, err)
-	unused, err := state.Get(formatWithdrawUsedKey([]byte("never-settled")))
+	unused, err := state.Get(formatWithdrawFinalKey([]byte("never-settled")))
 	require.ErrorIs(t, err, types.ErrNotFound)
 	require.Nil(t, unused)
 }

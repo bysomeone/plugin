@@ -13,7 +13,7 @@ import (
 )
 
 var (
-	// ErrInvalidThresholdSig RGB20 充值 TSS 阈值签名无效。
+	// ErrInvalidThresholdSig invalid RGB20 TSS group signature.
 	ErrInvalidThresholdSig = errors.New("invalid rgb20 threshold signature")
 )
 
@@ -28,32 +28,55 @@ func computeDepositSignMessage(dep *rtypes.DepositAsset) []byte {
 	return h[:]
 }
 
-// verifyThresholdSig 用 btcec 直接验签，禁用 chain33 VerifyBytes（其内部多一层 SHA256，双重哈希陷阱）。
-// pub 为 CrossChainInfo 中存储的 TSS 组公钥（压缩 secp256k1）。
-func verifyThresholdSig(pub []byte, dep *rtypes.DepositAsset) error {
-	if len(dep.GetThresholdSig()) == 0 {
-		elog.Error("verifyThresholdSig empty sig", "symbol", dep.GetAssetSymbol())
+// verifyGroupSignature verifies a DER-encoded secp256k1 signature over digest with the
+// compressed group public key stored in CrossChainInfo.
+//
+// btcec is used directly regardless of chain33 VerifyBytes, which applies another SHA256
+// internally (double-hashing trap). Every malformed/missing input is reported as
+// ErrInvalidThresholdSig so callers only need to distinguish "valid" from "not valid".
+func verifyGroupSignature(pub, sig, digest []byte) error {
+	if len(sig) == 0 {
+		elog.Error("verifyGroupSignature empty sig")
 		return ErrInvalidThresholdSig
 	}
 	if len(pub) == 0 {
-		elog.Error("verifyThresholdSig empty pubkey", "symbol", dep.GetAssetSymbol())
+		elog.Error("verifyGroupSignature empty pubkey")
 		return ErrInvalidThresholdSig
 	}
 	pubKey, err := btcec.ParsePubKey(pub)
 	if err != nil {
-		elog.Error("verifyThresholdSig parse pubkey", "symbol", dep.GetAssetSymbol(), "err", err)
+		elog.Error("verifyGroupSignature parse pubkey", "err", err)
 		return ErrInvalidThresholdSig
 	}
-	sig, err := ecdsa.ParseDERSignature(dep.GetThresholdSig())
+	signature, err := ecdsa.ParseDERSignature(sig)
 	if err != nil {
-		elog.Error("verifyThresholdSig parse sig", "symbol", dep.GetAssetSymbol(), "err", err)
+		elog.Error("verifyGroupSignature parse sig", "err", err)
 		return ErrInvalidThresholdSig
 	}
-	msg := computeDepositSignMessage(dep)
-	if !sig.Verify(msg, pubKey) {
-		elog.Error("verifyThresholdSig verify failed", "symbol", dep.GetAssetSymbol(),
-			"msg", fmt.Sprintf("%x", msg))
+	if !signature.Verify(digest, pubKey) {
+		elog.Error("verifyGroupSignature verify failed", "digest", fmt.Sprintf("%x", digest))
 		return ErrInvalidThresholdSig
+	}
+	return nil
+}
+
+// verifyThresholdSig verifies the RGB20 deposit TSS signature over computeDepositSignMessage.
+// pub is the TSS group public key (compressed secp256k1) from CrossChainInfo.
+func verifyThresholdSig(pub []byte, dep *rtypes.DepositAsset) error {
+	if err := verifyGroupSignature(pub, dep.GetThresholdSig(), computeDepositSignMessage(dep)); err != nil {
+		elog.Error("verifyThresholdSig failed", "symbol", dep.GetAssetSymbol(), "err", err)
+		return err
+	}
+	return nil
+}
+
+// verifyUnlockSig verifies the TSS group signature authorizing a withdrawal unlock.
+// The digest is derived by rtypes.UnlockSignDigest, which domain-separates it from the
+// deposit signature so a deposit signature can never be replayed as an unlock (and vice versa).
+func verifyUnlockSig(pub []byte, msg *rtypes.UnlockAsset) error {
+	if err := verifyGroupSignature(pub, msg.GetUnlockSig(), rtypes.UnlockSignDigest(msg)); err != nil {
+		elog.Error("verifyUnlockSig failed", "symbol", msg.GetAssetSymbol(), "err", err)
+		return err
 	}
 	return nil
 }

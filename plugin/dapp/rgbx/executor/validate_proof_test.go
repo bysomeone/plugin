@@ -587,7 +587,7 @@ func Test_checkWithdrawConfirm_burnReplayGuard(t *testing.T) {
 	require.NoError(t, r.CheckTx(tx, 0))
 
 	// 2) 结算登记后，同一 burn 再次确认 → 明确错误码拒绝
-	require.NoError(t, state.Set(formatWithdrawUsedKey(burnA), []byte("used")))
+	require.NoError(t, state.Set(formatWithdrawFinalKey(burnA), withdrawFinalSettled))
 	tx.Payload = types.Encode(action)
 	require.Equal(t, ErrWithdrawAlreadyConfirmed, r.CheckTx(tx, 0))
 

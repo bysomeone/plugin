@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 
@@ -133,7 +134,7 @@ func (r *rgbx) Query_GetCrossChainInfo(req *types.ReqString) (types.Message, err
 //
 // settled 是**查询时补算**的（不写回记录，记录本身不可变）：
 //   - 铸造记录：已铸造，恒 true；
-//   - 销毁记录：是否已结算放款 = 链上是否存在该 burn 的已消费键（formatWithdrawUsedKey，S3）。
+//   - 销毁记录：是否已结算放款 = 该 burn 的终态键是否为 settled（formatWithdrawFinalKey）；
 //
 // 找不到记录时返回 ErrNotFound（而不是空记录）：审计里"没有这条记录"和"记录内容为空"
 // 是两件不同的事，前者必须响亮。
@@ -223,14 +224,15 @@ func (r *rgbx) Query_ListOperations(req *rtypes.ReqListOperations) (types.Messag
 }
 
 // isOperationSettled 补算记录的"是否已结算"（不写回记录）。
-// 判定完全基于共识状态：销毁记录的结算标记就是 S3 的已消费键（formatWithdrawUsedKey），
+// 判定完全基于共识状态：销毁记录的结算标记就是 S3 的终态键（formatWithdrawFinalKey）。
+// 只有值 == settled 才算已结算：released 表示这笔 burn 已被 Unlock 退回（从未结算），
 // 铸造记录在铸造成功那一刻即已成账。
 func (r *rgbx) isOperationSettled(rec *rtypes.OperationRecord) bool {
 	if rec.GetKind() != rtypes.OperationKindBurn {
 		return true
 	}
-	_, err := r.GetStateDB().Get(formatWithdrawUsedKey(rec.GetChain33TxHash()))
-	return err == nil
+	value, err := r.GetStateDB().Get(formatWithdrawFinalKey(rec.GetChain33TxHash()))
+	return err == nil && bytes.Equal(value, withdrawFinalSettled)
 }
 
 func (r *rgbx) Query_ListPendingTxByFrom(req *types.ReqString) (types.Message, error) {

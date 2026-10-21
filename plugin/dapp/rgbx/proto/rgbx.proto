@@ -13,7 +13,27 @@ message RgbxAction {
         depositAsset  deposit   = 6;
         withdrawAsset withdraw  = 7;
         crossChainAssetMeta crossChainMeta = 8;
+        unlockAsset   unlock    = 9;
     }
+}
+
+// unlockAsset 放弃一笔尚未结算的提现：把仍锁在桥锁定地址里的金额退回给提现发起人。
+//
+// 它是"后验必然失败"的逃生口（侧车明确判定重试永远不可能成功，且该 pending 尚未产生
+// 任何付款签名）。授权只来自 TSS 门限组签名 unlockSig —— 链上不解析任何外部协议，
+// 也不认单个地址的提交（提交者是谁无关紧要，签名才决定是否允许）。
+//
+// 摘要必须与充值签名做域分隔，见 types.UnlockSignDigest。
+message unlockAsset {
+    // 被放弃的 Withdraw（锁定）交易哈希。
+    bytes  burnTxHash  = 1;
+    string assetSymbol = 2;
+    // 退款金额与接收方：必须与锁定时写入的台账记录逐字相等（链上以台账为准，
+    // 这里的值参与摘要绑定，防止签名被挪到别的金额/收款人上）。
+    int64  amount      = 3;
+    string owner       = 4;
+    // TSS 组签名（DER 序列化）。
+    bytes  unlockSig   = 5;
 }
 
 message rgbxAsset {

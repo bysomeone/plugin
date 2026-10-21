@@ -28,8 +28,13 @@ const (
 	crossChainInfoKeyPrefix   = KeyPrefixStateDB + "crosschain-info-"
 	// depositUsedTxIDKeyPrefix 充值已消费集合前缀（E1 修复）：key = 前缀 + btc txid。
 	depositUsedTxIDKeyPrefix = KeyPrefixStateDB + "deposited-txid-"
-	// withdrawUsedKeyPrefix 提现侧已消费（已结算）burn 集合前缀。
-	withdrawUsedKeyPrefix = KeyPrefixStateDB + "withdrawn-"
+	// withdrawFinalKeyPrefix indexes the terminal state of a withdrawal burn (S3).
+	// key = prefix + sha256(burnTxHash), value = withdrawFinalSettled or withdrawFinalReleased.
+	//
+	// One key for both outcomes is deliberate: settlement (Confirm) and refund (Unlock) are
+	// mutually exclusive terminal states for the same burn. Whichever writes first wins, and
+	// the other path is rejected on read, so a burn can never be both paid out and refunded.
+	withdrawFinalKeyPrefix = KeyPrefixStateDB + "withdraw-final-"
 	// confirmUsedKeyPrefix Confirm 结算（mint / transfer 两类 utxo 花费确认）已消费集合前缀（E14）。
 	confirmUsedKeyPrefix = KeyPrefixStateDB + "confirm-used-"
 	// operationRecordKeyPrefix 全局操作台账的单条**不可变**记录前缀（S2）：
@@ -70,17 +75,25 @@ func formatDepositUsedTxIDKey(txID []byte) []byte {
 	return append([]byte(depositUsedTxIDKeyPrefix), txID...)
 }
 
-// formatWithdrawUsedKey 按提现销毁（chain33 Withdraw 交易）哈希索引已结算的提现（S3）。
-// 与充值侧对称：充值防双铸，提现防同一 burn 重复放款。
-// 唯一标识取 burn 的 chain33 交易哈希（= payload 键所用的同一个 id），
-// 它在链上稳定、不随重组变化，且是 ConfirmTx 绑定的对象。
-func formatWithdrawUsedKey(burnTxHash []byte) []byte {
+// Terminal state values stored under formatWithdrawFinalKey.
+var (
+	// withdrawFinalSettled the burn was paid out through Confirm (tokens burned).
+	withdrawFinalSettled = []byte("settled")
+	// withdrawFinalReleased the burn was cancelled through Unlock (locked amount refunded).
+	withdrawFinalReleased = []byte("released")
+)
+
+// formatWithdrawFinalKey indexes the terminal state of a withdrawal burn (S3).
+// The identity is the burn's chain33 transaction hash (the same id used by the payload key),
+// which is stable on chain, survives reorgs, and is what ConfirmTx is bound to.
+// It is a fixed-length key: hash first, then concatenate (same shape as the old used-key).
+func formatWithdrawFinalKey(burnTxHash []byte) []byte {
 	hash := sha256.Sum256(burnTxHash)
-	return append([]byte(withdrawUsedKeyPrefix), hash[:]...)
+	return append([]byte(withdrawFinalKeyPrefix), hash[:]...)
 }
 
 // formatConfirmUsedKey 按**被确认交易**（mint / transfer 的那笔 chain33 交易）哈希索引已结算的
-// Confirm（E14）。与提现侧 formatWithdrawUsedKey、充值侧 formatDepositUsedTxIDKey 对称：
+// Confirm（E14）。与提现侧 formatWithdrawFinalKey、充值侧 formatDepositUsedTxIDKey 对称：
 // 三条资金流各自的"已消费"集合都落在共识状态（stateDB），而不是节点私有的 LocalDB。
 //
 // 为什么键取 confirm.GetTxHash()（被确认交易）而不是 SpendingTx 的 btc txid：
@@ -98,7 +111,7 @@ func formatWithdrawUsedKey(burnTxHash []byte) []byte {
 //     utxo id 的口径，不是去重键的口径）。
 //   - 口径安全性：confirm.GetTxHash() 是链上直接给出的 chain33 交易哈希字节，不经过"从可解析字节
 //     重新推导身份"这一步，故不存在 E1/A2 那类"同一身份的另一份编码"问题（chain33 交易哈希没有
-//     第二种编码）。定长化与 formatWithdrawUsedKey 一致：先 sha256 再拼接。
+//     第二种编码）。定长化与 formatWithdrawFinalKey 一致：先 sha256 再拼接。
 func formatConfirmUsedKey(confirmTxHash []byte) []byte {
 	hash := sha256.Sum256(confirmTxHash)
 	return append([]byte(confirmUsedKeyPrefix), hash[:]...)

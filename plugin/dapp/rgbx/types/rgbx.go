@@ -24,6 +24,9 @@ const (
 	TyWithdrawAsset
 	// TyCrossChainMetaAction 跨链资产元数据回填（精度），见 proto 的 crossChainAssetMeta。
 	TyCrossChainMetaAction
+	// TyUnlockAsset 放弃一笔尚未结算的提现，把锁定金额退回发起人（见 proto 的 unlockAsset）。
+	// 必须追加在末尾：action id 是共识判据，插入中间会改变既有 action 的编号。
+	TyUnlockAsset
 
 	NameMintAction      = "Mint"
 	NameTransferAction  = "Transfer"
@@ -35,6 +38,8 @@ const (
 	NameWithdrawAssetAction = "Withdraw"
 	// NameCrossChainMetaAction 对应 oneof 字段 crossChainMeta。
 	NameCrossChainMetaAction = "CrossChainMeta"
+	// NameUnlockAssetAction 对应 oneof 字段 unlock（不是 UnlockAsset）。
+	NameUnlockAssetAction = "Unlock"
 )
 
 // log类型id值
@@ -47,6 +52,8 @@ const (
 	TyWithdrawAssetLog
 	// TyCrossChainMetaLog 跨链资产元数据回填（精度）的回执日志。
 	TyCrossChainMetaLog
+	// TyUnlockAssetLog 放弃提现（退回锁定金额）的回执日志。
+	TyUnlockAssetLog
 
 	NameAssetLog         = "AssetLog"
 	NamePendingTxLog     = "PendingTxLog"
@@ -55,6 +62,8 @@ const (
 	NameWithdrawAssetLog = "WithdrawAssetLog"
 	// NameCrossChainMetaLog 回执里记录"哪个符号的精度被回填成了什么"，便于按区块核对链上值。
 	NameCrossChainMetaLog = "CrossChainMetaLog"
+	// NameUnlockAssetLog 回执里记录"哪一笔提现被放弃、退给了谁、退了多少"。
+	NameUnlockAssetLog = "UnlockAssetLog"
 )
 
 var (
@@ -70,6 +79,7 @@ var (
 		NameWithdrawAssetAction: TyWithdrawAsset,
 
 		NameCrossChainMetaAction: TyCrossChainMetaAction,
+		NameUnlockAssetAction:    TyUnlockAsset,
 	}
 	//定义log的id和具体log类型及名称，填入具体自定义log类型
 	logMap = map[int64]*types.LogInfo{
@@ -78,6 +88,7 @@ var (
 		TyCommitDKGLog: {Ty: reflect.TypeOf(types.ReqAddrs{}), Name: NameCommitDKGLog},
 		// 回填日志带的是载荷（symbol + precision），比"只留一条 KV"更适合按区块核对链上精度。
 		TyCrossChainMetaLog: {Ty: reflect.TypeOf(CrossChainAssetMeta{}), Name: NameCrossChainMetaLog},
+		TyUnlockAssetLog:    {Ty: reflect.TypeOf(UnlockAsset{}), Name: NameUnlockAssetLog},
 	}
 )
 
@@ -142,6 +153,8 @@ func GetActionName(ty int32) string {
 		return NameWithdrawAssetAction
 	case TyCrossChainMetaAction:
 		return NameCrossChainMetaAction
+	case TyUnlockAsset:
+		return NameUnlockAssetAction
 	default:
 		return "unknownAction"
 	}

@@ -196,7 +196,7 @@ func (r *rgbx) Exec_Confirm(confirm *rtypes.ConfirmTx, tx *types.Transaction, in
 
 // markConfirmUsed E14：mint / transfer 结算成功时，登记"该确认已在共识状态里消费"
 // （键见 formatConfirmUsedKey），作为 checkConfirmNotUsed 的权威判据。
-// 与提现侧 S3（confirmWithdrawSettlement 里的 formatWithdrawUsedKey）完全对称。
+// 与提现侧 S3（confirmWithdrawSettlement 里的 formatWithdrawFinalKey）完全对称。
 //
 // 三条要点：
 //   - **随回执 KV 写入**（而不是局部/直接写库）：回执 KV 由框架随 stateDB 一起提交，
@@ -260,11 +260,11 @@ func (r *rgbx) confirmWithdrawSettlement(confirm *rtypes.ConfirmTx, txHash, conf
 			"lockAddr", lockAddr, "symbol", withdraw.GetAssetSymbol(), "amount", withdraw.GetAmount(), "err", err)
 		return nil, err
 	}
-	// S3：登记该笔 burn 已消费（与 Exec_Deposit 登记已消费充值的 txid key 对称）。
+	// S3：登记该笔 burn 的终态为已结算（settled）。与 Exec_Deposit 登记已消费充值的 txid key 对称。
 	// 结算成功才写；写入随回执 KV 生效，重组时随 statedb 一起回滚，因此不会误伤重放。
 	receipt.KV = append(receipt.KV, &types.KeyValue{
-		Key:   formatWithdrawUsedKey(confirm.GetTxHash()),
-		Value: []byte("used"),
+		Key:   formatWithdrawFinalKey(confirm.GetTxHash()),
+		Value: withdrawFinalSettled,
 	})
 	// S2：销毁成功，供应量台账 burned += amount（与充电侧的 minted += amount 对称）。
 	// 与上面的已消费键同一位置：结算成功才累加，回滚随 statedb。

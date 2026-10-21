@@ -13,7 +13,7 @@ import (
 
 // 本文件补 E14 去重守卫缺失的一条断言：**读失败必须 fail-closed**。
 //
-// checkConfirmNotUsed 的取键语义（见 checktx.go 的注释）与提现侧 S3（formatWithdrawUsedKey）对称：
+// checkConfirmNotUsed 的取键语义（见 checktx.go 的注释）与提现侧 S3（formatWithdrawFinalKey）对称：
 //   - ErrNotFound ⇒ 没结算过，放行；
 //   - **其余任何错误（含键存在）⇒ 一律拒绝** —— 不把"读不到"当成"没结算过"。
 //
