@@ -209,7 +209,7 @@ fn failed_broadcast_is_replayed_not_rebuilt() -> Result<()> {
     // (PSBT inputs ∩ the consignment's closed seals). That comparison only works if the sidecar
     // still resolves the transition's closed seal *after* the first finalize consumed it in the
     // Stock — otherwise the retry would come back empty and be judged unrecoverable.
-    let insp = engine.validate_consignment(&replay.consignment)?;
+    let insp = engine.validate_consignment(&replay.consignment, None)?;
     assert!(insp.valid, "the replayed consignment must still validate: {:?}", insp.error);
     assert!(
         insp.closed_seals.contains(&seal_outpoint.to_string()),
