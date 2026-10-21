@@ -146,6 +146,9 @@ var (
 	// ErrInvalidAbandonRequest the abandon proposal is missing its required identity
 	// (burnTxHash / owner).
 	ErrInvalidAbandonRequest = errors.New("invalid abandon request")
+	// ErrInvalidDepositScriptRequest the deposit-script registration has no usable user id,
+	// or its derivation inputs (pubkey / user id) are invalid.
+	ErrInvalidDepositScriptRequest = errors.New("invalid deposit script registration")
 )
 
 const (
@@ -189,6 +192,8 @@ func (r *rgbx) CheckTx(tx *types.Transaction, index int) error {
 		err = r.checkBridgeConfigApprove(action.GetBridgeConfigApprove())
 	case rtypes.TyAbandonWithdraw:
 		err = r.checkAbandon(txHash, action.GetAbandon())
+	case rtypes.TyRegisterDepositScript:
+		err = r.checkRegisterDepositScript(txHash, tx.From())
 	default:
 		err = types.ErrActionNotSupport
 
