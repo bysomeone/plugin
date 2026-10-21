@@ -412,8 +412,12 @@ function scenario_rgb20_deposit() {
     local psbt_hex cons_hex
     psbt_hex=$(echo "${pay_json}" | jq -r '.psbt // empty')
     cons_hex=$(echo "${pay_json}" | jq -r '.consignment // empty')
-    assert_non_empty "${psbt_hex}" "rgb20 user_pay psbt empty"
-    assert_non_empty "${cons_hex}" "rgb20 user_pay consignment empty"
+    # 失败时把侧车的原始应答一起打出来：/sim/* 的错误体是 {"error": "..."}，只取 .psbt/.status
+    # 会让真正的失败原因（余额不足、seal 状态、consignment 校验）全部丢失。
+    [ -n "${psbt_hex}" ] ||
+        fail "rgb20 user_pay psbt empty; sidecar response: $(echo "${pay_json}" | head -c 600)"
+    [ -n "${cons_hex}" ] ||
+        fail "rgb20 user_pay consignment empty; sidecar response: $(echo "${pay_json}" | head -c 600)"
 
     # 3. Go 桥 TSS 组签名 PSBT（test sign-psbt 端点）
     local signed_psbt
@@ -422,11 +426,13 @@ function scenario_rgb20_deposit() {
     assert_non_empty "${signed_psbt}" "rgb20 sign-psbt empty"
 
     # 4. 侧车 test-sim 广播已签 PSBT + provide consignment → settle
-    local settle_status
-    settle_status=$(curl -s -X POST http://127.0.0.1:50064/sim/user_pay_submit \
+    local settle_json settle_status
+    settle_json=$(curl -s -X POST http://127.0.0.1:50064/sim/user_pay_submit \
         -H 'Content-Type: application/json' \
-        -d "{\"psbt\":\"${signed_psbt}\",\"consignment\":\"${cons_hex}\",\"receive_id\":\"${receive_id}\"}" | jq -r '.status // empty')
-    assert_eq "${settle_status}" "settled" "rgb20 settle status"
+        -d "{\"psbt\":\"${signed_psbt}\",\"consignment\":\"${cons_hex}\",\"receive_id\":\"${receive_id}\"}")
+    settle_status=$(echo "${settle_json}" | jq -r '.status // empty')
+    [ "${settle_status}" = "settled" ] ||
+        fail "rgb20 settle status expect=settled actual=${settle_status:-<empty>}; sidecar response: $(echo "${settle_json}" | head -c 600)"
 
     # 本场景的日志窗口起点（下面断言"首次归因没有报 empty txid"）。
     local deposit_started_at
@@ -443,8 +449,10 @@ function scenario_rgb20_deposit() {
     echo "${cons_up}" | grep -q '"code":200' || fail "rgb20 consignment upload failed: ${cons_up}"
 
     # 5. Go 桥 pollTransfers → submitDeposit（TSS 签 deposit）→ chain33 铸造 X.RGB20_USDT
+    # 期望增量必须用**实际下单金额**（第 2 个参数），不能用默认值：冷备演练会用压过的额度调用本函数
+    # （实测 44000 vs 默认 1000000），沿用默认值会等一个永远不会到的余额。
     local delta expected
-    delta=$(awk "BEGIN{printf \"%.8f\", ${RGB20_DEPOSIT_AMOUNT}/100000000}")
+    delta=$(awk "BEGIN{printf \"%.8f\", ${deposit_amount}/100000000}")
     expected=$(awk "BEGIN{printf \"%.8f\", ${before} + ${delta}}")
     wait_rgb20_balance_not_less_than "${USER_MAIN_ADDR}" "${expected}"
     log_step "RGB20 deposit OK: balance ${before} -> >= ${expected}"

@@ -322,6 +322,41 @@ function drill_ledger_minted_total() {
     echo "${json}" | jq -r '([.seals[]? | select((.status | ascii_downcase) == "minted") | .amount] | add // 0) | tostring'
 }
 
+# 每一枚 minted seal 的 outpoint/面额，只用于把"这次充值能用多少"写进日志（排障时一眼能对上）。
+function drill_minted_seals_desc() {
+    local json
+    json=$(rgb20_ledger_json)
+    if [ -z "${json}" ]; then
+        echo "<ledger unreadable>"
+        return 0
+    fi
+    echo "${json}" |
+        jq -r '[.seals[]? | select((.status | ascii_downcase) == "minted") | "\(.outpoint)=\(.amount)"] | join(" ") | if . == "" then "<none>" else . end'
+}
+
+# 付款前重新读一次账本，并等它连续若干次读数一致再采用。
+#
+# 为什么不能沿用更早的读数：侧车重启后桥会立刻重试前面场景遗留的 pending 提现，
+# 每次 BuildWithdrawal 都会先 sync() 一遍账本（引擎串行，但读侧车文件的是我们）。
+# 在 sync 落地前后取到的额度可能不同，而付款（test-sim 的 select_seals）只认那一刻的状态。
+# 读稳定后的值，才能保证"按这个额度付款"与"付款时账本真的能付"是同一份状态。
+# 超时仍不一致时返回最后一次读数，由调用方按实际额度决定（0 就走显式 SKIP）。
+function drill_minted_total_stable() {
+    local prev="" cur="" same=0 i
+    for ((i = 0; i < 12; i++)); do
+        cur=$(drill_ledger_minted_total)
+        if [ "${cur}" = "${prev}" ]; then
+            same=$((same + 1))
+            [ "${same}" -ge 2 ] && { echo "${cur}"; return 0; }
+        else
+            same=0
+        fi
+        prev="${cur}"
+        sleep 1
+    done
+    echo "${cur}"
+}
+
 # =====================================================================
 # 场景本体
 # =====================================================================
@@ -481,7 +516,10 @@ function scenario_cold_backup_restore() {
     # **生产里没有这个限制**——真实用户带自己的 USDT 来付款，不花桥的余额。
     # 因此这里按实际额度决定：有 minted 就跑充值腿；没有就显式跳过并把边界打出来，不假装覆盖。
     local minted_after
-    minted_after=$(drill_ledger_minted_total)
+    # 付款前现读一次（并等读数稳定），不用任何更早的快照：侧车重启后桥会重试遗留的 pending，
+    # 每次 BuildWithdrawal 内部的 sync() 都可能改变 seal 生命周期，旧读数的额度可能已经花不出去。
+    minted_after=$(drill_minted_total_stable)
+    log_step "post-restore deposit quota (live read): minted=${minted_after}, seals=$(drill_minted_seals_desc)"
     if [ "${minted_after}" -gt 0 ] 2>/dev/null; then
         local drill_deposit_amount="${RGB20_DEPOSIT_AMOUNT}"
         if [ "${drill_deposit_amount}" -gt "${minted_after}" ]; then
