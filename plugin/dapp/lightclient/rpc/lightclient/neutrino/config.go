@@ -29,6 +29,10 @@ type config struct {
 	// 于是 TECHNICAL.md / RGB_USDT_INTEGRATION.md 里的 PascalCase 写法（IsOfficialNode）也能用。
 	// 加上 tag 后两种写法仍然都能解析（json 的大小写不敏感匹配是兜底），只是契约在代码里显式了。
 	IsOfficialNode bool `json:"isOfficialNode"`
+	// AbandonOperators 手工放弃提现（AbandonWithdraw）提案的本地白名单（chain33 地址）。
+	// 链上提案只是存证；节点只受理提案人在此列表内的提案。空 = 关闭手工放弃流程。
+	// **各节点应配置同一份列表**，否则不同节点会对同一提案给出不同结论。
+	AbandonOperators []string `json:"abandonOperators"`
 	// MaxPeers is the maximum number of connections the client maintains.
 	MaxPeer int `json:"maxPeer"`
 	// BlockCacheSize indicates the size (in bytes) of blocks the block

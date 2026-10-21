@@ -73,6 +73,19 @@ type neutrinoClient struct {
 	chain33FeeRate    int64
 	withdrawReqChan   chan *rtypes.PendingTx
 
+	// paymentMu 串行化"付款签名/广播"与"受理放弃提现"，杜绝两者之间的检查-落盘竞态：
+	// 受理方持有它重新确认 hasSignedPayment 后再写 abandoning；付款方持有它重新确认未被放弃后
+	// 才签名/广播。任一时刻只有一方在推进同一笔 burn。
+	paymentMu sync.Mutex
+	// unlockMu 串行化 Unlock 的 CGGMP 组签名轮次（自动路径与手工路径可能同时到达）。
+	unlockMu sync.Mutex
+	// signedPayments 已签付款的持久记录（nil = 用 walletdb 默认实现）。
+	signedPayments signedPaymentKV
+	// signedPaymentMem 是持久化失败时的进程内兜底：签名已经产出、但磁盘没写下去时，
+	// 本进程仍必须拒绝该 burn 的 Unlock（重启后失去，那是存储故障的固有边界）。
+	signedPaymentMu  sync.Mutex
+	signedPaymentMem map[string]struct{}
+
 	// deposits 用户 P2WSH 充值脚本的 watch 集（program ↔ userID，见 deposit_address.go）。
 	// **所有节点都要有**：签名节点凭它认定"这个输入脚本是用户充值脚本"（IsUserDepositScript），
 	// 没有它，任何签名节点都会拒签花这笔 UTXO 的交易（C4 的跨节点分发要解决的就是这件事）。
@@ -263,6 +276,8 @@ func (n *neutrinoClient) Start() {
 	}
 	go n.depositWatcher()
 	go n.withdrawalProcessor()
+	// 手工放弃提现：与结算重试跑在同一个协调者进程里（见 abandon.go）。
+	go n.abandonWorker()
 	// 充值地址发放 HTTP（每用户 P2WSH 脚本按需 import，见 deposit_http.go / deposit_address.go）。
 	// 未配置时不开启，但要把后果说清楚：桥不会 watch 任何新用户的充值脚本，打到每用户地址上的
 	// BTC 除非已在 watch 集里（重启后从 neutrino.db 载入）否则**看不见**。

@@ -340,6 +340,14 @@ func pending2WithdrawRequest(chain33Pending *rtypes.PendingTx) *withdrawRequest 
 
 func (n *neutrinoClient) processWithdrawRequest(req *withdrawRequest) (err error) {
 
+	// 与"受理放弃提现"互斥：受理方写入 abandoning 之后这里必须立刻让位，不能继续签名/广播；
+	// 反过来，签名/广播进行中时受理方必须等它结束再重新检查 hasSignedPayment。
+	n.paymentMu.Lock()
+	defer n.paymentMu.Unlock()
+	if isAbandoningState(n.getWithdrawState(req.chain33WithdrawHash)) {
+		return fmt.Errorf("withdraw %s is being abandoned", hex.EncodeToString(req.chain33WithdrawHash))
+	}
+
 	txHash := hex.EncodeToString(req.chain33WithdrawHash)
 	tx, inputAmounts, lockedUTXOs, err := n.bw.buildWithdrawTx(req)
 	if err != nil {
@@ -386,6 +394,13 @@ func (n *neutrinoClient) processWithdrawRequest(req *withdrawRequest) (err error
 		log.Error("processWithdrawRequest processSignBtcTx", "txHash", txHash, "btcTxHash", btcTxHash, "err", err)
 		return err
 	}
+	// Signing succeeded: persist the fact before the signature can leave this node. If the write
+	// fails, the signed transaction is not broadcast and the caller retries (fail-closed).
+	if err = n.recordSignedPayment(req.chain33WithdrawHash); err != nil {
+		log.Error("processWithdrawRequest recordSignedPayment, refuse to broadcast",
+			"txHash", txHash, "btcTxHash", btcTxHash, "err", err)
+		return err
+	}
 
 	if err = n.bw.broadcastTransaction(tx, btcTxHash); err != nil {
 		log.Error("processWithdrawRequest broadcastTransaction", "txHash", txHash, "btcTxHash", btcTxHash, "err", err)
@@ -430,6 +445,9 @@ var (
 )
 
 func (n *neutrinoClient) getWithdrawState(chain33TxHash []byte) []byte {
+	if n == nil || n.neutrinoCfg.Database == nil {
+		return nil
+	}
 	var data []byte
 	err := walletdb.View(n.neutrinoCfg.Database, func(tx walletdb.ReadTx) error {
 		bucket := tx.ReadBucket(withdrawStateBucket)
@@ -619,6 +637,13 @@ func (n *neutrinoClient) processRgb20Withdraw(pending *rtypes.PendingTx) error {
 // 终止结算重试。如果该 pending 尚未产生任何付款签名，改走 Unlock 把锁定金额退回发起人
 // （见 unlock.go）；签名已经产出时只能继续重试结算，绝不解锁。
 func (n *neutrinoClient) retryRgb20Withdraw(p *rtypes.PendingTx, logMsg string) bool {
+	// Serialize with the manual-abandon acceptance decision: once abandoning is persisted, this
+	// path must not resume settlement, and an in-flight settlement must be visible to the acceptor.
+	n.paymentMu.Lock()
+	defer n.paymentMu.Unlock()
+	if !settlementAllowed(n.getWithdrawState(p.GetTxHash())) {
+		return false
+	}
 	err := n.processRgb20Withdraw(p)
 	if err == nil {
 		return false
@@ -650,6 +675,13 @@ func (n *neutrinoClient) withdrawalProcessor() {
 			tempWithdraws := withdrawReqList
 			withdrawReqList = withdrawReqList[:0]
 			for _, p := range tempWithdraws {
+				// A burn accepted for manual abandonment never goes back to settlement; its
+				// unlock retries are driven by abandonWorker (see abandon.go).
+				if !settlementAllowed(n.getWithdrawState(p.chain33WithdrawHash)) {
+					log.Debug("withdrawalProcessor skip settlement for abandoned withdraw",
+						"txHash", hex.EncodeToString(p.chain33WithdrawHash))
+					continue
+				}
 				if err := n.processWithdrawRequest(p); err != nil {
 					withdrawReqList = append(withdrawReqList, p)
 				}
@@ -657,6 +689,11 @@ func (n *neutrinoClient) withdrawalProcessor() {
 			tempRgb20 := rgb20WithdrawRetry
 			rgb20WithdrawRetry = rgb20WithdrawRetry[:0]
 			for _, p := range tempRgb20 {
+				if !settlementAllowed(n.getWithdrawState(p.GetTxHash())) {
+					log.Debug("withdrawalProcessor skip rgb20 settlement for abandoned withdraw",
+						"txHash", hex.EncodeToString(p.GetTxHash()))
+					continue
+				}
 				if n.retryRgb20Withdraw(p, "withdrawalProcessor rgb20 retry") {
 					rgb20WithdrawRetry = append(rgb20WithdrawRetry, p)
 				}
@@ -700,6 +737,13 @@ func (n *neutrinoClient) withdrawalProcessor() {
 			// 已提交（或链上已有终态）：终态以链上为准，本地只停止重复签名/提交。
 			if bytes.Equal(state, withdrawStatusUnlockSubmitted) {
 				log.Debug("withdrawalProcessor skip submitted unlock", "txHash", hex.EncodeToString(pending.GetTxHash()))
+				continue
+			}
+			// 已受理手工放弃：停止一切结算重试。解锁重试由 abandonWorker 驱动（见 abandon.go）：
+			// pending 拉取游标只前进，不能指望这里周期性再收到同一笔。
+			if isAbandoningState(state) {
+				log.Debug("withdrawalProcessor skip settlement for abandoned withdraw",
+					"txHash", hex.EncodeToString(pending.GetTxHash()), "state", string(state))
 				continue
 			}
 			// RGB20 提现：路由到 rgb20 适配器（invoice→BuildWithdrawal→TSS signPsbt→Finalize→广播→txid↔pending）。
