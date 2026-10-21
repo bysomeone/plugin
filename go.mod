@@ -262,7 +262,7 @@ require (
 	github.com/status-im/keycard-go v0.2.0 // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/supranational/blst v0.3.11 // indirect
-	github.com/syndtr/goleveldb v1.0.1-0.20220614013038-64ee5596c38a // indirect
+	github.com/syndtr/goleveldb v1.0.1-0.20220721030215-126854af5e6d // indirect
 	github.com/tklauser/go-sysconf v0.3.12 // indirect
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	github.com/tyler-smith/go-bip39 v1.1.0 // indirect
@@ -315,4 +315,4 @@ require (
 // 退出条件：chain33 分支合入上游并发版后，删掉本行、把上面的 require 指到发行版，MVS 自动接上。
 // 注意：曾经把它当"本地验证用、不提交"而只在工作区留着，结果 committed 的分支长期编不过、
 // 全靠未提交的工作区撑着 —— 别再那样做。
-replace github.com/33cn/chain33 => github.com/bysomeone/chain33 v1.72.1-0.20260919083032-36fb0fd21884
+replace github.com/33cn/chain33 => github.com/bysomeone/chain33 v1.72.1-0.20261021061654-f131da2fbe01
