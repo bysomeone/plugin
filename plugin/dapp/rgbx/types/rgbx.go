@@ -32,6 +32,8 @@ const (
 	TyBridgeConfigApprove
 	// TyAbandonWithdraw 业务侧放弃一笔提现（链上只存证，节点用本地白名单受理）。
 	TyAbandonWithdraw
+	// TyRegisterDepositScript 绑定用户专属充值地址（派生 + 登记 + 回执）。
+	TyRegisterDepositScript
 
 	NameMintAction      = "Mint"
 	NameTransferAction  = "Transfer"
@@ -51,6 +53,8 @@ const (
 	NameBridgeConfigApproveAction = "BridgeConfigApprove"
 	// NameAbandonWithdrawAction 对应 oneof 字段 abandon（不是 AbandonWithdraw）。
 	NameAbandonWithdrawAction = "Abandon"
+	// NameRegisterDepositScriptAction 对应 oneof 字段 registerDepositScript。
+	NameRegisterDepositScriptAction = "RegisterDepositScript"
 )
 
 // log类型id值
@@ -68,6 +72,8 @@ const (
 	// TyAbandonWithdrawLog 放弃提现提案（链上只存证）的回执日志。必须追加在末尾：
 	// log id 会写进回执，插在中间会改变既有 log 的编号。
 	TyAbandonWithdrawLog
+	// TyDepositScriptLog 用户充值地址绑定成功的回执日志（带完整地址信息）。
+	TyDepositScriptLog
 
 	NameAssetLog         = "AssetLog"
 	NamePendingTxLog     = "PendingTxLog"
@@ -80,6 +86,8 @@ const (
 	NameUnlockAssetLog = "UnlockAssetLog"
 	// NameAbandonWithdrawLog 回执里记录一条已被链上存证的放弃提现提案。
 	NameAbandonWithdrawLog = "AbandonWithdrawLog"
+	// NameDepositScriptLog 回执里记录用户绑定的充值地址、脚本与规格。
+	NameDepositScriptLog = "DepositScriptLog"
 )
 
 var (
@@ -100,6 +108,8 @@ var (
 		NameBridgeConfigApplyAction:   TyBridgeConfigApply,
 		NameBridgeConfigApproveAction: TyBridgeConfigApprove,
 		NameAbandonWithdrawAction:     TyAbandonWithdraw,
+
+		NameRegisterDepositScriptAction: TyRegisterDepositScript,
 	}
 	//定义log的id和具体log类型及名称，填入具体自定义log类型
 	logMap = map[int64]*types.LogInfo{
@@ -110,6 +120,7 @@ var (
 		TyCrossChainMetaLog:  {Ty: reflect.TypeOf(CrossChainAssetMeta{}), Name: NameCrossChainMetaLog},
 		TyUnlockAssetLog:     {Ty: reflect.TypeOf(UnlockAsset{}), Name: NameUnlockAssetLog},
 		TyAbandonWithdrawLog: {Ty: reflect.TypeOf(AbandonWithdrawItem{}), Name: NameAbandonWithdrawLog},
+		TyDepositScriptLog:   {Ty: reflect.TypeOf(DepositScriptItem{}), Name: NameDepositScriptLog},
 	}
 )
 
@@ -182,6 +193,8 @@ func GetActionName(ty int32) string {
 		return NameBridgeConfigApproveAction
 	case TyAbandonWithdraw:
 		return NameAbandonWithdrawAction
+	case TyRegisterDepositScript:
+		return NameRegisterDepositScriptAction
 	default:
 		return "unknownAction"
 	}

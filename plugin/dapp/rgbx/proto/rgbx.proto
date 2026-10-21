@@ -17,7 +17,30 @@ message RgbxAction {
         bridgeConfigApply   bridgeConfigApply   = 10;
         bridgeConfigApprove bridgeConfigApprove = 11;
         abandonWithdraw     abandon            = 12;
+        registerDepositScript registerDepositScript = 13;
     }
+}
+
+// registerDepositScript 绑定用户专属 BTC 充值地址（一步完成）。
+//
+// tx.From() 即 userID；执行时用 BTC 资产的 CrossChainInfo.pubkey 现场派生 P2WSH 地址，
+// 写入登记表，并在回执日志（TyDepositScriptLog）里返回完整地址信息。幂等：重复绑定
+// 返回同一结果。地址查询只读登记表——未绑定不返回派生值，否则用户可能向桥未监听的
+// 脚本充值。
+message registerDepositScript {
+}
+
+message depositScriptItem {
+    string userID   = 1;
+    string address  = 2;
+    string pkScript = 3; // hex of OP_0 <sha256(witnessScript)>
+    string spec     = 4;
+    int64  height   = 5;
+    int32  index    = 6;
+}
+
+message depositScriptList {
+    repeated depositScriptItem items = 1;
 }
 
 // bridgeConfigApply 桥配置变更申请（第一步）。
