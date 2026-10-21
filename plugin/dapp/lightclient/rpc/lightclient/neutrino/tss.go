@@ -1564,6 +1564,11 @@ func (t *tssService) handleSignNotify(data *types.TopicData) {
 			log.Error("handleSignNotify handleBtcSweepSign", "err", err)
 		}
 		return
+	case transactionTypeRgbxUnlock:
+		if err := t.handleUnlockSign(notify); err != nil {
+			log.Error("handleSignNotify handleUnlockSign", "err", err)
+		}
+		return
 	}
 
 	tx, inputAmounts, err := t.parseTxFromNotify(notify)
