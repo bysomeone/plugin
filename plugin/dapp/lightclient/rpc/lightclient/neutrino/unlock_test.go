@@ -54,21 +54,23 @@ func Test_unlockEligible(t *testing.T) {
 		name          string
 		err           error
 		state         []byte
+		signedRecord  bool
 		wantUnlock    bool
 		wantReasoning string
 	}{
-		{"permanent unsigned", permanent, nil, true, "no signature yet"},
-		{"permanent unlock pending", permanent, withdrawStatusUnlockPending, true, "an unlock request is not a payment signature"},
-		{"permanent unlock submitted", permanent, withdrawStatusUnlockSubmitted, true, "local unlock bookkeeping is not a payment signature"},
-		{"permanent broadcasted", permanent, withdrawStatusSent, false, "payment signature exists"},
-		{"permanent confirmed", permanent, withdrawStatusConfirmed, false, "payment settled"},
-		{"transient unsigned", transient, nil, false, "retry settlement"},
-		{"transient broadcasted", transient, withdrawStatusSent, false, "retry settlement"},
+		{"permanent unsigned", permanent, nil, false, true, "no signature yet"},
+		{"permanent unlock pending", permanent, withdrawStatusUnlockPending, false, true, "an unlock request is not a payment signature"},
+		{"permanent unlock submitted", permanent, withdrawStatusUnlockSubmitted, false, true, "local unlock bookkeeping is not a payment signature"},
+		{"permanent broadcasted", permanent, withdrawStatusSent, false, false, "payment signature exists"},
+		{"permanent confirmed", permanent, withdrawStatusConfirmed, false, false, "payment settled"},
+		{"permanent durable record", permanent, nil, true, false, "signed but not broadcast: durable record says a payment signature exists"},
+		{"transient unsigned", transient, nil, false, false, "retry settlement"},
+		{"transient broadcasted", transient, withdrawStatusSent, false, false, "retry settlement"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, unrecoverable := rgb20.IsUnrecoverableWithdraw(tc.err)
-			require.Equal(t, tc.wantUnlock, unlockEligible(unrecoverable, tc.state), tc.wantReasoning)
+			require.Equal(t, tc.wantUnlock, unlockEligible(unrecoverable, tc.state, tc.signedRecord), tc.wantReasoning)
 		})
 	}
 }

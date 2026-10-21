@@ -1599,7 +1599,17 @@ func (t *tssService) handleSignNotify(data *types.TopicData) {
 		}
 	}
 
-	if err = t.signBtcTx(tx, inputAmounts, notify.Signers); err != nil {
+	if notify.TxType == transactionTypeWithdraw {
+		// Every participating signer persists "I signed a payment for this burn" immediately after
+		// its signing round succeeds and before the handler reports success. The record is what
+		// makes this node refuse a later Unlock for the same burn (threshold-intersection safety).
+		err = t.signAndRecordOnParticipant(notify.Payload, func() error {
+			return t.signBtcTx(tx, inputAmounts, notify.Signers)
+		})
+	} else {
+		err = t.signBtcTx(tx, inputAmounts, notify.Signers)
+	}
+	if err != nil {
 		log.Error("handleSignNotify signBtcTx", "type", notify.TxType, "err", err)
 		return
 	}
@@ -1669,7 +1679,13 @@ func (t *tssService) handleRgb20WithdrawSign(notify *ltypes.TssSignNotify) error
 	if err != nil {
 		return err
 	}
-	if _, err := t.signPsbtInternal(psbtBytes, notify.Signers); err != nil {
+	// Every participating signer persists the signed-payment fact after its PSBT signing round
+	// succeeds and before reporting success; a failed write fails the handler (the signed PSBT is
+	// not released). This is what lets the node refuse a later Unlock for the same burn.
+	if err := t.signAndRecordOnParticipant(payload.Chain33TxHash, func() error {
+		_, err := t.signPsbtInternal(psbtBytes, notify.Signers)
+		return err
+	}); err != nil {
 		return fmt.Errorf("sign rgb20 withdrawal psbt: %w", err)
 	}
 	// sticky 记录只在签名成功之后写（镜像 BTC 侧 handleSignNotify → setWithdrawStickyUTXO）：

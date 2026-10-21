@@ -47,16 +47,18 @@ var withdrawStatusUnlockSubmitted = []byte("unlock-submitted")
 //   - withdrawStatusConfirmed 在链上结算确认之后写入。
 //
 // 两者任一存在 ⇒ 签名已经产出：此时绝不解锁（否则签名交易一旦落地就是双付），只能继续重试
-// 结算。注意反向不成立（签名成功但广播失败时还没有状态），这是现有状态机已知的窗口；本路径
-// 按既定契约以这两个键为准，不引入新的持久化信号。
+// 结算。注意反向不成立（签名成功但广播失败时还没有状态），这个窗口由新增的
+// signed-payment 持久记录补齐；判定时用 paymentSignatureMayExist 把两条证据合起来看。
 func withdrawHasPaymentSignature(state []byte) bool {
 	return bytes.Equal(state, withdrawStatusSent) || bytes.Equal(state, withdrawStatusConfirmed)
 }
 
 // unlockEligible 是"这笔提现可以走 Unlock"的完整判定：失败被明确判为永久（unrecoverable）
 // 且尚未产生付款签名。永久判定由调用方从 rgb20.IsUnrecoverableWithdraw 得到——不用超时。
-func unlockEligible(unrecoverable bool, state []byte) bool {
-	return unrecoverable && !withdrawHasPaymentSignature(state)
+//
+// signedRecord 是新增的持久签名记录：它覆盖"签名成功但广播失败"的窗口（此时旧状态还是空）。
+func unlockEligible(unrecoverable bool, state []byte, signedRecord bool) bool {
+	return unrecoverable && !paymentSignatureMayExist(signedRecord, state)
 }
 
 // handleUnrecoverableRgb20Withdraw 处理"重试永远不可能成功"的 RGB20 提现：在未产生付款签名
@@ -66,7 +68,7 @@ func unlockEligible(unrecoverable bool, state []byte) bool {
 func (n *neutrinoClient) handleUnrecoverableRgb20Withdraw(p *rtypes.PendingTx, class string, cause error) bool {
 	txHash := hex.EncodeToString(p.GetTxHash())
 	state := n.getWithdrawState(p.GetTxHash())
-	if !unlockEligible(true, state) {
+	if !unlockEligible(true, state, n.hasSignedPayment(p.GetTxHash())) {
 		log.Error("withdrawalProcessor rgb20 withdraw UNRECOVERABLE but payment signature already produced, refuse to unlock",
 			"txHash", txHash, "assetSymbol", p.GetAssetSymbol(), "state", string(state),
 			"class", class, "err", cause)
@@ -139,6 +141,10 @@ func newUnlockAsset(p *rtypes.PendingTx, withdraw *rtypes.WithdrawAsset) (*rtype
 // 节点独立核对后入场，本节点再加入同一轮 CGGMP 签名。任一步失败都返回错误，由调度器重试；
 // 重复提交被链上以 ErrWithdrawAlreadyFinal 拒绝，说明该 burn 已有终态，本地停止重试。
 func (n *neutrinoClient) tryUnlockWithdraw(p *rtypes.PendingTx) error {
+	// One CGGMP round at a time: automatic (RGB20 permanent) and manual (abandon) paths can
+	// otherwise race into the same signing session.
+	n.unlockMu.Lock()
+	defer n.unlockMu.Unlock()
 	if p == nil || len(p.GetTxHash()) == 0 {
 		return fmt.Errorf("unlock: empty burn tx hash")
 	}
@@ -147,6 +153,11 @@ func (n *neutrinoClient) tryUnlockWithdraw(p *rtypes.PendingTx) error {
 	}
 	if p.GetConfirmed() {
 		return fmt.Errorf("unlock: withdraw %s already confirmed", hex.EncodeToString(p.GetTxHash()))
+	}
+	// Final gate for every participant, including the coordinator's own local signing round:
+	// never co-sign an unlock for a burn this node already signed a payment for.
+	if err := n.tss.ensureNoPaymentSignature(p.GetTxHash()); err != nil {
+		return fmt.Errorf("unlock: %w", err)
 	}
 
 	msg, err := n.buildUnlockAsset(p)
@@ -194,8 +205,13 @@ func (n *neutrinoClient) tryUnlockWithdraw(p *rtypes.PendingTx) error {
 
 	// Deliberately not a terminal marker: settled/released on chain is the only terminal truth.
 	// This only stops the local scheduler from signing and submitting the same unlock again.
-	if err := n.setWithdrawState(p.GetTxHash(), withdrawStatusUnlockSubmitted); err != nil {
-		log.Error("unlock: setWithdrawState unlock-submitted", "txHash", hex.EncodeToString(p.GetTxHash()), "err", err)
+	// A manual abandonment marker must never be downgraded or cleared: the abandoning record is
+	// single-direction local evidence, and losing it would let settlement retries resume after a
+	// restart. The manual path decides when to stop by reading the chain's terminal key.
+	if !isAbandoningState(n.getWithdrawState(p.GetTxHash())) {
+		if err := n.setWithdrawState(p.GetTxHash(), withdrawStatusUnlockSubmitted); err != nil {
+			log.Error("unlock: setWithdrawState unlock-submitted", "txHash", hex.EncodeToString(p.GetTxHash()), "err", err)
+		}
 	}
 	return nil
 }
@@ -240,6 +256,12 @@ func (t *tssService) handleUnlockSign(notify *ltypes.TssSignNotify) error {
 		return fmt.Errorf("read withdraw payload for unlock: %w", err)
 	}
 	if err := verifyUnlockClaim(claim, pending, withdraw); err != nil {
+		return err
+	}
+	// Threshold-intersection safety: a node that ever produced a payment signature for this burn
+	// must refuse to co-sign its refund. Otherwise the payment signer set and the unlock signer set
+	// need not intersect, and a signed payment plus a refund can both land.
+	if err := t.ensureNoPaymentSignature(burnHash); err != nil {
 		return err
 	}
 

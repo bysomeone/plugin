@@ -52,7 +52,18 @@ func (n *neutrinoClient) SubmitConfirm(confirm *rtypes.ConfirmTx) error {
 // SignPsbt 通过 TSS 组对 RGB20 提现 PSBT 签名：把提现上下文（chain33 提现哈希、金额、费率、
 // 同步高度门槛、收款 invoice、consignment）一并下发，签名节点据此独立核对后参与 CGGMP 组签名（E11）。
 func (n *neutrinoClient) SignPsbt(req *rgb20.WithdrawSignRequest) ([]byte, error) {
-	return n.tss.signPsbt(req)
+	signed, err := n.tss.signPsbt(req)
+	if err != nil {
+		return nil, err
+	}
+	// Signing succeeded: persist the fact before handing the signed PSBT back for finalize/broadcast.
+	// A failed write must not release the signature (fail-closed).
+	if err := n.recordSignedPayment(req.Chain33TxHash); err != nil {
+		log.Error("SignPsbt recordSignedPayment, refuse to release the signed PSBT",
+			"chain33Hash", hex.EncodeToString(req.Chain33TxHash), "err", err)
+		return nil, err
+	}
+	return signed, nil
 }
 
 // SignPsbtTestOnly 仅供 E2E 的 sign-psbt 测试端点：无提现上下文，签名节点不做任何提现核对。
