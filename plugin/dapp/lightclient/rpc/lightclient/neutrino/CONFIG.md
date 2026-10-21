@@ -664,6 +664,8 @@ peerblockfilters=1
 上线/联调前建议逐项核对：
 
 - `btcNetName == netName == BTC 节点 network`
+  - **`btcNetName` 是共识级配置**：除了决定 BTC 头校验，它还决定 `RegisterDepositScript` 写进共识状态的
+    充值地址串。各节点取值不一致会让同一笔绑定交易写出不同的状态，直接造成状态不一致。
 - 主链 `guardianParachainTitle == 平行链 Title`
 - `commitAddress/commitAddr/authAccount` 与私钥管理匹配
 - 主链 `[exec.sub.lightclient].commitAddress` **非空**（留空节点起不来）

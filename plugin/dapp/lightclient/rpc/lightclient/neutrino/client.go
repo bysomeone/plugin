@@ -278,6 +278,8 @@ func (n *neutrinoClient) Start() {
 	go n.withdrawalProcessor()
 	// 手工放弃提现：与结算重试跑在同一个协调者进程里（见 abandon.go）。
 	go n.abandonWorker()
+	// 链上充值地址登记 → 钱包 watch 集（见 deposit_registry.go）。
+	go n.depositRegistryWorker()
 	// 充值地址发放 HTTP（每用户 P2WSH 脚本按需 import，见 deposit_http.go / deposit_address.go）。
 	// 未配置时不开启，但要把后果说清楚：桥不会 watch 任何新用户的充值脚本，打到每用户地址上的
 	// BTC 除非已在 watch 集里（重启后从 neutrino.db 载入）否则**看不见**。
