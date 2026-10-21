@@ -191,6 +191,19 @@ BTCD_MINING_ADDR="mrCDrCybB6J1vRfbwM5hemdJz73FwDBC8r"
 BTC_FUNDING_WIF="${BTC_FUNDING_WIF:-}"
 USER_MAIN_ADDR="${USER_MAIN_ADDR:-14KEKbYtKKQm4wMthSK9J4La4nAiidGozt}"
 
+# 手工放弃提现（Abandon）场景（E2E）：
+#   - ABANDON_OPERATOR_ADDR/KEY：白名单提案人（链上只按 tx.From() 比对，取本 harness 持有的
+#     AUTH_ADDR1；它在主链有余额可付手续费）；
+#   - RGB20_ABANDON_WITHDRAW_AMOUNT：被放弃的提现额（min units）。它排在 fee-mismatch 场景之后，
+#     用户此时只剩 20000，且放弃会原额退回，故取 10000（> withdrawFee 1000，能被桥构建）。
+#   - DEPOSIT_BIND_*：#78 充值地址绑定场景的被测账户与充值额（sats）。
+ABANDON_OPERATOR_ADDR="${ABANDON_OPERATOR_ADDR:-${AUTH_ADDR1}}"
+ABANDON_OPERATOR_KEY="${ABANDON_OPERATOR_KEY:-${AUTH_KEY1}}"
+RGB20_ABANDON_WITHDRAW_AMOUNT="${RGB20_ABANDON_WITHDRAW_AMOUNT:-10000}"
+DEPOSIT_BIND_USER_ADDR="${DEPOSIT_BIND_USER_ADDR:-${USER_B_ADDR}}"
+DEPOSIT_BIND_USER_KEY="${DEPOSIT_BIND_USER_KEY:-${USER_B_KEY}}"
+DEPOSIT_BIND_AMOUNT_SATS="${DEPOSIT_BIND_AMOUNT_SATS:-200000}"
+
 function join_csv_as_toml_array() {
     local csv="${1}"
     local out=""
@@ -299,12 +312,17 @@ function config_para_file() {
     # （btc wallet + 充值 watch 集），也只有它需要"按需 import 用户充值脚本"这个入口；
     # 非官方节点开了也没有钱包可发行（请求会 503），只是多一个空转的监听，故这里关掉。
     local deposit_address_listen=""
+    # 手工放弃提现（Abandon）的本地白名单。只有官方节点跑协调者（abandonWorker），也就只有它
+    # 需要这份列表；E2E 用它同时验证"白名单受理"与"非白名单忽略"两条路径。
+    local abandon_block=""
     # 扫集（C4）：与"发放充值地址"同一个开关理由 —— 只有官方节点跑真正的 BTC 桥（钱包 + 充值
     # watch 集），也只有它看得见那些停在用户 P2WSH 上的充值 UTXO。E2E 把阈值/间隔/确认数都压到
     # 最小，好让扫集在场景里立刻发生；生产默认是 5 笔 / 300s / 6 确认（见 lightclient config.go）。
     local sweep_block=""
     if [ "${official}" = "true" ]; then
         deposit_address_listen="0.0.0.0:17001"
+        abandon_block='
+abandonOperators=["'"${ABANDON_OPERATOR_ADDR}"'"]'
         sweep_block='
 
 [rpc.sub.light.neutrino.userDepositSweep]
@@ -332,7 +350,7 @@ blockConfirmations=1
 maxUtxoRescanTime=60
 # 充值地址发放入口（空 = 不开启）。E2E 脚本按 127.0.0.1:17001 领地址，见 docker-compose.yml
 # 里 para1 的 17001 端口发布与 scripts/btc_test.sh 的 BRIDGE_DEPOSIT_URL。
-depositAddressListen="${deposit_address_listen}"${sweep_block}
+depositAddressListen="${deposit_address_listen}"${abandon_block}${sweep_block}
 
 [rpc.sub.light.neutrino.btcRPC]
 host="${BTC_RPC_ADDR}"

@@ -36,6 +36,73 @@ function rgbx_query() {
         -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Chain33.Query\",\"params\":[{\"execer\":\"rgbx\",\"funcName\":\"${func_name}\",\"payload\":${payload}}]}"
 }
 
+# normalize_tx_hash：去掉 0x 前缀并转小写。CLI/日志用带 0x 的哈希，节点日志与查询载荷用裸
+# 64-hex；比较前统一成同一份拼写（与 #70 场景同一口径）。
+function normalize_tx_hash() {
+    echo "$1" | tr 'A-Z' 'a-z' | sed 's/^0x//'
+}
+
+# send_main_rgbx_action <actionName> <payload-json> <privkey> → 打印主链交易哈希（0x...）。
+#
+# rgbx 的 RegisterDepositScript / Abandon 只在执行器里注册了 action，没有 chain33-cli 子命令。
+# 这里走通用的 Chain33.CreateTransaction（execer=rgbx + actionName + JSON payload）→
+# wallet sign（用给定私钥）→ wallet send。payload 的 bytes 字段按 chain33 jsonpb 的 hex 约定传。
+function send_main_rgbx_action() {
+    local action="$1" payload="$2" key="$3"
+    local created raw signed sent tx_hash
+    created=$(curl -s -X POST "http://127.0.0.1:8801" \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Chain33.CreateTransaction\",\"params\":[{\"execer\":\"rgbx\",\"actionName\":\"${action}\",\"payload\":${payload}}]}")
+    raw=$(echo "${created}" | jq -r '.result // empty')
+    if [ -z "${raw}" ]; then
+        # This helper runs inside $( ), so a stdout `fail` would be captured into the caller's
+        # variable and the message would vanish; send it to stderr (the run log) instead.
+        fail "Chain33.CreateTransaction ${action} failed: $(echo "${created}" | head -c 500)" 1>&2
+    fi
+    if ! signed=$(${MAIN_CLI} wallet sign -d "${raw}" -k "${key}" 2>&1); then
+        fail "wallet sign ${action} failed: ${signed}" 1>&2
+    fi
+    signed=$(echo "${signed}" | tr -d '\r' | tail -1)
+    if ! sent=$(${MAIN_CLI} wallet send -d "${signed}" 2>&1); then
+        fail "wallet send ${action} failed: ${sent}" 1>&2
+    fi
+    tx_hash=$(echo "${sent}" | tr -d '\r' | tail -1)
+    if [ "${#tx_hash}" -ne 66 ]; then
+        fail "${action}: wallet send did not return a 0x transaction hash (got '${tx_hash}')" 1>&2
+    fi
+    echo "${tx_hash}"
+}
+
+# wait_main_tx_committed <tx hash> [retries]：等主链交易落块（height > 0），打印 "<height> <index>"。
+# wallet send 返回时交易只进了 mempool（solo 矿工通常立刻出块，但不保证），receipt 查询必须以
+# 落块后的详情为准。
+function wait_main_tx_committed() {
+    local bare="$1" retries="${2:-60}" i details height
+    for ((i = 0; i < retries; i++)); do
+        details=$(${MAIN_CLI} tx query -s "${bare}" 2>/dev/null) || details=""
+        height=$(echo "${details}" | jq -r '.height // 0' 2>/dev/null) || height=0
+        if [[ "${height}" =~ ^[0-9]+$ ]] && [ "${height}" -gt 0 ]; then
+            echo "${height} $(echo "${details}" | jq -r '.index // 0')"
+            return 0
+        fi
+        sleep 1
+    done
+    fail "main-chain tx not committed after ${retries}s: ${bare}" 1>&2
+}
+
+# main_tx_receipt_log <bare tx hash> <log name>：取回执里指定 tyName 的第一条日志（JSON，无则空）。
+function main_tx_receipt_log() {
+    local bare="$1" name="$2"
+    ${MAIN_CLI} tx query -s "${bare}" 2>/dev/null |
+        jq -c --arg n "${name}" '[.receipt.logs[]? | select(.tyName == $n) | .log] | first // empty' || true
+}
+
+# main_tx_receipt_ty <bare tx hash>：回执类型名（ExecOk / ExecErr）。
+function main_tx_receipt_ty() {
+    local bare="$1"
+    ${MAIN_CLI} tx query -s "${bare}" 2>/dev/null | jq -r '.receipt.tyName // empty' || true
+}
+
 # query_withdraw_final_state <burn tx hash>: "" (still locked) | "settled" | "released".
 # This reads the consensus-state terminal key, i.e. the same value both Confirm and Unlock write.
 function query_withdraw_final_state() {
@@ -96,6 +163,17 @@ function para1_logs_since() {
         elapsed=1
     fi
     compose_cmd logs --no-color --since "${elapsed}s" para1 2>&1 || true
+}
+
+# para_logs_since <service> <since_epoch>：任意 para 节点在该时刻之后的日志。
+# 跨节点 watch 集传播（para2-4 从侧车并集补齐）只能从**各自**的日志观察，不能只看官方节点。
+function para_logs_since() {
+    local svc="$1" since_epoch="$2"
+    local elapsed=$(( $(date +%s) - since_epoch ))
+    if [ "${elapsed}" -lt 1 ]; then
+        elapsed=1
+    fi
+    compose_cmd logs --no-color --since "${elapsed}s" "${svc}" 2>&1 || true
 }
 
 # main（主链）节点在 since_epoch（unix 秒）之后新产生的日志。
@@ -1422,11 +1500,396 @@ function scenario_btc_header_guard_armed() {
 }
 
 # =====================================================================
+# #78 链上充值地址绑定：登记 -> 回执/查询 -> 桥 watch 集 -> 向绑定地址充值铸币
+# =====================================================================
+#
+# 链上契约（executor/deposit_script.go）：
+#   - RegisterDepositScript：payload 为空，userID = tx.From()；Exec 按
+#     (userID, CrossChainInfo.pubkey) 派生 P2WSH 地址，写登记表 + 按高度的索引，并在回执
+#     TyDepositScriptLog（tyName=DepositScriptLog）里返回 userID/address/pkScript/spec；
+#   - 幂等：同一 userID 重复绑定返回已存条目，不写任何 KV（索引与高度计数都不增长）；
+#   - Query_GetDepositAddress 只读登记表：未绑定返回 ErrNotFound，绝不现场派生（否则会把
+#     桥没 watch 过的地址展示给用户）。
+#
+# 桥侧（deposit_registry.go）：官方节点每 10s 扫 ListDepositRegistrations，把每条登记导入
+# 钱包 watch 集（ensureUserDepositScript）。**这一步才是"地址可用"的关键**：登记在链上但
+# 没进 watch 集，用户打进去的 BTC 对桥不可见。本场景因此不用充值地址发放 HTTP（那会替桥
+# 把脚本导进去、掩盖链上同步是否生效），而是等 para1 的 watch 集日志，再向链上登记得到的
+# 地址充值，断言 XBTC 确实铸到该 userID 名下。
+#
+# 被测账户取 USER_B（AUTH_ADDR2）：主链有余额可付手续费，且不参与后续 RGB20 余额断言
+# （那些都用 USER_MAIN_ADDR）。
+function scenario_rgbx_deposit_address_binding() {
+    log_step "scenario: on-chain deposit address binding -> bridge watch set -> BTC deposit mints XBTC (#78)"
+    local user="${DEPOSIT_BIND_USER_ADDR:-${USER_B_ADDR}}"
+    local key="${DEPOSIT_BIND_USER_KEY:-${USER_B_KEY}}"
+    local amount="${DEPOSIT_BIND_AMOUNT_SATS:-200000}"
+    assert_non_empty "${user}" "deposit binding user address empty"
+    assert_non_empty "${key}" "deposit binding user key empty"
+
+    # ---- 1. 绑定前：明确 NotFound（不是空地址，也不是现场派生）----
+    local pre
+    pre=$(rgbx_query "GetDepositAddress" "{\"data\":\"${user}\"}")
+    if ! echo "${pre}" | jq -e '.result == null and (.error | tostring | test("ErrNotFound"))' >/dev/null 2>&1; then
+        fail "GetDepositAddress before binding must fail with ErrNotFound (it must never derive on the fly), got: $(echo "${pre}" | head -c 400)"
+    fi
+    log_step "  pre-binding: GetDepositAddress -> ErrNotFound (as required)"
+
+    # ---- 2. 用测试账户发一笔 RegisterDepositScript（payload 为空）----
+    local reg_started_at reg_hash reg_bare
+    reg_started_at=$(date +%s)
+    reg_hash=$(send_main_rgbx_action "RegisterDepositScript" '{}' "${key}")
+    reg_bare=$(normalize_tx_hash "${reg_hash}")
+    local reg_pos reg_height reg_index
+    reg_pos=$(wait_main_tx_committed "${reg_bare}")
+    reg_height=${reg_pos%% *}
+    reg_index=${reg_pos##* }
+    assert_eq "$(main_tx_receipt_ty "${reg_bare}")" "ExecOk" "RegisterDepositScript receipt"
+
+    # ---- 3. 回执日志必须带 address/pkScript/spec（执行器写的就是这三样）----
+    local reg_item address pk_script spec
+    reg_item=$(main_tx_receipt_log "${reg_bare}" "DepositScriptLog")
+    assert_non_empty "${reg_item}" "RegisterDepositScript receipt has no DepositScriptLog"
+    address=$(echo "${reg_item}" | jq -r '.address // empty')
+    pk_script=$(echo "${reg_item}" | jq -r '.pkScript // empty')
+    spec=$(echo "${reg_item}" | jq -r '.spec // empty')
+    assert_non_empty "${address}" "DepositScriptLog address empty"
+    assert_length "${pk_script}" 68 "DepositScriptLog pkScript must be a 34-byte P2WSH program (68 hex chars)"
+    assert_eq "${spec}" "p2wsh-deposit-v1" "DepositScriptLog spec"
+    assert_eq "$(echo "${reg_item}" | jq -r '.userID // empty')" "${user}" \
+        "DepositScriptLog userID must be tx.From()"
+    log_step "  receipt: address=${address} pkScript=${pk_script} spec=${spec} height=${reg_height}"
+
+    # 查询返回同一条登记（只读登记表，不是重新派生）。
+    local q
+    q=$(rgbx_query "GetDepositAddress" "{\"data\":\"${user}\"}" | jq -c '.result // empty' || true)
+    assert_non_empty "${q}" "GetDepositAddress after binding returned nothing"
+    assert_eq "$(echo "${q}" | jq -r '.address')" "${address}" "query address differs from the receipt"
+    assert_eq "$(echo "${q}" | jq -r '.pkScript')" "${pk_script}" "query pkScript differs from the receipt"
+    assert_eq "$(echo "${q}" | jq -r '.spec')" "${spec}" "query spec differs from the receipt"
+    assert_eq "$(echo "${q}" | jq -r '.height')" "${reg_height}" "query height differs from the receipt"
+
+    # ---- 4. 重复绑定必须幂等：返回同一条目，且不新增登记/索引 ----
+    local dup_started_at dup_hash dup_bare dup_pos dup_height dup_item
+    dup_started_at=$(date +%s)
+    dup_hash=$(send_main_rgbx_action "RegisterDepositScript" '{}' "${key}")
+    dup_bare=$(normalize_tx_hash "${dup_hash}")
+    dup_pos=$(wait_main_tx_committed "${dup_bare}")
+    dup_height=${dup_pos%% *}
+    assert_eq "$(main_tx_receipt_ty "${dup_bare}")" "ExecOk" "duplicate RegisterDepositScript receipt"
+    dup_item=$(main_tx_receipt_log "${dup_bare}" "DepositScriptLog")
+    assert_non_empty "${dup_item}" "duplicate RegisterDepositScript receipt has no DepositScriptLog"
+    assert_eq "$(echo "${dup_item}" | jq -r '.address // empty')" "${address}" \
+        "duplicate binding must return the stored address"
+    assert_eq "$(echo "${dup_item}" | jq -r '.pkScript // empty')" "${pk_script}" \
+        "duplicate binding must return the stored pkScript"
+
+    # 高度区间查询覆盖两次绑定所在的高度：userID 只能出现一次（第二次没有写 KV）。
+    local list_start=$(( reg_height > 0 ? reg_height - 1 : 0 ))
+    local reg_list reg_count
+    reg_list=$(rgbx_query "ListDepositRegistrations" \
+        "{\"startHeight\":${list_start},\"startIndex\":0,\"count\":100,\"endHeight\":$(( dup_height + 2 ))}")
+    reg_count=$(echo "${reg_list}" | jq --arg u "${user}" '[.result.items[]? | select(.userID == $u)] | length' || true)
+    assert_eq "${reg_count}" "1" \
+        "duplicate binding wrote a second registration/index entry (window ${list_start}..$((dup_height + 2)))"
+
+    # 第二次执行走 "already registered" 分支（不派生、不写 KV）。
+    if ! main_logs_since "${dup_started_at}" | grep -q "Exec_RegisterDepositScript already registered"; then
+        fail "the duplicate RegisterDepositScript did not take the already-registered branch"
+    fi
+    log_step "  duplicate binding is idempotent: same address/pkScript, 1 registry entry, no new index"
+
+    # ---- 5. 桥必须把链上登记导入 watch 集（"地址可用"的关键）----
+    local i bridge_logs imported=""
+    for ((i = 0; i < 90; i++)); do
+        bridge_logs=$(para1_logs_since "${reg_started_at}")
+        # `|| true`：grep 无匹配时管道返回 1，而这是普通赋值（不是 if 条件），set -e 会让
+        # 整个 run 在"还没等到日志"的那一刻静默退出。
+        imported=$(echo "${bridge_logs}" | grep "ensureUserDepositScript watch set grown" | grep "${user}" | tail -1 || true)
+        [ -n "${imported}" ] && break
+        sleep 1
+    done
+    if [ -z "${imported}" ]; then
+        if echo "${bridge_logs}" | grep -q "ALERT deposit registry entry cannot be imported"; then
+            fail "the bridge failed to import the on-chain registration: $(echo "${bridge_logs}" | grep "ALERT deposit registry entry cannot be imported" | tail -1)"
+        fi
+        fail "the bridge did not import the on-chain registration of ${user} into its watch set; para1 log tail: $(echo "${bridge_logs}" | tail -8)"
+    fi
+    log_step "  bridge watch set: ${imported}"
+
+    # ---- 5.1 等签名节点（para2-4）也拿到这条脚本，再充值 ----
+    #
+    # 为什么必须等：扫集由官方节点发起，但**签名节点各自核对**"这个 P2WSH 输入是不是已登记的
+    # 用户充值脚本"（IsUserDepositScript）。非官方节点不扫链，它们每 30s 才从侧车并集里补齐
+    # watch 集。如果充值刚确认、扫集 worker（3s 周期）立刻开签，签名节点还看不到该脚本，会以
+    # "is not a registered user deposit script" 拒签；同一笔 PSBT 重试时复用同一个 CGGMP 会话名，
+    # 超时轮次的残留消息会把后续轮次打成 "state Init -> Failed"，整条扫集路径就此卡住
+    # （实测会把后面 scenario_user_deposit_sweep 一起拖失败）。
+    local merged_all="" svc
+    for ((i = 0; i < 90; i++)); do
+        merged_all="true"
+        for svc in para2 para3 para4; do
+            if ! para_logs_since "${svc}" "${reg_started_at}" |
+                grep -q "mergeRemoteDepositScripts merged remote deposit scripts"; then
+                merged_all=""
+                break
+            fi
+        done
+        [ -n "${merged_all}" ] && break
+        sleep 2
+    done
+    assert_true "${merged_all}" \
+        "signing nodes did not merge the on-chain deposit script within 180s; signing a sweep now would be refused with 'not a registered user deposit script' (para2-4 log tail: $(para_logs_since para2 "${reg_started_at}" | tail -2; para_logs_since para3 "${reg_started_at}" | tail -2; para_logs_since para4 "${reg_started_at}" | tail -2))"
+    log_step "  signing nodes merged the deposit script registry (para2-4)"
+
+    # ---- 6. 向**绑定得到的地址**充值（不再经过发放 HTTP），断言铸到该 userID ----
+    local tss_pubkey derived
+    tss_pubkey=$(${MAIN_CLI} rgbx getCrossChainInfo -s "${MINT_SYMBOL}" | jq -r '.pubkey // empty')
+    assert_non_empty "${tss_pubkey}" "tss pubkey empty before binding-scenario deposit"
+    derived=$(compose_cmd exec -T main /root/chain33-cli rgbx btcDepositAddress \
+        --net "${BTC_NETWORK}" -d "${user}" -k "${tss_pubkey}" 2>/dev/null | tail -1 || true)
+    assert_eq "$(echo "${derived}" | jq -r '.address // empty')" "${address}" \
+        "local derivation disagrees with the on-chain registration (bridge would watch a different script)"
+    assert_eq "$(echo "${derived}" | jq -r '.pkScript // empty')" "${pk_script}" \
+        "local pkScript derivation disagrees with the on-chain registration"
+
+    local utxo before_xbtc expected_xbtc deposit_tx
+    utxo=$(build_mature_coinbase_utxo "$(( amount + 500 ))")
+    assert_non_empty "${utxo}" "funding utxo empty for binding-scenario deposit"
+    before_xbtc=$(query_xbtc_balance "${user}")
+    deposit_tx=$(compose_cmd exec -T main /root/chain33-cli rgbx btcDepositTx \
+        --net "${BTC_NETWORK}" \
+        --rpcHost "${BTC_RPC_ADDR}" \
+        --rpcUser "${BTCD_RPC_USER}" \
+        --rpcPass "${BTCD_RPC_PASS}" \
+        --disableTLS=false \
+        --rpcCertFile "${BTCD_RPC_CERT_IN_CONTAINER}" \
+        --wif "${BTC_FUNDING_WIF}" \
+        --utxo "${utxo}" \
+        --depositAddress "${user}" \
+        --tssPubkey "${tss_pubkey}" \
+        --amount "${amount}" \
+        --fee 500)
+    assert_length "${deposit_tx}" 64 "btc deposit tx hash (binding scenario)"
+    mine_btcd_blocks 2
+    expected_xbtc=$(awk "BEGIN{printf \"%.8f\", ${before_xbtc} + ${amount}/100000000}")
+    wait_xbtc_balance_not_less_than "${user}" "${expected_xbtc}" 180
+    log_step "PASS: #78 binding usable end to end: user=${user} address=${address} btcTx=${deposit_tx} " \
+        "xbtc ${before_xbtc} -> >= ${expected_xbtc}"
+}
+
+# =====================================================================
+# 手工放弃提现（Abandon）：链上存证 -> 桥按本地白名单受理 -> TSS Unlock -> released
+# =====================================================================
+#
+# 契约：
+#   - 链上 Abandon（action 名 "Abandon"，字段 burnTxHash/owner/reason）只存证，不做授权判定；
+#     它只校验提案描述的是"真实且未终态的提现"（payload/台账/owner/终态键）；
+#   - 桥侧（只有官方节点跑 abandonWorker）用本地白名单 abandonOperators 决定是否受理；受理
+#     还要求 pending 未确认、owner 与台账一致、链上无终态、本节点从未产出付款签名；
+#   - 受理是单向的：先落盘 abandoning，再复用 Unlock 通道组签名退回锁定金额；
+#   - 受理后结算重试永久让位（settlementAllowed=false）；同一 burn 的 Confirm 被链上终态键拒绝。
+#
+# "不会被付款的提现"的构造：发票**不扣**手续费 → 桥每轮 BuildWithdrawal 后以 payout mismatch
+# 拒绝（可重试、但永远不签名不广播），pending 一直挂着。不用"BTC 主池余额不足"是因为它在本
+# harness 里不可稳定构造：充值会被扫集自动归集回主池，而 XBTC 余额又受 1:1 铸币上限约束。
+#
+# 位置：排在 fee-mismatch 负例之后。它自己那笔提现在本场景内被退回（余额复原），不会影响
+# 后续场景；后面唯一还会读 RGB20 余额的只有备份演练（它自己重新充值）。
+function scenario_rgbx_manual_abandon_withdraw() {
+    log_step "scenario: manual abandon (chain-33 proposal -> local whitelist -> TSS Unlock -> released)"
+    local operator="${ABANDON_OPERATOR_ADDR:-${AUTH_ADDR1}}"
+    local operator_key="${ABANDON_OPERATOR_KEY:-${AUTH_KEY1}}"
+    local amount="${RGB20_ABANDON_WITHDRAW_AMOUNT:-10000}"
+    local started_at
+    started_at=$(date +%s)
+
+    local before lock_addr lock_before sidecar_before
+    before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
+    lock_addr=$(query_rgb20_lock_address)
+    assert_non_empty "${lock_addr}" "cannot read the cross-chain lock address"
+    lock_before=$(query_rgb20_balance "${lock_addr}")
+    sidecar_before=$(query_rgb20_ledger_spendable)
+    assert_true "$(awk "BEGIN{print (${sidecar_before} >= ${amount})?\"true\":\"false\"}")" \
+        "rgb20 sidecar holdings too low for the abandon case: have=${sidecar_before}, need=${amount}"
+    local amount_decimal
+    amount_decimal=$(awk "BEGIN{printf \"%.8f\", ${amount}/100000000}")
+    assert_true "$(awk "BEGIN{print (${before} >= ${amount_decimal})?\"true\":\"false\"}")" \
+        "rgb20 user balance too low for the abandon case: have=${before}, need=${amount_decimal}"
+
+    # ---- 1. 发票不扣手续费：桥会每轮拒绝（可重试），永远不会签名/广播 ----
+    local user_invoice
+    user_invoice=$(curl -s -X POST http://127.0.0.1:50064/sim/user_invoice \
+        -H 'Content-Type: application/json' \
+        -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${amount}}" | jq -r '.invoice // empty')
+    assert_non_empty "${user_invoice}" "abandon case: user invoice empty"
+
+    # ---- 2. 链上提现（金额进入锁定地址）----
+    local withdraw_hash burn_hash burn_amount
+    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amount_decimal}" -f 20 -d "${user_invoice}" \
+        -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
+    assert_length "${withdraw_hash}" 66 "abandon case: withdraw tx hash"
+    burn_hash=$(normalize_tx_hash "${withdraw_hash}")
+    burn_amount=$(wait_pending_withdraw_amount "${USER_MAIN_ADDR}" "${withdraw_hash}")
+    assert_eq "${burn_amount}" "${amount}" "abandon case: chain33 burn amount"
+    assert_balance "$(query_rgb20_balance "${USER_MAIN_ADDR}")" \
+        "$(awk "BEGIN{printf \"%.8f\", ${before} - ${amount_decimal}}")" \
+        "abandon case: the amount must leave the user's balance when the withdraw locks it"
+    assert_balance "$(query_rgb20_balance "${lock_addr}")" \
+        "$(awk "BEGIN{printf \"%.8f\", ${lock_before} + ${amount_decimal}}")" \
+        "abandon case: the amount must arrive at the lock address"
+
+    # 桥已经在重试结算、并且拒绝点早于签名：payout mismatch 是"永不付款"的直接证据。
+    local i logs reason=""
+    for ((i = 0; i < 60; i++)); do
+        logs=$(para1_logs_since "${started_at}" | perl -pe 's/\e\[[0-9;]*m//g')
+        # 必须按本笔 burn 过滤：上一场景（fee-mismatch 负例）的 pending 也会一直刷同一条
+        # "withdraw payout mismatch"，只匹配文案会把别人的重试当成自己的证据。
+        reason=$(echo "${logs}" | grep "withdraw payout mismatch" | grep "${burn_hash}" | tail -1 || true)
+        [ -n "${reason}" ] && break
+        sleep 1
+    done
+    if [ -z "${reason}" ]; then
+        fail "abandon case: the bridge did not refuse the fee-less invoice (no 'withdraw payout mismatch'); para1 tail: $(para1_logs_since "${started_at}" | tail -5)"
+    fi
+    log_step "  the pending can never be paid: $(echo "${reason}" | head -c 300)"
+
+    # ---- 3. 非白名单提案：链上存证，但桥必须忽略（不发起 unlock）----
+    local nonwl_started_at nonwl_hash nonwl_bare nonwl_pos
+    nonwl_started_at=$(date +%s)
+    nonwl_hash=$(send_main_rgbx_action "Abandon" \
+        "{\"burnTxHash\":\"0x${burn_hash}\",\"owner\":\"${USER_MAIN_ADDR}\",\"reason\":\"e2e non-whitelist proposer\"}" \
+        "${GENESIS_KEY}")
+    nonwl_bare=$(normalize_tx_hash "${nonwl_hash}")
+    nonwl_pos=$(wait_main_tx_committed "${nonwl_bare}")
+    assert_eq "$(main_tx_receipt_ty "${nonwl_bare}")" "ExecOk" "non-whitelist Abandon receipt"
+    assert_non_empty "$(main_tx_receipt_log "${nonwl_bare}" "AbandonWithdrawLog")" \
+        "the non-whitelist proposal must still be recorded on chain (the chain only stores it)"
+    if ! main_logs_since "${nonwl_started_at}" | grep "Exec_Abandon recorded" | grep -q "${burn_hash}"; then
+        fail "the non-whitelist proposal was not recorded on chain (no Exec_Abandon recorded for ${burn_hash})"
+    fi
+
+    local rejected=""
+    for ((i = 0; i < 60; i++)); do
+        logs=$(para1_logs_since "${nonwl_started_at}" | perl -pe 's/\e\[[0-9;]*m//g')
+        rejected=$(echo "${logs}" | grep "abandon proposal rejected" | grep "${nonwl_bare}" | tail -1 || true)
+        [ -n "${rejected}" ] && break
+        sleep 1
+    done
+    if [ -z "${rejected}" ]; then
+        fail "the bridge did not reject the non-whitelist proposal ${nonwl_bare}; para1 tail: $(para1_logs_since "${nonwl_started_at}" | tail -5)"
+    fi
+    echo "${rejected}" | grep -q "not a configured abandon operator" ||
+        fail "the non-whitelist proposal was rejected for the wrong reason: ${rejected}"
+    if echo "${logs}" | grep "abandon proposal accepted" | grep -q "${burn_hash}"; then
+        fail "a non-whitelist proposal was accepted for ${burn_hash}"
+    fi
+    if main_logs_since "${nonwl_started_at}" | grep "Exec_Unlock released" | grep -q "${burn_hash}"; then
+        fail "a non-whitelist proposal triggered an on-chain unlock for ${burn_hash}"
+    fi
+    log_step "  non-whitelist proposer ignored: ${rejected}"
+
+    # ---- 4. 白名单提案：受理 -> abandoning 落盘 -> 组签名 Unlock ----
+    local wl_started_at wl_hash wl_bare wl_pos accept_at accepted=""
+    wl_started_at=$(date +%s)
+    wl_hash=$(send_main_rgbx_action "Abandon" \
+        "{\"burnTxHash\":\"0x${burn_hash}\",\"owner\":\"${USER_MAIN_ADDR}\",\"reason\":\"e2e operator abandonment\"}" \
+        "${operator_key}")
+    wl_bare=$(normalize_tx_hash "${wl_hash}")
+    wl_pos=$(wait_main_tx_committed "${wl_bare}")
+    assert_eq "$(main_tx_receipt_ty "${wl_bare}")" "ExecOk" "whitelisted Abandon receipt"
+
+    for ((i = 0; i < 90; i++)); do
+        logs=$(para1_logs_since "${wl_started_at}" | perl -pe 's/\e\[[0-9;]*m//g')
+        accepted=$(echo "${logs}" | grep "abandon proposal accepted" | grep "${burn_hash}" | tail -1 || true)
+        [ -n "${accepted}" ] && break
+        sleep 1
+    done
+    if [ -z "${accepted}" ]; then
+        fail "the whitelisted proposal was not accepted for ${burn_hash}; para1 tail: $(para1_logs_since "${wl_started_at}" | tail -8)"
+    fi
+    accept_at=$(date +%s)
+    echo "${accepted}" | grep -q "${operator}" ||
+        fail "acceptance log does not name the whitelisted proposer ${operator}: ${accepted}"
+    log_step "  accepted: ${accepted}"
+
+    # abandoning 落盘：受理日志只在 setWithdrawState 成功之后打印；再用 neutrino.db 里的
+    # 明文值做一次独立核对（受理失败会记 "cannot persist abandoning state" 并拒绝受理）。
+    if echo "${logs}" | grep -q "cannot persist abandoning state"; then
+        fail "the bridge refused the proposal because the abandoning state could not be persisted"
+    fi
+    local persisted
+    persisted=$(compose_cmd exec -T para1 sh -c \
+        "grep -a -c 'abandoning' /root/paradatadir/lightclient/neutrino.db 2>/dev/null || true" | tr -d '\r')
+    assert_true "$([ "${persisted:-0}" -ge 1 ] 2>/dev/null && echo true || echo false)" \
+        "the abandoning state is not persisted in para1's neutrino.db (got '${persisted}')"
+
+    # ---- 5. 链上终态 released（共识键，不是桥自报）+ 只解锁一次 ----
+    local final_state="" state_retries=180
+    for ((i = 0; i < state_retries; i++)); do
+        final_state=$(query_withdraw_final_state "${burn_hash}")
+        [ "${final_state}" = "released" ] && break
+        sleep 1
+    done
+    assert_eq "${final_state}" "released" \
+        "abandon case: on-chain terminal state must be released (TSS group signature + Exec_Unlock)"
+    local unlock_count
+    unlock_count=$(main_logs_since "${wl_started_at}" | perl -pe 's/\e\[[0-9;]*m//g' |
+        grep "Exec_Unlock released" | grep -c "${burn_hash}" || true)
+    assert_eq "${unlock_count}" "1" "abandon case: exactly one on-chain release expected for ${burn_hash}"
+
+    # ---- 6. 退款到账、锁定地址回退、无付款广播 ----
+    local refunded
+    refunded=$(wait_rgb20_balance_equal "${USER_MAIN_ADDR}" "${before}") ||
+        fail "abandon case: user balance did not return to ${before}, got ${refunded}"
+    assert_balance "$(query_rgb20_balance "${lock_addr}")" "${lock_before}" \
+        "abandon case: the lock address must drop back to its pre-withdraw balance"
+    if para1_logs_since "${started_at}" | grep "BroadcastTx rgb20 withdraw" | grep -q "${burn_hash}"; then
+        fail "abandon case: a payment was broadcast for ${burn_hash}, but abandonment must happen before any payment signature"
+    fi
+
+    # ---- 7. 受理后不得回到结算重试（唯一可观察的"单向状态"证据）----
+    # 受理时在途的一轮结算重试已经结束（两边共用 paymentMu）；之后 settlementAllowed=false，
+    # 不应再出现任何针对该 burn 的结算重试日志。
+    sleep 6
+    local retries_after
+    retries_after=$(para1_logs_since "$(( accept_at + 5 ))" | perl -pe 's/\e\[[0-9;]*m//g' |
+        grep "withdrawalProcessor rgb20 retry" | grep -c "${burn_hash}" || true)
+    assert_eq "${retries_after}" "0" \
+        "abandon case: settlement was retried ${retries_after} time(s) after acceptance for ${burn_hash}"
+
+    # ---- 8. 重复 Confirm 被链上终态键拒绝 ----
+    local details height index replay_started_at replay_out
+    details=$(${MAIN_CLI} tx query -s "${burn_hash}" 2>/dev/null || true)
+    height=$(echo "${details}" | jq -r '.height // 0' 2>/dev/null || echo 0)
+    index=$(echo "${details}" | jq -r '.index // 0' 2>/dev/null || echo 0)
+    if ! [[ "${height}" =~ ^[0-9]+$ ]] || [ "${height}" -le 0 ]; then
+        fail "abandon case: cannot locate burn ${burn_hash} on chain (tx query: $(echo "${details}" | head -c 200))"
+    fi
+    replay_started_at=$(date +%s)
+    set +e
+    replay_out=$(replay_confirm_bounded 106 "${height}" "${index}" "${burn_hash}" 30 2>&1)
+    set -e
+    echo "${replay_out}" | grep -q "withdraw already confirmed" ||
+        fail "abandon case: settling a released burn was not rejected with the terminal-state error. out=$(echo "${replay_out}" | head -c 300)"
+    if ! main_logs_since "${replay_started_at}" | perl -pe 's/\e\[[0-9;]*m//g' |
+        grep -q "checkWithdrawConfirm burn already used"; then
+        fail "abandon case: the main node did not run the terminal-state guard on the Confirm replay"
+    fi
+
+    log_step "PASS: manual abandon released on chain: burn=${burn_hash} proposer=${operator} " \
+        "balance ${before} -> ${refunded}, lock ${lock_before} -> ${lock_before}, no payment broadcast, Confirm rejected"
+}
+
+# =====================================================================
 # 入口（testcase.sh 调用）
 # =====================================================================
 
 function run_rgb20_all() {
     run_rgb20_env
+    # #78 紧跟 env：桥（官方节点）刚就绪、btcd 的 segwit 已激活，充值地址绑定 + 充值铸币
+    # 走的就是这条已就绪的 P2WSH 通道（不消耗 RGB20 流动性）。
+    scenario_rgbx_deposit_address_binding
     run_rgb20_sidecar_genesis_withdraw_probe
     scenario_rgb20_deposit
     # E16 紧跟充值场景：它复用那笔已 settle 的 consignment 与 receive（不额外消耗流动性），
@@ -1443,4 +1906,8 @@ function run_rgb20_all() {
     # 负例排在**最后**：它故意留下一笔永久 pending 并锁住用户的资产（见该场景的注释），
     # 不会（也不该）被后面的场景消化掉。
     scenario_rgb20_withdraw_fee_mismatch
+    # 手工放弃提现：自己新建一笔"永不付款"的 pending（发票不扣手续费），分别用非白名单/白名单
+    # 提案人验证受理判定，最后把它退回。排在 fee-mismatch 之后：它不再依赖用户余额（放弃是原额
+    # 退回），也不会消化别人那笔 pending（所有等待都按 tx hash 认领）。
+    scenario_rgbx_manual_abandon_withdraw
 }

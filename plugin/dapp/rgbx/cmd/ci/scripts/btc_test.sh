@@ -7,6 +7,9 @@
 P2WSH_DEPOSIT_TX=""
 P2WSH_DEPOSIT_ADDR=""
 
+# 已经等过"签名节点补齐 watch 集"的 userID（见 p2wsh_deposit_once 里的有界等待）。
+declare -A DEPOSIT_WATCH_SYNCED_USERS=()
+
 # p2wsh_deposit_once <amount_sats>：往该用户的 P2WSH 充值地址打一笔 BTC，并挖块确认。
 function p2wsh_deposit_once() {
     local amount_sats="$1"
@@ -31,6 +34,40 @@ function p2wsh_deposit_once() {
     deposit_addr=$(curl -sf "${bridge_deposit_url}?chain33Addr=${USER_MAIN_ADDR}" | jq -r '.data.address // empty') || true
     assert_non_empty "${deposit_addr}" \
         "deposit address empty from ${bridge_deposit_url} (is neutrino.depositAddressListen configured and reachable?)"
+
+    # 跨节点 watch 集传播（有界 best-effort 等待）：
+    #
+    # 扫集由官方节点发起，但**每个签名节点各自核对** PSBT 输入是不是"已登记的用户充值脚本"
+    # （IsUserDepositScript）。非官方节点不扫链，每 30s 才从侧车并集里补齐自己的 watch 集。
+    # 刚向桥领到（并 import）新地址就立刻充值、扫集 worker（3s 周期）又立刻开签时，签名节点
+    # 可能还不认识该脚本，于是以 "is not a registered user deposit script" 拒签；同一 PSBT
+    # 重试会复用同一个 CGGMP 会话名，超时轮次的残留消息把后续轮次打成 "state Init -> Failed"，
+    # 整条扫集路径会卡住（实测会把 scenario_user_deposit_sweep 一起拖失败）。
+    #
+    # 这里最多等 ~36s（拿到 para2-4 的 merge 日志即返回）。同一 userID 只会等待一次：后续充值
+    # 时签名节点必然已经持有该脚本；等待超时也照常继续（不改变原有行为，只多一次等待）。
+    if [ -z "${DEPOSIT_WATCH_SYNCED_USERS[${USER_MAIN_ADDR}]:-}" ]; then
+        local merge_started_at merge_all="" svc j
+        merge_started_at=$(date +%s)
+        for ((j = 0; j < 18; j++)); do
+            merge_all="true"
+            for svc in para2 para3 para4; do
+                if ! para_logs_since "${svc}" "${merge_started_at}" |
+                    grep -q "mergeRemoteDepositScripts merged remote deposit scripts"; then
+                    merge_all=""
+                    break
+                fi
+            done
+            [ -n "${merge_all}" ] && break
+            sleep 2
+        done
+        if [ -n "${merge_all}" ]; then
+            log_step "p2wsh deposit: signing nodes merged the deposit script registry (para2-4)"
+        else
+            log_step "p2wsh deposit: signing nodes did not report a registry merge within 36s; continuing (the script may already be known)"
+        fi
+        DEPOSIT_WATCH_SYNCED_USERS[${USER_MAIN_ADDR}]=1
+    fi
 
     local deposit_tx_hash
     deposit_tx_hash=$(compose_cmd exec -T main /root/chain33-cli rgbx btcDepositTx \
