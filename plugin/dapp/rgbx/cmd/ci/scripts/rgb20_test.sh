@@ -12,6 +12,44 @@ function query_rgb20_balance() {
     ${MAIN_CLI} asset balance -a "${addr}" --asset_exec=rgbx --asset_symbol=X"${RGB20_SYMBOL}" | jq -r '.balance // "0"'
 }
 
+# rgbx_query <funcName> <payload-json>: call a read-only rgbx query through the main node's
+# JSON-RPC (port 8801 is published on the host). The generic Chain33.Query entry dispatches on the
+# executor's Query_<funcName> methods, so no CLI subcommand is needed for observation helpers.
+function rgbx_query() {
+    local func_name="$1" payload="$2"
+    curl -s -X POST "http://127.0.0.1:8801" \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Chain33.Query\",\"params\":[{\"execer\":\"rgbx\",\"funcName\":\"${func_name}\",\"payload\":${payload}}]}"
+}
+
+# query_withdraw_final_state <burn tx hash>: "" (still locked) | "settled" | "released".
+# This reads the consensus-state terminal key, i.e. the same value both Confirm and Unlock write.
+function query_withdraw_final_state() {
+    local burn_hash="$1"
+    rgbx_query "GetWithdrawFinalState" "{\"data\":\"${burn_hash}\"}" | jq -r '.result.data // empty'
+}
+
+# query_rgb20_lock_address: the shared address that holds unsettled withdrawal amounts.
+function query_rgb20_lock_address() {
+    rgbx_query "GetCrossChainLockAddress" "{\"data\":\"${RGB20_SYMBOL}\"}" | jq -r '.result.data // empty'
+}
+
+# Wait until an address's balance equals want (numeric comparison: the CLI prints 4 decimals).
+function wait_rgb20_balance_equal() {
+    local addr="$1" want="$2" retries="${3:-120}"
+    local i balance
+    for ((i = 0; i < retries; i++)); do
+        balance=$(query_rgb20_balance "${addr}")
+        if awk -v a="${balance}" -v b="${want}" 'BEGIN{exit !(a == b)}'; then
+            echo "${balance}"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "${balance}"
+    return 1
+}
+
 function wait_rgb20_balance_not_less_than() {
     local addr="$1"
     local expected="$2"
@@ -843,6 +881,212 @@ function scenario_rgb20_withdraw_fee_mismatch() {
 }
 
 # =====================================================================
+# #70 unlock E2E: permanently rejected withdrawal -> TSS group signature -> on-chain release
+# =====================================================================
+#
+# Full chain under test: the bridge classifies a withdrawal as "retry can never succeed", the TSS
+# group signs the Unlock message, chain33 refunds the locked amount, the user's balance returns,
+# and the same burn can never be settled afterwards (the double-payment guard).
+#
+# How the permanent failure is constructed (deterministic, no source changes):
+#   1. create a user invoice against the current sidecar ledger (contract A1);
+#   2. rebuild the sidecar ledger and re-issue the asset (contract A2). The asset id is derived
+#      from the genesis seal's random blinding factor, so re-issuing always changes it;
+#   3. submit a withdraw using the A1 invoice. BuildWithdrawal parses the invoice, compares it
+#      with the ledger's contract (A2) and returns FailedPrecondition
+#      "invoice contract ... != asset contract ..." => classifyWithdrawSidecarError =>
+#      asset-contract-mismatch => handleUnrecoverableRgb20Withdraw => Unlock.
+#
+# The sidecar ledger is snapshotted and restored around this scenario: later scenarios expect
+# the original contract (and the backup drill would otherwise capture a ledger that no longer
+# matches the configured contracts.assetId). This scenario must therefore run BEFORE
+# scenario_rgb20_withdraw_fee_mismatch, which is the one that intentionally leaves a pending.
+function scenario_rgb20_unlock_after_permanent_rejection() {
+    log_step "scenario: permanently rejected withdrawal -> TSS unlock -> on-chain released -> refund (#70)"
+
+    local amount="${RGB20_UNLOCK_WITHDRAW_AMOUNT}"
+    local payout=$((amount - RGB20_WITHDRAW_FEE))
+    assert_true "$(awk "BEGIN{print (${RGB20_WITHDRAW_FEE} > 0)?\"true\":\"false\"}")" \
+        "this scenario needs a non-zero RGB20_WITHDRAW_FEE (the invoice must deduct it)"
+    assert_true "$(awk "BEGIN{print (${payout} > 0)?\"true\":\"false\"}")" \
+        "rgb20 unlock amount ${amount} does not cover the configured fee ${RGB20_WITHDRAW_FEE}"
+
+    local before amount_decimal lock_addr lock_before
+    before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
+    amount_decimal=$(awk "BEGIN{printf \"%.8f\", ${amount}/100000000}")
+    assert_true "$(awk "BEGIN{print (${before} >= ${amount_decimal})?\"true\":\"false\"}")" \
+        "rgb20 user balance too low for the unlock case: have=${before}, need=${amount_decimal}"
+    lock_addr=$(query_rgb20_lock_address)
+    assert_non_empty "${lock_addr}" \
+        "cannot read the cross-chain lock address (Query_GetCrossChainLockAddress)"
+    lock_before=$(query_rgb20_balance "${lock_addr}")
+    log_step "  pre-state: user=${before}, lockAddr=${lock_addr} locked=${lock_before}, " \
+        "withdraw=${amount} (payout=${payout})"
+
+    # 1. Invoice against the CURRENT contract (A1). It will name a contract the rebuilt ledger no
+    #    longer has.
+    local user_invoice old_asset_id
+    user_invoice=$(curl -s -X POST http://127.0.0.1:50064/sim/user_invoice \
+        -H 'Content-Type: application/json' \
+        -d "{\"asset_symbol\":\"${RGB20_SIDECAR_SYMBOL}\",\"amount\":${payout}}" | jq -r '.invoice // empty')
+    assert_non_empty "${user_invoice}" "rgb20 unlock user invoice empty"
+    old_asset_id="${RGB20_ASSET_ID}"
+    assert_non_empty "${old_asset_id}" \
+        "RGB20_ASSET_ID is empty; the mismatch this scenario constructs cannot be verified"
+
+    # 2. Snapshot the sidecar data dir (bind-mounted host dir: the data itself lives in a volume,
+    #    so docker cp into a stopped container would be shadowed by the volume mount).
+    local backup_dir
+    backup_dir=$(mktemp -d)
+    compose_cmd run --rm --no-deps -v "${backup_dir}":/backup rgb-sidecar \
+        sh -c 'tar -C /data -cf /backup/data.tar .' >/dev/null 2>&1 ||
+        fail "cannot snapshot the rgb-sidecar data dir"
+    assert_non_empty "$(ls -A "${backup_dir}" 2>/dev/null || true)" \
+        "rgb-sidecar data snapshot is empty"
+
+    # 3. Rebuild the ledger with a freshly issued asset (A2 != A1).
+    compose_cmd stop rgb-sidecar >/dev/null 2>&1 || true
+    compose_cmd run --rm --no-deps rgb-sidecar \
+        sh -c 'rm -rf /data/* /data/.[!.]* 2>/dev/null || true' >/dev/null 2>&1 || true
+    local issue_out new_asset_id
+    issue_out=$(compose_cmd run --rm --no-deps \
+        -e RGB_SIDECAR_TSS_PUBKEY="${RGB20_TSS_PUBKEY}" \
+        -e RGB_BITCOIND_RPC="${RGB20_BITCOIND_RPC}" \
+        -e RGB_BITCOIND_USER="${RGB20_BITCOIND_USER}" \
+        -e RGB_BITCOIND_PASS="${RGB20_BITCOIND_PASS}" \
+        -e RGB_BITCOIND_CERT="${RGB20_BITCOIND_CERT}" \
+        -e BTC_FUNDING_WIF="${BTC_FUNDING_WIF:-}" \
+        rgb-sidecar /sidecar/issue_usdt 2>&1)
+    echo "${issue_out}" | tail -10
+    echo "${issue_out}" | grep -q "ISSUE-DONE" || fail "unlock case: issue_usdt did not complete"
+    new_asset_id=$(echo "${issue_out}" | sed -n 's/^issued [^ ]* asset_id=\(.*\)$/\1/p' | head -1 | tr -d '\r')
+    assert_non_empty "${new_asset_id}" "unlock case: cannot read the re-issued asset id"
+    assert_true "$([ "${new_asset_id}" != "${old_asset_id}" ] && echo true || echo false)" \
+        "re-issuing produced the same asset id (${new_asset_id}); the invoice would NOT mismatch and the permanent-failure path would not run"
+    log_step "  sidecar ledger rebuilt: asset ${old_asset_id} -> ${new_asset_id}"
+    compose_cmd up -d rgb-sidecar >/dev/null
+    wait_rgb20_sidecar_grpc
+
+    # 4. Submit the withdraw paying the A1 invoice.
+    local started_at withdraw_hash burn_hash burn_amount
+    started_at=$(date +%s)
+    withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amount_decimal}" -f 20 -d "${user_invoice}" \
+        -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
+    assert_length "${withdraw_hash}" 66 "rgb20 unlock withdraw tx hash"
+    # The CLI prints "0x"-prefixed hashes; the node logs (hex.EncodeToString) and the query payload
+    # use the bare 64-hex form. Normalise once so every comparison uses the same spelling.
+    burn_hash=$(echo "${withdraw_hash}" | tr 'A-Z' 'a-z' | sed 's/^0x//')
+    burn_amount=$(wait_pending_withdraw_amount "${USER_MAIN_ADDR}" "${withdraw_hash}")
+    assert_eq "${burn_amount}" "${amount}" "chain33 burn amount (unlock case)"
+
+    # The withdraw already moved the amount into the shared lock address.
+    assert_balance "$(query_rgb20_balance "${USER_MAIN_ADDR}")" \
+        "$(awk "BEGIN{printf \"%.8f\", ${before} - ${amount_decimal}}")" \
+        "unlock case: the amount must leave the user's balance when the withdraw locks it"
+    assert_balance "$(query_rgb20_balance "${lock_addr}")" \
+        "$(awk "BEGIN{printf \"%.8f\", ${lock_before} + ${amount_decimal}}")" \
+        "unlock case: the amount must arrive at the lock address"
+
+    # 5. The bridge must classify it as unrecoverable and request the unlock (before any payment
+    #    signature exists). The sidecar is restarted at this point, so allow time for the bridge's
+    #    gRPC connection to come back and for the 10s pending poll.
+    # Strip ANSI colour codes: logrus colours field names, so "class=..." would otherwise be seen
+    # as "class<ESC>[0m=..." and never match.
+    local i logs reason=""
+    for ((i = 0; i < 150; i++)); do
+        logs=$(para1_logs_since "${started_at}" | perl -pe 's/\e\[[0-9;]*m//g')
+        if echo "${logs}" | grep -F "requesting unlock (refund)" | grep -q "${burn_hash}"; then
+            reason=$(echo "${logs}" | grep -F "requesting unlock (refund)" | grep -m1 "${burn_hash}")
+            break
+        fi
+        sleep 1
+    done
+    if [ -z "${reason}" ]; then
+        fail "rgb20 unlock: the bridge did not request an unlock for ${burn_hash}. para1 log tail: $(para1_logs_since "${started_at}" | tail -5)"
+    fi
+    echo "${reason}" | grep -q "class=asset-contract-mismatch" ||
+        fail "rgb20 unlock: expected class=asset-contract-mismatch, got: ${reason}"
+    log_step "  bridge requested unlock: ${reason}"
+
+    # 6. On-chain terminal state: released (consensus key, not a bridge self-report).
+    local final_state="" state_retries=180
+    for ((i = 0; i < state_retries; i++)); do
+        final_state=$(query_withdraw_final_state "${burn_hash}")
+        [ "${final_state}" = "released" ] && break
+        sleep 1
+    done
+    assert_eq "${final_state}" "released" \
+        "rgb20 unlock: on-chain terminal state must be released (TSS group signature + Exec_Unlock)"
+
+    # 7. Refund reached the user and the lock address gave the amount back.
+    local refunded
+    refunded=$(wait_rgb20_balance_equal "${USER_MAIN_ADDR}" "${before}") ||
+        fail "rgb20 unlock: user balance did not return to pre-withdraw ${before}, got ${refunded}"
+    assert_balance "$(query_rgb20_balance "${lock_addr}")" "${lock_before}" \
+        "rgb20 unlock: the lock address must drop back to its pre-withdraw balance"
+    log_step "  refunded: user=${refunded} (pre-withdraw ${before}), locked=${lock_before}"
+
+    # 8. The same burn can never be settled now: Confirm is rejected by the terminal-state key.
+    #    The CLI exits 0 even when CheckTx rejects (see scenario_duplicate_confirm_rejected), so
+    #    the assertions are on its output and on the node's own diagnostic.
+    local details height index replay_started_at replay_out replay_rc
+    details=$(${MAIN_CLI} tx query -s "${burn_hash}" 2>/dev/null || true)
+    height=$(echo "${details}" | jq -r '.height // 0' 2>/dev/null || echo 0)
+    index=$(echo "${details}" | jq -r '.index // 0' 2>/dev/null || echo 0)
+    if ! [[ "${height}" =~ ^[0-9]+$ ]] || [ "${height}" -le 0 ]; then
+        fail "rgb20 unlock: cannot locate burn ${burn_hash} on chain (tx query: $(echo "${details}" | head -c 200))"
+    fi
+    replay_started_at=$(date +%s)
+    set +e
+    replay_out=$(replay_confirm_bounded 106 "${height}" "${index}" "${burn_hash}" 30 2>&1)
+    replay_rc=$?
+    set -e
+    log_step "  replay confirm after release: rc=${replay_rc} (diagnostic only), out=$(echo "${replay_out}" | head -c 300)"
+    echo "${replay_out}" | grep -q "withdraw already confirmed" ||
+        fail "rgb20 unlock: settling a released burn was not rejected with the terminal-state error. out=$(echo "${replay_out}" | head -c 300)"
+    logs=$(main_logs_since "${replay_started_at}" | perl -pe 's/\e\[[0-9;]*m//g')
+    echo "${logs}" | grep -q "checkWithdrawConfirm burn already used" ||
+        fail "rgb20 unlock: main node did not run the terminal-state guard on the Confirm replay"
+
+    # 9. Exactly one unlock, no duplicate signing/retry of the same burn, and no payment broadcast.
+    local unlock_count request_count retry_count
+    unlock_count=$(main_logs_since "${started_at}" | perl -pe 's/\e\[[0-9;]*m//g' |
+        grep "Exec_Unlock released" | grep -c "${burn_hash}" || true)
+    assert_eq "${unlock_count}" "1" \
+        "rgb20 unlock: exactly one on-chain release expected for ${burn_hash}"
+    logs=$(para1_logs_since "${started_at}" | perl -pe 's/\e\[[0-9;]*m//g')
+    request_count=$(echo "${logs}" | grep -F "requesting unlock (refund)" | grep -c "${burn_hash}" || true)
+    assert_eq "${request_count}" "1" \
+        "rgb20 unlock: exactly one unlock request expected for ${burn_hash}"
+    retry_count=$(echo "${logs}" | grep -c -e "unlock failed, will retry.*${burn_hash}" \
+        -e "withdrawalProcessor retry unlock.*${burn_hash}" || true)
+    assert_eq "${retry_count}" "0" \
+        "rgb20 unlock: unlock was retried ${retry_count} time(s) for ${burn_hash} (duplicate signing/submission)"
+    if echo "${logs}" | grep "BroadcastTx rgb20 withdraw" | grep -q "${burn_hash}"; then
+        fail "rgb20 unlock: a payment was broadcast for ${burn_hash}, but unlock must only happen before any payment signature"
+    fi
+
+    # 10. Restore the original sidecar ledger so later scenarios (and the backup drill) see the
+    #     contract configured in contracts.assetId.
+    compose_cmd stop rgb-sidecar >/dev/null 2>&1 || true
+    compose_cmd run --rm --no-deps -v "${backup_dir}":/backup rgb-sidecar \
+        sh -c 'rm -rf /data/* /data/.[!.]* 2>/dev/null || true; tar -C /data -xf /backup/data.tar' \
+        >/dev/null 2>&1 || fail "rgb20 unlock: cannot restore the rgb-sidecar data dir"
+    compose_cmd up -d rgb-sidecar >/dev/null
+    wait_rgb20_sidecar_grpc
+    rm -rf "${backup_dir}"
+    # The ledger's asset map is keyed by asset id, so look the entry up by its symbol field.
+    local restored_id
+    restored_id=$(rgb20_ledger_json |
+        jq -r --arg s "${RGB20_SIDECAR_SYMBOL}" '[.assets[]? | select(.symbol == $s) | .asset_id] | first // empty')
+    assert_eq "${restored_id}" "${old_asset_id}" \
+        "rgb20 unlock: sidecar ledger restore did not bring back the original contract"
+    log_step "  sidecar ledger restored: asset=${restored_id}"
+
+    log_step "PASS: #70 permanently rejected withdraw released on chain (burn=${burn_hash}), balance ${before} -> ${refunded}, lock ${lock_before} -> ${lock_before}, Confirm rejected"
+}
+
+# =====================================================================
 # Go↔Rust 互操作 smoke（compose 内暴露的侧车 50061）
 # =====================================================================
 
@@ -1166,6 +1410,10 @@ function run_rgb20_all() {
     scenario_rgb20_two_withdrawals
     scenario_rgb20_truncation_withdraw
     run_rgb20_sidecar_smoke
+    # #70 unlock: rebuilds the sidecar ledger (then restores it) to construct a permanently
+    # rejected withdrawal. It must run before the fee-mismatch case: that case intentionally
+    # leaves a pending, and a ledger swap while it exists would turn it into a second unlock.
+    scenario_rgb20_unlock_after_permanent_rejection
     # 负例排在**最后**：它故意留下一笔永久 pending 并锁住用户的资产（见该场景的注释），
     # 不会（也不该）被后面的场景消化掉。
     scenario_rgb20_withdraw_fee_mismatch

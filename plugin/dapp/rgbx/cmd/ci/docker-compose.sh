@@ -176,6 +176,10 @@ RGB20_TRUNCATION_WITHDRAW_AMOUNT="${RGB20_TRUNCATION_WITHDRAW_AMOUNT:-60000}"
 # 取小值是因为它排在最后、且会永久锁住这笔资产（前序场景已 burn 掉 960000/1000000，
 # 用户余额还剩 40000），同时仍要够大以覆盖手续费、让应发额为正。
 RGB20_FEE_MISMATCH_WITHDRAW_AMOUNT="${RGB20_FEE_MISMATCH_WITHDRAW_AMOUNT:-20000}"
+# #70 unlock E2E: the withdrawal is locked briefly and then refunded by Unlock, so it does not
+# consume the user's balance. It runs before the fee-mismatch case (which needs 20000 of the
+# 40000 left after the earlier withdrawals), hence the small value.
+RGB20_UNLOCK_WITHDRAW_AMOUNT="${RGB20_UNLOCK_WITHDRAW_AMOUNT:-10000}"
 BTC_WITHDRAW_FEE_RATE="${BTC_WITHDRAW_FEE_RATE:-20}"
 XBTC_TRANSFER_AMOUNT="${XBTC_TRANSFER_AMOUNT:-500000}"
 
