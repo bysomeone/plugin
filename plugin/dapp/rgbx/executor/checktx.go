@@ -652,7 +652,12 @@ func (r *rgbx) checkDeposit(txHash string, deposit *rtypes.DepositAsset) error {
 		}
 	}
 	// B8：链上最小确认数（放最后，理由见 checkBtcConfirmations 的注释）。
-	return r.checkBtcConfirmations("deposit", txHash, deposit.GetTxProof())
+	// 大额充值按治理配置要求更深的确认数（链上可执行；提现侧没有对应项）。
+	extra, err := r.depositExtraConfirmations(deposit)
+	if err != nil {
+		return err
+	}
+	return r.checkBtcConfirmations("deposit", txHash, deposit.GetTxProof(), extra)
 }
 
 func (r *rgbx) checkConfirm(fromAddr, txHash string, confirm *rtypes.ConfirmTx) error {
