@@ -187,8 +187,8 @@ func (r *rgbx) checkBridgeConfigApply(apply *rtypes.BridgeConfigApply) error {
 		return ErrInvalidBridgeConfig
 	}
 	if apply.GetMaxPerTx() < 0 || apply.GetMaxPerWindow1H() < 0 || apply.GetMaxPerWindow24H() < 0 ||
-		apply.GetMaxMintPerWindow() < 0 || apply.GetLargeWithdrawThreshold() < 0 ||
-		apply.GetLargeWithdrawDelayBlocks() < 0 {
+		apply.GetMaxMintPerWindow() < 0 || apply.GetLargeDepositThreshold() < 0 ||
+		apply.GetLargeDepositExtraConfirmations() < 0 {
 		elog.Error("checkBridgeConfigApply negative limit", "symbol", apply.GetAssetSymbol())
 		return ErrInvalidBridgeConfig
 	}
@@ -461,6 +461,30 @@ func (r *rgbx) checkDepositPaused(deposit *rtypes.DepositAsset) error {
 		return ErrBridgeDepositPaused
 	}
 	return nil
+}
+
+// depositExtraConfirmations returns the extra BTC confirmations a large deposit must wait
+// for on top of the base count. 0 means the base count is enough.
+//
+// This delay lives on the deposit side on purpose: minting is a consensus action, so the
+// chain can enforce it. A withdrawal delay would have to be honoured by the bridge before it
+// signs, which the chain cannot verify, so there is deliberately no withdrawal counterpart.
+func (r *rgbx) depositExtraConfirmations(deposit *rtypes.DepositAsset) (int64, error) {
+	symbol := formatSymbol(deposit.GetAssetSymbol())
+	if symbol == "" {
+		return 0, nil
+	}
+	cfg, err := r.loadBridgeConfig(symbol)
+	if err != nil {
+		return 0, err
+	}
+	if cfg == nil || cfg.GetLargeDepositExtraConfirmations() <= 0 {
+		return 0, nil
+	}
+	if cfg.GetLargeDepositThreshold() <= 0 || deposit.GetAmount() < cfg.GetLargeDepositThreshold() {
+		return 0, nil
+	}
+	return cfg.GetLargeDepositExtraConfirmations(), nil
 }
 
 // checkDepositMintLimit enforces maxMintPerWindow for the asset.

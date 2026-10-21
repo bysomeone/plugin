@@ -27,7 +27,10 @@ message RgbxAction {
 // 通过后由 bridgeConfigApprove 生效。执行器不明白名单，也不认单个地址。
 //
 // assetSymbol 为空表示全局配置：只允许 limitsEnabled / pauseDeposit / pauseWithdraw /
-// largeWithdraw* 生效，数值型上限必须为 0；非空表示该资产的数值上限。
+// largeDeposit* 生效，数值型上限必须为 0；非空表示该资产的数值上限。
+//
+// 大额提现的延迟只能由桥执行（付款在链下），链上无法验证，因此这里只保留充值侧
+// 可控的旋钮：大额充值要求更深的 BTC 确认数。
 message bridgeConfigApply {
     string assetSymbol = 1;
     // 总开关：关闭时不做任何数值上限检查（暂停开关仍独立生效）。
@@ -37,8 +40,9 @@ message bridgeConfigApply {
     int64  maxPerWindow1h        = 4;
     int64  maxPerWindow24h       = 5;
     int64  maxMintPerWindow      = 6;
-    int64  largeWithdrawThreshold = 7;
-    int64  largeWithdrawDelayBlocks = 8;
+    // 大额充值：金额达到阈值后，额外要求这么多 BTC 确认（在基础确认数之上）。
+    int64  largeDepositThreshold          = 7;
+    int64  largeDepositExtraConfirmations = 8;
     // 紧急制动，按方向独立；只能由治理流程改变。
     bool   pauseDeposit  = 9;
     bool   pauseWithdraw = 10;

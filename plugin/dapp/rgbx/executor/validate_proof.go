@@ -118,7 +118,7 @@ func (r *rgbx) checkWithdrawConfirm(txHash, confirmHash string, confirm *rtypes.
 		return err
 	}
 	// B8：链上最小确认数（放最后，理由见 checkBtcConfirmations 的注释）。
-	return r.checkBtcConfirmations("withdrawConfirm", txHash, confirm.GetBtcTxProof())
+	return r.checkBtcConfirmations("withdrawConfirm", txHash, confirm.GetBtcTxProof(), 0)
 }
 
 // deriveDepositPkScript 按冻结规格确定性重建"该用户在本 symbol 下的 P2WSH program"。
@@ -384,12 +384,15 @@ func btcConfirmations(tipHeight, proofHeight uint64) uint64 {
 //
 // fail-closed：查询不到 canonical tip（lightclient 不可用、头链为空）时同样拒绝 ——
 // 确定不了深度就不能默认深度足够。
-func (r *rgbx) checkBtcConfirmations(action, txHash string, proof *rtypes.BtcTxProof) error {
+func (r *rgbx) checkBtcConfirmations(action, txHash string, proof *rtypes.BtcTxProof, extra int64) error {
 	required := rgbxCfg.MinBtcConfirmations
 	if required <= 0 {
 		// 防御性兜底：initCfg 保证 > 0（<= 0 取默认值）；此处覆盖绕过 Init 直接构造的调用方。
 		required = defaultMinBtcConfirmations
 	}
+	// Large deposits may require a deeper confirmation depth (governed config). The extra
+	// applies only to deposits; withdrawals pass 0.
+	required += extra
 	height := proof.GetBlockHeight()
 
 	tip, err := r.getBtcCanonicalTip()

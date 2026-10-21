@@ -431,3 +431,32 @@ func TestBridgeConfig_ActionDispatch(t *testing.T) {
 	require.NoError(t, err)
 	require.ErrorIs(t, r.CheckTx(badApprove, 0), ErrInvalidBridgeConfig)
 }
+
+// TestBridgeConfig_DepositExtraConfirmations pins the large-deposit confirmation rule: the
+// extra depth applies only at or above the configured threshold, only to that asset, and
+// nothing changes when no config exists.
+func TestBridgeConfig_DepositExtraConfirmations(t *testing.T) {
+	r, state, _ := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+
+	extra, err := r.depositExtraConfirmations(&rtypes.DepositAsset{AssetSymbol: "BTC", Amount: 1_000_000})
+	require.NoError(t, err)
+	require.Zero(t, extra, "no config means no extra wait")
+
+	setBridgeConfigForTest(t, state, formatSymbol("BTC"), &rtypes.BridgeConfigApply{
+		AssetSymbol:                    "BTC",
+		LargeDepositThreshold:          1_000_000,
+		LargeDepositExtraConfirmations: 12,
+	})
+
+	below, err := r.depositExtraConfirmations(&rtypes.DepositAsset{AssetSymbol: "BTC", Amount: 999_999})
+	require.NoError(t, err)
+	require.Zero(t, below, "below the threshold uses the base confirmation count")
+
+	at, err := r.depositExtraConfirmations(&rtypes.DepositAsset{AssetSymbol: "BTC", Amount: 1_000_000})
+	require.NoError(t, err)
+	require.Equal(t, int64(12), at, "at the threshold the extra depth applies")
+
+	other, err := r.depositExtraConfirmations(&rtypes.DepositAsset{AssetSymbol: "RGB20_USDT", Amount: 1_000_000})
+	require.NoError(t, err)
+	require.Zero(t, other, "a different asset is unaffected")
+}
