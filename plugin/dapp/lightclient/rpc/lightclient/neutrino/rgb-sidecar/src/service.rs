@@ -171,8 +171,11 @@ impl RgbSidecar for RgbSidecarService {
     ) -> Result<Response<ConsignmentValidation>, Status> {
         let req = request.into_inner();
         let mut engine = self.engine.lock().await;
+        // 0 means "not provided" on the wire; when the bridge does provide it, the recipient is
+        // matched against this exact amount so a historical bundle cannot answer for the delivery.
+        let expected_amount = (req.expected_amount > 0).then_some(req.expected_amount);
         let insp: ConsignmentInspection = engine
-            .validate_consignment(&req.consignment)
+            .validate_consignment(&req.consignment, expected_amount)
             .map_err(err)?;
         let synced_height = engine.synced_height();
         let resp = ConsignmentValidation {

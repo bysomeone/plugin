@@ -23,7 +23,7 @@ use rgbcore::validation::{
 };
 use rgbcore::vm::WitnessOrd;
 use rgbcore::{ChainNet, ContractId, Opout, TxoSeal, Txid};
-use rgbstd::containers::{Consignment, ConsignmentExt, Fascia, ValidContract};
+use rgbstd::containers::{Consignment, ConsignmentExt, Fascia, ValidContract, WitnessBundle};
 use rgbstd::contract::{AllocatedState, ContractBuilder, ContractData, IssuerWrapper, TransitionBuilder};
 use rgbstd::invoice::Amount;
 use rgbstd::persistence::{ContractStateRead, MemContract, Stock};
@@ -1050,10 +1050,18 @@ impl RgbEngine {
     // ===================================================================
 
     /// Deterministic consignment validation (no wallet / private-key state).
-    pub fn validate_consignment(&mut self, bytes: &[u8]) -> Result<ConsignmentInspection> {
+    ///
+    /// `expected_amount` is the amount the caller is settling (the bridge's
+    /// `ValidateConsignmentRequest::expected_amount`); when given, an opened seal carrying exactly
+    /// that amount is preferred — see [`Self::inspect_opened_seals`].
+    pub fn validate_consignment(
+        &mut self,
+        bytes: &[u8],
+        expected_amount: Option<i64>,
+    ) -> Result<ConsignmentInspection> {
         let consignment = consignment_from_bytes(bytes)?;
         let config = self.validation_config();
-        let mut inspection = self.inspect(&consignment);
+        let mut inspection = self.inspect(&consignment, expected_amount);
         match consignment.validate(&self.resolver, &config) {
             Ok(_) => inspection.valid = true,
             Err(e) => {
@@ -1074,7 +1082,21 @@ impl RgbEngine {
     ) -> Result<ReceiveRec> {
         let consignment = consignment_from_bytes(bytes)?;
         let config = self.validation_config();
-        let inspection = self.inspect(&consignment);
+
+        // The hint is resolved *before* the inspection: it names the receive this consignment is
+        // meant to settle, and its `amount_requested` is what tells the inspection which opened
+        // seal is the delivery rather than a recipient output of the history it carries (#77).
+        let hinted = match receive_id_hint {
+            None => None,
+            Some(h) => Some(
+                self.ledger
+                    .receive(h)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("receive_id_hint names unknown receive {h}"))?,
+            ),
+        };
+
+        let inspection = self.inspect(&consignment, hinted.as_ref().map(|r| r.amount_requested));
         let valid = consignment
             .clone()
             .validate(&self.resolver, &config)
@@ -1094,16 +1116,6 @@ impl RgbEngine {
         // would misattribute the consignment instead of rejecting it).
         let corresponds = |r: &ReceiveRec| {
             r.asset_id == inspection.asset_id && r.amount_requested == inspection.recipient_amount
-        };
-
-        let hinted = match receive_id_hint {
-            None => None,
-            Some(h) => Some(
-                self.ledger
-                    .receive(h)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("receive_id_hint names unknown receive {h}"))?,
-            ),
         };
 
         // Idempotent re-settle: the Go bridge uploads the consignment AFTER the test-sim already
@@ -1210,11 +1222,19 @@ impl RgbEngine {
     }
 
     /// Extract the structural inspection of a consignment (no consensus check).
-    fn inspect(&self, consignment: &Consignment<true>) -> ConsignmentInspection {
+    ///
+    /// `expected_amount` is the amount the caller expects this consignment to deliver, when it
+    /// knows one (see [`Self::inspect_opened_seals`]).
+    fn inspect(
+        &self,
+        consignment: &Consignment<true>,
+        expected_amount: Option<i64>,
+    ) -> ConsignmentInspection {
         let asset_id = consignment.contract_id().to_string();
         let schema_id = consignment.schema_id().to_string();
         let closed_seals = self.resolve_closed_seals(consignment);
-        let (opened, recipient, recipient_amount) = self.inspect_opened_seals(consignment);
+        let (opened, recipient, recipient_amount) =
+            self.inspect_opened_seals(consignment, expected_amount);
         ConsignmentInspection {
             asset_id,
             schema_id,
@@ -1958,16 +1978,51 @@ impl RgbEngine {
         self.rpc.get_transaction(wtxid).ok().flatten()
     }
 
-    /// Inspect opened seals; find the recipient (opened seal at the TSS script).
+    /// Inspect opened seals and identify the recipient: the opened seal at the TSS script that
+    /// belongs to the transition this consignment **delivers**.
+    ///
+    /// A transfer consignment carries the whole ancestry of its transition back to genesis, so a
+    /// second deposit into the same contract also carries the first deposit's transition — whose
+    /// recipient output pays the very same TSS script. Scanning *all* bundles and taking the first
+    /// match therefore picked the history: the first deposit's amount was reported as the second
+    /// deposit's amount, and `provide_consignment` rejected the second delivery (#77).
+    ///
+    /// The delivered transition can only be in the **last bundle**:
+    ///
+    /// * `Consignment::validate` (§ single-use-seal pass) consumes every transition input from the
+    ///   state built by the transitions processed before it, and fails with `NoPrevState` if the
+    ///   input is not there yet (`rgb-consensus` 0.11.1-rc.11, `validation/validator.rs`,
+    ///   `validate_bundles`/`validate_transition`). A valid consignment's bundle order is therefore
+    ///   topological: ancestors strictly before descendants.
+    /// * The consigning side builds a transfer with `Stock::transfer_from_fascia`, whose
+    ///   `consign_bundles` collects exactly the ancestors of the requested transition and then
+    ///   sorts them topologically (`sort_bundles`). That transition is the DAG's only maximal
+    ///   element, so it lands in the last bundle. This is also what the sidecar's own payer-side
+    ///   builder (`build_transfer`) produces.
+    ///
+    /// When `expected_amount` is known (a hinted receive, or the bridge's own expected amount), an
+    /// opened seal carrying exactly that amount is preferred, so history can never answer for the
+    /// delivery even if a consignment were to end in a bundle unrelated to it. If no seal in the
+    /// last bundle carries that amount, the first TSS-script seal there is reported instead: on a
+    /// **withdrawal** consignment the TSS output is the change output (`input - withdrawn`), which
+    /// can never equal the expected withdrawal amount, and the bridge reads this amount as "the
+    /// consignment covers the withdrawal" (`rgb20/sidecar_live_test.go`).
+    ///
+    /// Without `expected_amount`, only the last bundle is considered; a consignment that opens no
+    /// seal there is reported as having no recipient rather than silently falling back to a
+    /// historical one.
     fn inspect_opened_seals(
         &self,
         consignment: &Consignment<true>,
+        expected_amount: Option<i64>,
     ) -> (Vec<OpenedSealInfo>, Option<String>, i64) {
         let asset_id = consignment.contract_id().to_string();
         let mut opened = Vec::new();
-        let mut recipient: Option<String> = None;
-        let mut recipient_amount = 0i64;
-        for bundle in consignment.bundled_witnesses() {
+        // Reporting covers the whole consignment (history included): the bridge cross-checks these
+        // outpoints against its own anchor tx and the withdrawal coverage computation filters them
+        // by txid, so dropping historical entries would hide spend evidence it relies on.
+        let bundles = consignment.bundled_witnesses().collect::<Vec<_>>();
+        for bundle in &bundles {
             let wtxid = bundle.witness_id();
             for kt in bundle.bundle().known_transitions.iter() {
                 for assigns in kt.transition.assignments.values() {
@@ -1975,33 +2030,69 @@ impl RgbEngine {
                         if let Some(seal) = a.revealed_seal() {
                             let vout = seal.vout();
                             let amount: Amount = (*a.as_revealed_state()).into();
-                            let outpoint = format!("{wtxid}:{vout}");
                             opened.push(OpenedSealInfo {
-                                outpoint: outpoint.clone(),
+                                outpoint: format!("{wtxid}:{vout}"),
                                 amount: amount.value() as i64,
                                 asset_id: asset_id.clone(),
                             });
-                            if recipient.is_none() {
-                                // Resolve through the local anchor cache as well: for a withdrawal
-                                // the anchor is still unbroadcast here, and resolving it only from
-                                // btcd left `recipient_amount` at 0 — the bridge then rejected the
-                                // withdrawal with "consignment=0 expected=…" whenever the bridge
-                                // holds nothing but the genesis seal (no earlier mined anchor).
-                                if let Some(tx) = self.witness_tx(&wtxid) {
-                                    if let Some(o) = tx.output.get(vout.to_u32() as usize) {
-                                        if o.script_pubkey == self.tss_script {
-                                            recipient = Some(outpoint);
-                                            recipient_amount = amount.value() as i64;
-                                        }
-                                    }
-                                }
-                            }
                         }
                     }
                 }
             }
         }
+
+        let mut recipient: Option<String> = None;
+        let mut recipient_amount = 0i64;
+        if let Some(bundle) = bundles.last() {
+            let delivery = expected_amount
+                .and_then(|expected| {
+                    self.tss_receipt_in_bundle(bundle, |amount| amount == expected)
+                })
+                .or_else(|| self.tss_receipt_in_bundle(bundle, |_| true));
+            if let Some((outpoint, amount)) = delivery {
+                recipient = Some(outpoint);
+                recipient_amount = amount;
+            }
+        }
         (opened, recipient, recipient_amount)
+    }
+
+    /// The first opened assignment in `bundle` that pays the TSS script and whose fungible amount
+    /// satisfies `accept`, as `(outpoint, amount)`.
+    ///
+    /// The witness transaction is resolved through the local anchor cache as well: for a withdrawal
+    /// the anchor is still unbroadcast here, and resolving it only from btcd left
+    /// `recipient_amount` at 0 — the bridge then rejected the withdrawal with
+    /// "consignment=0 expected=…" whenever the bridge holds nothing but the genesis seal (no
+    /// earlier mined anchor).
+    fn tss_receipt_in_bundle(
+        &self,
+        bundle: &WitnessBundle,
+        accept: impl Fn(i64) -> bool,
+    ) -> Option<(String, i64)> {
+        let wtxid = bundle.witness_id();
+        let tx = self.witness_tx(&wtxid)?;
+        for kt in bundle.bundle().known_transitions.iter() {
+            for assigns in kt.transition.assignments.values() {
+                for a in assigns.as_fungible() {
+                    let Some(seal) = a.revealed_seal() else {
+                        continue;
+                    };
+                    let amount: Amount = (*a.as_revealed_state()).into();
+                    let amount = amount.value() as i64;
+                    if !accept(amount) {
+                        continue;
+                    }
+                    let vout = seal.vout();
+                    if let Some(o) = tx.output.get(vout.to_u32() as usize) {
+                        if o.script_pubkey == self.tss_script {
+                            return Some((format!("{wtxid}:{vout}"), amount));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
