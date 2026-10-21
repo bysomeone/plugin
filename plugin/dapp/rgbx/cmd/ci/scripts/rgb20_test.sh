@@ -12,6 +12,20 @@ function query_rgb20_balance() {
     ${MAIN_CLI} asset balance -a "${addr}" --asset_exec=rgbx --asset_symbol=X"${RGB20_SYMBOL}" | jq -r '.balance // "0"'
 }
 
+# Raw balance in min units (the exact integer from consensus state).
+#
+# `asset balance` formats through types.FormatAmount2FloatDisplay, which truncates anything
+# beyond ShowPrecisionNum (4) decimals. An amount like 64000 min units (0.00064) therefore
+# prints as 0.0006, so a display-based `>=` check can never reach an 8-decimal expectation.
+# Compare min units whenever the expected amount is not representable in 4 decimals.
+function query_rgb20_balance_units() {
+    local addr="$1"
+    curl -s -X POST "http://127.0.0.1:8801" \
+        -H 'Content-Type: application/json' \
+        -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"Chain33.GetBalance\",\"params\":[{\"addresses\":[\"${addr}\"],\"execer\":\"rgbx\",\"asset_exec\":\"rgbx\",\"asset_symbol\":\"X${RGB20_SYMBOL}\"}]}" |
+        jq -r '.result[0].balance // "0"'
+}
+
 # rgbx_query <funcName> <payload-json>: call a read-only rgbx query through the main node's
 # JSON-RPC (port 8801 is published on the host). The generic Chain33.Query entry dispatches on the
 # executor's Query_<funcName> methods, so no CLI subcommand is needed for observation helpers.
@@ -50,16 +64,17 @@ function wait_rgb20_balance_equal() {
     return 1
 }
 
+# Wait until an address holds at least expected_units min units (compared in raw units).
 function wait_rgb20_balance_not_less_than() {
     local addr="$1"
-    local expected="$2"
+    local expected_units="$2"
     local retries="${3:-60}"
     local i
     for ((i = 0; i < retries; i++)); do
-        local balance
-        balance=$(query_rgb20_balance "${addr}")
-        if awk "BEGIN{exit !(${balance} >= ${expected})}"; then
-            log_step "rgb20 balance reached: addr=${addr}, balance=${balance} >= ${expected}"
+        local balance_units
+        balance_units=$(query_rgb20_balance_units "${addr}")
+        if [ "${balance_units:-0}" -ge "${expected_units}" ] 2>/dev/null; then
+            log_step "rgb20 balance reached: addr=${addr}, balance=${balance_units} min units >= ${expected_units}"
             return 0
         fi
         # 主链铸币依赖签名节点的 VerifyDepositSpv —— 它查主链 lightclient 的 BTC 头。
@@ -69,7 +84,7 @@ function wait_rgb20_balance_not_less_than() {
         mine_btcd_blocks 1
         sleep 2
     done
-    fail "rgb20 balance not reached, addr=${addr}, expected>=${expected}"
+    fail "rgb20 balance not reached, addr=${addr}, expected>=${expected_units} min units"
 }
 
 # para1（官方节点，跑 Go 桥）在 since_epoch（unix 秒）之后新产生的日志。
@@ -390,8 +405,6 @@ function scenario_rgb20_deposit() {
     local request_id="${1:-rgb20-dep-1}"
     local deposit_amount="${2:-${RGB20_DEPOSIT_AMOUNT}}"
     log_step "scenario: RGB20 deposit (user pay -> sidecar settle -> TSS deposit sign -> chain33 mint) requestId=${request_id} amount=${deposit_amount}"
-    local before
-    before=$(query_rgb20_balance "${USER_MAIN_ADDR}")
 
     # 1. Go 桥 CreateReceive（para1 rgb20 HTTP）→ 侧车 invoice
     local rec_json
@@ -451,11 +464,16 @@ function scenario_rgb20_deposit() {
     # 5. Go 桥 pollTransfers → submitDeposit（TSS 签 deposit）→ chain33 铸造 X.RGB20_USDT
     # 期望增量必须用**实际下单金额**（第 2 个参数），不能用默认值：冷备演练会用压过的额度调用本函数
     # （实测 44000 vs 默认 1000000），沿用默认值会等一个永远不会到的余额。
-    local delta expected
+    # 全程按最小单位比较：deposit_amount 不是 4 位小数（如 44000 = 0.00044）时，
+    # `asset balance` 的显示值会被截断（0.00064 -> 0.0006），用它做 >= 判据永远不成立。
+    local before_units expected_units delta
+    before_units=$(query_rgb20_balance_units "${USER_MAIN_ADDR}")
+    [ -n "${before_units}" ] && [ "${before_units}" -ge 0 ] 2>/dev/null ||
+        fail "rgb20 balance (min units) unreadable for ${USER_MAIN_ADDR} (got '${before_units}'); cannot compute the expected deposit balance"
+    expected_units=$(( before_units + deposit_amount ))
     delta=$(awk "BEGIN{printf \"%.8f\", ${deposit_amount}/100000000}")
-    expected=$(awk "BEGIN{printf \"%.8f\", ${before} + ${delta}}")
-    wait_rgb20_balance_not_less_than "${USER_MAIN_ADDR}" "${expected}"
-    log_step "RGB20 deposit OK: balance ${before} -> >= ${expected}"
+    wait_rgb20_balance_not_less_than "${USER_MAIN_ADDR}" "${expected_units}"
+    log_step "RGB20 deposit OK: balance ${before_units} -> >= ${expected_units} min units (delta ${delta})"
 
     # 6. 首次归因必须一次成功。旧实现在首次归因分支里拿着 Settle() 之前的陈旧副本调
     #    BuildSpvProof，必然报 "build spv proof: empty txid"，要等下一轮 30s 轮询拿到
