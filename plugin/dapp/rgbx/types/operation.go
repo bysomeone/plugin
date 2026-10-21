@@ -82,7 +82,7 @@ func MintOperationID(symbol string, btcTxID []byte, depositAddress string, amoun
 // BurnOperationID 派生"提现销毁"操作的全局 id。
 //
 // chain33TxHash 是 burn 那笔 chain33 交易（Withdraw）的哈希——与 S3 的已消费集合
-// （executor 的 formatWithdrawUsedKey）取同一个身份，因此"台账里的提现 op"与"防重复放款的键"
+// （executor 的 formatWithdrawFinalKey）取同一个身份，因此"台账里的提现 op"与"防重复放款的键"
 // 一一对应，审计时两条记录可以互相印证。
 func BurnOperationID(symbol string, chain33TxHash []byte) ([]byte, error) {
 	if len(chain33TxHash) == 0 || symbol == "" {
