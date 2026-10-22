@@ -44,6 +44,16 @@ func Cmd() *cobra.Command {
 		getOperationCMD(),
 		getOperationSupplyCMD(),
 		listOperationsCMD(),
+		bridgeConfigApplyCMD(),
+		bridgeConfigApproveCMD(),
+		abandonWithdrawCMD(),
+		bumpWithdrawFeeCMD(),
+		registerDepositScriptCMD(),
+		getBridgeConfigCMD(),
+		listAbandonRequestsCMD(),
+		listBumpWithdrawFeeRequestsCMD(),
+		getDepositAddressCMD(),
+		listDepositRegistrationsCMD(),
 	)
 	return cmd
 }

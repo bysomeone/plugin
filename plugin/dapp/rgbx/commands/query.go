@@ -2,6 +2,7 @@ package commands
 
 import (
 	"fmt"
+	"math"
 	"os"
 
 	"github.com/33cn/chain33/types"
@@ -296,4 +297,153 @@ func listPendingByFrom(cmd *cobra.Command, _ []string) {
 	}
 	reply := &rtypes.PendingTxs{}
 	sendQueryRPC(cmd, "ListPendingTxByFrom", &types.ReqString{Data: from}, reply, false)
+}
+
+// maxListCount is the executor's upper bound for one height-indexed listing call
+// (executor.maxListCount). Checking it here turns an invalid request into a local error
+// instead of a round trip.
+const maxListCount = 1000
+
+// listHeightRangeFlags registers the paging flags shared by the height-indexed request
+// lists (ReqListPendingTx). startHeight/startIndex/count keep the names and shorthands of
+// listPendingTx; endHeight = 0 means "up to the current height".
+func listHeightRangeFlags(cmd *cobra.Command) {
+	cmd.Flags().Uint64P("startHeight", "s", 0, "list start height")
+	cmd.Flags().Uint64P("startIndex", "i", 0, "skip records with a lower block tx index at startHeight")
+	cmd.Flags().Uint64P("endHeight", "e", 0, "list end height (0 = up to the current height)")
+	cmd.Flags().Uint32P("count", "c", 20, "max records to return (1..1000)")
+}
+
+func buildListPendingReq(cmd *cobra.Command) (*rtypes.ReqListPendingTx, error) {
+	startHeight, _ := cmd.Flags().GetUint64("startHeight")
+	startIndex, _ := cmd.Flags().GetUint64("startIndex")
+	endHeight, _ := cmd.Flags().GetUint64("endHeight")
+	count, _ := cmd.Flags().GetUint32("count")
+	return validateListPendingReq(startHeight, startIndex, endHeight, count)
+}
+
+// validateListPendingReq mirrors the executor's paging validation, so an impossible range
+// is reported before any RPC.
+func validateListPendingReq(startHeight, startIndex, endHeight uint64,
+	count uint32) (*rtypes.ReqListPendingTx, error) {
+
+	if count == 0 || count > maxListCount {
+		return nil, fmt.Errorf("invalid count %d: must be in [1, %d]", count, maxListCount)
+	}
+	if startHeight > math.MaxInt64 || startIndex > math.MaxInt64 || endHeight > math.MaxInt64 {
+		return nil, fmt.Errorf("invalid height/index: value overflows int64")
+	}
+	if endHeight != 0 && endHeight < startHeight {
+		return nil, fmt.Errorf("invalid height range: endHeight %d is below startHeight %d", endHeight, startHeight)
+	}
+	return &rtypes.ReqListPendingTx{
+		StartHeight: int64(startHeight),
+		StartIndex:  int64(startIndex),
+		EndHeight:   int64(endHeight),
+		Count:       int32(count),
+	}, nil
+}
+
+// getBridgeConfigCMD returns the effective bridge config; an empty symbol addresses the
+// global record (same key the apply command uses).
+func getBridgeConfigCMD() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "get-bridge-config",
+		Short:   "get the effective bridge configuration",
+		Run:     getBridgeConfig,
+		Example: "get-bridge-config\n  get-bridge-config --asset-symbol XBTC",
+	}
+	cmd.Flags().String("asset-symbol", "", "asset symbol; empty returns the global config")
+	return cmd
+}
+
+func getBridgeConfig(cmd *cobra.Command, _ []string) {
+	symbol, _ := cmd.Flags().GetString("asset-symbol")
+	reply := &rtypes.BridgeConfigApply{}
+	sendQueryRPC(cmd, "GetBridgeConfig", &types.ReqString{Data: symbol}, reply, false)
+}
+
+func listAbandonRequestsCMD() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "list-abandon-requests",
+		Short:   "list abandon-withdraw proposals by height range",
+		Run:     listAbandonRequests,
+		Example: "list-abandon-requests -s 100 -e 200 -c 20",
+	}
+	listHeightRangeFlags(cmd)
+	return cmd
+}
+
+func listAbandonRequests(cmd *cobra.Command, _ []string) {
+	req, err := buildListPendingReq(cmd)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "invalid args: %s\n", err)
+		return
+	}
+	reply := &rtypes.AbandonWithdrawList{}
+	sendQueryRPC(cmd, "ListAbandonRequests", req, reply, false)
+}
+
+func listBumpWithdrawFeeRequestsCMD() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "list-bump-withdraw-fee-requests",
+		Short:   "list withdrawal fee-bump requests by height range",
+		Run:     listBumpWithdrawFeeRequests,
+		Example: "list-bump-withdraw-fee-requests -s 100 -e 200 -c 20",
+	}
+	listHeightRangeFlags(cmd)
+	return cmd
+}
+
+func listBumpWithdrawFeeRequests(cmd *cobra.Command, _ []string) {
+	req, err := buildListPendingReq(cmd)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "invalid args: %s\n", err)
+		return
+	}
+	reply := &rtypes.BumpWithdrawFeeList{}
+	sendQueryRPC(cmd, "ListBumpWithdrawFeeRequests", req, reply, false)
+}
+
+func getDepositAddressCMD() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "get-deposit-address",
+		Short:   "get the registered BTC deposit address of a user id",
+		Run:     getDepositAddress,
+		Example: "get-deposit-address --user-id <chain33Address>",
+	}
+	cmd.Flags().String("user-id", "", "user id (the chain33 address that registered the script)")
+	markRequired(cmd, "user-id")
+	return cmd
+}
+
+func getDepositAddress(cmd *cobra.Command, _ []string) {
+	userID, _ := cmd.Flags().GetString("user-id")
+	if userID == "" {
+		_, _ = fmt.Fprintln(os.Stderr, "user id is required")
+		return
+	}
+	reply := &rtypes.DepositScriptItem{}
+	sendQueryRPC(cmd, "GetDepositAddress", &types.ReqString{Data: userID}, reply, false)
+}
+
+func listDepositRegistrationsCMD() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "list-deposit-registrations",
+		Short:   "list registered BTC deposit scripts by height range",
+		Run:     listDepositRegistrations,
+		Example: "list-deposit-registrations -s 100 -e 200 -c 20",
+	}
+	listHeightRangeFlags(cmd)
+	return cmd
+}
+
+func listDepositRegistrations(cmd *cobra.Command, _ []string) {
+	req, err := buildListPendingReq(cmd)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "invalid args: %s\n", err)
+		return
+	}
+	reply := &rtypes.DepositScriptList{}
+	sendQueryRPC(cmd, "ListDepositRegistrations", req, reply, false)
 }
