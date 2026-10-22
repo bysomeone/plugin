@@ -118,6 +118,12 @@ type btcWallet struct {
 	pendingTxs map[chainhash.Hash]*btcPendingTx
 	rescanDone bool
 	// txLock     sync.RWMutex
+
+	// blockCache 按 blockHash 缓存证明所需的块内 txid/时间/高度（见 block_cache.go）。
+	// nil 表示不缓存（手工构造的 btcWallet / 测试）；newBtcWallet 会装上默认缓存。
+	blockCache *btcBlockCache
+	// blockVerboseFn 可选：注入 getblockverbose 实现（默认走 rpcClient），仅测试用。
+	blockVerboseFn btcBlockVerboseFetcher
 }
 
 type btcPendingTx struct {
@@ -146,6 +152,7 @@ func newBtcWallet(n *neutrinoClient) (*btcWallet, error) {
 		removePendingChan: make(chan chainhash.Hash, 100),
 		requiredConfs:     int32(n.cfg.BlockConfirmations),
 		pendingTxs:        make(map[chainhash.Hash]*btcPendingTx),
+		blockCache:        newBtcBlockCache(defaultBtcBlockCacheSize),
 	}
 
 	if n.cfg.BtcRPC.Host != "" {
@@ -1111,6 +1118,10 @@ func buildTxHashesFromBlockTxs(blockTxs []*wire.MsgTx, targetTxHash chainhash.Ha
 // buildTxExistenceProof 计算交易存在性证明（SPV）
 // 输入: pendingTx（需要包含 tx 和 blockHash）
 // 输出: ltypes.BtcSpv
+//
+// getblockverbose 路径带块级缓存：同一区块里的 N 笔充值只取一次块。缓存键是 blockHash，
+// 块内容对给定 hash 不可变（重组后是同高度、不同 hash 的另一个块），因此无需失效逻辑。
+// 缓存取块失败时退回原来的 neutrino 路径；缓存本身绝不会让证明失败或返回空证明。
 func (b *btcWallet) buildTxExistenceProof(pending *btcPendingTx) (*ltypes.BtcSpv, error) {
 	if pending == nil || pending.tx == nil {
 		return nil, fmt.Errorf("pending tx data missing")
@@ -1119,20 +1130,33 @@ func (b *btcWallet) buildTxExistenceProof(pending *btcPendingTx) (*ltypes.BtcSpv
 		return nil, fmt.Errorf("invalid pending block height")
 	}
 	txHashStr := pending.tx.TxHash().String()
-	if b.rpcClient != nil {
-		block, err := b.rpcClient.GetBlockVerbose(&pending.blockHash)
+	if fetch := b.blockVerboseEndpoint(); fetch != nil {
+		meta, err := b.blockCache.getOrLoad(pending.blockHash, func(hash chainhash.Hash) (*btcBlockMeta, error) {
+			block, err := fetch(&hash)
+			if err != nil {
+				return nil, err
+			}
+			if block == nil {
+				return nil, fmt.Errorf("empty block result")
+			}
+			return &btcBlockMeta{
+				txIDs:  block.Tx,
+				time:   block.Time,
+				height: block.Height,
+			}, nil
+		})
 		if err != nil {
 			log.Error("buildTxExistenceProof GetBlockVerbose failed, fallback neutrino",
 				"txHash", txHashStr, "blockHash", pending.blockHash.String(), "err", err)
 		} else {
-			txs, txIndex, err := buildTxHashesFromVerbose(block.Tx, txHashStr)
+			txs, txIndex, err := buildTxHashesFromVerbose(meta.txIDs, txHashStr)
 			if err != nil {
 				log.Error("buildTxExistenceProof buildTxHashesFromVerbose failed",
 					"txHash", txHashStr, "blockHash", pending.blockHash.String(), "err", err)
 				return nil, err
 			}
 			return buildBtcSpv(
-				txHashStr, pending.blockHash.String(), block.Time, uint64(block.Height), txs, txIndex,
+				txHashStr, pending.blockHash.String(), meta.time, uint64(meta.height), txs, txIndex,
 			), nil
 		}
 	}
