@@ -62,6 +62,29 @@ const (
 	NameBumpWithdrawFeeAction = "BumpWithdrawFee"
 )
 
+// bridgeConfigApply 的单项更新掩码里使用的字段名。取值与 proto 字段名逐字一致：
+// 掩码是链上治理的输入，改这里等于改 wire 契约。Apply 校验与 Exec 合并共用同一份
+// 名称集合，避免两处字符串漂移。
+//
+// assetSymbol 与 fields 本身不在其中：前者标识记录、后者是掩码，都不允许被掩码修改。
+const (
+	BridgeConfigFieldLimitsEnabled                  = "limitsEnabled"
+	BridgeConfigFieldMaxPerTx                       = "maxPerTx"
+	BridgeConfigFieldMaxPerWindow1H                 = "maxPerWindow1h"
+	BridgeConfigFieldMaxPerWindow24H                = "maxPerWindow24h"
+	BridgeConfigFieldMaxMintPerWindow               = "maxMintPerWindow"
+	BridgeConfigFieldLargeDepositThreshold          = "largeDepositThreshold"
+	BridgeConfigFieldLargeDepositExtraConfirmations = "largeDepositExtraConfirmations"
+	BridgeConfigFieldPauseDeposit                   = "pauseDeposit"
+	BridgeConfigFieldPauseWithdraw                  = "pauseWithdraw"
+	// BridgeConfigFieldWithdrawMaxFeeRateSatPerVbyte BTC 计价提现的费率上限（sat/vB）。
+	BridgeConfigFieldWithdrawMaxFeeRateSatPerVbyte = "withdrawMaxFeeRateSatPerVbyte"
+	// BridgeConfigFieldRgb20WithdrawFeeLockVbytes RGB20 BTC 通道的保守交易体积（vB）。
+	BridgeConfigFieldRgb20WithdrawFeeLockVbytes = "rgb20WithdrawFeeLockVbytes"
+	// BridgeConfigFieldRgb20WithdrawFee RGB20 资产固定手续费列表（掩码命中时整体替换）。
+	BridgeConfigFieldRgb20WithdrawFee = "rgb20WithdrawFee"
+)
+
 // log类型id值
 const (
 	TyUnknownLog = iota + 100
