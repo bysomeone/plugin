@@ -8,8 +8,10 @@
 //!      不依赖"跑之前先 git stash 一下"。
 //!   2. **冷层归档本身**：单笔的写/读耗时与体积（hex → deflate+b64），以及 W 笔时的总占用
 //!      （未裁剪 / 已裁剪成墓碑）。
-//!   3. `BtcWallet::register_user_script` —— 注册表每次插入都重写**整个 JSON 文件**
-//!      （`save_user_scripts`），所以 N 个用户 = O(N²) 字节。这条是 O5，本文件只做基线记录。
+//!   3. `BtcWallet::register_user_script` —— O5. Reproducible before/after: the current code
+//!      writes one small file per user (`user_scripts/<sha256(userID)>.json`), while
+//!      [`LegacyRegistry`] below replicates the old "rewrite the whole JSON array on every
+//!      insert" form (O(N²) bytes + one fsync of a growing file).
 //!
 //! 记录体积用**实测量级**（来自一次真实 E2E 运行后容器内的 `/data/ledger.json`）：
 //!   `withdrawal_builds` 一条 = psbt_hex 1994 + consignment_hex 15926 + fascia_hex 1552
@@ -341,23 +343,60 @@ fn perf_build_archive_footprint() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Pre-O5 on-disk form: one JSON array with every entry, rewritten in full on each insert.
+#[derive(Serialize)]
+struct LegacyRegistry {
+    scripts: Vec<LegacyRegistryRec>,
+}
+
+#[derive(Serialize, Clone)]
+struct LegacyRegistryRec {
+    user_id: String,
+    pk_script: String,
+    witness_script: String,
+}
+
+/// Same temp → fsync → rename pattern the product uses (replicated because `write_atomic` is
+/// crate-private), so the only difference measured is the write amplification.
+fn legacy_write_atomic(path: &std::path::Path, bytes: &[u8]) {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let tmp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    {
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(bytes).unwrap();
+        f.sync_all().unwrap();
+    }
+    std::fs::rename(&tmp, path).unwrap();
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+}
+
 #[test]
 fn perf_user_script_registry_write_amplification() {
     println!();
-    println!("=== BtcWallet 注册表：每次插入重写整个 JSON 文件（O5，本文件只记录基线）===");
+    println!("=== BtcWallet 注册表：增量单用户文件（现状） vs 每次全量重写（O5）===");
     let rpc = Arc::new(
         BtcdRpc::connect("127.0.0.1:1", "u", "p", None, bitcoin::Network::Regtest).unwrap(),
     );
     let pubkey_hex = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    let pubkey: bitcoin::CompressedPublicKey = pubkey_hex.parse().unwrap();
     for n in [100usize, 1_000, 5_000] {
-        let dir = std::env::temp_dir().join(format!("perf-uscripts-{n}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        // ---- current: one file per user ----
+        let dir = std::env::temp_dir().join(format!("perf-uscripts-inc-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("user_scripts.json");
         let mut w = BtcWallet::new(rpc.clone(), pubkey_hex, bitcoin::Network::Regtest)
             .unwrap()
             .with_user_scripts_path(path.clone());
-        let pubkey: bitcoin::CompressedPublicKey = pubkey_hex.parse().unwrap();
-
         let mut per_insert = Vec::with_capacity(n);
         let t_all = Instant::now();
         for i in 0..n {
@@ -369,11 +408,58 @@ fn perf_user_script_registry_write_amplification() {
             per_insert.push(t.elapsed().as_secs_f64() * 1e3);
         }
         let total = t_all.elapsed();
-        let size = std::fs::metadata(&path).unwrap().len();
+        let registry_dir = dir.join("user_scripts");
+        let size: u64 = std::fs::read_dir(&registry_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.metadata().unwrap().len())
+            .sum();
         let first100: f64 = per_insert.iter().take(100).sum::<f64>() / 100.0;
         let last100: f64 = per_insert.iter().rev().take(100).sum::<f64>() / 100.0;
         println!(
-            "  n={n:<6} 总耗时 {:>8.1} ms | 首100条均值 {:>6.3} ms → 末100条均值 {:>6.3} ms | 文件 {:>6.1} KB",
+            "  n={n:<6} 增量: 总 {:>8.1} ms | 首100条均值 {:>6.3} ms → 末100条均值 {:>6.3} ms | 目录 {:>6.1} KB",
+            total.as_secs_f64() * 1e3,
+            first100,
+            last100,
+            size as f64 / 1e3
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ---- legacy: rewrite the whole array on every insert ----
+        let dir = std::env::temp_dir().join(format!("perf-uscripts-old-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("user_scripts.json");
+        let mut recs: Vec<LegacyRegistryRec> = Vec::with_capacity(n);
+        let mut legacy_per_insert = Vec::with_capacity(n);
+        let t_all = Instant::now();
+        for i in 0..n {
+            let user_id = format!("1PerfUser{i:0>24}");
+            let ws = deposit_witness_script(&user_id, &pubkey).unwrap();
+            let pk = bitcoin::ScriptBuf::new_p2wsh(&ws.wscript_hash());
+            recs.push(LegacyRegistryRec {
+                user_id,
+                pk_script: bitcoin::hex::DisplayHex::to_hex_string(
+                    pk.as_bytes(),
+                    bitcoin::hex::Case::Lower,
+                ),
+                witness_script: bitcoin::hex::DisplayHex::to_hex_string(
+                    ws.as_bytes(),
+                    bitcoin::hex::Case::Lower,
+                ),
+            });
+            let t = Instant::now();
+            let file = LegacyRegistry {
+                scripts: recs.clone(),
+            };
+            legacy_write_atomic(&path, &serde_json::to_vec_pretty(&file).unwrap());
+            legacy_per_insert.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let total = t_all.elapsed();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let first100: f64 = legacy_per_insert.iter().take(100).sum::<f64>() / 100.0;
+        let last100: f64 = legacy_per_insert.iter().rev().take(100).sum::<f64>() / 100.0;
+        println!(
+            "        旧全量: 总 {:>8.1} ms | 首100条均值 {:>6.3} ms → 末100条均值 {:>6.3} ms | 文件 {:>6.1} KB",
             total.as_secs_f64() * 1e3,
             first100,
             last100,
