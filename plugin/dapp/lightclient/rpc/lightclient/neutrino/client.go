@@ -81,6 +81,8 @@ type neutrinoClient struct {
 	unlockMu sync.Mutex
 	// signedPayments 已签付款的持久记录（nil = 用 walletdb 默认实现）。
 	signedPayments signedPaymentKV
+	// signedTxs 已签名提现的最终原始交易，用于周期重播（nil = 用 walletdb 默认实现）。
+	signedTxs signedWithdrawTxStore
 	// signedPaymentMem 是持久化失败时的进程内兜底：签名已经产出、但磁盘没写下去时，
 	// 本进程仍必须拒绝该 burn 的 Unlock（重启后失去，那是存储故障的固有边界）。
 	signedPaymentMu  sync.Mutex

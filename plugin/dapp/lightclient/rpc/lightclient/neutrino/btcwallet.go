@@ -53,6 +53,14 @@ const (
 	minPendingHeightKey    = "min-pending-height"
 )
 
+// withdrawInputSequence opts every withdrawal input into BIP125 replace-by-fee.
+// 0xfffffffd (wire.MaxTxInSequenceNum - 2) is the conventional RBF value used by Bitcoin
+// Core's wallet. Locktime stays 0, so this does not enable locktime-based semantics.
+//
+// nSequence is committed by the sighash and the txid, so this is a network-wide change:
+// every bridge node must build and sign the same transaction (fine before launch).
+const withdrawInputSequence = wire.MaxTxInSequenceNum - 2
+
 // utxoLockID UTXO锁定ID
 var utxoLockID = wtxmgr.LockID{
 	'R', 'G', 'B', 'X', '-', 'L', 'O', 'C', 'K',
@@ -124,6 +132,10 @@ type btcWallet struct {
 	blockCache *btcBlockCache
 	// blockVerboseFn 可选：注入 getblockverbose 实现（默认走 rpcClient），仅测试用。
 	blockVerboseFn btcBlockVerboseFetcher
+	// selectInputsFn 可选：注入提现输入的选择与锁定（默认走钱包 listUnspent + LeaseOutput），仅测试用。
+	selectInputsFn func(target, feeRate btcutil.Amount, sticky *UTXO) ([]*UTXO, btcutil.Amount, error)
+	// sendRawTxFn 可选：注入 sendrawtransaction 实现（默认走 rpcClient / chainClient），仅测试用。
+	sendRawTxFn func(tx *wire.MsgTx) error
 }
 
 type btcPendingTx struct {
@@ -420,6 +432,12 @@ func (b *btcWallet) monitorTransactions() {
 	b.minPendingHeight = rescanHeight
 	interval := b.client.cfg.BtcBlockInterval/2 + 1
 	ticker := time.NewTicker(time.Second * time.Duration(interval))
+	defer ticker.Stop()
+	// Replay signed-but-unconfirmed withdrawals. It runs in this goroutine because it reads
+	// b.pendingTxs, which is owned here (no lock), and is driven by persisted records so a
+	// restarted process still replays.
+	replayTicker := time.NewTicker(signedTxReplayInterval)
+	defer replayTicker.Stop()
 	rescanChan := make(chan *wallet.GetTransactionsResult, 1)
 	firstProcessFlag := true
 	for {
@@ -465,6 +483,8 @@ func (b *btcWallet) monitorTransactions() {
 					"minPendingHeight", b.minPendingHeight, "bestHeight", b.client.getBestBlockHeight())
 			}
 			b.updateTransactionConfirmations()
+		case <-replayTicker.C:
+			b.replaySignedWithdrawTxs()
 		}
 	}
 }
@@ -751,33 +771,25 @@ func (b *btcWallet) buildTransaction(outputs []*wire.TxOut, feeRate btcutil.Amou
 	}
 
 	hashStr := hex.EncodeToString(chain33Hash)
-	// 获取可用UTXO
-	utxos, err := b.listUnspent()
-	if err != nil {
-		log.Error("buildTransaction listUnspent failed", "hash", hashStr, "targetAmount", outputTotal,
-			"utxos", len(utxos), "err", err)
-		return nil, nil, nil, fmt.Errorf("list unspent failed: %w", err)
-	}
-
-	// 选择并锁定UTXO（防止并发双花）
 	selectionFeeRate := feeRate
 	if receiverPaysFee {
 		selectionFeeRate = 0
 	}
-	selectedUTXOs, inputTotal, err := b.selectAndLockUTXOs(utxos, outputTotal, selectionFeeRate, stickyUTXO)
+	selectedUTXOs, inputTotal, err := b.selectWithdrawInputs(outputTotal, selectionFeeRate, stickyUTXO)
 	if err != nil {
-		log.Error("buildTransaction selectAndLockUTXOs failed", "hash", hashStr, "targetAmount", outputTotal,
-			"err", err)
+		log.Error("buildTransaction select withdraw inputs failed", "hash", hashStr, "targetAmount", outputTotal, "err", err)
 		return nil, nil, nil, err
 	}
 
 	// 创建交易
 	tx := wire.NewMsgTx(wire.TxVersion)
 
-	// 添加输入
+	// 添加输入（全部 signal BIP125 RBF）
 	inputAmounts := make([]int64, 0, len(selectedUTXOs))
 	for _, utxo := range selectedUTXOs {
-		tx.AddTxIn(wire.NewTxIn(&utxo.OutPoint, nil, nil))
+		txIn := wire.NewTxIn(&utxo.OutPoint, nil, nil)
+		txIn.Sequence = withdrawInputSequence
+		tx.AddTxIn(txIn)
 		inputAmounts = append(inputAmounts, int64(utxo.Amount))
 	}
 
@@ -891,6 +903,20 @@ func (b *btcWallet) listUnspent() ([]*UTXO, error) {
 
 	log.Debug("listUnspent", "count", len(utxos), "totalAmount", totalAmount.ToBTC())
 	return utxos, nil
+}
+
+// selectWithdrawInputs lists, selects and leases the inputs of a withdrawal. Tests may
+// inject selectInputsFn when no wallet is available.
+func (b *btcWallet) selectWithdrawInputs(target, feeRate btcutil.Amount, sticky *UTXO) ([]*UTXO, btcutil.Amount, error) {
+	if b.selectInputsFn != nil {
+		return b.selectInputsFn(target, feeRate, sticky)
+	}
+	utxos, err := b.listUnspent()
+	if err != nil {
+		return nil, 0, fmt.Errorf("list unspent failed: %w", err)
+	}
+	// 选择并锁定UTXO（防止并发双花）
+	return b.selectAndLockUTXOs(utxos, target, feeRate, sticky)
 }
 
 // selectUTXOs 找到最少数量的UTXO组合
@@ -1044,24 +1070,41 @@ type UTXO struct {
 	PkScript []byte
 }
 
+// sendRawTransaction submits a fully signed transaction without logging. Callers choose
+// the log policy (initial broadcast vs. periodic replay).
+func (b *btcWallet) sendRawTransaction(tx *wire.MsgTx) error {
+	if b.sendRawTxFn != nil {
+		return b.sendRawTxFn(tx)
+	}
+	if b.rpcClient != nil {
+		_, err := b.rpcClient.SendRawTransaction(tx, false)
+		return err
+	}
+	_, err := b.chainClient.SendRawTransaction(tx, false)
+	return err
+}
+
 // broadcastTransaction 广播交易
 // lockedUTXOs: 已锁定的UTXO列表，广播失败时会自动释放
 func (b *btcWallet) broadcastTransaction(tx *wire.MsgTx, btcTxHash string) error {
-
-	if b.rpcClient != nil {
-		_, err := b.rpcClient.SendRawTransaction(tx, false)
-		if err != nil {
-			log.Error("BroadcastTransaction failed", "txHash", btcTxHash, "err", err)
-			return err
-		}
-	} else {
-		_, err := b.chainClient.SendRawTransaction(tx, false)
-		if err != nil {
-			log.Error("BroadcastTransaction failed", "txHash", btcTxHash, "err", err)
-			return err
-		}
+	if err := b.sendRawTransaction(tx); err != nil {
+		log.Error("BroadcastTransaction failed", "txHash", btcTxHash, "err", err)
+		return err
 	}
 	log.Debug("broadcastTransaction success", "txHash", btcTxHash)
+	return nil
+}
+
+// broadcastSignedWithdrawTx broadcasts a signed withdrawal and, once the broadcast has
+// succeeded, records its final bytes for periodic replay. A persistence failure is logged
+// but does not fail the call: the broadcast already happened.
+func (b *btcWallet) broadcastSignedWithdrawTx(tx *wire.MsgTx, btcTxHash string, burnTxHash []byte) error {
+	if err := b.broadcastTransaction(tx, btcTxHash); err != nil {
+		return err
+	}
+	if b.client != nil {
+		b.client.persistSignedWithdrawTxBestEffort(burnTxHash, tx)
+	}
 	return nil
 }
 
