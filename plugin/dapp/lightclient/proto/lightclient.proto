@@ -101,6 +101,14 @@ message tssSignNotify {
     bytes           psbt         = 6;
     // RGB20 提现：该笔转移的 consignment（签名节点 ValidateConsignment 用）。
     bytes           consignment  = 7;
+    // BTC 提现加价替换：上一版已签交易（Serialize，含 witness）。签名节点据此校验新交易与
+    // 上一版至少共享一个输入、且绝对手续费严格更高。
+    bytes           prevBtcTxData    = 8;
+    // BTC 提现加价替换：上一版每笔输入的金额，与 prevBtcTxData 的输入顺序一一对应。
+    repeated int64  prevInputAmounts = 9;
+    // BTC 提现加价替换：授权本次替换的链上加价请求（BumpWithdrawFee）txHash。签名节点必须
+    // 自己去链上读这条请求的费率，不能相信通知里的声称值。
+    bytes           bumpRequestTxHash = 10;
 }
 
 message reqGetBtcHeader {

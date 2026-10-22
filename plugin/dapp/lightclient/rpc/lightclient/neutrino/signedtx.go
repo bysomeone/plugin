@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"encoding/hex"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/walletdb"
 )
@@ -21,6 +23,15 @@ import (
 // deleted. Dropping a replay record here does not weaken that invariant.
 var signedWithdrawTxBucket = []byte("rgbx-signed-withdraw-tx")
 
+var (
+	// withdrawBumpAppliedRateBucket 记录每笔 burn 已生效的提现费率（sat/vB）。替换必须严格高于
+	// 它（BIP125 至少 +1），且跨重启保持单调，避免进程重启后用旧费率覆盖新版本。
+	withdrawBumpAppliedRateBucket = []byte("rgbx-withdraw-bump-applied-rate")
+	// withdrawSignedInputAmountsBucket 记录每笔 burn 上一版已签交易的输入金额，供下一次加价时
+	// 下发给签名节点（签名节点用它校验"新交易绝对手续费高于上一版"）。
+	withdrawSignedInputAmountsBucket = []byte("rgbx-withdraw-signed-input-amounts")
+)
+
 // signedTxReplayInterval is how often signed-but-unconfirmed withdrawals are pushed to
 // the bitcoin network again. A transaction signed by the bridge is safe to rebroadcast
 // verbatim: the bytes never change, so a replay can only be accepted once.
@@ -31,6 +42,9 @@ const signedTxReplayInterval = 5 * time.Minute
 type signedWithdrawTxStore interface {
 	// PutOnce is idempotent: an existing record for the burn is left untouched.
 	PutOnce(burnTxHash, rawTx []byte) error
+	// Replace overwrites an existing record. It is only called through
+	// replaceSignedWithdrawTx, which enforces the monotonic fee-rate rule.
+	Replace(burnTxHash, rawTx []byte) error
 	// Get returns nil when there is no record.
 	Get(burnTxHash []byte) ([]byte, error)
 	// All returns every record, keyed by burn tx hash.
@@ -53,6 +67,20 @@ func (s *walletSignedWithdrawTxStore) PutOnce(burnTxHash, rawTx []byte) error {
 		}
 		if bucket.Get(burnTxHash) != nil {
 			return nil
+		}
+		value := append([]byte(nil), rawTx...)
+		return bucket.Put(burnTxHash, value)
+	})
+}
+
+func (s *walletSignedWithdrawTxStore) Replace(burnTxHash, rawTx []byte) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("signed withdraw tx store is not initialized")
+	}
+	return walletdb.Update(s.db, func(tx walletdb.ReadWriteTx) error {
+		bucket, err := tx.CreateTopLevelBucket(signedWithdrawTxBucket)
+		if err != nil {
+			return err
 		}
 		value := append([]byte(nil), rawTx...)
 		return bucket.Put(burnTxHash, value)
@@ -161,6 +189,135 @@ func (n *neutrinoClient) dropSignedWithdrawTx(burnTxHash []byte) {
 	if err := n.signedWithdrawTxStorage().Delete(burnTxHash); err != nil {
 		log.Error("dropSignedWithdrawTx", "burnTxHash", hex.EncodeToString(burnTxHash), "err", err)
 	}
+}
+
+// getAppliedWithdrawFeeRate 读取该 burn 已生效的提现费率。ok=false 表示还没有替换过
+// （或记录损坏），调用方应回退到链上原始提现费率。
+func (n *neutrinoClient) getAppliedWithdrawFeeRate(burnTxHash []byte) (btcutil.Amount, bool) {
+	if n == nil || n.neutrinoCfg.Database == nil || len(burnTxHash) == 0 {
+		return 0, false
+	}
+	var raw []byte
+	err := walletdb.View(n.neutrinoCfg.Database, func(tx walletdb.ReadTx) error {
+		bucket := tx.ReadBucket(withdrawBumpAppliedRateBucket)
+		if bucket == nil {
+			return nil
+		}
+		raw = bucket.Get(burnTxHash)
+		return nil
+	})
+	if err != nil {
+		log.Error("getAppliedWithdrawFeeRate", "burnTxHash", hex.EncodeToString(burnTxHash), "err", err)
+		return 0, false
+	}
+	if len(raw) == 0 {
+		return 0, false
+	}
+	rate, err := strconv.ParseInt(string(raw), 10, 64)
+	if err != nil || rate <= 0 {
+		log.Error("getAppliedWithdrawFeeRate decode", "burnTxHash", hex.EncodeToString(burnTxHash), "err", err)
+		return 0, false
+	}
+	return btcutil.Amount(rate), true
+}
+
+func (n *neutrinoClient) setAppliedWithdrawFeeRate(burnTxHash []byte, rate btcutil.Amount) error {
+	if n == nil || n.neutrinoCfg.Database == nil {
+		return fmt.Errorf("withdraw bump rate store is not initialized")
+	}
+	return walletdb.Update(n.neutrinoCfg.Database, func(tx walletdb.ReadWriteTx) error {
+		bucket, err := tx.CreateTopLevelBucket(withdrawBumpAppliedRateBucket)
+		if err != nil {
+			return err
+		}
+		return bucket.Put(burnTxHash, []byte(strconv.FormatInt(int64(rate), 10)))
+	})
+}
+
+// replaceSignedWithdrawTx 用加价后的版本覆盖重播记录。
+//
+// 这是唯一允许覆盖已签交易的入口，并保留单调校验：新费率必须严格高于 floorRate（调用方传入
+// max(已生效费率, 链上原始费率)）。先写交易、再写费率：若中间失败，重试时旧费率仍会让本次替换
+// 被接受并幂等重写，而不会出现"费率已抬高、交易还是旧版本"的窗口。
+func (n *neutrinoClient) replaceSignedWithdrawTx(burnTxHash []byte, tx *wire.MsgTx,
+	newRate, floorRate btcutil.Amount) error {
+
+	if n == nil {
+		return fmt.Errorf("signed withdraw tx: no bridge to persist the transaction")
+	}
+	if len(burnTxHash) == 0 || tx == nil {
+		return fmt.Errorf("signed withdraw tx: empty burn hash or nil transaction")
+	}
+	if newRate < floorRate+1 {
+		return fmt.Errorf("signed withdraw tx: replacement fee rate %d is not above the applied rate %d",
+			newRate, floorRate)
+	}
+	var buf bytes.Buffer
+	buf.Grow(tx.SerializeSize())
+	if err := tx.Serialize(&buf); err != nil {
+		return fmt.Errorf("signed withdraw tx: serialize %s: %w", tx.TxHash(), err)
+	}
+	if err := n.signedWithdrawTxStorage().Replace(burnTxHash, buf.Bytes()); err != nil {
+		return fmt.Errorf("signed withdraw tx: replace %s: %w", hex.EncodeToString(burnTxHash), err)
+	}
+	if err := n.setAppliedWithdrawFeeRate(burnTxHash, newRate); err != nil {
+		return fmt.Errorf("signed withdraw tx: persist applied fee rate %d for %s: %w",
+			newRate, hex.EncodeToString(burnTxHash), err)
+	}
+	return nil
+}
+
+// saveSignedWithdrawInputAmounts 记录上一版已签交易的输入金额（供下一次加价下发给签名节点）。
+func (n *neutrinoClient) saveSignedWithdrawInputAmounts(burnTxHash []byte, amounts []int64) error {
+	if n == nil || n.neutrinoCfg.Database == nil {
+		return fmt.Errorf("signed withdraw input amounts store is not initialized")
+	}
+	parts := make([]string, 0, len(amounts))
+	for _, amount := range amounts {
+		parts = append(parts, strconv.FormatInt(amount, 10))
+	}
+	raw := []byte(strings.Join(parts, ","))
+	return walletdb.Update(n.neutrinoCfg.Database, func(tx walletdb.ReadWriteTx) error {
+		bucket, err := tx.CreateTopLevelBucket(withdrawSignedInputAmountsBucket)
+		if err != nil {
+			return err
+		}
+		return bucket.Put(burnTxHash, raw)
+	})
+}
+
+// loadSignedWithdrawInputAmounts 读回上一版已签交易的输入金额。缺失/损坏返回 false。
+func (n *neutrinoClient) loadSignedWithdrawInputAmounts(burnTxHash []byte) ([]int64, bool) {
+	if n == nil || n.neutrinoCfg.Database == nil || len(burnTxHash) == 0 {
+		return nil, false
+	}
+	var raw []byte
+	err := walletdb.View(n.neutrinoCfg.Database, func(tx walletdb.ReadTx) error {
+		bucket := tx.ReadBucket(withdrawSignedInputAmountsBucket)
+		if bucket == nil {
+			return nil
+		}
+		raw = bucket.Get(burnTxHash)
+		return nil
+	})
+	if err != nil {
+		log.Error("loadSignedWithdrawInputAmounts", "burnTxHash", hex.EncodeToString(burnTxHash), "err", err)
+		return nil, false
+	}
+	if len(raw) == 0 {
+		return nil, false
+	}
+	parts := strings.Split(string(raw), ",")
+	amounts := make([]int64, 0, len(parts))
+	for _, part := range parts {
+		amount, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			log.Error("loadSignedWithdrawInputAmounts decode", "burnTxHash", hex.EncodeToString(burnTxHash), "err", err)
+			return nil, false
+		}
+		amounts = append(amounts, amount)
+	}
+	return amounts, true
 }
 
 // signedTxReplayEligible reports whether a burn's local state still allows rebroadcasting.
