@@ -97,12 +97,24 @@ type userDepositSweepConfig struct {
 	IntervalSeconds int `json:"intervalSeconds"`
 	// MinUtxos 触发阈值：可扫的充值 UTXO 少于这个数就不扫（等它攒够）。<=0 用默认值。
 	MinUtxos int `json:"minUtxos"`
-	// FeeRate 扫集的费率（sat/vB）。<=0 用默认值。
+	// FeeRate 扫集的费率下限（sat/vB）。<=0 用默认值。
 	//
-	// 它同时是签名节点核对扫集手续费区间的费率（见 tssService.sweepSignFeeRate）：扫集没有链上
-	// pending 可作真值，费率只能取本地配置。因此各节点的这个值应当一致，否则签名节点可能拒签
-	// 一笔合法扫集（费率上界按各节点自己的值算）。
+	// 每轮扫集前会向 btcd 估算动态费率（estimatesmartfee，6 个确认目标）：估算值低于本值时
+	// 仍用本值，避免费率过低导致扫集长期不上链；估算失败 / 节点无估算（regtest 常态）时也回退到本值。
+	//
+	// 它同时是签名节点核对扫集手续费区间的回退费率（见 tssService.sweepSignFeeRate，未配置
+	// MaxFeeRate 时使用）：扫集没有链上 pending 可作真值，费率只能取本地配置。因此各节点的
+	// 这个值应当一致，否则签名节点可能拒签一笔合法扫集（费率上界按各节点自己的值算）。
 	FeeRate int `json:"feeRate"`
+	// MaxFeeRate 扫集费率的**硬上限**（sat/vB）。<=0 用默认值（defaultSweepMaxFeeRate）。
+	//
+	// 动态估算值超过这个上限时**本轮跳过扫集**（不会降级到上限继续扫，下一轮再看），
+	// 日志 INFO 给出估算值与上限。扫集只是 UTXO 整理，不值得为它付离谱的矿工费。
+	//
+	// 它同时是签名节点核对扫集手续费区间时用的**上界参考值**（见 tssService.sweepSignFeeRate）：
+	// 协调者按动态估算出价、且估算值不会超过本值，所以核对上界取本值才不会误拒合法扫集。
+	// 这是**共识性参数**：各节点的 maxFeeRate 必须一致，否则签名节点可能拒签一笔合法扫集。
+	MaxFeeRate int `json:"maxFeeRate"`
 	// MinConfirmations 只归集达到该确认数的充值 UTXO。<=0 用默认值（defaultSweepMinConfirmations）。
 	MinConfirmations int `json:"minConfirmations"`
 }
