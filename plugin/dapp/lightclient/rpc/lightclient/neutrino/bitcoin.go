@@ -402,7 +402,7 @@ func (n *neutrinoClient) processWithdrawRequest(req *withdrawRequest) (err error
 		return err
 	}
 
-	if err = n.bw.broadcastTransaction(tx, btcTxHash); err != nil {
+	if err = n.bw.broadcastSignedWithdrawTx(tx, btcTxHash, req.chain33WithdrawHash); err != nil {
 		log.Error("processWithdrawRequest broadcastTransaction", "txHash", txHash, "btcTxHash", btcTxHash, "err", err)
 		return err
 	}
@@ -846,6 +846,7 @@ func (n *neutrinoClient) processWithdrawConfirm(confirm *confirmWithdraw) bool {
 		if err := n.clearWithdrawStickyUTXO(confirm.confirmTx.GetTxHash()); err != nil {
 			log.Error("processWithdrawConfirm clearWithdrawFirstInput", "confirmHash", confirmHash, "err", err)
 		}
+		n.dropSignedWithdrawTx(confirm.confirmTx.GetTxHash())
 		log.Debug("processWithdrawConfirm already confirmed local state", "confirmHash", confirmHash)
 		return true
 	}
@@ -859,6 +860,7 @@ func (n *neutrinoClient) processWithdrawConfirm(confirm *confirmWithdraw) bool {
 	if err := n.clearWithdrawStickyUTXO(confirm.confirmTx.GetTxHash()); err != nil {
 		log.Error("processWithdrawConfirm clearWithdrawFirstInput", "confirmHash", confirmHash, "err", err)
 	}
+	n.dropSignedWithdrawTx(confirm.confirmTx.GetTxHash())
 	log.Debug("processWithdrawConfirm success", "txHash", txHash,
 		"btcTxHash", confirm.btcPending.txHash.String(), "confirmHash", confirmHash)
 	return true

@@ -195,6 +195,15 @@ func (n *neutrinoClient) BroadcastTx(psbtSigned []byte, txid string) error {
 		}
 	}
 
+	// Persist the final raw transaction keyed by the chain33 burn hash so a dropped
+	// transaction can be replayed after a restart. Best-effort: the broadcast already
+	// happened, so a write failure must not fail this call.
+	if len(chain33Hash) > 0 {
+		n.persistSignedWithdrawTxBestEffort(chain33Hash, tx)
+	} else {
+		log.Warn("BroadcastTx rgb20 withdraw not persisted for replay: missing chain33 mapping", "btcTxid", txid)
+	}
+
 	n.bw.addPendingTx(&btcPendingTx{
 		tx:                    tx,
 		submitTime:            types.Now(),
