@@ -6,7 +6,9 @@
 //! the same TSS group key (the script's `<pubkey>` is the group key) but they hang off their own
 //! script, so each one needs its own `witnessScript` (the BIP143 scriptCode) to be signed.
 //! The wallet holds NO private keys; it discovers UTXOs by querying btcd's
-//! `searchrawtransactions` (address index) + `gettxout`.
+//! `searchrawtransactions` (address index) + `gettxout`. Those queries are the authoritative
+//! liveness view: a per-script `O(outputs)` `gettxout` round is batched into one JSON-RPC request
+//! per chunk, and `getblockcount` is read once per sweep instead of once per script (O4-lite).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -406,21 +408,19 @@ impl BtcWallet {
     /// 主池（TSS P2WPKH）的 UTXO 集。**语义不变**：seal 生命周期推导（`RgbEngine::sync`）、
     /// 创世 seal 选择、`list_unspent_btc` 都只关心主池，用户 P2WSH 的余额不是 seal。
     pub fn list_unspent(&self) -> Vec<WalletUtxo> {
-        self.list_unspent_for(&self.script)
+        self.list_unspent_many(std::slice::from_ref(&self.script))
     }
 
     /// 全部 watch 脚本的 UTXO 集（主池 ∪ 已登记的用户充值脚本）。
     ///
     /// 构造交易时用它来解析**每个输入自己的脚本与面额**：用户 P2WSH 的充值 UTXO 可能被当作
     /// RGB seal 花掉（C4 的扫集），那时输入脚本不再是主池脚本，PSBT 必须带上它自己的
-    /// witnessScript。代价是每多一个注册脚本就多一次 `searchrawtransactions`
-    /// （逐脚本 RPC = O(N)，见规格 §3.2；主路径应改成逐块扫输出，属 C4）。
+    /// witnessScript。O4-lite 之后，这一轮的 RPC 次数与注册脚本数近似无关（分块批量）。
     pub fn list_unspent_all(&self) -> Vec<WalletUtxo> {
-        let mut out = self.list_unspent();
-        for script in self.user_scripts.keys() {
-            out.extend(self.list_unspent_for(script));
-        }
-        out
+        let mut scripts = Vec::with_capacity(self.user_scripts.len() + 1);
+        scripts.push(self.script.clone());
+        scripts.extend(self.user_scripts.keys().cloned());
+        self.list_unspent_many(&scripts)
     }
 
     /// **只有用户 P2WSH 充值脚本**的 UTXO 集（扫集器的输入候选）。
@@ -428,47 +428,70 @@ impl BtcWallet {
     /// 与 `list_unspent_all` 分开：扫集要把这些 UTXO 归集回主池，不能把主池自己的 UTXO 当成
     /// 待归集对象（那笔交易等于自己花自己，白付手续费）。
     pub fn list_unspent_user_deposits(&self) -> Vec<WalletUtxo> {
-        let mut out = Vec::new();
-        for script in self.user_scripts.keys() {
-            out.extend(self.list_unspent_for(script));
-        }
-        out
+        let scripts: Vec<ScriptBuf> = self.user_scripts.keys().cloned().collect();
+        self.list_unspent_many(&scripts)
     }
 
     /// 单个脚本的 UTXO 集，通过 btcd 的地址索引发现。
     pub fn list_unspent_for(&self, script: &ScriptBuf) -> Vec<WalletUtxo> {
-        let Ok(txs) = self.rpc.search_txs_for_script(script) else {
-            return Vec::new();
-        };
+        self.list_unspent_many(std::slice::from_ref(script))
+    }
+
+    /// Resolve the UTXO set of a set of scripts with a bounded number of RPC round-trips:
+    ///
+    ///   1. batched `searchrawtransactions` for the scripts (chunks of [`crate::rpc`]'s search
+    ///      batch size),
+    ///   2. **one** `getblockcount` for the whole round (pre-O4 it ran once per script),
+    ///   3. batched `gettxout` for every candidate output (chunked).
+    ///
+    /// The result is the same set the pre-O4 per-script loop produced: the address index still
+    /// decides which outputs pay each script, and `gettxout` still decides liveness. Only the
+    /// transport is batched — no local UTXO state is introduced, so there is no cursor to persist,
+    /// no reorg rollback and no startup rebuild to get wrong.
+    fn list_unspent_many(&self, scripts: &[ScriptBuf]) -> Vec<WalletUtxo> {
+        let searches = self.rpc.search_txs_for_scripts(scripts);
+        // A single tip read for the whole sweep: `gettxout` confirmations are relative to the tip
+        // at query time, and the pre-O4 code re-read the same value once per script.
         let best = self.rpc.get_block_count().unwrap_or(0);
-        let mut out = Vec::new();
-        for tx in txs {
-            for (vout, txout) in tx.outputs {
-                let outpoint = OutPoint {
-                    txid: tx.txid,
-                    vout,
-                };
-                // Still unspent?
-                let Ok(Some(live)) = self.rpc.get_txout(&outpoint) else {
-                    continue;
-                };
-                let height = if live.confirmations > 0 {
-                    // gettxout confirmations is relative to the chain tip at query time.
-                    Some((best.saturating_sub(live.confirmations - 1)) as u32)
-                } else {
-                    None
-                };
-                out.push(WalletUtxo {
-                    outpoint,
-                    value: live.value,
-                    script_pubkey: txout.script_pubkey.clone(),
-                    height,
-                });
+
+        let mut candidates: Vec<(OutPoint, ScriptBuf)> = Vec::new();
+        for result in searches {
+            // Per-script failure ⇒ empty set, matching the pre-O4 `let Ok(txs) = ... else return`.
+            let Ok(txs) = result else { continue };
+            for tx in txs {
+                for (vout, txout) in tx.outputs {
+                    candidates.push((
+                        OutPoint {
+                            txid: tx.txid,
+                            vout,
+                        },
+                        txout.script_pubkey,
+                    ));
+                }
             }
+        }
+
+        let outpoints: Vec<OutPoint> = candidates.iter().map(|(outpoint, _)| *outpoint).collect();
+        let live = self.rpc.get_txouts(&outpoints);
+        let mut out = Vec::with_capacity(candidates.len());
+        for ((outpoint, script_pubkey), live) in candidates.into_iter().zip(live) {
+            // An outpoint the node cannot answer for is skipped, exactly as before.
+            let Some(live) = live else { continue };
+            let height = if live.confirmations > 0 {
+                // gettxout confirmations is relative to the chain tip at query time.
+                Some(best.saturating_sub(live.confirmations - 1) as u32)
+            } else {
+                None
+            };
+            out.push(WalletUtxo {
+                outpoint,
+                value: live.value,
+                script_pubkey,
+                height,
+            });
         }
         out
     }
-
 }
 
 fn hex_of(bytes: &[u8]) -> String {

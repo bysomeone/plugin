@@ -23,10 +23,17 @@
 //! （用 `#[test]` 而不是 libtest 的 bench harness —— 后者要改 Cargo.toml 加
 //! `harness = false`，那是产品文件，本次评估不动。）
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use bitcoin::{
+    Address, Amount, CompressedPublicKey, Network, OutPoint, ScriptBuf, Sequence, Transaction,
+    TxIn, TxOut, Witness,
+};
 use rgb_sidecar::build_store::BuildStore;
 use rgb_sidecar::ledger::{FinalizedWithdrawalRec, Ledger, RecordedWithdrawal};
 use rgb_sidecar::rpc::BtcdRpc;
@@ -34,6 +41,7 @@ use rgb_sidecar::types::SealStatus;
 use rgb_sidecar::wallet::{deposit_witness_script, BtcWallet};
 use rgb_sidecar::SealTxOut;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 /// 确定性伪随机（xorshift64）——基准要可复现，不能用系统随机源。
 struct Rng(u64);
@@ -467,4 +475,303 @@ fn perf_user_script_registry_write_amplification() {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+// =====================================================================
+// O4-lite: UTXO sweep RPC shape (before / after)
+// =====================================================================
+
+/// Per-script funding index for the counting mock. `searchrawtransactions` is answered from
+/// `by_script`, so the mock's own cost stays O(outputs of that script) — the measurement is the
+/// client's round-trip count, not the mock's scan.
+#[derive(Default)]
+struct O4Chain {
+    height: u64,
+    confirmations: u64,
+    /// script hex -> live outputs (txid, vout, value sat)
+    by_script: HashMap<String, Vec<(String, u32, u64)>>,
+    /// "txid:vout" -> (value sat, script hex)
+    live: HashMap<String, (u64, String)>,
+    http_requests: usize,
+    calls: HashMap<String, usize>,
+}
+
+impl O4Chain {
+    fn add_output(&mut self, txid: String, vout: u32, value: u64, script: &ScriptBuf) {
+        let hex =
+            bitcoin::hex::DisplayHex::to_hex_string(script.as_bytes(), bitcoin::hex::Case::Lower);
+        self.by_script
+            .entry(hex.clone())
+            .or_default()
+            .push((txid.clone(), vout, value));
+        self.live.insert(format!("{txid}:{vout}"), (value, hex));
+    }
+
+    fn reset_counters(&mut self) {
+        self.http_requests = 0;
+        self.calls.clear();
+    }
+
+    fn call_count(&self, method: &str) -> usize {
+        self.calls.get(method).copied().unwrap_or(0)
+    }
+}
+
+fn o4_handle_request(chain: &Arc<Mutex<O4Chain>>, req: &Value) -> Value {
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let params = req.get("params").cloned().unwrap_or_else(|| json!([]));
+    let id = req.get("id").cloned().unwrap_or_else(|| json!(1));
+    {
+        let mut c = chain.lock().unwrap();
+        *c.calls.entry(method.to_string()).or_insert(0) += 1;
+    }
+    let (result, error): (Value, Value) = match method {
+        "getblockcount" => (json!(chain.lock().unwrap().height), Value::Null),
+        "searchrawtransactions" => {
+            let addr = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+            let script = Address::from_str(addr)
+                .ok()
+                .and_then(|a| a.require_network(Network::Regtest).ok())
+                .map(|a| a.script_pubkey());
+            let hex = script.map(|s| {
+                bitcoin::hex::DisplayHex::to_hex_string(s.as_bytes(), bitcoin::hex::Case::Lower)
+            });
+            let outputs = hex
+                .clone()
+                .and_then(|h| chain.lock().unwrap().by_script.get(&h).cloned())
+                .unwrap_or_default();
+            let hex = hex.unwrap_or_default();
+            let mut per_tx: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+            for (txid, vout, value) in outputs {
+                per_tx.entry(txid).or_default().push(json!({
+                    "n": vout,
+                    "value": value as f64 / 100_000_000.0,
+                    "scriptPubKey": {"hex": hex},
+                }));
+            }
+            let arr: Vec<Value> = per_tx
+                .into_iter()
+                .map(|(txid, vouts)| json!({"txid": txid, "confirmations": 100, "vout": vouts}))
+                .collect();
+            (Value::Array(arr), Value::Null)
+        }
+        "gettxout" => {
+            let txid = params.get(0).and_then(|v| v.as_str()).unwrap_or("");
+            let vout = params.get(1).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let key = format!("{txid}:{vout}");
+            let c = chain.lock().unwrap();
+            match c.live.get(&key) {
+                Some((value, script)) => (
+                    json!({
+                        "value": *value as f64 / 100_000_000.0,
+                        "scriptPubKey": {"hex": script},
+                        "confirmations": c.confirmations,
+                    }),
+                    Value::Null,
+                ),
+                None => (Value::Null, Value::Null),
+            }
+        }
+        _ => (
+            Value::Null,
+            json!({"code": -32601, "message": format!("method {method} not found")}),
+        ),
+    };
+    json!({"result": result, "error": error, "id": id})
+}
+
+fn o4_handle_conn(mut stream: TcpStream, chain: Arc<Mutex<O4Chain>>) {
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
+        return;
+    }
+    let mut len = 0usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).unwrap_or(0) == 0 {
+            return;
+        }
+        let header = header.trim().to_ascii_lowercase();
+        if header.is_empty() {
+            break;
+        }
+        if let Some(v) = header.strip_prefix("content-length:") {
+            len = v.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut body = vec![0u8; len];
+    if len > 0 && reader.read_exact(&mut body).is_err() {
+        return;
+    }
+    let Ok(req) = serde_json::from_slice::<Value>(&body) else {
+        return;
+    };
+    let response = if let Some(batch) = req.as_array() {
+        Value::Array(batch.iter().map(|r| o4_handle_request(&chain, r)).collect())
+    } else {
+        o4_handle_request(&chain, &req)
+    };
+    {
+        chain.lock().unwrap().http_requests += 1;
+    }
+    let text = response.to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+        text.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn o4_start_mock() -> (String, Arc<Mutex<O4Chain>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock btcd");
+    let host = listener.local_addr().expect("local addr").to_string();
+    let chain = Arc::new(Mutex::new(O4Chain {
+        height: 200,
+        confirmations: 100,
+        ..Default::default()
+    }));
+    let chain_for_thread = chain.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let chain = chain_for_thread.clone();
+            std::thread::spawn(move || o4_handle_conn(stream, chain));
+        }
+    });
+    (host, chain)
+}
+
+/// The **pre-O4** algorithm, verbatim: for every script, one `searchrawtransactions`, one
+/// `getblockcount`, then one `gettxout` per candidate output.
+fn legacy_sweep(rpc: &BtcdRpc, scripts: &[ScriptBuf]) -> Vec<(OutPoint, u64)> {
+    let mut out = Vec::new();
+    for script in scripts {
+        let Ok(txs) = rpc.search_txs_for_script(script) else {
+            continue;
+        };
+        let best = rpc.get_block_count().unwrap_or(0);
+        let _ = best;
+        for tx in txs {
+            for (vout, _txout) in tx.outputs {
+                let outpoint = OutPoint {
+                    txid: tx.txid,
+                    vout,
+                };
+                if let Ok(Some(live)) = rpc.get_txout(&outpoint) {
+                    out.push((outpoint, live.value));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Before/after of one sweep. The set of discovered UTXOs must be identical; only the number of
+/// HTTP round-trips (and therefore the elapsed time) changes.
+#[test]
+fn perf_o4_utxo_discovery() {
+    println!();
+    println!("=== O4-lite：一次 UTXO 扫集的 RPC 往返（改前逐脚本 vs 改后分块批量）===");
+    println!(
+        "{:>7} | {:>10} {:>10} | {:>10} {:>10} | {:>7}",
+        "N", "改前 RPC", "改前 ms", "改后 RPC", "改后 ms", "倍率"
+    );
+    println!("{}", "-".repeat(72));
+
+    let tss_pubkey_hex = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+    let pubkey: CompressedPublicKey = tss_pubkey_hex.parse().unwrap();
+
+    for n in [100usize, 1_000, 5_000] {
+        let (host, chain) = o4_start_mock();
+        let rpc = Arc::new(BtcdRpc::connect(&host, "u", "p", None, Network::Regtest).unwrap());
+        let mut wallet = BtcWallet::new(rpc.clone(), tss_pubkey_hex, Network::Regtest).unwrap();
+        let main_script = Address::p2wpkh(&pubkey, Network::Regtest).script_pubkey();
+        let mut scripts = Vec::with_capacity(n + 1);
+        scripts.push(main_script);
+
+        for i in 0..n {
+            let user_id = format!("1PerfUser{i:0>24}");
+            let witness_script = deposit_witness_script(&user_id, &pubkey).unwrap();
+            let pk_script = ScriptBuf::new_p2wsh(&witness_script.wscript_hash());
+            // A confirmed deposit for every user script.
+            let funding = Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::from_bytes((i as u32 + 1).to_le_bytes().to_vec()),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(10_000),
+                    script_pubkey: pk_script.clone(),
+                }],
+            };
+            let txid = funding.compute_txid().to_string();
+            chain
+                .lock()
+                .unwrap()
+                .add_output(txid, 0, 10_000, &pk_script);
+            wallet
+                .register_user_script(pk_script.clone(), user_id, witness_script)
+                .unwrap();
+            scripts.push(pk_script);
+        }
+
+        // ---- 改前 ----
+        chain.lock().unwrap().reset_counters();
+        let t = Instant::now();
+        let legacy = legacy_sweep(&rpc, &scripts);
+        let legacy_ms = t.elapsed().as_secs_f64() * 1e3;
+        let legacy_rpcs = chain.lock().unwrap().http_requests;
+        assert_eq!(legacy.len(), n, "every funded output must be discovered");
+
+        // ---- 改后 ----
+        chain.lock().unwrap().reset_counters();
+        let t = Instant::now();
+        let batched = wallet.list_unspent_all();
+        let batched_ms = t.elapsed().as_secs_f64() * 1e3;
+        let batched_rpcs = chain.lock().unwrap().http_requests;
+        {
+            let c = chain.lock().unwrap();
+            assert_eq!(
+                c.call_count("getblockcount"),
+                1,
+                "one tip read per sweep, not one per script"
+            );
+        }
+        let mut a: Vec<(String, u64)> = legacy.iter().map(|(op, v)| (op.to_string(), *v)).collect();
+        let mut b: Vec<(String, u64)> = batched
+            .iter()
+            .map(|u| (u.outpoint.to_string(), u.value))
+            .collect();
+        a.sort();
+        b.sort();
+        assert_eq!(
+            a, b,
+            "batched and per-script sweeps must return the same UTXO set"
+        );
+
+        println!(
+            "{:>7} | {:>10} {:>10.1} | {:>10} {:>10.1} | {:>6.1}x",
+            n,
+            legacy_rpcs,
+            legacy_ms,
+            batched_rpcs,
+            batched_ms,
+            legacy_rpcs as f64 / batched_rpcs.max(1) as f64
+        );
+    }
+
+    println!();
+    println!("静态口径（N 个脚本、每个 1 个候选输出）：");
+    println!("  改前 = (N+1) search + (N+1) getblockcount + N gettxout = 3N+2 HTTP 往返");
+    println!("  改后 = ceil((N+1)/64) search 批次 + 1 getblockcount + ceil(N/1000) gettxout 批次");
+    println!(
+        "  ⇒ N=1e4 时约 30,002 → 168 次往返（与本文 §4.1 的 ~30,000 一致）；\
+         集合仍由 searchrawtransactions + gettxout 决定，语义不变"
+    );
 }
