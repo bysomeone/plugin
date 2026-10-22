@@ -475,7 +475,9 @@ impl RgbEngine {
     ///   - 只取用户充值脚本的 UTXO，且**排除任何承载 RGB 状态的 outpoint**（那是 seal，花它必须
     ///     走 RGB 转移，不能当普通 BTC 扫走）；
     ///   - 确认数不足的不要；
-    ///   - 少于 `min_utxos` 笔就返回 `None`（UTXO 太少时扫集的手续费不划算，等它攒够）。
+    ///   - **逐个**丢掉不经济的 UTXO（花掉它自己的边际手续费已吃掉它的价值，见
+    ///     `build_sweep_from_utxos` 的公式）：留在原地，等费率回落后下一轮再扫，不是错误；
+    ///   - 过滤后少于 `min_utxos` 笔就返回 `None`（UTXO 太少时扫集的手续费不划算，等它攒够）。
     ///
     /// **【不变式·冻结】归集目标只有一个：主池 TSS 脚本**（规格 §2.3(b)：桥的任何自有付款都不得
     /// 落到用户 P2WSH —— 那笔付款会被该用户回头当成充值证明再认领一次）。因此本交易只有一个输出，
@@ -505,6 +507,32 @@ impl RgbEngine {
         fee_rate: u64,
         min_utxos: u32,
     ) -> Result<Option<SweepBuild>> {
+        // Per-UTXO economics: sweeping the UTXO contributes one P2WSH input, whose marginal fee is
+        // `SWEEP_P2WSH_INPUT_VBYTES * fee_rate`. The swept value also has to leave a non-dust output,
+        // so an input that nets less than `SWEEP_DUST_LIMIT` after paying its own marginal fee is a
+        // net loss for the pool:
+        //
+        //     value - SWEEP_P2WSH_INPUT_VBYTES * fee_rate <= SWEEP_DUST_LIMIT
+        //     => value <= SWEEP_P2WSH_INPUT_VBYTES * fee_rate + SWEEP_DUST_LIMIT   (skip)
+        //
+        // These UTXOs are left untouched on the user deposit script (no error, no protocol change):
+        // they do not block the economical ones, and they become sweepable again on their own once
+        // the fee rate falls. Saturating arithmetic keeps a nonsensical fee rate from panicking.
+        let uneconomical_below = SWEEP_P2WSH_INPUT_VBYTES
+            .saturating_mul(fee_rate)
+            .saturating_add(SWEEP_DUST_LIMIT);
+        let candidate_count = utxos.len();
+        utxos.retain(|u| u.value > uneconomical_below);
+        let skipped = candidate_count - utxos.len();
+        if skipped > 0 {
+            eprintln!(
+                "sweep: skipped {skipped} uneconomical user deposit utxo(s) with value <= \
+                 {uneconomical_below} sat at fee_rate {fee_rate} sat/vB; they stay on the user \
+                 scripts until the fee rate falls"
+            );
+        }
+        // The filter runs before the `min_utxos` gate on purpose: if too few economical UTXOs are
+        // left, the whole round waits for the next one instead of sweeping an under-sized batch.
         if (utxos.len() as u32) < min_utxos {
             return Ok(None);
         }
@@ -2348,6 +2376,110 @@ mod sweep_tests {
         // 只有 1 笔、阈值 2 ⇒ 不构建（闲时攒够再扫），且**不是错误**。
         let one = engine.build_sweep_from_utxos(vec![utxo(0, 20_000, a)], 2, 2).unwrap();
         assert!(one.is_none());
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
+
+    /// At fee_rate 2 the per-UTXO threshold is `100 * 2 + 294 = 494` sat: an input at or below it
+    /// does not pay for its own marginal fee plus dust, so it must be left behind while the
+    /// economical UTXOs are still swept.
+    #[test]
+    fn sweep_skips_uneconomical_utxos() {
+        let mut engine = test_engine();
+        let (a, b) = two_users(&mut engine);
+        let uneconomical = utxo(0, 494, a);
+        let uneconomical_outpoint = uneconomical.outpoint;
+        let build = engine
+            .build_sweep_from_utxos(vec![uneconomical, utxo(1, 20_000, b)], 2, 1)
+            .unwrap()
+            .expect("仍有可扫的 UTXO");
+
+        assert_eq!(build.input_count, 1, "不经济的 UTXO 必须被跳过");
+        assert_eq!(build.input_value, 20_000);
+        assert!(
+            !build
+                .psbt
+                .unsigned_tx
+                .input
+                .iter()
+                .any(|i| i.previous_output == uneconomical_outpoint),
+            "被过滤的 outpoint 不得进入交易"
+        );
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
+
+    /// Filtering happens **before** the `min_utxos` gate: one economical UTXO is not enough to make
+    /// a batch of two, so the round returns `None` (wait for the next tick) rather than sweeping the
+    /// under-sized, uneconomical remainder.
+    #[test]
+    fn sweep_returns_none_when_filtering_drops_below_min_utxos() {
+        let mut engine = test_engine();
+        let (a, b) = two_users(&mut engine);
+        let candidates = vec![
+            utxo(0, 100, a.clone()), // below 494 at fee_rate 2
+            utxo(1, 200, a),         // below 494 at fee_rate 2
+            utxo(2, 20_000, b),      // economical, but only one
+        ];
+        let build = engine.build_sweep_from_utxos(candidates, 2, 2).unwrap();
+        assert!(build.is_none(), "过滤后只剩 1 笔，不足 min_utxos=2");
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
+
+    /// The filter must not touch UTXOs that sit just above the threshold: filtering one loss-making
+    /// input out is fine, dropping profitable ones would silently stop the sweep.
+    #[test]
+    fn sweep_keeps_economical_utxos() {
+        let mut engine = test_engine();
+        let (a, b) = two_users(&mut engine);
+        // 495 and 20_000 are both > 494, so both must be swept.
+        let build = engine
+            .build_sweep_from_utxos(vec![utxo(0, 495, a), utxo(1, 20_000, b)], 2, 2)
+            .unwrap()
+            .expect("两笔都经济，应该可扫");
+        assert_eq!(build.input_count, 2);
+        assert_eq!(build.input_value, 20_495);
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
+
+    /// The threshold moves with the fee rate: the same 600 sat UTXO is economical at 1 sat/vB
+    /// (threshold 394) and uneconomical at 4 sat/vB (threshold 694), which is how these UTXOs
+    /// come back on their own once fees fall.
+    #[test]
+    fn sweep_threshold_tracks_the_fee_rate() {
+        let mut engine = test_engine();
+        let (a, b) = two_users(&mut engine);
+        let candidates = || vec![utxo(0, 600, a.clone()), utxo(1, 100_000, b.clone())];
+
+        let low = engine
+            .build_sweep_from_utxos(candidates(), 1, 1)
+            .unwrap()
+            .expect("低费率下两笔都经济");
+        assert_eq!(low.input_count, 2);
+        assert_eq!(low.input_value, 100_600);
+
+        let high = engine
+            .build_sweep_from_utxos(candidates(), 4, 1)
+            .unwrap()
+            .expect("高费率下大额 UTXO 仍可扫");
+        assert_eq!(high.input_count, 1, "600 sat 在 4 sat/vB 下被过滤");
+        assert_eq!(high.input_value, 100_000);
+        let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
+    }
+
+    /// The existing loud failure is preserved: filtering is per-input economics, not a promise that
+    /// the survivors cover the whole transaction. A 400 sat UTXO passes the per-input threshold at
+    /// 1 sat/vB (394) yet cannot pay the 142 vbyte fee plus dust, so this must still be an `Err`
+    /// (the caller retries) rather than a silent `None`.
+    #[test]
+    fn sweep_still_fails_loudly_when_survivors_cannot_cover_the_fee() {
+        let mut engine = test_engine();
+        let (a, _b) = two_users(&mut engine);
+        let err = engine
+            .build_sweep_from_utxos(vec![utxo(0, 400, a)], 1, 1)
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("cannot cover fee"),
+            "unexpected error: {err}"
+        );
         let _ = std::fs::remove_dir_all(&engine.cfg.data_dir);
     }
 
