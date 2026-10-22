@@ -47,7 +47,11 @@ import (
 const (
 	// defaultMaxWatchedDepositScripts watch 集默认上限（配置键未设或为 0 时生效）。
 	defaultMaxWatchedDepositScripts = 10000
-	// depositScriptBucket 用户充值脚本 watch 集的持久化 bucket（neutrino.db）：
+	// depositScriptBucket 用户充值脚本 watch 集的持久化 bucket：
+	//   - 有钱包的节点（官方节点）：btcwallet.db —— 与脚本导入共用一个 bolt 事务，发放地址只需
+	//     一次提交（O6）；
+	//   - 没有钱包的节点：neutrino.db —— 它们不 watch，只需持有登记供签名核对。旧版本写在
+	//     neutrino.db 的条目在启动时迁移到主库。
 	// key = userID（chain33 地址串原始字节），value = pkScript（34 字节）。
 	depositScriptBucket = "rgbx-deposit-scripts"
 	// waddrmgrNamespaceKey 与 btcwallet wallet 包内同名常量一致（那边是私有的），
@@ -204,13 +208,8 @@ func (b *btcWallet) ensureUserDepositScript(userID string) (string, error) {
 			"refusing to hand out a new deposit address: a script the wallet does not watch would make the "+
 			"user's BTC invisible to the bridge", size, limit)
 	}
-	if _, err := b.importDepositWitnessScript(witnessScript); err != nil {
+	if _, err := b.importAndSaveDepositScript(userID, witnessScript, pkScript); err != nil {
 		return "", err
-	}
-	// 先落盘再入内存：import 已经发生（钱包确实在 watch 了），映射丢了只会漏认，不会认错。
-	if err := b.client.saveDepositScript(userID, pkScript); err != nil {
-		log.Error("ensureUserDepositScript persist watch entry failed",
-			"userID", userID, "address", addr, "err", err)
 	}
 	b.client.deposits.add(userID, pkScript)
 	log.Info("ensureUserDepositScript watch set grown", "userID", userID, "address", addr,
@@ -238,24 +237,59 @@ func validateDepositUserID(userID string) error {
 	return nil
 }
 
-// importDepositWitnessScript 把用户充值脚本导入钱包地址管理器（watching-only 的 imported account），
-// 并让链客户端订阅它 —— 这样钱包才能看见打进来的充值。返回该脚本对应的 P2WSH 地址。
+// importAndSaveDepositScript 把用户充值脚本导入钱包地址管理器，并在**同一个 bolt 事务**里记下
+// userID → pkScript 的映射（O6）。一次提交保证"钱包在 watch"与"桥记得它属于谁"不会只落一半：
+// 任一写入失败整笔事务回滚，地址就不会发给用户。
 //
-// 上游 btcwallet 在 Wallet 层**没有** ImportScript/ImportWitnessScript 包装（只有 waddrmgr 层有，
-// 见 C0 §7.2），这里照 Wallet.ImportTaprootScript 的写法自己写一个：写 waddrmgr 命名空间 +
-// chainClient.NotifyReceived。
-//
-// bs 取"钱包当前已同步到的块"：它只影响地址管理器的 start block，而**不允许把这个块往回拉**
-// （拉回去等于让钱包从更早的块开始重扫，主网代价极大）。历史充值由 NotifyReceived 触发的
-// neutrino rescan（从钱包生日起）覆盖，不依赖这里。
-//
-// 幂等：重复导入（ErrDuplicateAddress）视为成功，订阅与记账照走。
-func (b *btcWallet) importDepositWitnessScript(witnessScript []byte) (btcutil.Address, error) {
-	addrs, err := b.importDepositWitnessScripts([][]byte{witnessScript})
+// 订阅（NotifyReceived）在事务提交之后：它不在磁盘上，失败时返回错误、地址不发放，重启后由
+// loadDepositScripts 重新导入并订阅。
+func (b *btcWallet) importAndSaveDepositScript(userID string, witnessScript, pkScript []byte) (btcutil.Address, error) {
+	manager, err := b.ensureScopedKeyManager(waddrmgr.KeyScopeBIP0084)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch bip84 scoped key manager: %w", err)
 	}
-	return addrs[0], nil
+	bs := b.Wallet.Manager.SyncedTo()
+	var addr btcutil.Address
+	err = walletdb.Update(b.db, func(tx walletdb.ReadWriteTx) error {
+		ns := tx.ReadWriteBucket([]byte(waddrmgrNamespaceKey))
+		if ns == nil {
+			return fmt.Errorf("waddrmgr namespace not found in wallet db")
+		}
+		// 登记先写：它失败时导入还没发生，连地址管理器的内存缓存都不会被污染（导入会先更新
+		// 缓存再依赖事务提交）。导入失败则整笔回滚，登记也不会留下。
+		bucket, berr := tx.CreateTopLevelBucket([]byte(depositScriptBucket))
+		if berr != nil {
+			return berr
+		}
+		if berr := bucket.Put([]byte(userID), pkScript); berr != nil {
+			return berr
+		}
+		// witnessVersion=0（v0 P2WSH）、isSecretScript=false：watch-only 钱包只能以非机密脚本
+		// 导入（脚本用公开密钥加密存储；watching-only 下 waddrmgr 不保留 witnessScript 原文，
+		// 需要时由 (userID, tssPub) 重新派生，见本文件开头）。
+		managed, ierr := manager.ImportWitnessScript(ns, witnessScript, &bs, 0, false)
+		switch {
+		case ierr == nil:
+			addr = managed.Address()
+		case waddrmgr.IsError(ierr, waddrmgr.ErrDuplicateAddress):
+			// 已导入过：重新算出地址（P2WSH 地址 = bech32(sha256(witnessScript))，与派生同源）。
+			derived, derr := btcutil.NewAddressWitnessScriptHash(sha256Sum(witnessScript), &b.chainParams)
+			if derr != nil {
+				return fmt.Errorf("rebuild deposit address after duplicate import: %w", derr)
+			}
+			addr = derived
+		default:
+			return ierr
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("import and register deposit script: %w", err)
+	}
+	if err := b.notifyAddrs([]btcutil.Address{addr}); err != nil {
+		return nil, fmt.Errorf("subscribe deposit address: %w", err)
+	}
+	return addr, nil
 }
 
 // importDepositWitnessScripts 批量导入用户充值脚本，并**只订阅一次**（NotifyReceived 一次一批）。
@@ -319,44 +353,41 @@ func (b *btcWallet) notifyAddrs(addrs []btcutil.Address) error {
 	return b.chainClient.NotifyReceived(addrs)
 }
 
-// loadDepositScripts 从 neutrino.db 载入 watch 集，并**按当前群公钥重新派生**每条记录的 program：
+// loadDepositScripts 从本节点的持久化 bucket 载入 watch 集，并**按当前群公钥重新派生**每条记录的 program：
 // 对不上（旧世代 DKG 的残留 / 记录损坏）就跳过并告警 —— 那种脚本上的 BTC 已经不可花费
 // （群公钥一变所有地址作废，见 C0 §1.6），继续 watch 只会把不可认领的充值误认成充值。
 //
-// 载入时**顺带重新导入**钱包地址管理器（幂等）：脚本的权威存放处是 btcwallet.db，而 watch 集记在
-// neutrino.db —— 两个库可能不同步（钱包恢复/重建），重新导入让"记在集合里的脚本一定真的被 watch"
-// 这条不变式自愈，代价只是启动时一次 AddAddrs（rescan 已在跑时）或一次 rescan。
+// bucket 在本节点的主库（有钱包的节点是 btcwallet.db，其余节点是 neutrino.db）。
+//
+// 载入时**顺带重新导入**钱包地址管理器（幂等）：脚本的权威存放处是 btcwallet.db，而登记与
+// 钱包可能不同步（钱包恢复/重建），重新导入让"记在集合里的脚本一定真的被 watch"这条不变式自愈，
+// 代价只是启动时一次 AddAddrs（rescan 已在跑时）或一次 rescan。
 func (n *neutrinoClient) loadDepositScripts() {
 	pub := n.depositTssPubKey()
-	if len(pub) == 0 || n.deposits == nil || n.neutrinoCfg.Database == nil {
+	if len(pub) == 0 || n.deposits == nil {
 		return
 	}
-	type entry struct{ userID, program string }
-	var entries []entry
-	err := walletdb.View(n.neutrinoCfg.Database, func(tx walletdb.ReadTx) error {
-		bucket := tx.ReadBucket([]byte(depositScriptBucket))
-		if bucket == nil {
-			return nil
-		}
-		return bucket.ForEach(func(k, v []byte) error {
-			entries = append(entries, entry{userID: string(k), program: hex.EncodeToString(v)})
-			return nil
-		})
-	})
+	primary := n.depositRegistryDB()
+	if primary == nil {
+		return
+	}
+	stored, err := readDepositScriptEntries(primary)
 	if err != nil {
 		log.Error("loadDepositScripts read bucket", "err", err)
 		return
 	}
+	entries := stored
 	skipped := 0
 	// 本轮新载入的脚本（钱包不在 watch 的节点只维护登记，不导入）。
 	var loaded [][]byte
 	var adds []depositScriptEntry
 	for _, e := range entries {
+		program := hex.EncodeToString(e.pkScript)
 		pkScript, derr := rtypes.DeriveDepositPkScript(e.userID, pub)
-		if derr != nil || hex.EncodeToString(pkScript) != e.program {
+		if derr != nil || hex.EncodeToString(pkScript) != program {
 			skipped++
 			log.Warn("loadDepositScripts stale watch entry (derivation mismatch), skip",
-				"userID", e.userID, "storedProgram", e.program, "err", derr)
+				"userID", e.userID, "storedProgram", program, "err", derr)
 			continue
 		}
 		// 只有真的在 watch 的节点才需要把脚本导入钱包：非官方节点不跑交易监听，导入了也看不见
@@ -524,28 +555,75 @@ func (n *neutrinoClient) mergeRemoteDepositScripts(entries []*pb.DepositScriptEn
 			return
 		}
 	}
+	// 整批一次提交：逐条 Update 会把一次下发放大成 N 次 fsync（这批可能上千条）。
+	if err := n.saveDepositScripts(adds); err != nil {
+		log.Error("mergeRemoteDepositScripts persist watch entries failed", "count", len(adds), "err", err)
+	}
 	for _, a := range adds {
-		if err := n.saveDepositScript(a.userID, a.pkScript); err != nil {
-			log.Error("mergeRemoteDepositScripts persist watch entry failed", "userID", a.userID, "err", err)
-		}
 		n.deposits.add(a.userID, a.pkScript)
 	}
 	log.Info("mergeRemoteDepositScripts merged remote deposit scripts", "merged", len(adds),
 		"watchSetSize", n.deposits.size(), "skipped", skipped, "walletWatching", n.depositImporter != nil)
 }
 
-// saveDepositScript 持久化一条 watch 记录（重启后不必等用户再要一次地址）。
-func (n *neutrinoClient) saveDepositScript(userID string, pkScript []byte) error {
-	if n == nil || n.neutrinoCfg.Database == nil {
+// depositRegistryDB 返回本节点持久化 watch 集所用的库。
+//
+// 有钱包的节点用钱包库：发地址时"导入脚本"与"记下映射"是同一个 btcwallet.db 事务（O6），
+// 一笔提交、要么都在要么都不在。没有钱包的验证节点用 neutrino.db（它只需要登记本身）。
+func (n *neutrinoClient) depositRegistryDB() walletdb.DB {
+	if n == nil {
 		return nil
 	}
-	return walletdb.Update(n.neutrinoCfg.Database, func(tx walletdb.ReadWriteTx) error {
+	if n.bw != nil && n.bw.db != nil {
+		return n.bw.db
+	}
+	return n.neutrinoCfg.Database
+}
+
+// readDepositScriptEntries 读出一个库里的全部登记（空库 = 空集）。
+func readDepositScriptEntries(db walletdb.DB) ([]depositScriptEntry, error) {
+	if db == nil {
+		return nil, nil
+	}
+	var out []depositScriptEntry
+	err := walletdb.View(db, func(tx walletdb.ReadTx) error {
+		bucket := tx.ReadBucket([]byte(depositScriptBucket))
+		if bucket == nil {
+			return nil
+		}
+		return bucket.ForEach(func(k, v []byte) error {
+			out = append(out, depositScriptEntry{userID: string(k), pkScript: append([]byte(nil), v...)})
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// writeDepositScriptEntries 在一个事务里写入一批登记。任一写入失败整笔回滚。
+func writeDepositScriptEntries(db walletdb.DB, entries []depositScriptEntry) error {
+	if db == nil || len(entries) == 0 {
+		return nil
+	}
+	return walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
 		bucket, err := tx.CreateTopLevelBucket([]byte(depositScriptBucket))
 		if err != nil {
 			return err
 		}
-		return bucket.Put([]byte(userID), pkScript)
+		for _, e := range entries {
+			if err := bucket.Put([]byte(e.userID), e.pkScript); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
+}
+
+// saveDepositScripts 把一批 watch 记录持久化到本节点的主库（重启后不必等用户再要一次地址）。
+func (n *neutrinoClient) saveDepositScripts(entries []depositScriptEntry) error {
+	return writeDepositScriptEntries(n.depositRegistryDB(), entries)
 }
 
 // isWatchedDepositScript 目标脚本是不是已发放的用户充值脚本（提现/扫集的输入归属核对用）。

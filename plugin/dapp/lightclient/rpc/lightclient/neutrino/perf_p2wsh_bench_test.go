@@ -171,6 +171,45 @@ func BenchmarkEnsureUserDepositScript(b *testing.B) {
 	}
 }
 
+// legacyEnsureUserDepositScript replicates the pre-O6 path: import scripts (one bolt commit in
+// btcwallet.db) and then persist the watch entry in a second commit (neutrino.db). It stays in
+// the benchmark so the before/after comparison is reproducible after the product code switched
+// to a single transaction.
+func legacyEnsureUserDepositScript(b *btcWallet, userID string) error {
+	pub := b.client.depositTssPubKey()
+	ws, err := rtypes.DeriveDepositWitnessScript(userID, pub)
+	if err != nil {
+		return err
+	}
+	pk, err := rtypes.DeriveDepositPkScript(userID, pub)
+	if err != nil {
+		return err
+	}
+	if _, err := b.importDepositWitnessScripts([][]byte{ws}); err != nil {
+		return err
+	}
+	if err := writeDepositScriptEntries(b.client.neutrinoCfg.Database,
+		[]depositScriptEntry{{userID: userID, pkScript: pk}}); err != nil {
+		return err
+	}
+	b.client.deposits.add(userID, pk)
+	return nil
+}
+
+// BenchmarkEnsureUserDepositScriptLegacy 改前的发放路径（两次 bolt 提交），与
+// BenchmarkEnsureUserDepositScript 同机、同数据形状对照。
+func BenchmarkEnsureUserDepositScriptLegacy(b *testing.B) {
+	priv, _ := btcec.PrivKeyFromBytes(bytes.Repeat([]byte{0x11}, 32))
+	pub := priv.PubKey()
+	w, _ := benchNewWallet(b, pub, config{})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := legacyEnsureUserDepositScript(w, chain33Addr(i)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkDeriveDepositPkScript 派生本身（纯函数，链下调用一次）—— 用来证明"派生不是瓶颈"。
 func BenchmarkDeriveDepositPkScript(b *testing.B) {
 	priv, _ := btcec.PrivKeyFromBytes(bytes.Repeat([]byte{0x11}, 32))

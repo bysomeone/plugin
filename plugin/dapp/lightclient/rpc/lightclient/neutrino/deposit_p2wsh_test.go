@@ -100,6 +100,8 @@ func newTestWallet(t *testing.T, pub *btcec.PublicKey, cfg config) (*btcWallet, 
 			neutrinoCfg: neutrino.Config{Database: neutrinoDB},
 		},
 	}
+	// 与生产一致：官方节点的 watch 集落在钱包库（导入与登记同一事务），client.bw 指回自己。
+	b.client.bw = b
 	return b, walletDB, neutrinoDB
 }
 
@@ -175,6 +177,7 @@ func TestEnsureUserDepositScript_persistsAndReloads(t *testing.T) {
 			neutrinoCfg: neutrino.Config{Database: neutrinoDB},
 		},
 	}
+	reloaded.client.bw = reloaded
 	// 模拟官方节点：载入时要把脚本重新导入钱包（测试里链客户端没起，订阅用注入的 notifyFn）。
 	reloaded.client.depositImporter = func(ws [][]byte) error {
 		_, err := reloaded.importDepositWitnessScripts(ws)
@@ -182,7 +185,7 @@ func TestEnsureUserDepositScript_persistsAndReloads(t *testing.T) {
 	}
 	reloaded.notifyFn = func([]btcutil.Address) error { return nil }
 	reloaded.client.loadDepositScripts()
-	assert.Equal(t, 2, reloaded.client.deposits.size(), "重启后 watch 集必须从 neutrino.db 恢复")
+	assert.Equal(t, 2, reloaded.client.deposits.size(), "重启后 watch 集必须从钱包库恢复")
 	userID, ok := reloaded.client.deposits.lookupUser(mustPkScriptHex(t, addr1, &params))
 	assert.True(t, ok)
 	assert.Equal(t, v1.UserID, userID)
@@ -193,6 +196,67 @@ func TestEnsureUserDepositScript_persistsAndReloads(t *testing.T) {
 	reloaded.client.deposits = newDepositScriptSet()
 	reloaded.client.loadDepositScripts()
 	assert.Equal(t, 0, reloaded.client.deposits.size(), "旧世代的 watch 条目必须被跳过（地址已作废）")
+}
+
+// TestEnsureUserDepositScript_oneCommitForWalletAndRegistry 一次发放后，钱包 watch 与登记必须
+// 同时可见，而且两者都落在钱包库里（同一个 bolt 事务，O6）。
+func TestEnsureUserDepositScript_oneCommitForWalletAndRegistry(t *testing.T) {
+	vectors := loadDepositVectors(t)
+	v := vectors[0]
+	pub, err := btcec.ParsePubKey(vectorPub(t, v))
+	require.NoError(t, err)
+
+	b, _, neutrinoDB := newTestWallet(t, pub, config{})
+	b.notifyFn = func([]btcutil.Address) error { return nil }
+
+	addr, err := b.ensureUserDepositScript(v.UserID)
+	require.NoError(t, err)
+
+	// 钱包侧：脚本已导入地址管理器。
+	_, err = b.Wallet.AddressInfo(mustWitnessAddr(t, addr))
+	require.NoError(t, err, "地址必须已导入钱包地址管理器")
+
+	// 登记侧：主库（钱包库）里能按 userID 读到该 program，且旧库不再增长。
+	pkScript, err := hex.DecodeString(v.PkScript)
+	require.NoError(t, err)
+	primary, err := readDepositScriptEntries(b.db)
+	require.NoError(t, err)
+	require.Len(t, primary, 1, "发放一次只应写一条登记")
+	assert.Equal(t, v.UserID, primary[0].userID)
+	assert.Equal(t, pkScript, primary[0].pkScript)
+
+	legacy, err := readDepositScriptEntries(neutrinoDB)
+	require.NoError(t, err)
+	assert.Empty(t, legacy, "新写入不得再落旧库（否则又会变回两次提交）")
+}
+
+// TestImportAndSaveDepositScript_rollsBackOnPersistFailure 模拟事务的第二段（登记写入）
+// 失败：钱包导入必须一并回滚，不能出现"钱包导入了但 watch 集没记"的半状态。
+func TestImportAndSaveDepositScript_rollsBackOnPersistFailure(t *testing.T) {
+	pub, err := btcec.ParsePubKey(vectorPub(t, loadDepositVectors(t)[0]))
+	require.NoError(t, err)
+
+	b, _, _ := newTestWallet(t, pub, config{})
+	b.notifyFn = func([]btcutil.Address) error { return nil }
+
+	userID := "1RollbackUserForTheSameGroupKey"
+	ws, err := rtypes.DeriveDepositWitnessScript(userID, pub.SerializeCompressed())
+	require.NoError(t, err)
+	pkScript, err := rtypes.DeriveDepositPkScript(userID, pub.SerializeCompressed())
+	require.NoError(t, err)
+	addr, err := rtypes.DeriveDepositAddress(userID, pub.SerializeCompressed(), &b.chainParams)
+	require.NoError(t, err)
+
+	// 空 userID 让事务的第二段（bucket.Put）返回 ErrKeyRequired —— 导入已经在这个事务里执行过，
+	// 整笔必须回滚。
+	_, err = b.importAndSaveDepositScript("", ws, pkScript)
+	require.Error(t, err)
+
+	_, err = b.Wallet.AddressInfo(mustWitnessAddr(t, addr))
+	require.Error(t, err, "事务失败后钱包不得留下导入的脚本")
+	stored, err := readDepositScriptEntries(b.db)
+	require.NoError(t, err)
+	assert.Empty(t, stored, "事务失败后登记不得留下任何条目")
 }
 
 // TestEnsureUserDepositScript_rejectsBadRequests 输入校验与上限：拿不到地址就必须报错，
