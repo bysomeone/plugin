@@ -55,6 +55,12 @@ message depositScriptList {
 //
 // 大额提现的延迟只能由桥执行（付款在链下），链上无法验证，因此这里只保留充值侧
 // 可控的旋钮：大额充值要求更深的 BTC 确认数。
+//
+// fields 是**单项更新掩码**：为空时整条配置全量替换（原有行为）；非空时只更新列出的
+// 字段，其余字段沿用同名记录（global / 该资产）在链上的现值，首次申请时未列出的字段
+// 取默认零值。字段名就是本 message 的字段名（assetSymbol 除外，它标识记录本身）；
+// 出现未知字段名时整笔申请被拒绝，不静默忽略。列表字段（rgb20WithdrawFee）命中掩码时
+// 整体替换，不做逐条合并。
 message bridgeConfigApply {
     string assetSymbol = 1;
     // 总开关：关闭时不做任何数值上限检查（暂停开关仍独立生效）。
@@ -70,6 +76,23 @@ message bridgeConfigApply {
     // 紧急制动，按方向独立；只能由治理流程改变。
     bool   pauseDeposit  = 9;
     bool   pauseWithdraw = 10;
+    // BTC 计价提现的矿工费率上限（sat/vB）。BTC 提现与 RGB20 的 BTC 付费通道共用。
+    // 取值范围 1..1000（执行器硬边界 maxBtcFeeRate）；0 表示未设置（不额外限制）。
+    uint32 withdrawMaxFeeRateSatPerVbyte = 11;
+    // RGB20 的 BTC 付费通道估算 xBTC 锁定上限时采用的**保守交易体积**（vB）。
+    // 取值范围 1..2000（maxRgb20WithdrawFeeLockVbytes）；0 表示未设置。
+    uint32 rgb20WithdrawFeeLockVbytes = 12;
+    // RGB20 资产 U 通道的固定手续费（按资产 symbol，单位为该资产最小单位）。
+    // 掩码命中时整体替换列表。每个 symbol 必须是已登记且 assetKind = RGB20 的跨链资产。
+    repeated rgb20WithdrawFee rgb20WithdrawFee = 13;
+    // 单项更新掩码：空 = 全量更新；非空 = 只更新列出的字段。见本 message 的说明。
+    repeated string fields = 14;
+}
+
+// rgb20WithdrawFee RGB20 资产 U 通道的固定手续费（最小单位，0 合法）。
+message rgb20WithdrawFee {
+    string symbol      = 1;
+    int64  feeMinUnits = 2;
 }
 
 // bridgeConfigApprove 配置生效（第二步）。执行器必须向同链 autonomy 查询

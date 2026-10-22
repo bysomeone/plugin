@@ -460,3 +460,216 @@ func TestBridgeConfig_DepositExtraConfirmations(t *testing.T) {
 	require.NoError(t, err)
 	require.Zero(t, other, "a different asset is unaffected")
 }
+
+// applyAndApproveBridgeConfig runs the two-step governance flow and applies the resulting
+// receipt KVs, so the test observes what the chain would store.
+func applyAndApproveBridgeConfig(t *testing.T, r *rgbx, state kvSetter,
+	cfg *rtypes.BridgeConfigApply, label string) {
+	t.Helper()
+	applyTx := signedTestTx("apply-" + label)
+	applyReceipt, err := r.Exec_BridgeConfigApply(cfg, applyTx, 0)
+	require.NoError(t, err)
+	applyStateKV(t, state, applyReceipt.GetKV())
+
+	approveReceipt, err := r.Exec_BridgeConfigApprove(&rtypes.BridgeConfigApprove{
+		ApplyConfigId:  hex.EncodeToString(applyTx.Hash()),
+		AutonomyItemId: "item-" + label,
+	}, signedTestTx("approve-"+label), 0)
+	require.NoError(t, err)
+	applyStateKV(t, state, approveReceipt.GetKV())
+}
+
+func TestBridgeConfig_PartialMaskOnlyTouchesListedFields(t *testing.T) {
+	r, state, api := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	api.On("QueryChain", mock.Anything).Return(&types.ReplyString{}, nil)
+	setCrossChainInfoForTest(t, state, "usdt", rtypes.CrossChainAssetRgb20, 6, []byte{0x02})
+
+	setBridgeConfigForTest(t, state, "usdt", &rtypes.BridgeConfigApply{
+		AssetSymbol:                   "usdt",
+		LimitsEnabled:                 true,
+		MaxPerTx:                      100,
+		PauseDeposit:                  true,
+		WithdrawMaxFeeRateSatPerVbyte: 50,
+	})
+
+	// The apply names maxPerTx only; its other payload values must not leak into the
+	// effective config.
+	applyAndApproveBridgeConfig(t, r, state, &rtypes.BridgeConfigApply{
+		AssetSymbol:   "usdt",
+		MaxPerTx:      200,
+		PauseWithdraw: true,
+		Fields:        []string{rtypes.BridgeConfigFieldMaxPerTx},
+	}, "mask")
+
+	effective, err := r.loadBridgeConfig("usdt")
+	require.NoError(t, err)
+	require.Equal(t, int64(200), effective.GetMaxPerTx(), "listed field is updated")
+	require.True(t, effective.GetLimitsEnabled(), "unlisted field keeps its on-chain value")
+	require.True(t, effective.GetPauseDeposit(), "unlisted field keeps its on-chain value")
+	require.False(t, effective.GetPauseWithdraw(), "an unlisted payload value is not applied")
+	require.Equal(t, uint32(50), effective.GetWithdrawMaxFeeRateSatPerVbyte())
+	require.Empty(t, effective.GetFields(), "the mask itself is never persisted")
+}
+
+func TestBridgeConfig_PartialMaskOnMissingBaseUsesZeroDefaults(t *testing.T) {
+	r, state, api := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	api.On("QueryChain", mock.Anything).Return(&types.ReplyString{}, nil)
+	setCrossChainInfoForTest(t, state, "usdt", rtypes.CrossChainAssetRgb20, 6, []byte{0x02})
+
+	applyAndApproveBridgeConfig(t, r, state, &rtypes.BridgeConfigApply{
+		AssetSymbol:  "usdt",
+		PauseDeposit: true,
+		MaxPerTx:     999,
+		Fields:       []string{rtypes.BridgeConfigFieldPauseDeposit},
+	}, "first-mask")
+
+	effective, err := r.loadBridgeConfig("usdt")
+	require.NoError(t, err)
+	require.True(t, effective.GetPauseDeposit())
+	require.Zero(t, effective.GetMaxPerTx(), "unlisted fields default to zero on first apply")
+}
+
+func TestBridgeConfig_UnknownMaskFieldRejected(t *testing.T) {
+	r, state, _ := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	setCrossChainInfoForTest(t, state, "usdt", rtypes.CrossChainAssetRgb20, 6, []byte{0x02})
+
+	_, err := r.Exec_BridgeConfigApply(&rtypes.BridgeConfigApply{
+		AssetSymbol: "usdt", Fields: []string{"notAField"},
+	}, signedTestTx("unknown-field"), 0)
+	require.ErrorIs(t, err, ErrInvalidBridgeConfig)
+
+	// assetSymbol identifies the record and cannot be changed through a mask.
+	_, err = r.Exec_BridgeConfigApply(&rtypes.BridgeConfigApply{
+		AssetSymbol: "usdt", Fields: []string{"assetSymbol"},
+	}, signedTestTx("mask-asset-symbol"), 0)
+	require.ErrorIs(t, err, ErrInvalidBridgeConfig)
+
+	// The same check runs in CheckTx.
+	bad, txErr := r.GetExecutorType().CreateTransaction(rtypes.NameBridgeConfigApplyAction,
+		&rtypes.BridgeConfigApply{AssetSymbol: "usdt", Fields: []string{"notAField"}})
+	require.NoError(t, txErr)
+	require.ErrorIs(t, r.CheckTx(bad, 0), ErrInvalidBridgeConfig)
+}
+
+func TestBridgeConfig_Rgb20WithdrawFeeValidation(t *testing.T) {
+	r, state, _ := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	setCrossChainInfoForTest(t, state, "usdt", rtypes.CrossChainAssetRgb20, 6, []byte{0x02})
+	setCrossChainInfoForTest(t, state, "btc", rtypes.CrossChainAssetBtc,
+		rtypes.BTCChainPrecision, []byte{0x02})
+
+	// fee = 0 is legal.
+	_, err := r.Exec_BridgeConfigApply(&rtypes.BridgeConfigApply{
+		Rgb20WithdrawFee: []*rtypes.Rgb20WithdrawFee{{Symbol: "usdt", FeeMinUnits: 0}},
+	}, signedTestTx("fee-zero"), 0)
+	require.NoError(t, err)
+
+	// Negative fee is rejected.
+	_, err = r.Exec_BridgeConfigApply(&rtypes.BridgeConfigApply{
+		Rgb20WithdrawFee: []*rtypes.Rgb20WithdrawFee{{Symbol: "usdt", FeeMinUnits: -1}},
+	}, signedTestTx("fee-negative"), 0)
+	require.ErrorIs(t, err, ErrInvalidBridgeConfig)
+
+	// Duplicate symbols are rejected after normalization.
+	_, err = r.Exec_BridgeConfigApply(&rtypes.BridgeConfigApply{
+		Rgb20WithdrawFee: []*rtypes.Rgb20WithdrawFee{
+			{Symbol: "usdt", FeeMinUnits: 1},
+			{Symbol: "USDT", FeeMinUnits: 2},
+		},
+	}, signedTestTx("fee-duplicate"), 0)
+	require.ErrorIs(t, err, ErrInvalidBridgeConfig)
+
+	// Empty symbol is invalid.
+	_, err = r.Exec_BridgeConfigApply(&rtypes.BridgeConfigApply{
+		Rgb20WithdrawFee: []*rtypes.Rgb20WithdrawFee{{Symbol: "", FeeMinUnits: 1}},
+	}, signedTestTx("fee-empty-symbol"), 0)
+	require.ErrorIs(t, err, ErrInvalidAssetSymbol)
+
+	// A registered BTC-kind asset is not allowed.
+	_, err = r.Exec_BridgeConfigApply(&rtypes.BridgeConfigApply{
+		Rgb20WithdrawFee: []*rtypes.Rgb20WithdrawFee{{Symbol: "btc", FeeMinUnits: 1}},
+	}, signedTestTx("fee-btc"), 0)
+	require.ErrorIs(t, err, ErrInvalidAssetKind)
+
+	// An unregistered asset is rejected rather than assumed to be RGB20.
+	_, err = r.Exec_BridgeConfigApply(&rtypes.BridgeConfigApply{
+		Rgb20WithdrawFee: []*rtypes.Rgb20WithdrawFee{{Symbol: "unknown", FeeMinUnits: 1}},
+	}, signedTestTx("fee-unknown"), 0)
+	require.ErrorIs(t, err, ErrGetCrossChainInfo)
+}
+
+func TestBridgeConfig_FeeRelatedUpperBounds(t *testing.T) {
+	r, _, _ := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+
+	// The fee-rate cap uses the executor's existing hard bound (1000 sat/vB).
+	_, err := r.Exec_BridgeConfigApply(&rtypes.BridgeConfigApply{
+		WithdrawMaxFeeRateSatPerVbyte: uint32(maxBtcFeeRate) + 1,
+	}, signedTestTx("rate-over"), 0)
+	require.ErrorIs(t, err, ErrInvalidBridgeConfig)
+	_, err = r.Exec_BridgeConfigApply(&rtypes.BridgeConfigApply{
+		WithdrawMaxFeeRateSatPerVbyte: uint32(maxBtcFeeRate),
+	}, signedTestTx("rate-max"), 0)
+	require.NoError(t, err)
+
+	// The conservative transaction size is bounded by maxRgb20WithdrawFeeLockVbytes.
+	_, err = r.Exec_BridgeConfigApply(&rtypes.BridgeConfigApply{
+		Rgb20WithdrawFeeLockVbytes: maxRgb20WithdrawFeeLockVbytes + 1,
+	}, signedTestTx("vbytes-over"), 0)
+	require.ErrorIs(t, err, ErrInvalidBridgeConfig)
+	_, err = r.Exec_BridgeConfigApply(&rtypes.BridgeConfigApply{
+		Rgb20WithdrawFeeLockVbytes: maxRgb20WithdrawFeeLockVbytes,
+	}, signedTestTx("vbytes-max"), 0)
+	require.NoError(t, err)
+}
+
+func TestBridgeConfig_QueryReturnsFeeFields(t *testing.T) {
+	r, state, api := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	api.On("QueryChain", mock.Anything).Return(&types.ReplyString{}, nil)
+	setCrossChainInfoForTest(t, state, "usdt", rtypes.CrossChainAssetRgb20, 6, []byte{0x02})
+	setCrossChainInfoForTest(t, state, "other", rtypes.CrossChainAssetRgb20, 6, []byte{0x02})
+
+	applyAndApproveBridgeConfig(t, r, state, &rtypes.BridgeConfigApply{
+		AssetSymbol:                   "usdt",
+		WithdrawMaxFeeRateSatPerVbyte: 25,
+		Rgb20WithdrawFeeLockVbytes:    500,
+		Rgb20WithdrawFee: []*rtypes.Rgb20WithdrawFee{
+			{Symbol: "usdt", FeeMinUnits: 100},
+			{Symbol: "other", FeeMinUnits: 0},
+		},
+	}, "query")
+
+	msg, err := r.Query_GetBridgeConfig(&types.ReqString{Data: "usdt"})
+	require.NoError(t, err)
+	cfg := msg.(*rtypes.BridgeConfigApply)
+	require.Equal(t, uint32(25), cfg.GetWithdrawMaxFeeRateSatPerVbyte())
+	require.Equal(t, uint32(500), cfg.GetRgb20WithdrawFeeLockVbytes())
+	require.Len(t, cfg.GetRgb20WithdrawFee(), 2)
+	require.Equal(t, "usdt", cfg.GetRgb20WithdrawFee()[0].GetSymbol())
+	require.Equal(t, int64(100), cfg.GetRgb20WithdrawFee()[0].GetFeeMinUnits())
+	require.Equal(t, "other", cfg.GetRgb20WithdrawFee()[1].GetSymbol())
+	require.Zero(t, cfg.GetRgb20WithdrawFee()[1].GetFeeMinUnits())
+}
+
+func TestBridgeConfig_MaskReplacesFeeListWholesale(t *testing.T) {
+	r, state, api := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	api.On("QueryChain", mock.Anything).Return(&types.ReplyString{}, nil)
+	setCrossChainInfoForTest(t, state, "usdt", rtypes.CrossChainAssetRgb20, 6, []byte{0x02})
+	setCrossChainInfoForTest(t, state, "other", rtypes.CrossChainAssetRgb20, 6, []byte{0x02})
+
+	setBridgeConfigForTest(t, state, "", &rtypes.BridgeConfigApply{
+		Rgb20WithdrawFee: []*rtypes.Rgb20WithdrawFee{
+			{Symbol: "usdt", FeeMinUnits: 5},
+			{Symbol: "other", FeeMinUnits: 7},
+		},
+	})
+
+	applyAndApproveBridgeConfig(t, r, state, &rtypes.BridgeConfigApply{
+		Rgb20WithdrawFee: []*rtypes.Rgb20WithdrawFee{{Symbol: "usdt", FeeMinUnits: 9}},
+		Fields:           []string{rtypes.BridgeConfigFieldRgb20WithdrawFee},
+	}, "list-replace")
+
+	effective, err := r.loadBridgeConfig("")
+	require.NoError(t, err)
+	require.Len(t, effective.GetRgb20WithdrawFee(), 1, "the list is replaced, not merged")
+	require.Equal(t, "usdt", effective.GetRgb20WithdrawFee()[0].GetSymbol())
+	require.Equal(t, int64(9), effective.GetRgb20WithdrawFee()[0].GetFeeMinUnits())
+}

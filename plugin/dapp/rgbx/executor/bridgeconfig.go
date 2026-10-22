@@ -46,7 +46,61 @@ const (
 	// Apply record status values.
 	bridgeConfigStatusApply    = int32(1)
 	bridgeConfigStatusApproved = int32(2)
+
+	// maxRgb20WithdrawFeeLockVbytes is the upper bound for the conservative transaction size
+	// used to derive the xBTC lock cap on the RGB20 BTC-paying channel. A realistic RGB20
+	// transfer plus its BTC anchor is a few hundred vB; 2000 vB keeps the derived cap
+	// meaningful while still bounding what a single governance proposal can introduce.
+	maxRgb20WithdrawFeeLockVbytes = uint32(2000)
 )
+
+// bridgeConfigMaskedFields maps a field-mask name to its copy operation. The same table
+// drives both apply-time validation (an unknown name rejects the whole apply) and the
+// approve-time merge, so the two sides cannot drift. Field names are the proto field names,
+// defined in rtypes.BridgeConfigField*.
+//
+// assetSymbol and fields are deliberately absent: the former identifies the record, the
+// latter is the mask itself, so neither can be changed through a mask.
+var bridgeConfigMaskedFields = map[string]func(dst, src *rtypes.BridgeConfigApply){
+	rtypes.BridgeConfigFieldLimitsEnabled: func(dst, src *rtypes.BridgeConfigApply) {
+		dst.LimitsEnabled = src.GetLimitsEnabled()
+	},
+	rtypes.BridgeConfigFieldMaxPerTx: func(dst, src *rtypes.BridgeConfigApply) {
+		dst.MaxPerTx = src.GetMaxPerTx()
+	},
+	rtypes.BridgeConfigFieldMaxPerWindow1H: func(dst, src *rtypes.BridgeConfigApply) {
+		dst.MaxPerWindow1H = src.GetMaxPerWindow1H()
+	},
+	rtypes.BridgeConfigFieldMaxPerWindow24H: func(dst, src *rtypes.BridgeConfigApply) {
+		dst.MaxPerWindow24H = src.GetMaxPerWindow24H()
+	},
+	rtypes.BridgeConfigFieldMaxMintPerWindow: func(dst, src *rtypes.BridgeConfigApply) {
+		dst.MaxMintPerWindow = src.GetMaxMintPerWindow()
+	},
+	rtypes.BridgeConfigFieldLargeDepositThreshold: func(dst, src *rtypes.BridgeConfigApply) {
+		dst.LargeDepositThreshold = src.GetLargeDepositThreshold()
+	},
+	rtypes.BridgeConfigFieldLargeDepositExtraConfirmations: func(dst, src *rtypes.BridgeConfigApply) {
+		dst.LargeDepositExtraConfirmations = src.GetLargeDepositExtraConfirmations()
+	},
+	rtypes.BridgeConfigFieldPauseDeposit: func(dst, src *rtypes.BridgeConfigApply) {
+		dst.PauseDeposit = src.GetPauseDeposit()
+	},
+	rtypes.BridgeConfigFieldPauseWithdraw: func(dst, src *rtypes.BridgeConfigApply) {
+		dst.PauseWithdraw = src.GetPauseWithdraw()
+	},
+	rtypes.BridgeConfigFieldWithdrawMaxFeeRateSatPerVbyte: func(dst, src *rtypes.BridgeConfigApply) {
+		dst.WithdrawMaxFeeRateSatPerVbyte = src.GetWithdrawMaxFeeRateSatPerVbyte()
+	},
+	rtypes.BridgeConfigFieldRgb20WithdrawFeeLockVbytes: func(dst, src *rtypes.BridgeConfigApply) {
+		dst.Rgb20WithdrawFeeLockVbytes = src.GetRgb20WithdrawFeeLockVbytes()
+	},
+	rtypes.BridgeConfigFieldRgb20WithdrawFee: func(dst, src *rtypes.BridgeConfigApply) {
+		// A list-valued field is replaced wholesale when the mask names it: the mask means
+		// "this field", not "merge entries one by one".
+		dst.Rgb20WithdrawFee = append([]*rtypes.Rgb20WithdrawFee(nil), src.GetRgb20WithdrawFee()...)
+	},
+}
 
 // Window sizes are derived from the chain's block interval, never from wall-clock time:
 // the verdict must be reproducible by every node from consensus data alone. The interval
@@ -186,6 +240,28 @@ func (r *rgbx) checkBridgeConfigApply(apply *rtypes.BridgeConfigApply) error {
 	if apply == nil {
 		return ErrInvalidBridgeConfig
 	}
+	if err := checkBridgeConfigFieldMask(apply.GetFields()); err != nil {
+		return err
+	}
+	// The fee-rate cap and the conservative transaction size are shared by both payment
+	// channels, so they are validated on every record. 0 means "not configured", which keeps
+	// pre-existing full-snapshot callers (who cannot know these fields) valid; a configured
+	// value must be non-zero and within the executor's hard bounds.
+	if apply.GetWithdrawMaxFeeRateSatPerVbyte() > uint32(maxBtcFeeRate) {
+		elog.Error("checkBridgeConfigApply withdraw fee rate cap out of range",
+			"symbol", apply.GetAssetSymbol(), "cap", apply.GetWithdrawMaxFeeRateSatPerVbyte(),
+			"max", maxBtcFeeRate)
+		return ErrInvalidBridgeConfig
+	}
+	if apply.GetRgb20WithdrawFeeLockVbytes() > maxRgb20WithdrawFeeLockVbytes {
+		elog.Error("checkBridgeConfigApply rgb20 lock vbytes out of range",
+			"symbol", apply.GetAssetSymbol(), "vbytes", apply.GetRgb20WithdrawFeeLockVbytes(),
+			"max", maxRgb20WithdrawFeeLockVbytes)
+		return ErrInvalidBridgeConfig
+	}
+	if err := r.checkRgb20WithdrawFees(apply.GetRgb20WithdrawFee()); err != nil {
+		return err
+	}
 	if apply.GetMaxPerTx() < 0 || apply.GetMaxPerWindow1H() < 0 || apply.GetMaxPerWindow24H() < 0 ||
 		apply.GetMaxMintPerWindow() < 0 || apply.GetLargeDepositThreshold() < 0 ||
 		apply.GetLargeDepositExtraConfirmations() < 0 {
@@ -211,6 +287,87 @@ func (r *rgbx) checkBridgeConfigApply(apply *rtypes.BridgeConfigApply) error {
 		return ErrGetCrossChainInfo
 	}
 	return nil
+}
+
+// checkBridgeConfigFieldMask rejects any unknown field name in an apply's mask. An unknown
+// name rejects the whole apply instead of being ignored: silently dropping it would let a
+// proposer believe a field was changed when it was not.
+func checkBridgeConfigFieldMask(fields []string) error {
+	for _, name := range fields {
+		if _, ok := bridgeConfigMaskedFields[name]; !ok {
+			elog.Error("checkBridgeConfigApply unknown field in mask", "field", name)
+			return ErrInvalidBridgeConfig
+		}
+	}
+	return nil
+}
+
+// checkRgb20WithdrawFees validates the per-asset RGB20 fixed-fee table. Each symbol must be
+// a registered cross-chain asset of kind RGB20 (a missing registration is rejected rather
+// than assumed), fees are non-negative (0 is legal) and duplicate symbols are rejected after
+// normalization, so "usdt" cannot shadow "USDT".
+func (r *rgbx) checkRgb20WithdrawFees(fees []*rtypes.Rgb20WithdrawFee) error {
+	seen := make(map[string]struct{}, len(fees))
+	for _, fee := range fees {
+		if fee == nil {
+			elog.Error("checkBridgeConfigApply nil rgb20 withdraw fee entry")
+			return ErrInvalidBridgeConfig
+		}
+		symbol := fee.GetSymbol()
+		if !isValidSymbolCharset(symbol) {
+			elog.Error("checkBridgeConfigApply invalid rgb20 fee symbol", "symbol", symbol)
+			return ErrInvalidAssetSymbol
+		}
+		normalized := formatSymbol(symbol)
+		if _, dup := seen[normalized]; dup {
+			elog.Error("checkBridgeConfigApply duplicate rgb20 fee symbol", "symbol", normalized)
+			return ErrInvalidBridgeConfig
+		}
+		seen[normalized] = struct{}{}
+		if fee.GetFeeMinUnits() < 0 {
+			elog.Error("checkBridgeConfigApply negative rgb20 fee", "symbol", symbol,
+				"fee", fee.GetFeeMinUnits())
+			return ErrInvalidBridgeConfig
+		}
+		info, err := r.getCrossChainInfo(symbol)
+		if err != nil {
+			elog.Error("checkBridgeConfigApply rgb20 fee asset not registered",
+				"symbol", symbol, "err", err)
+			return ErrGetCrossChainInfo
+		}
+		if !rtypes.IsRgb20CrossChainAsset(info) {
+			elog.Error("checkBridgeConfigApply rgb20 fee asset kind mismatch",
+				"symbol", symbol, "assetKind", info.GetAssetKind())
+			return ErrInvalidAssetKind
+		}
+	}
+	return nil
+}
+
+// mergeBridgeConfig returns the config that should become effective when src is applied on
+// top of base. An empty mask is a full replacement (the historical behaviour); a non-empty
+// mask copies only the named fields and keeps every other value from base. List-valued
+// fields are replaced wholesale. The mask is never persisted in the effective config.
+func mergeBridgeConfig(base, src *rtypes.BridgeConfigApply) *rtypes.BridgeConfigApply {
+	// Clone rather than copy by value: generated protobuf structs embed a mutex and must
+	// never be copied with a struct assignment.
+	if len(src.GetFields()) == 0 {
+		merged := proto.Clone(src).(*rtypes.BridgeConfigApply)
+		merged.Fields = nil
+		return merged
+	}
+	merged := &rtypes.BridgeConfigApply{}
+	if base != nil {
+		merged = proto.Clone(base).(*rtypes.BridgeConfigApply)
+	}
+	merged.AssetSymbol = src.GetAssetSymbol()
+	merged.Fields = nil
+	for _, name := range src.GetFields() {
+		if set, ok := bridgeConfigMaskedFields[name]; ok {
+			set(merged, src)
+		}
+	}
+	return merged
 }
 
 // checkBridgeConfigApprove performs the cheap payload checks. The autonomy query and the
@@ -318,20 +475,30 @@ func (r *rgbx) Exec_BridgeConfigApprove(approve *rtypes.BridgeConfigApprove, _ *
 		elog.Error("Exec_BridgeConfigApprove decode snapshot", "applyId", id, "err", err)
 		return nil, err
 	}
-	// The snapshot was validated at apply time; re-run the shape check so a corrupt record
-	// can never promote a malformed config (cheap, and it keeps the invariant local).
-	if err = r.checkBridgeConfigApply(snapshot); err != nil {
+	// A masked apply is merged with the config as it stands at approval time, not with the
+	// one that existed when the apply was submitted: approval is when the change takes
+	// effect, so fields the mask did not name keep their current (possibly newer) values.
+	base, err := r.loadBridgeConfig(snapshot.GetAssetSymbol())
+	if err != nil {
+		elog.Error("Exec_BridgeConfigApprove load effective config", "applyId", id, "err", err)
+		return nil, err
+	}
+	effective := mergeBridgeConfig(base, snapshot)
+	// The snapshot was validated at apply time; re-run the shape check on the merged result
+	// so a corrupt record can never promote a malformed config (cheap, and it keeps the
+	// invariant local).
+	if err = r.checkBridgeConfigApply(effective); err != nil {
 		return nil, err
 	}
 	record.Status = bridgeConfigStatusApproved
 	elog.Info("Exec_BridgeConfigApprove approved", "applyId", id, "itemId", approve.GetAutonomyItemId(),
-		"symbol", snapshot.GetAssetSymbol(), "limitsEnabled", snapshot.GetLimitsEnabled(),
-		"pauseDeposit", snapshot.GetPauseDeposit(), "pauseWithdraw", snapshot.GetPauseWithdraw())
+		"symbol", effective.GetAssetSymbol(), "limitsEnabled", effective.GetLimitsEnabled(),
+		"pauseDeposit", effective.GetPauseDeposit(), "pauseWithdraw", effective.GetPauseWithdraw())
 	return &types.Receipt{
 		Ty: types.ExecOk,
 		KV: []*types.KeyValue{
 			{Key: recordKey, Value: types.Encode(record)},
-			{Key: formatBridgeConfigKey(snapshot.GetAssetSymbol()), Value: types.Encode(snapshot)},
+			{Key: formatBridgeConfigKey(effective.GetAssetSymbol()), Value: types.Encode(effective)},
 		},
 	}, nil
 }
