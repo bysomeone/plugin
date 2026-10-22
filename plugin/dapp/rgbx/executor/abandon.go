@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
-	"fmt"
 
-	"github.com/33cn/chain33/system/dapp"
 	"github.com/33cn/chain33/types"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 )
@@ -30,41 +28,25 @@ import (
 const (
 	abandonRequestKeyPrefix     = KeyPrefixStateDB + "abandon-req-"
 	abandonHeightCountKeyPrefix = KeyPrefixStateDB + "abandon-count-"
-	// maxAbandonHeightScan bounds how many heights one listing call walks: stateDB has no
-	// List, so callers page by advancing StartHeight.
-	maxAbandonHeightScan = int64(maxListCount)
 )
 
-// formatAbandonRequestKey indexes a proposal by (height, per-height sequence). The sequence
-// keeps keys contiguous inside a block, which is what the query loop walks.
+// The storage layout, per-height counter and paging rules are shared with the other
+// height-indexed request lists (see height_index.go); these wrappers keep the abandon keys and
+// helpers readable at the call sites.
+
+// formatAbandonRequestKey indexes a proposal by (height, per-height sequence).
 func formatAbandonRequestKey(height, sequence int64) []byte {
-	return []byte(abandonRequestKeyPrefix + dapp.HeightIndexStr(height, sequence))
+	return formatHeightIndexKey(abandonRequestKeyPrefix, height, sequence)
 }
 
-// formatAbandonHeightCountKey stores how many proposals exist at a height. StateDB has no
-// List, so this counter is how the height-range query enumerates them.
+// formatAbandonHeightCountKey stores how many proposals exist at a height.
 func formatAbandonHeightCountKey(height int64) []byte {
-	return []byte(fmt.Sprintf("%s%020d", abandonHeightCountKeyPrefix, height))
+	return formatHeightCountKey(abandonHeightCountKeyPrefix, height)
 }
 
 // abandonHeightCount reads the number of proposals at a height (missing = 0).
 func (r *rgbx) abandonHeightCount(height int64) (int64, error) {
-	if r.GetStateDB() == nil {
-		return 0, nil
-	}
-	value, err := r.GetStateDB().Get(formatAbandonHeightCountKey(height))
-	if errors.Is(err, types.ErrNotFound) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	count := &types.Int64{}
-	if err = types.Decode(value, count); err != nil {
-		elog.Error("abandonHeightCount decode", "height", height, "err", err)
-		return 0, err
-	}
-	return count.GetData(), nil
+	return r.heightIndexCount(abandonHeightCountKeyPrefix, height)
 }
 
 // checkAbandon validates an abandon proposal against consensus state.
@@ -147,10 +129,7 @@ func (r *rgbx) Exec_Abandon(abandon *rtypes.AbandonWithdraw, tx *types.Transacti
 		"proposer", tx.From(), "height", height, "index", index)
 	return &types.Receipt{
 		Ty: types.ExecOk,
-		KV: []*types.KeyValue{
-			{Key: formatAbandonRequestKey(height, sequence), Value: types.Encode(item)},
-			{Key: formatAbandonHeightCountKey(height), Value: types.Encode(&types.Int64{Data: sequence + 1})},
-		},
+		KV: r.heightIndexKVs(abandonRequestKeyPrefix, abandonHeightCountKeyPrefix, height, sequence, item),
 		Logs: []*types.ReceiptLog{
 			{Ty: rtypes.TyAbandonWithdrawLog, Log: types.Encode(item)},
 		},
@@ -159,50 +138,12 @@ func (r *rgbx) Exec_Abandon(abandon *rtypes.AbandonWithdraw, tx *types.Transacti
 
 // Query_ListAbandonRequests lists proposals in a height range. StartIndex skips proposals
 // whose block transaction index is lower at StartHeight. EndHeight = 0 means "up to the
-// current height". StateDB has no List, so at most maxAbandonHeightScan heights are walked
-// per call; callers page by advancing StartHeight.
+// current height". Callers page by advancing StartHeight.
 func (r *rgbx) Query_ListAbandonRequests(req *rtypes.ReqListPendingTx) (*rtypes.AbandonWithdrawList, error) {
-	if req.GetCount() <= 0 || req.GetCount() > maxListCount {
-		return nil, types.ErrInvalidParam
+	items, err := listHeightIndexed(r, req, abandonRequestKeyPrefix, abandonHeightCountKeyPrefix,
+		func() *rtypes.AbandonWithdrawItem { return &rtypes.AbandonWithdrawItem{} })
+	if err != nil {
+		return nil, err
 	}
-	start := req.GetStartHeight()
-	if start < 0 {
-		return nil, types.ErrInvalidParam
-	}
-	end := req.GetEndHeight()
-	if end > 0 && end < start {
-		return nil, types.ErrInvalidParam
-	}
-	if end <= 0 {
-		end = r.GetHeight()
-		if end < start {
-			end = start + maxAbandonHeightScan - 1
-		}
-	}
-	if end-start+1 > maxAbandonHeightScan {
-		end = start + maxAbandonHeightScan - 1
-	}
-	reply := &rtypes.AbandonWithdrawList{}
-	for height := start; height <= end; height++ {
-		count, err := r.abandonHeightCount(height)
-		if err != nil {
-			return nil, err
-		}
-		for sequence := int64(0); sequence < count; sequence++ {
-			item := &rtypes.AbandonWithdrawItem{}
-			if err = readDB(r.GetStateDB(), formatAbandonRequestKey(height, sequence), item); err != nil {
-				elog.Error("Query_ListAbandonRequests read item", "height", height,
-					"sequence", sequence, "err", err)
-				return nil, err
-			}
-			if height == start && int64(item.GetIndex()) < req.GetStartIndex() {
-				continue
-			}
-			reply.Items = append(reply.Items, item)
-			if int32(len(reply.Items)) >= req.GetCount() {
-				return reply, nil
-			}
-		}
-	}
-	return reply, nil
+	return &rtypes.AbandonWithdrawList{Items: items}, nil
 }

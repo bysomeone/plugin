@@ -34,6 +34,9 @@ const (
 	TyAbandonWithdraw
 	// TyRegisterDepositScript 绑定用户专属充值地址（派生 + 登记 + 回执）。
 	TyRegisterDepositScript
+	// TyBumpWithdrawFee 提现发起人请求提高一笔尚未结算提现的矿工费率（见 proto 的 bumpWithdrawFee）。
+	// 必须追加在末尾：action id 是共识判据，插入中间会改变既有 action 的编号。
+	TyBumpWithdrawFee
 
 	NameMintAction      = "Mint"
 	NameTransferAction  = "Transfer"
@@ -55,6 +58,8 @@ const (
 	NameAbandonWithdrawAction = "Abandon"
 	// NameRegisterDepositScriptAction 对应 oneof 字段 registerDepositScript。
 	NameRegisterDepositScriptAction = "RegisterDepositScript"
+	// NameBumpWithdrawFeeAction 对应 oneof 字段 bumpWithdrawFee。
+	NameBumpWithdrawFeeAction = "BumpWithdrawFee"
 )
 
 // log类型id值
@@ -74,6 +79,9 @@ const (
 	TyAbandonWithdrawLog
 	// TyDepositScriptLog 用户充值地址绑定成功的回执日志（带完整地址信息）。
 	TyDepositScriptLog
+	// TyBumpWithdrawFeeLog 提现加价请求（链上只存证 + 发事件）的回执日志。必须追加在末尾：
+	// log id 会写进回执，插在中间会改变既有 log 的编号。
+	TyBumpWithdrawFeeLog
 
 	NameAssetLog         = "AssetLog"
 	NamePendingTxLog     = "PendingTxLog"
@@ -88,6 +96,8 @@ const (
 	NameAbandonWithdrawLog = "AbandonWithdrawLog"
 	// NameDepositScriptLog 回执里记录用户绑定的充值地址、脚本与规格。
 	NameDepositScriptLog = "DepositScriptLog"
+	// NameBumpWithdrawFeeLog 回执里记录一条已被链上存证的提现加价请求。
+	NameBumpWithdrawFeeLog = "BumpWithdrawFeeLog"
 )
 
 var (
@@ -110,6 +120,8 @@ var (
 		NameAbandonWithdrawAction:     TyAbandonWithdraw,
 
 		NameRegisterDepositScriptAction: TyRegisterDepositScript,
+
+		NameBumpWithdrawFeeAction: TyBumpWithdrawFee,
 	}
 	//定义log的id和具体log类型及名称，填入具体自定义log类型
 	logMap = map[int64]*types.LogInfo{
@@ -121,6 +133,7 @@ var (
 		TyUnlockAssetLog:     {Ty: reflect.TypeOf(UnlockAsset{}), Name: NameUnlockAssetLog},
 		TyAbandonWithdrawLog: {Ty: reflect.TypeOf(AbandonWithdrawItem{}), Name: NameAbandonWithdrawLog},
 		TyDepositScriptLog:   {Ty: reflect.TypeOf(DepositScriptItem{}), Name: NameDepositScriptLog},
+		TyBumpWithdrawFeeLog: {Ty: reflect.TypeOf(BumpWithdrawFeeItem{}), Name: NameBumpWithdrawFeeLog},
 	}
 )
 
@@ -195,6 +208,8 @@ func GetActionName(ty int32) string {
 		return NameAbandonWithdrawAction
 	case TyRegisterDepositScript:
 		return NameRegisterDepositScriptAction
+	case TyBumpWithdrawFee:
+		return NameBumpWithdrawFeeAction
 	default:
 		return "unknownAction"
 	}

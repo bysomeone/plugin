@@ -18,6 +18,7 @@ message RgbxAction {
         bridgeConfigApprove bridgeConfigApprove = 11;
         abandonWithdraw     abandon            = 12;
         registerDepositScript registerDepositScript = 13;
+        bumpWithdrawFee     bumpWithdrawFee     = 14;
     }
 }
 
@@ -370,6 +371,33 @@ message ReqListOperations {
     // start 起始下标（首次查询填 0；后续用上一次返回的 nextIndex 续查）
     int64  start       = 3;
     int32  count       = 4;
+}
+
+// bumpWithdrawFee 请求提高一笔尚未结算提现的矿工费率（由提现发起人本人提交）。
+//
+// 链上只记录请求并发事件，不改变提现的结算 / 放弃逻辑：桥按高度区间轮询到请求后，
+// 用新费率重签一笔替换交易。链上只要求新费率高于原提现费率且不超过上限；不锚定上一次
+// bump 请求（被桥拒绝的请求不应占位），是否高于"上一次真正应用的费率"由桥侧判断。
+message bumpWithdrawFee {
+    // 被加价的 Withdraw（锁定）交易哈希。
+    bytes withdrawalTxHash = 1;
+    // 新的矿工费率（sat/vB）。
+    int64 feeRate          = 2;
+}
+
+// bumpWithdrawFeeItem 一条已上链的提现加价请求（链上只存证 + 发事件）。
+message bumpWithdrawFeeItem {
+    bytes  txHash           = 1; // 本次 bump 交易哈希
+    bytes  withdrawalTxHash = 2; // 被加价的 Withdraw 交易哈希
+    string owner            = 3; // 提现发起人（也是 bump 提交人）
+    int64  feeRate          = 4; // bump 后的费率
+    int64  oldFeeRate       = 5; // 加价基准：被 bump 提现的原费率
+    int64  height           = 6;
+    int32  index            = 7;
+}
+
+message bumpWithdrawFeeList {
+    repeated bumpWithdrawFeeItem items = 1;
 }
 
 service rgbx {}
