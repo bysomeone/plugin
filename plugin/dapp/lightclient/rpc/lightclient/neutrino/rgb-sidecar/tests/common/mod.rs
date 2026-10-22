@@ -35,6 +35,14 @@ pub struct MockChain {
     pub txs: HashMap<String, Transaction>,
     /// live (unspent) UTXOs.
     pub utxos: HashMap<OutPoint, (u64, ScriptBuf)>,
+    /// HTTP request count (a JSON-RPC batch is **one** request, however many calls it carries).
+    /// Used by the O4-lite tests to prove the sweep is batched.
+    pub http_requests: usize,
+    /// Per-method invocation count inside those requests.
+    pub calls: HashMap<String, usize>,
+    /// `false` = behave like a node that does not implement JSON-RPC batches (it answers an array
+    /// body with one error object). Used to pin the sequential fallback.
+    pub batch_supported: bool,
 }
 
 impl MockChain {
@@ -50,6 +58,15 @@ impl MockChain {
     pub fn spend(&mut self, outpoint: OutPoint) {
         self.utxos.remove(&outpoint);
     }
+
+    pub fn call_count(&self, method: &str) -> usize {
+        self.calls.get(method).copied().unwrap_or(0)
+    }
+
+    pub fn reset_counters(&mut self) {
+        self.http_requests = 0;
+        self.calls.clear();
+    }
 }
 
 pub fn to_hex(bytes: &[u8]) -> String {
@@ -60,6 +77,10 @@ fn handle_request(chain: &Arc<Mutex<MockChain>>, req: &Value) -> Value {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or_else(|| json!([]));
     let id = req.get("id").cloned().unwrap_or_else(|| json!(1));
+    {
+        let mut c = chain.lock().unwrap();
+        *c.calls.entry(method.to_string()).or_insert(0) += 1;
+    }
     let (result, error): (Value, Value) = match method {
         "getblockcount" => (json!(chain.lock().unwrap().height), Value::Null),
         "getrawtransaction" => {
@@ -163,7 +184,26 @@ fn handle_conn(mut stream: TcpStream, chain: Arc<Mutex<MockChain>>) {
         let Ok(req) = serde_json::from_slice::<Value>(&body) else {
             return;
         };
-        let text = handle_request(&chain, &req).to_string();
+        // JSON-RPC batch: an array of requests gets an array of replies (one HTTP round-trip).
+        let response = if let Some(batch) = req.as_array() {
+            if chain.lock().unwrap().batch_supported {
+                Value::Array(batch.iter().map(|r| handle_request(&chain, r)).collect())
+            } else {
+                // A node without batch support rejects the whole array; the client must fall back
+                // to single calls and still return the same set.
+                json!({
+                    "result": Value::Null,
+                    "error": {"code": -32600, "message": "JSON-RPC batch not supported"},
+                    "id": Value::Null,
+                })
+            }
+        } else {
+            handle_request(&chain, &req)
+        };
+        {
+            chain.lock().unwrap().http_requests += 1;
+        }
+        let text = response.to_string();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
             text.len()
@@ -181,6 +221,7 @@ pub fn start_mock_btcd() -> (String, Arc<Mutex<MockChain>>) {
     let chain = Arc::new(Mutex::new(MockChain {
         height: 200,
         confirmations: 100,
+        batch_supported: true,
         ..Default::default()
     }));
     let chain_for_thread = chain.clone();
