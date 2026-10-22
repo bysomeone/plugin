@@ -149,6 +149,15 @@ var (
 	// ErrInvalidDepositScriptRequest the deposit-script registration has no usable user id,
 	// or its derivation inputs (pubkey / user id) are invalid.
 	ErrInvalidDepositScriptRequest = errors.New("invalid deposit script registration")
+	// ErrInvalidBumpWithdrawFeeRequest the fee-bump request names no withdrawal.
+	ErrInvalidBumpWithdrawFeeRequest = errors.New("invalid bump withdraw fee request")
+	// ErrBumpWithdrawFeeNotOwner the submitter is not the withdrawal's original sender.
+	// Only that sender may ask the bridge to re-sign the withdrawal with a higher fee.
+	ErrBumpWithdrawFeeNotOwner = errors.New("bump withdraw fee not owner")
+	// ErrBumpWithdrawFeeRateNotHigher the requested rate is not above the original withdrawal
+	// rate. Monotonicity against the last rate actually applied to the BTC transaction is a
+	// bridge-side decision; the chain does not anchor to previous bump requests.
+	ErrBumpWithdrawFeeRateNotHigher = errors.New("bump withdraw fee rate not higher")
 )
 
 const (
@@ -194,6 +203,8 @@ func (r *rgbx) CheckTx(tx *types.Transaction, index int) error {
 		err = r.checkAbandon(txHash, action.GetAbandon())
 	case rtypes.TyRegisterDepositScript:
 		err = r.checkRegisterDepositScript(txHash, tx.From())
+	case rtypes.TyBumpWithdrawFee:
+		err = r.checkBumpWithdrawFee(tx.From(), txHash, action.GetBumpWithdrawFee())
 	default:
 		err = types.ErrActionNotSupport
 
