@@ -39,6 +39,17 @@ func (m *memSignedWithdrawTxStore) PutOnce(burnTxHash, rawTx []byte) error {
 	return nil
 }
 
+func (m *memSignedWithdrawTxStore) Replace(burnTxHash, rawTx []byte) error {
+	if m.putErr != nil {
+		return m.putErr
+	}
+	if m.txs == nil {
+		m.txs = make(map[string][]byte)
+	}
+	m.txs[string(burnTxHash)] = append([]byte(nil), rawTx...)
+	return nil
+}
+
 func (m *memSignedWithdrawTxStore) Get(burnTxHash []byte) ([]byte, error) {
 	if m.getErr != nil {
 		return nil, m.getErr

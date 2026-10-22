@@ -92,6 +92,23 @@ type withdrawRequest struct {
 	feeRate             btcutil.Amount // sat/byte，0表示使用默认
 	toAddress           string
 	stickyUTXO          *UTXO
+	// bump 非 nil 表示这是一次"用户请求加价后的替换交易"。构造、校验、签名、广播仍走
+	// processWithdrawRequest 同一条路径，只是费率要按 dust 上限封顶并额外做 RBF 校验。
+	bump *withdrawBumpContext
+}
+
+// withdrawBumpContext 一笔 burn 的加价替换上下文。
+//
+// requestedFeeRate 是链上加价请求的费率（用户愿望上限）；effectiveFeeRate 由构造阶段按
+// "用户输出 >= dust" 封顶后写回，是真正用于签名/校验的费率。appliedFeeRate 是本地已生效的
+// 上一版费率（重启后从 DB 恢复），替换必须严格高于它。
+type withdrawBumpContext struct {
+	requestTxHash    []byte
+	requestedFeeRate btcutil.Amount
+	appliedFeeRate   btcutil.Amount
+	effectiveFeeRate btcutil.Amount
+	prevSignedTx     *wire.MsgTx
+	prevInputAmounts []int64
 }
 
 type btcWallet struct {
@@ -118,6 +135,9 @@ type btcWallet struct {
 	withdrawChan      chan *btcPendingTx
 	addPendingChan    chan *btcPendingTx
 	removePendingChan chan chainhash.Hash
+	// replacePendingChan 用新版本的替换交易顶替同一 burn 的旧 pending 记录（RBF 加价）。
+	// 单独一条 channel：先删后加必须是原子的，否则 replay 可能选中已作废的旧版本。
+	replacePendingChan chan *btcPendingTx
 
 	// 配置
 	requiredConfs int32
@@ -156,15 +176,16 @@ type btcPendingTx struct {
 
 func newBtcWallet(n *neutrinoClient) (*btcWallet, error) {
 	bw := &btcWallet{
-		client:            n,
-		chainParams:       n.neutrinoCfg.ChainParams,
-		depositChan:       make(chan *btcPendingTx, 100),
-		withdrawChan:      make(chan *btcPendingTx, 100),
-		addPendingChan:    make(chan *btcPendingTx, 100),
-		removePendingChan: make(chan chainhash.Hash, 100),
-		requiredConfs:     int32(n.cfg.BlockConfirmations),
-		pendingTxs:        make(map[chainhash.Hash]*btcPendingTx),
-		blockCache:        newBtcBlockCache(defaultBtcBlockCacheSize),
+		client:             n,
+		chainParams:        n.neutrinoCfg.ChainParams,
+		depositChan:        make(chan *btcPendingTx, 100),
+		withdrawChan:       make(chan *btcPendingTx, 100),
+		addPendingChan:     make(chan *btcPendingTx, 100),
+		removePendingChan:  make(chan chainhash.Hash, 100),
+		replacePendingChan: make(chan *btcPendingTx, 100),
+		requiredConfs:      int32(n.cfg.BlockConfirmations),
+		pendingTxs:         make(map[chainhash.Hash]*btcPendingTx),
+		blockCache:         newBtcBlockCache(defaultBtcBlockCacheSize),
 	}
 
 	if n.cfg.BtcRPC.Host != "" {
@@ -468,6 +489,18 @@ func (b *btcWallet) monitorTransactions() {
 		case pending := <-b.addPendingChan:
 			b.pendingTxs[pending.txHash] = pending
 			log.Debug("addPendingTx", "txHash", pending.txHash.String(), "txType", pending.txType)
+		case pending := <-b.replacePendingChan:
+			// 一笔 burn 的任何时刻只能有一版交易可能在链上确认：先移除同一 burn 的旧版本，
+			// 再放入替换版本（两个动作在同一事件里完成，replay 不会看到中间态）。
+			for txHash, existing := range b.pendingTxs {
+				if existing != nil && existing.txType == transactionTypeWithdraw &&
+					bytes.Equal(existing.chain33WithdrawTxHash, pending.chain33WithdrawTxHash) {
+					delete(b.pendingTxs, txHash)
+				}
+			}
+			b.pendingTxs[pending.txHash] = pending
+			log.Debug("replacePendingTx", "txHash", pending.txHash.String(),
+				"burnTxHash", hex.EncodeToString(pending.chain33WithdrawTxHash))
 		case txHash := <-b.removePendingChan:
 			delete(b.pendingTxs, txHash)
 			log.Debug("removePendingTx", "txHash", txHash.String(), "txLen", len(b.pendingTxs),
@@ -564,6 +597,14 @@ func (b *btcWallet) addPendingTx(pending *btcPendingTx) {
 
 func (b *btcWallet) removePendingTx(txHash chainhash.Hash) {
 	b.removePendingChan <- txHash
+}
+
+// replacePendingTx 以新版本交易顶替同一 burn 的旧 pending 记录（RBF 替换）。
+func (b *btcWallet) replacePendingTx(pending *btcPendingTx) {
+	if b == nil || b.replacePendingChan == nil || pending == nil {
+		return
+	}
+	b.replacePendingChan <- pending
 }
 
 // parseWithdrawCommitment 解析提现承诺 OP_RETURN：`rgbx:withdraw:<32 字节 chain33 提现哈希>`。
@@ -714,38 +755,14 @@ func (b *btcWallet) sendTransactionNotification(_ chainhash.Hash, pending *btcPe
 // 返回: (交易, 输入金额列表, 已锁定的UTXO列表, 错误)
 // 注意: 如果返回错误，UTXO锁定会自动释放；如果成功，调用方需要在广播失败时调用releaseUTXOs
 func (b *btcWallet) buildWithdrawTx(req *withdrawRequest) (*wire.MsgTx, []int64, []*UTXO, error) {
-
-	// 解析目标地址
-	toAddr, err := btcutil.DecodeAddress(req.toAddress, &b.chainParams)
+	outputs, err := b.withdrawOutputs(req)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("invalid to address: %w", err)
+		return nil, nil, nil, err
 	}
-
-	// 构建输出
-	pkScript, err := txscript.PayToAddrScript(toAddr)
-	if err != nil {
-		return nil, nil, nil, fmt.Errorf("create pk script failed: %w", err)
-	}
-
-	// 护栏（不动式）：桥的自有付款不得落到用户 P2WSH 充值脚本上。
-	// 违反它的后果见 rgbx/executor/validate_proof.go 的"冻结不变式"：桥自己付出去的那笔交易，
-	// 收款用户可以拿回来当**充值证明**再铸一次（链上分不清付款方）。链上只挡得住"发起人自己的
-	// 充值地址"（checkWithdraw 的 E15-a），用**另一个自己控制的 chain33 地址**当提现目标那一段
-	// 只能由桥侧兜底 —— 就是这里：watch 集里的脚本都是已发放的充值地址，命中即拒。
-	// 只拒"我们自己发放过的脚本"，普通 P2WSH（交易所/多签/闪电通道）不受影响。
-	if userID, ok := b.client.isWatchedDepositScript(pkScript); ok {
-		log.Error("buildWithdrawTx refuse to pay a user deposit script (bridge self-payment invariant)",
-			"toAddress", req.toAddress, "depositUserID", userID)
-		return nil, nil, nil, fmt.Errorf("withdraw target %s is a user deposit script (userID %s): "+
-			"paying it would let the payee re-claim the same btc tx as a deposit (double mint), refused",
-			req.toAddress, userID)
-	}
-
-	outputs := []*wire.TxOut{
-		{
-			Value:    int64(req.amount),
-			PkScript: pkScript,
-		},
+	// 加价替换与首次提现共用同一套交易构造（见 bump_withdraw_fee.go）；唯一差别是费率要先按
+	// "用户输出不得低于 dust" 封顶。
+	if req.bump != nil {
+		return b.buildWithdrawReplacementTx(req, outputs)
 	}
 
 	// 手动选择UTXO并构建交易
@@ -758,6 +775,40 @@ func (b *btcWallet) buildWithdrawTx(req *withdrawRequest) (*wire.MsgTx, []int64,
 		"inputs", len(tx.TxIn), "outputs", len(tx.TxOut), "lockedUTXOs", len(lockedUTXOs))
 
 	return tx, inputAmounts, lockedUTXOs, nil
+}
+
+// withdrawOutputs 构造提现的用户输出，并执行"不得付给用户充值脚本"这一桥侧护栏。
+func (b *btcWallet) withdrawOutputs(req *withdrawRequest) ([]*wire.TxOut, error) {
+	// 解析目标地址
+	toAddr, err := btcutil.DecodeAddress(req.toAddress, &b.chainParams)
+	if err != nil {
+		return nil, fmt.Errorf("invalid to address: %w", err)
+	}
+
+	// 构建输出
+	pkScript, err := txscript.PayToAddrScript(toAddr)
+	if err != nil {
+		return nil, fmt.Errorf("create pk script failed: %w", err)
+	}
+
+	// 护栏（不动式）：桥的自有付款不得落到用户 P2WSH 充值脚本上。
+	// 违反它的后果见 rgbx/executor/validate_proof.go 的"冻结不变式"：桥自己付出去的那笔交易，
+	// 收款用户可以拿回来当**充值证明**再铸一次（链上分不清付款方）。链上只挡得住"发起人自己的
+	// 充值地址"（checkWithdraw 的 E15-a），用**另一个自己控制的 chain33 地址**当提现目标那一段
+	// 只能由桥侧兜底 —— 就是这里：watch 集里的脚本都是已发放的充值地址，命中即拒。
+	// 只拒"我们自己发放过的脚本"，普通 P2WSH（交易所/多签/闪电通道）不受影响。
+	if userID, ok := b.client.isWatchedDepositScript(pkScript); ok {
+		log.Error("buildWithdrawTx refuse to pay a user deposit script (bridge self-payment invariant)",
+			"toAddress", req.toAddress, "depositUserID", userID)
+		return nil, fmt.Errorf("withdraw target %s is a user deposit script (userID %s): "+
+			"paying it would let the payee re-claim the same btc tx as a deposit (double mint), refused",
+			req.toAddress, userID)
+	}
+
+	return []*wire.TxOut{{
+		Value:    int64(req.amount),
+		PkScript: pkScript,
+	}}, nil
 }
 
 // buildTransaction 手动构建交易
@@ -781,6 +832,27 @@ func (b *btcWallet) buildTransaction(outputs []*wire.TxOut, feeRate btcutil.Amou
 		return nil, nil, nil, err
 	}
 
+	tx, inputAmounts, err := b.buildTransactionFromInputs(outputs, selectedUTXOs, inputTotal, feeRate, receiverPaysFee, chain33Hash)
+	if err != nil {
+		// 构建失败时释放锁定（sticky 输入按既有口径保留）。
+		b.releaseUTXOsExcept(selectedUTXOs, stickyUTXO)
+		return nil, nil, nil, err
+	}
+	return tx, inputAmounts, selectedUTXOs, nil
+}
+
+// buildTransactionFromInputs 用**已选定并锁定**的输入组装交易。首次提现与加价替换共用它，
+// 保证两条路径的输入顺序、OP_RETURN 承诺、找零与费率计算完全一致。
+func (b *btcWallet) buildTransactionFromInputs(outputs []*wire.TxOut, selectedUTXOs []*UTXO,
+	inputTotal btcutil.Amount, feeRate btcutil.Amount, receiverPaysFee bool,
+	chain33Hash []byte) (*wire.MsgTx, []int64, error) {
+
+	var outputTotal btcutil.Amount
+	for _, output := range outputs {
+		outputTotal += btcutil.Amount(output.Value)
+	}
+	hashStr := hex.EncodeToString(chain33Hash)
+
 	// 创建交易
 	tx := wire.NewMsgTx(wire.TxVersion)
 
@@ -799,7 +871,7 @@ func (b *btcWallet) buildTransaction(outputs []*wire.TxOut, feeRate btcutil.Amou
 	opScript, err := txscript.NullDataScript(buf)
 	if err != nil {
 		log.Error("build tx op script failed", "hash", hashStr, "err", err)
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	tx.AddTxOut(wire.NewTxOut(0, opScript))
 	// 添加输出
@@ -815,10 +887,9 @@ func (b *btcWallet) buildTransaction(outputs []*wire.TxOut, feeRate btcutil.Amou
 	if receiverPaysFee {
 		// 提现输出金额过小，则不构建交易
 		if fee+minChangeAmount >= outputTotal {
-			b.releaseUTXOsExcept(selectedUTXOs, stickyUTXO)
 			log.Error("buildTransaction withdraw amount too small for fee", "hash", hashStr, "targetAmount", outputTotal,
 				"fee", fee, "change", change)
-			return nil, nil, nil, fmt.Errorf("withdraw amount too small for fee: amount %d, fee %d", outputTotal, fee)
+			return nil, nil, fmt.Errorf("withdraw amount too small for fee: amount %d, fee %d", outputTotal, fee)
 		}
 		outputs[0].Value = int64(outputTotal - fee)
 	} else {
@@ -831,17 +902,167 @@ func (b *btcWallet) buildTransaction(outputs []*wire.TxOut, feeRate btcutil.Amou
 		// 添加找零输出（使用预计算的脚本）
 		tx.AddTxOut(wire.NewTxOut(int64(change), b.tssPkScript))
 	} else if change < 0 {
-		// 资金不足，释放已锁定的UTXO
-		b.releaseUTXOsExcept(selectedUTXOs, stickyUTXO)
+		// 资金不足
 		log.Error("buildTransaction insufficient funds", "hash", hashStr, "targetAmount", outputTotal,
 			"fee", fee, "change", change)
-		return nil, nil, nil, fmt.Errorf("insufficient funds: need %d, have %d", outputTotal+fee, inputTotal)
+		return nil, nil, fmt.Errorf("insufficient funds: need %d, have %d", outputTotal+fee, inputTotal)
 	}
 
 	log.Debug("buildTransaction success", "inputs", len(selectedUTXOs), "inputTotal", inputTotal,
 		"outputTotal", outputTotal, "fee", fee, "change", change)
 
-	return tx, inputAmounts, selectedUTXOs, nil
+	return tx, inputAmounts, nil
+}
+
+// errWithdrawBumpRateNotHigher 本次加价无法产出严格更高的费率：要么用户请求的费率不高于已生效
+// 费率（过期/重复请求），要么按 dust 上限封顶后仍无法比上一版至少高 1 sat/vB（BIP125 的替换要求）。
+// 调用方按"本次不签"处理（WARN），不写终态、不报错。
+var errWithdrawBumpRateNotHigher = errors.New("withdraw bump cannot produce a higher fee rate")
+
+// buildWithdrawReplacementTx 构造一笔加价替换交易。
+//
+// 复用首次提现的选择/组装逻辑，只额外保证：
+//   - 绑定输入（sticky）必须作为输入出现，保证两版交易互斥，最多一笔能上链；
+//   - 费率取 min(用户请求, dust 上限)：用户输出 = 原 pending 金额 - 手续费，必须 >= dust；
+//   - 实际费率必须严格高于本地已生效费率（BIP125 要求至少 +1 sat/vB）。
+func (b *btcWallet) buildWithdrawReplacementTx(req *withdrawRequest,
+	outputs []*wire.TxOut) (*wire.MsgTx, []int64, []*UTXO, error) {
+
+	if req.bump == nil || req.stickyUTXO == nil {
+		return nil, nil, nil, fmt.Errorf("withdraw replacement requires a bump context and the bound sticky input")
+	}
+	requested := int64(req.bump.requestedFeeRate)
+	applied := int64(req.bump.appliedFeeRate)
+	if requested <= applied {
+		return nil, nil, nil, errWithdrawBumpRateNotHigher
+	}
+
+	// 选择规则与首次提现完全一致（receiverPaysFee ⇒ 输入选择不预留手续费），sticky 会被追加为
+	// 最后一个输入；主池不够时再补其它 UTXO。
+	selected, inputTotal, err := b.selectWithdrawInputs(btcutil.Amount(req.amount), 0, req.stickyUTXO)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	release := func() { b.releaseUTXOsExcept(selected, req.stickyUTXO) }
+
+	// 硬要求：sticky 必须真的在输入集合里，否则无法保证与上一版互斥。
+	if !containsOutPoint(selected, req.stickyUTXO.OutPoint) {
+		release()
+		return nil, nil, nil, fmt.Errorf("withdraw replacement did not reuse the bound sticky input %s",
+			req.stickyUTXO.OutPoint.String())
+	}
+
+	// 手续费按"尚未加入找零输出"的交易大小计算（与 buildTransactionFromInputs 同口径）。
+	// 交易结构（输入数量、目标脚本长度）与费率无关，所以先用 0 费率组装一次探测交易，
+	// 从它反解出精确的计费大小；这样不必假设收款地址是 P2WPKH。
+	probe, _, err := b.buildTransactionFromInputs(outputs, selected, inputTotal, 0, true, req.chain33WithdrawHash)
+	if err != nil {
+		release()
+		return nil, nil, nil, err
+	}
+	baseSize, err := withdrawFeeBaseSize(probe, b.tssPkScript)
+	if err != nil {
+		release()
+		return nil, nil, nil, err
+	}
+	maxFeasible := maxWithdrawFeeRate(int64(req.amount), baseSize)
+	if maxFeasible <= 0 {
+		release()
+		return nil, nil, nil, fmt.Errorf("withdraw %s is too small to pay a replacement fee while keeping the output above dust",
+			hex.EncodeToString(req.chain33WithdrawHash))
+	}
+	effective := requested
+	if effective > maxFeasible {
+		effective = maxFeasible
+	}
+	if effective <= applied {
+		release()
+		return nil, nil, nil, errWithdrawBumpRateNotHigher
+	}
+	req.bump.effectiveFeeRate = btcutil.Amount(effective)
+
+	tx, inputAmounts, err := b.buildTransactionFromInputs(outputs, selected, inputTotal,
+		btcutil.Amount(effective), true, req.chain33WithdrawHash)
+	if err != nil {
+		release()
+		return nil, nil, nil, err
+	}
+	// 签名端还要求"新交易绝对手续费严格高于上一版"。输入集合可能变化（上一版多选了 UTXO），
+	// 高费率不必然带来高绝对手续费；在发起 TSS 轮次前先算清楚，避免签名端拒签后干等超时。
+	if req.bump.prevSignedTx != nil &&
+		len(req.bump.prevInputAmounts) == len(req.bump.prevSignedTx.TxIn) {
+		var prevFee int64
+		for _, amount := range req.bump.prevInputAmounts {
+			prevFee += amount
+		}
+		for _, out := range req.bump.prevSignedTx.TxOut {
+			prevFee -= out.Value
+		}
+		var newFee int64
+		for _, amount := range inputAmounts {
+			newFee += amount
+		}
+		for _, out := range tx.TxOut {
+			newFee -= out.Value
+		}
+		if prevFee > 0 && newFee <= prevFee {
+			release()
+			return nil, nil, nil, fmt.Errorf("%w: new absolute fee %d is not above the previous fee %d",
+				errWithdrawBumpRateNotHigher, newFee, prevFee)
+		}
+	}
+	// 后续 validateWithdrawTx 用同一费率核对手续费。
+	req.feeRate = btcutil.Amount(effective)
+
+	log.Info("buildWithdrawReplacementTx", "burnTxHash", hex.EncodeToString(req.chain33WithdrawHash),
+		"requestedFeeRate", requested, "effectiveFeeRate", effective, "maxFeasibleFeeRate", maxFeasible,
+		"stickyInput", req.stickyUTXO.OutPoint.String(), "inputs", len(selected),
+		"btcTxid", tx.TxHash().String())
+	return tx, inputAmounts, selected, nil
+}
+
+// containsOutPoint 判断输入集合里是否有指定 outpoint。
+func containsOutPoint(utxos []*UTXO, op wire.OutPoint) bool {
+	for _, utxo := range utxos {
+		if utxo != nil && utxo.OutPoint == op {
+			return true
+		}
+	}
+	return false
+}
+
+// maxWithdrawFeeRate 是"用户输出仍 >= dust"允许的最大费率（sat/vB，向下取整）。
+// 与 buildTransactionFromInputs 的边界保持一致：fee + minChangeAmount >= amount 即拒绝。
+func maxWithdrawFeeRate(amount int64, baseSize int) int64 {
+	if baseSize <= 0 {
+		return 0
+	}
+	maxFee := amount - minChangeAmount - 1
+	if maxFee <= 0 {
+		return 0
+	}
+	return maxFee / int64(baseSize)
+}
+
+// withdrawFeeBaseSize 返回提现交易的"计费大小"：未签交易的序列化大小 + 每输入 108 字节的
+// witness 估算，再扣除找零输出（手续费在加入找零输出之前计算，见 buildTransactionFromInputs）。
+// 它让签名节点能从交易本身反解出实际费率，而不需要相信通知里的任何声称值。
+func withdrawFeeBaseSize(tx *wire.MsgTx, poolScript []byte) (int, error) {
+	if tx == nil || len(tx.TxIn) == 0 {
+		return 0, fmt.Errorf("withdraw tx has no inputs")
+	}
+	size := tx.SerializeSize() + len(tx.TxIn)*108
+	if len(poolScript) > 0 {
+		for _, out := range tx.TxOut {
+			if bytes.Equal(out.PkScript, poolScript) {
+				size -= 8 + wire.VarIntSerializeSize(uint64(len(out.PkScript))) + len(out.PkScript)
+			}
+		}
+	}
+	if size <= 0 {
+		return 0, fmt.Errorf("withdraw tx fee base size is not positive")
+	}
+	return size, nil
 }
 
 // listUnspent 获取可用UTXO

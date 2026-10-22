@@ -347,6 +347,18 @@ func (n *neutrinoClient) processWithdrawRequest(req *withdrawRequest) (err error
 	if isAbandoningState(n.getWithdrawState(req.chain33WithdrawHash)) {
 		return fmt.Errorf("withdraw %s is being abandoned", hex.EncodeToString(req.chain33WithdrawHash))
 	}
+	// 已经换过更高费率的版本时，绝不能再签一次原始低费率交易：周期性重扫可能重新投递同一条
+	// pending，若这里照常构造原始交易，会覆盖输入金额记录，甚至把旧版本重新广播出去。
+	// 替换后的重播由 signedtx.go 的最新记录负责。
+	if req.bump == nil {
+		if applied, ok := n.getAppliedWithdrawFeeRate(req.chain33WithdrawHash); ok &&
+			int64(req.feeRate) < int64(applied) {
+			log.Debug("processWithdrawRequest skip: a higher-fee replacement is already applied",
+				"txHash", hex.EncodeToString(req.chain33WithdrawHash),
+				"originalFeeRate", req.feeRate, "appliedFeeRate", applied)
+			return nil
+		}
+	}
 
 	txHash := hex.EncodeToString(req.chain33WithdrawHash)
 	tx, inputAmounts, lockedUTXOs, err := n.bw.buildWithdrawTx(req)
@@ -389,24 +401,40 @@ func (n *neutrinoClient) processWithdrawRequest(req *withdrawRequest) (err error
 		log.Error("processSignBtcTx validateWithdrawTx", "txHash", txHash, "err", err)
 		return err
 	}
+	var signOpts *tssSignOptions
+	if req.bump != nil {
+		if req.bump.prevSignedTx == nil || len(req.bump.requestTxHash) == 0 {
+			return fmt.Errorf("withdraw replacement is missing the previous signed tx or bump request")
+		}
+		if len(req.bump.prevInputAmounts) != len(req.bump.prevSignedTx.TxIn) {
+			return fmt.Errorf("withdraw replacement previous input amounts mismatch: tx=%d amounts=%d",
+				len(req.bump.prevSignedTx.TxIn), len(req.bump.prevInputAmounts))
+		}
+		var prevBuf bytes.Buffer
+		prevBuf.Grow(req.bump.prevSignedTx.SerializeSize())
+		if err = req.bump.prevSignedTx.Serialize(&prevBuf); err != nil {
+			return fmt.Errorf("serialize previous signed withdraw tx: %w", err)
+		}
+		signOpts = &tssSignOptions{
+			prevBtcTxData:     prevBuf.Bytes(),
+			prevInputAmounts:  req.bump.prevInputAmounts,
+			bumpRequestTxHash: req.bump.requestTxHash,
+		}
+	}
 	btcTxHash := tx.TxHash().String()
-	if err = n.tss.processSignBtcTx(tx, transactionTypeWithdraw, inputAmounts, req.chain33WithdrawHash); err != nil {
-		log.Error("processWithdrawRequest processSignBtcTx", "txHash", txHash, "btcTxHash", btcTxHash, "err", err)
+	if err = n.tss.processSignBtcTx(tx, transactionTypeWithdraw, inputAmounts, req.chain33WithdrawHash, signOpts); err != nil {
+		log.Error("processWithdrawRequest processSignBtcTx", "txHash", txHash, "btcTxid", btcTxHash, "err", err)
 		return err
 	}
 	// Signing succeeded: persist the fact before the signature can leave this node. If the write
 	// fails, the signed transaction is not broadcast and the caller retries (fail-closed).
 	if err = n.recordSignedPayment(req.chain33WithdrawHash); err != nil {
 		log.Error("processWithdrawRequest recordSignedPayment, refuse to broadcast",
-			"txHash", txHash, "btcTxHash", btcTxHash, "err", err)
+			"txHash", txHash, "btcTxid", btcTxHash, "err", err)
 		return err
 	}
 
-	if err = n.bw.broadcastSignedWithdrawTx(tx, btcTxHash, req.chain33WithdrawHash); err != nil {
-		log.Error("processWithdrawRequest broadcastTransaction", "txHash", txHash, "btcTxHash", btcTxHash, "err", err)
-		return err
-	}
-	n.bw.addPendingTx(&btcPendingTx{
+	pending := &btcPendingTx{
 		tx:                    tx,
 		submitTime:            types.Now(),
 		confirmations:         0,
@@ -415,13 +443,44 @@ func (n *neutrinoClient) processWithdrawRequest(req *withdrawRequest) (err error
 		txType:                transactionTypeWithdraw,
 		withdrawAddress:       req.toAddress,
 		chain33WithdrawTxHash: req.chain33WithdrawHash,
-	})
+	}
+	if req.bump != nil {
+		// Replacement: persist the new version BEFORE broadcasting so the periodic replay can
+		// never push the superseded (lower-fee) transaction. A failed broadcast is not fatal:
+		// the persisted record is replayed on the next tick, so the request is considered applied.
+		if err = n.replaceSignedWithdrawTx(req.chain33WithdrawHash, tx,
+			req.bump.effectiveFeeRate, req.bump.appliedFeeRate); err != nil {
+			log.Error("processWithdrawRequest replaceSignedWithdrawTx, refuse to broadcast",
+				"txHash", txHash, "btcTxid", btcTxHash, "err", err)
+			return err
+		}
+		if berr := n.bw.broadcastTransaction(tx, btcTxHash); berr != nil {
+			log.Warn("processWithdrawRequest replacement broadcast failed; the signed replacement "+
+				"is persisted and will be replayed", "txHash", txHash, "btcTxid", btcTxHash, "err", berr)
+		}
+		n.bw.replacePendingTx(pending)
+	} else {
+		if err = n.bw.broadcastSignedWithdrawTx(tx, btcTxHash, req.chain33WithdrawHash); err != nil {
+			log.Error("processWithdrawRequest broadcastTransaction", "txHash", txHash, "btcTxid", btcTxHash, "err", err)
+			return err
+		}
+		n.bw.addPendingTx(pending)
+	}
+
+	// Remember the input amounts of the version that is now live, so a later fee bump can prove
+	// to the other signers that the replacement spends the same inputs and pays a strictly higher
+	// absolute fee. A failure is not fatal for this tx; it only disables future bumps.
+	if err = n.saveSignedWithdrawInputAmounts(req.chain33WithdrawHash, inputAmounts); err != nil {
+		log.Error("processWithdrawRequest saveSignedWithdrawInputAmounts: later fee bumps will be refused",
+			"txHash", txHash, "err", err)
+	}
 
 	if setStateErr := n.setWithdrawState(req.chain33WithdrawHash, withdrawStatusSent); setStateErr != nil {
-		log.Error("processWithdrawRequest setWithdrawState", "txHash", txHash, "btcTxHash", btcTxHash, "err", setStateErr)
+		log.Error("processWithdrawRequest setWithdrawState", "txHash", txHash, "btcTxid", btcTxHash, "err", setStateErr)
 		return setStateErr
 	}
-	log.Debug("processWithdrawRequest success", "withdrawTxHash", txHash, "btcTxHash", btcTxHash)
+	log.Debug("processWithdrawRequest success", "withdrawTxHash", txHash, "btcTxid", btcTxHash,
+		"replacement", req.bump != nil)
 	return nil
 }
 

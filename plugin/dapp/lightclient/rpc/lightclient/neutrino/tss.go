@@ -718,9 +718,18 @@ func validateSignerCombination(signers []string, bks map[string]*tss.BK, thresho
 	return nil
 }
 
+// tssSignOptions 携带 BTC 提现加价替换的额外上下文（首次提现为 nil）。
+// 这些字段会随签名通知下发；签名节点只把它们当作"待验证的声称"，链上请求与交易本身才是真值。
+type tssSignOptions struct {
+	prevBtcTxData     []byte
+	prevInputAmounts  []int64
+	bumpRequestTxHash []byte
+}
+
 // processSignBtcTx processes a Bitcoin transaction using TSS protocol
 // This is called by the main node to initiate TSS signing
-func (t *tssService) processSignBtcTx(tx *wire.MsgTx, txType string, inputAmounts []int64, payload []byte) error {
+func (t *tssService) processSignBtcTx(tx *wire.MsgTx, txType string, inputAmounts []int64, payload []byte,
+	opts *tssSignOptions) error {
 
 	signers := t.waitForSufficientSigners()
 	buf := bytes.NewBuffer(make([]byte, 0, tx.SerializeSizeStripped()))
@@ -735,6 +744,11 @@ func (t *tssService) processSignBtcTx(tx *wire.MsgTx, txType string, inputAmount
 		Payload:      payload,
 		BtcTxData:    buf.Bytes(),
 		Signers:      signers,
+	}
+	if opts != nil {
+		notify.PrevBtcTxData = opts.prevBtcTxData
+		notify.PrevInputAmounts = opts.prevInputAmounts
+		notify.BumpRequestTxHash = opts.bumpRequestTxHash
 	}
 	// Publish notification to all TSS nodes
 	t.pubMsg(tssSignNotifyTopic, types.Encode(notify))
@@ -1456,6 +1470,181 @@ func (t *tssService) validateWithdrawTx(tx *wire.MsgTx, inputAmounts []int64, re
 	return nil
 }
 
+// isWithdrawBumpNotify 签名通知是否声明为一次"加价替换"。任一加价字段出现即按替换处理：
+// 字段不全时 validateWithdrawReplacement 直接拒绝（fail-closed），不会退回普通提现校验。
+func isWithdrawBumpNotify(notify *ltypes.TssSignNotify) bool {
+	if notify == nil {
+		return false
+	}
+	return len(notify.PrevBtcTxData) > 0 || len(notify.PrevInputAmounts) > 0 || len(notify.BumpRequestTxHash) > 0
+}
+
+// validateWithdrawReplacement 是签名节点对加价替换交易的独立校验，返回实际生效费率。
+//
+// 签名节点不掌握协调者的本地状态，因此只用两类**可独立验证**的事实：
+//   - 链上：该 burn 的加价请求（按通知里的 requestTxHash 从链上查，不信任通知声称的费率）；
+//   - 交易本身：输入金额由通知给出，但输入/输出结构与费率都由签名节点自己重算。
+//
+// 规则：
+//  1. 必须是同一笔未确认提现、OP_RETURN 承诺仍是原 burn；
+//  2. 预期费率（即构造用户输出所用的费率）必须等于 min(链上请求费率, dust 上限)，且严格高于
+//     原始提现费率。dust 上限由交易自身大小反解，因此请求费率被协调者封顶时，签名节点算出的
+//     期望值同样是被封顶后的值 —— 不是无脑信任请求费率。实际手续费允许比预期多出不足 dust 的
+//     找零零头（构造器把 <= dust 的找零并入手续费），用户输出必须精确等于"pending 金额 -
+//     baseSize*预期费率"；
+//  3. 新交易必须与上一版已签交易至少共享一个输入（互斥，保证同一 burn 最多一笔能上链）；
+//  4. 新交易的绝对手续费必须严格高于上一版。
+func (t *tssService) validateWithdrawReplacement(tx *wire.MsgTx, inputAmounts []int64,
+	req *withdrawRequest, pending *rtypes.PendingTx, notify *ltypes.TssSignNotify) (btcutil.Amount, error) {
+
+	if req == nil || pending == nil || notify == nil {
+		return 0, fmt.Errorf("invalid replacement context")
+	}
+	if len(notify.PrevBtcTxData) == 0 || len(notify.BumpRequestTxHash) == 0 ||
+		len(notify.PrevInputAmounts) == 0 {
+		return 0, fmt.Errorf("replacement notify is missing prev tx, prev input amounts or bump request hash")
+	}
+	if len(inputAmounts) != len(tx.TxIn) {
+		return 0, fmt.Errorf("input count mismatch: tx=%d amounts=%d", len(tx.TxIn), len(inputAmounts))
+	}
+	for idx, txIn := range tx.TxIn {
+		if txIn.Sequence != withdrawInputSequence {
+			return 0, fmt.Errorf("replacement input %d does not signal opt-in RBF (sequence %d)",
+				idx, txIn.Sequence)
+		}
+	}
+
+	// 1. OP_RETURN 承诺必须仍是原 burn。
+	commitmentOK := false
+	for _, out := range tx.TxOut {
+		if commitment, ok := parseWithdrawCommitment(out.PkScript); ok &&
+			bytes.Equal(commitment, req.chain33WithdrawHash) {
+			commitmentOK = true
+			break
+		}
+	}
+	if !commitmentOK {
+		return 0, fmt.Errorf("replacement lacks the burn commitment for %s",
+			hex.EncodeToString(req.chain33WithdrawHash))
+	}
+
+	var fee int64
+	for _, amount := range inputAmounts {
+		fee += amount
+	}
+	for _, out := range tx.TxOut {
+		fee -= out.Value
+	}
+	baseSize, err := withdrawFeeBaseSize(tx, t.pkScript)
+	if err != nil {
+		return 0, err
+	}
+	if fee <= 0 {
+		return 0, fmt.Errorf("replacement has a non-positive fee %d", fee)
+	}
+
+	item, err := t.client.findBumpWithdrawFeeRequest(req.chain33WithdrawHash,
+		pending.GetTxBlockHeight(), notify.BumpRequestTxHash)
+	if err != nil {
+		return 0, err
+	}
+	if !bytes.Equal(item.GetWithdrawalTxHash(), req.chain33WithdrawHash) {
+		return 0, fmt.Errorf("bump request %s does not belong to burn %s",
+			hex.EncodeToString(item.GetTxHash()), hex.EncodeToString(req.chain33WithdrawHash))
+	}
+	if item.GetFeeRate() <= pending.GetFeeRate() {
+		return 0, fmt.Errorf("bump request fee rate %d is not above the original withdraw fee rate %d",
+			item.GetFeeRate(), pending.GetFeeRate())
+	}
+	// 2. 链上请求是上限；实际可用费率还要受 dust 约束（与协调者同一口径）。
+	maxFeasible := maxWithdrawFeeRate(pending.GetAmount(), baseSize)
+	if maxFeasible <= 0 {
+		return 0, fmt.Errorf("withdraw amount %d cannot pay any replacement fee while keeping the output above dust",
+			pending.GetAmount())
+	}
+	expected := btcutil.Amount(item.GetFeeRate())
+	if expected > btcutil.Amount(maxFeasible) {
+		expected = btcutil.Amount(maxFeasible)
+	}
+	// 构造器按 expected 计算用户输出 = pending 金额 - baseSize*expected；若找零 <= dust 未单独成
+	// 输出，那部分零头会被并入手续费。因此实际手续费落在 [baseSize*expected,
+	// baseSize*expected + dust] 内。用户输出仍必须精确等于 baseSize*expected 对应的金额。
+	intendedFee := int64(baseSize) * int64(expected)
+	if fee < intendedFee || fee > intendedFee+minChangeAmount {
+		return 0, fmt.Errorf("replacement fee %d is outside the range implied by the on-chain request "+
+			"after the dust cap (requested %d, maxFeasible %d, expected %d, baseSize %d)",
+			fee, item.GetFeeRate(), maxFeasible, expected, baseSize)
+	}
+	if expected <= btcutil.Amount(pending.GetFeeRate()) {
+		return 0, fmt.Errorf("replacement fee rate %d is not above the original withdraw fee rate %d",
+			expected, pending.GetFeeRate())
+	}
+
+	// 用户输出必须精确等于"原 pending 金额 - 预期手续费"：只校验上限会让协调者把差额挪进
+	// 找零（桥自己的输出），用户实际到手变少而费率看起来仍然正确。
+	destAddr, err := btcutil.DecodeAddress(req.toAddress, &t.client.neutrinoCfg.ChainParams)
+	if err != nil {
+		return 0, fmt.Errorf("decode replacement target address: %w", err)
+	}
+	destScript, err := txscript.PayToAddrScript(destAddr)
+	if err != nil {
+		return 0, fmt.Errorf("build replacement target script: %w", err)
+	}
+	var destAmount int64
+	for _, out := range tx.TxOut {
+		if bytes.Equal(out.PkScript, destScript) {
+			destAmount += out.Value
+		}
+	}
+	if destAmount != pending.GetAmount()-intendedFee {
+		return 0, fmt.Errorf("replacement pays the target %d, want %d (pending amount %d minus fee %d)",
+			destAmount, pending.GetAmount()-intendedFee, pending.GetAmount(), intendedFee)
+	}
+
+	// 3/4. 与上一版共享输入，且绝对手续费更高。
+	var prevTx wire.MsgTx
+	if err = prevTx.Deserialize(bytes.NewReader(notify.PrevBtcTxData)); err != nil {
+		return 0, fmt.Errorf("decode previous signed withdraw tx: %w", err)
+	}
+	if len(prevTx.TxIn) != len(notify.PrevInputAmounts) {
+		return 0, fmt.Errorf("previous input amount count mismatch: tx=%d amounts=%d",
+			len(prevTx.TxIn), len(notify.PrevInputAmounts))
+	}
+	newInputs := make(map[wire.OutPoint]int64, len(tx.TxIn))
+	for idx, txIn := range tx.TxIn {
+		newInputs[txIn.PreviousOutPoint] = inputAmounts[idx]
+	}
+	shared := false
+	for idx, txIn := range prevTx.TxIn {
+		newAmount, ok := newInputs[txIn.PreviousOutPoint]
+		if !ok {
+			continue
+		}
+		if newAmount != notify.PrevInputAmounts[idx] {
+			return 0, fmt.Errorf("shared input %s amount mismatch: replacement=%d previous=%d",
+				txIn.PreviousOutPoint.String(), newAmount, notify.PrevInputAmounts[idx])
+		}
+		shared = true
+	}
+	if !shared {
+		return 0, fmt.Errorf("replacement shares no input with the previous signed transaction")
+	}
+	var prevFee int64
+	for _, amount := range notify.PrevInputAmounts {
+		prevFee += amount
+	}
+	for _, out := range prevTx.TxOut {
+		prevFee -= out.Value
+	}
+	if prevFee <= 0 {
+		return 0, fmt.Errorf("previous signed transaction has a non-positive fee %d", prevFee)
+	}
+	if fee <= prevFee {
+		return 0, fmt.Errorf("replacement absolute fee %d is not above the previous fee %d", fee, prevFee)
+	}
+	return expected, nil
+}
+
 func (t *tssService) checkNonOfficialWithdrawSign(chain33WithdrawHash []byte) (*rtypes.PendingTx, error) {
 
 	txHash := hex.EncodeToString(chain33WithdrawHash)
@@ -1599,10 +1788,23 @@ func (t *tssService) handleSignNotify(data *types.TopicData) {
 			return
 		}
 		req := pending2WithdrawRequest(pendingTx)
+		if isWithdrawBumpNotify(notify) {
+			// 加价替换：先在链上加价请求/上一版交易的约束下核对交易本身的费率，
+			// 再用同一套提现校验（目标地址、金额、dust、费用区间）复核一遍。
+			effective, verr := t.validateWithdrawReplacement(tx, inputAmounts, req, pendingTx, notify)
+			if verr != nil {
+				log.Error("handleSignNotify validateWithdrawReplacement", "err", verr,
+					"withdrawHash", hex.EncodeToString(chain33WithdrawHash), "btcTxid", tx.TxHash().String())
+				return
+			}
+			// validateWithdrawTx 用 req.feeRate 做手续费区间校验；替换的合法费率来自链上请求
+			// （经 dust 封顶），不是原始提现费率。
+			req.feeRate = effective
+		}
 		err = t.validateWithdrawTx(tx, inputAmounts, req)
 		if err != nil {
 			log.Error("handleSignNotify validateWithdrawTx", "err", err,
-				"withdrawHash", hex.EncodeToString(chain33WithdrawHash), "btcHash", tx.TxHash().String())
+				"withdrawHash", hex.EncodeToString(chain33WithdrawHash), "btcTxid", tx.TxHash().String())
 			return
 		}
 	}
