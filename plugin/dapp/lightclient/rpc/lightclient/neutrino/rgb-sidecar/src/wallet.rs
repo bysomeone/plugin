@@ -9,11 +9,12 @@
 //! `searchrawtransactions` (address index) + `gettxout`.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use bitcoin::hashes::{sha256, Hash};
 use bitcoin::opcodes::all::{OP_CHECKSIG, OP_DROP};
 use bitcoin::script::{Builder, PushBytesBuf};
 use bitcoin::{Address, CompressedPublicKey, Network, OutPoint, ScriptBuf};
@@ -88,8 +89,8 @@ pub struct UserDepositScript {
     pub witness_script: ScriptBuf,
 }
 
-/// Persisted form of the registry (hex strings: `ScriptBuf` has no serde impl without the
-/// `serde` feature, and the on-disk form should be readable without knowing rust-bitcoin).
+/// Legacy on-disk form of the registry: one JSON file holding every user script. Read at startup
+/// and migrated to one file per user; no longer written (O5).
 #[derive(Serialize, Deserialize, Default)]
 struct UserScriptsFile {
     scripts: Vec<UserScriptRec>,
@@ -102,6 +103,13 @@ struct UserScriptRec {
     witness_script: String,
 }
 
+/// Name of the per-user registry file. `sha256(userID)` keeps the name fixed-size and independent
+/// of the user ID's length / characters; the user ID itself is stored in the file body.
+fn user_script_file_name(user_id: &str) -> String {
+    let digest = sha256::Hash::hash(user_id.as_bytes());
+    format!("{}.json", hex_of(&digest.to_byte_array()))
+}
+
 pub struct BtcWallet {
     rpc: Arc<BtcdRpc>,
     address: Address,
@@ -111,9 +119,14 @@ pub struct BtcWallet {
     tss_pubkey: CompressedPublicKey,
     /// programme(pkScript) → 该用户充值脚本的原文与 userID（主池之外的 watch 集）。
     user_scripts: HashMap<ScriptBuf, UserDepositScript>,
-    /// 注册表落盘路径（`None` = 纯内存，测试用）。注册**必须**持久化：重启后 watch 集一丢，
-    /// 已经打进用户 P2WSH 的 BTC 就变成"看得见但花不掉"（witnessScript 只能从 (userID, tssPub)
-    /// 重新派生，而 userID 只在桥的注册表里）。
+    /// Legacy registry file path (`data_dir/user_scripts.json`); `None` = purely in-memory.
+    /// The registry must be persisted: losing the watch set on restart makes the `witnessScript`
+    /// of already-handed-out addresses unrecoverable (it can only be re-derived from
+    /// `(userID, tssPub)`, and the user ID is only in the bridge's registry).
+    ///
+    /// Entries are written as one small file per user under the sibling directory
+    /// (`data_dir/user_scripts/`), so a registration is O(1) instead of rewriting the whole set.
+    /// The legacy single file is still read at startup and migrated into that directory.
     user_scripts_path: Option<PathBuf>,
 }
 
@@ -194,8 +207,11 @@ impl BtcWallet {
         if self.user_scripts.get(&pk_script) == Some(&entry) {
             return Ok(()); // 幂等：同一条目不重复落盘
         }
+        // Persist first, then update the in-memory set: a failed write leaves both unchanged.
+        // Only this user's file is written, so the existing set is never rewritten (O5).
+        self.save_user_script(&pk_script, &entry)?;
         self.user_scripts.insert(pk_script, entry);
-        self.save_user_scripts()
+        Ok(())
     }
 
     /// 登记桥下发的用户充值脚本条目：**不采信**下发的 witnessScript（根本没有这个字段），
@@ -254,59 +270,133 @@ impl BtcWallet {
         out
     }
 
-    /// 从落盘文件载入注册表（不存在视为空；损坏/单条非法一律报错而不静默丢弃 —— watch 集少一条
-    /// 就等于那笔充值花不掉，静默降级会让故障延后到"提现时才炸"）。
+    /// Load the registry from disk.
+    ///
+    /// Entries live in one JSON file per user under `user_scripts/`. A legacy single
+    /// `user_scripts.json` (written by older sidecars) is read too, then migrated into that
+    /// directory and retired to `user_scripts.json.migrated`. This is idempotent: a crash
+    /// between the per-user writes and the rename leaves the legacy file in place and the next
+    /// start simply writes the same files again.
+    ///
+    /// A malformed record or a pkScript/witnessScript pair that does not bind aborts startup
+    /// (nothing is loaded). A missing watch entry means that deposit can never be spent, so
+    /// silently dropping it would only defer the failure to withdrawal time.
     pub fn load_user_scripts(&mut self) -> Result<()> {
-        let Some(path) = self.user_scripts_path.clone() else {
+        let Some(legacy_path) = self.user_scripts_path.clone() else {
             return Ok(());
         };
-        if !path.exists() {
-            return Ok(());
+        let dir = user_scripts_dir_for(&legacy_path);
+
+        let mut recs: Vec<UserScriptRec> = Vec::new();
+        if dir.exists() {
+            for entry in std::fs::read_dir(&dir)
+                .map_err(|e| anyhow!("read user scripts dir {}: {e}", dir.display()))?
+            {
+                let entry =
+                    entry.map_err(|e| anyhow!("read user scripts dir {}: {e}", dir.display()))?;
+                let path = entry.path();
+                // Only `*.json`: `write_atomic` stages as `<name>.tmp`, which is not a record.
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let raw = std::fs::read_to_string(&path)
+                    .map_err(|e| anyhow!("read user scripts {}: {e}", path.display()))?;
+                let rec: UserScriptRec = serde_json::from_str(&raw)
+                    .map_err(|e| anyhow!("user scripts {}: {e}", path.display()))?;
+                recs.push(rec);
+            }
         }
-        let raw = std::fs::read_to_string(&path)?;
-        let file: UserScriptsFile = serde_json::from_str(&raw)
-            .map_err(|e| anyhow!("user scripts {}: {e}", path.display()))?;
-        for rec in file.scripts {
+        let legacy_exists = legacy_path.exists();
+        let legacy_recs = if legacy_exists {
+            let raw = std::fs::read_to_string(&legacy_path)?;
+            let file: UserScriptsFile = serde_json::from_str(&raw)
+                .map_err(|e| anyhow!("user scripts {}: {e}", legacy_path.display()))?;
+            file.scripts
+        } else {
+            Vec::new()
+        };
+
+        // Validate all records before touching disk or memory (fail-closed).
+        let mut loaded: HashMap<ScriptBuf, UserDepositScript> = HashMap::new();
+        for rec in recs.iter().chain(legacy_recs.iter()) {
             let pk_script = ScriptBuf::from_bytes(decode_hex(&rec.pk_script)?);
             let witness_script = ScriptBuf::from_bytes(decode_hex(&rec.witness_script)?);
             if pk_script != ScriptBuf::new_p2wsh(&witness_script.wscript_hash()) {
                 return Err(anyhow!(
                     "user scripts {}: entry for {} does not bind (pkScript != p2wsh(witnessScript))",
-                    path.display(),
+                    dir.display(),
                     rec.user_id
                 ));
             }
-            self.user_scripts.insert(
-                pk_script,
-                UserDepositScript {
-                    user_id: rec.user_id,
-                    witness_script,
-                },
-            );
+            let deposit = UserDepositScript {
+                user_id: rec.user_id.clone(),
+                witness_script,
+            };
+            if loaded
+                .get(&pk_script)
+                .is_some_and(|existing| existing != &deposit)
+                || self
+                    .user_scripts
+                    .get(&pk_script)
+                    .is_some_and(|existing| existing != &deposit)
+            {
+                return Err(anyhow!(
+                    "user scripts {}: conflicting records for pkScript {}",
+                    dir.display(),
+                    rec.pk_script
+                ));
+            }
+            loaded.insert(pk_script, deposit);
         }
+
+        // Migrate the legacy file: write one file per entry, then retire it. A failed write keeps
+        // the legacy file, and the next start retries the (idempotent) migration. A user that
+        // already has a per-user file keeps it: that file is the newer source (the legacy file
+        // may be a leftover from a migration that crashed before the rename).
+        if legacy_exists {
+            let per_user: std::collections::HashSet<&str> =
+                recs.iter().map(|r| r.user_id.as_str()).collect();
+            for rec in &legacy_recs {
+                if per_user.contains(rec.user_id.as_str()) {
+                    continue;
+                }
+                self.write_user_script_rec(rec)?;
+            }
+            let retired = legacy_path.with_file_name(format!(
+                "{}.migrated",
+                legacy_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "user_scripts".to_string())
+            ));
+            std::fs::rename(&legacy_path, &retired).map_err(|e| {
+                anyhow!("retire legacy user scripts {}: {e}", legacy_path.display())
+            })?;
+        }
+
+        self.user_scripts.extend(loaded);
         Ok(())
     }
 
-    fn save_user_scripts(&self) -> Result<()> {
+    /// Persist one entry as `user_scripts/<sha256(userID)>.json`, next to the legacy file path.
+    fn save_user_script(&self, pk_script: &ScriptBuf, entry: &UserDepositScript) -> Result<()> {
+        self.write_user_script_rec(&UserScriptRec {
+            user_id: entry.user_id.clone(),
+            pk_script: hex_of(pk_script.as_bytes()),
+            witness_script: hex_of(entry.witness_script.as_bytes()),
+        })
+    }
+
+    fn write_user_script_rec(&self, rec: &UserScriptRec) -> Result<()> {
         let Some(path) = self.user_scripts_path.as_ref() else {
             return Ok(());
         };
-        let file = UserScriptsFile {
-            scripts: self
-                .user_scripts
-                .iter()
-                .map(|(pk, e)| UserScriptRec {
-                    user_id: e.user_id.clone(),
-                    pk_script: hex_of(pk.as_bytes()),
-                    witness_script: hex_of(e.witness_script.as_bytes()),
-                })
-                .collect(),
-        };
+        let file = user_scripts_dir_for(path).join(user_script_file_name(&rec.user_id));
         // Atomic like the rest of the sidecar's state (tmp → fsync → rename): losing this registry
         // to a torn write means losing the `witnessScript` of every address already handed out,
-        // i.e. BTC that can never be spent again — the same class of loss as losing the Stock.
-        crate::ledger::write_atomic(path, &serde_json::to_vec_pretty(&file)?)
-            .map_err(|e| anyhow!("write user scripts {}: {e:#}", path.display()))
+        // i.e. BTC that can never be spent again.
+        crate::ledger::write_atomic(&file, &serde_json::to_vec_pretty(rec)?)
+            .map_err(|e| anyhow!("write user scripts {}: {e:#}", file.display()))
     }
 
     // ------------------------------------------------------------------
@@ -383,6 +473,12 @@ impl BtcWallet {
 
 fn hex_of(bytes: &[u8]) -> String {
     bitcoin::hex::DisplayHex::to_hex_string(bytes, bitcoin::hex::Case::Lower)
+}
+
+/// Per-user registry directory: the legacy file path with its extension removed
+/// (`data_dir/user_scripts.json` → `data_dir/user_scripts`).
+fn user_scripts_dir_for(legacy_path: &Path) -> PathBuf {
+    legacy_path.with_extension("")
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
@@ -591,6 +687,154 @@ mod tests {
         assert!(format!("{err}").contains("does not bind"), "{err}");
         // 宁可启动失败，也不带着半份 watch 集跑（那会让充值无声地花不掉）。
         assert!(w.user_scripts().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Legacy `user_scripts.json` (one array of every entry) is read, migrated to one file per
+    /// user, and retired. A second start then loads from the per-user files alone.
+    #[test]
+    fn legacy_single_file_is_migrated_to_per_user_files() {
+        let dir =
+            std::env::temp_dir().join(format!("rgb-sidecar-wallet-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user_scripts.json");
+        let (pk_a, ws_a) = deposit_scripts(2);
+        let (pk_b, ws_b) = deposit_scripts(3);
+        let legacy = serde_json::json!({
+            "scripts": [
+                {
+                    "user_id": "user-a",
+                    "pk_script": hex_of(pk_a.as_bytes()),
+                    "witness_script": hex_of(ws_a.as_bytes()),
+                },
+                {
+                    "user_id": "user-b",
+                    "pk_script": hex_of(pk_b.as_bytes()),
+                    "witness_script": hex_of(ws_b.as_bytes()),
+                },
+            ]
+        });
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let mut w = test_wallet(Some(path.clone()));
+        w.load_user_scripts().unwrap();
+        assert_eq!(
+            w.user_scripts().len(),
+            2,
+            "legacy entries must be loaded before the format change drops them"
+        );
+        assert_eq!(w.witness_script_for(&pk_a), Some(ws_a));
+        assert!(
+            !path.exists(),
+            "the legacy file must be retired after migration"
+        );
+        assert!(
+            dir.join("user_scripts.json.migrated").exists(),
+            "the legacy file is kept as a backup, not deleted"
+        );
+        for user in ["user-a", "user-b"] {
+            assert!(
+                dir.join("user_scripts")
+                    .join(user_script_file_name(user))
+                    .exists(),
+                "each migrated entry needs its own file"
+            );
+        }
+
+        // Second start: per-user files only, no legacy file involved.
+        let mut again = test_wallet(Some(path));
+        again.load_user_scripts().unwrap();
+        assert_eq!(again.user_scripts().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed per-user write must leave the already-registered set intact (both in memory and
+    /// on disk) instead of truncating or losing it.
+    #[test]
+    #[cfg(unix)]
+    fn failed_write_does_not_touch_the_existing_set() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("rgb-sidecar-wallet-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("user_scripts.json");
+        let (pk_a, ws_a) = deposit_scripts(2);
+        let (pk_b, ws_b) = deposit_scripts(3);
+
+        let mut w = test_wallet(Some(path.clone()));
+        w.register_user_script(pk_a.clone(), "user-a".into(), ws_a.clone())
+            .unwrap();
+
+        let registry_dir = dir.join("user_scripts");
+        let perms = std::fs::metadata(&registry_dir).unwrap().permissions();
+        std::fs::set_permissions(&registry_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = w
+            .register_user_script(pk_b.clone(), "user-b".into(), ws_b)
+            .unwrap_err();
+        std::fs::set_permissions(&registry_dir, perms).unwrap();
+        assert!(format!("{err}").contains("write user scripts"), "{err}");
+        assert_eq!(
+            w.user_scripts().len(),
+            1,
+            "the failed entry must not enter memory"
+        );
+        assert!(
+            w.witness_script_for(&pk_b).is_none(),
+            "the failed entry must not be readable"
+        );
+
+        // The first entry is still on disk and loads back.
+        let mut reloaded = test_wallet(Some(path));
+        reloaded.load_user_scripts().unwrap();
+        assert_eq!(reloaded.witness_script_for(&pk_a), Some(ws_a));
+        assert_eq!(reloaded.witness_script_for(&pk_b), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrent writers each own their user's file, so no entry is lost. This is the property
+    /// the old single-file rewrite could not provide without a process-wide lock.
+    #[test]
+    fn concurrent_registrations_do_not_lose_entries() {
+        let dir =
+            std::env::temp_dir().join(format!("rgb-sidecar-wallet-conc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("user_scripts.json");
+        let pubkey = vector_pubkey();
+        const N: usize = 16;
+
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let rpc = Arc::new(
+                        BtcdRpc::connect("127.0.0.1:1", "", "", None, Network::Regtest).unwrap(),
+                    );
+                    let mut w = BtcWallet::new(rpc, VECTOR_TSS_PUB, Network::Regtest)
+                        .unwrap()
+                        .with_user_scripts_path(path);
+                    let user_id = format!("1ConcurrentUser{i:0>20}");
+                    let ws = deposit_witness_script(&user_id, &pubkey).unwrap();
+                    let pk = ScriptBuf::new_p2wsh(&ws.wscript_hash());
+                    w.register_user_script(pk, user_id, ws).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut w = test_wallet(Some(path));
+        w.load_user_scripts().unwrap();
+        assert_eq!(
+            w.user_scripts().len(),
+            N,
+            "every concurrent registration must survive"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
