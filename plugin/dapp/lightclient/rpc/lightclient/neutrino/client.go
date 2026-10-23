@@ -316,13 +316,8 @@ func (n *neutrinoClient) Start() {
 			"BTC deposited to per-user P2WSH addresses stays there until it is swept, so withdrawals " +
 			"have no main-pool BTC to spend unless something else refills the pool")
 	}
-	if n.cfg.DepositAddressListen != "" {
-		go n.serveDepositAddressHTTP(n.cfg.DepositAddressListen)
-	} else {
-		log.Warn("deposit address issuance is disabled (neutrino.depositAddressListen is empty): " +
-			"per-user P2WSH deposit scripts can no longer be imported on demand, deposits to addresses " +
-			"that are not already watched will be invisible to the bridge")
-	}
+	// Deposit addresses are registered on chain (RegisterDepositScript) and imported into the
+	// wallet by depositRegistryWorker; the bridge exposes no HTTP endpoint for them.
 	n.rgbx.start(n)
 	// RGB20 官方节点：充值轮询 + HTTP（consignment 上传/充值请求）。Start 非阻塞，后台等待侧车连接。
 	if n.rgb20 != nil {

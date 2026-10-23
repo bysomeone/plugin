@@ -292,19 +292,16 @@ program       = sha256(witnessScript);  address = bech32 v0(program)
 所以**桥不保存任何"地址簿"**。桥唯一要记住的是 **watch 集**：钱包必须先 import 该脚本才看得见打进来的
 充值（若看不到，那笔充值不会被自动认领 —— 钱不会丢，但会卡在桥控脚本里）。
 
-- `depositAddressListen` (string)
-  - 含义：**充值地址发放 HTTP** 的监听地址（空 = 不开启，也是默认）。
-  - 接口（明文 HTTP，应只对可信网段开放）：
-    - `GET  /rgbx/v1/btc-deposit-address?chain33Addr=<chain33 地址>`
-    - `POST /rgbx/v1/btc-deposit-address` body `{"chain33Addr":"<chain33 地址>"}`
-    - 返回 `{"code":200,"message":"ok","data":{"userID","address","pkScript","spec","watchSize"}}`
-  - 副作用（**这是它存在的唯一理由**）：把该用户的派生脚本按需 import 进钱包并订阅（幂等）。
-    地址本身是公开可算的（离线可枚举），注册别人的地址也不会让别人丢钱（脚本绑定的是那个人的 userID）；
-    可被滥用的只有 watch 集增长，由下面的上限兜住。
-  - **不配置的后果**：桥不会 watch 任何新用户的充值脚本 —— 打到每用户地址上的 BTC 除非已经在
-    watch 集里（重启后从 `neutrino.db` 载入），否则**看不见**。启动时会打一条 WARN 说明这一点。
+- 充值地址登记（**链上**，无 HTTP 接口）
+  - 用户向链上提交 `RegisterDepositScript`（payload 空，userID = `tx.From()`）；执行器按
+    `P2WSH(chain33 地址, TSS 公钥)` 派生地址并写入登记表，回执 `DepositScriptLog` 携带
+    address / pkScript / spec / height。重复提交幂等。
+  - 官方节点的 `depositRegistryWorker` 轮询链上登记，把新脚本 import 进钱包 watch 集；
+    签名节点通过侧车并集补齐自己的 watch 集。
+  - 地址查询：`GetDepositAddress`（参数为 chain33 地址；未登记返回 `ErrNotFound`，**不现场派生**）。
+  - 桥不提供任何地址发放 HTTP 接口；地址本身是公开可算的，登记绑定的是提交人的 userID。
 - `maxWatchedDepositScripts` (int)
-  - 含义：watch 集上限，达到上限后**拒绝发放新地址**（明确失败优于静默变慢/静默漏认充值）。
+  - 含义：watch 集上限，达到上限后**拒绝导入新的链上登记**（明确失败优于静默变慢/静默漏认充值）。
   - 默认行为：未设置或 <=0 时用默认值 10000。
   - 代价量级：每个脚本往 neutrino 的 watch 列表加一个 34 字节 program（内存 + 每块 filter 匹配的常数项，
     **不产生逐地址的 RPC**）；大头是**首次 import 触发的那次 rescan**（rescan 未在跑时会从钱包生日回扫），

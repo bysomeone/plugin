@@ -24,16 +24,36 @@ function p2wsh_deposit_once() {
     tss_pubkey=$(${MAIN_CLI} rgbx getCrossChainInfo -s "${MINT_SYMBOL}" | jq -r '.pubkey // empty')
     assert_non_empty "${tss_pubkey}" "tss pubkey empty before deposit (checkCommitDKG must carry it)"
 
-    # 桥必须先 watch 该用户的派生脚本才看得见这笔充值 —— 地址要**向桥要**（发放接口会按需 import），
-    # 本地推导的地址（rgbx btcDepositAddress）仅供对账，桥不会因为本地推导就去 watch。
-    # 桥侧需配置：neutrino.depositAddressListen（见 lightclient CONFIG.md）+ 把该端口暴露给本脚本。
-    local bridge_deposit_url="${BRIDGE_DEPOSIT_URL:-http://127.0.0.1:17001/rgbx/v1/btc-deposit-address}"
-    local deposit_addr
-    # `|| true`：curl 连不上时（--fail 非 2xx / 连接被拒）赋值会因 set -e 直接结束整个 run，
-    # 后面那句带排障提示的 assert 就永远看不到。这里让 assert 来报错，失败信息才有指向性。
-    deposit_addr=$(curl -sf "${bridge_deposit_url}?chain33Addr=${USER_MAIN_ADDR}" | jq -r '.data.address // empty') || true
+    # 充值地址的权威来源是链上登记（#78）：用户先发 RegisterDepositScript（userID = tx.From()），
+    # 官方节点的 depositRegistryWorker 再从链上同步 watch 集，地址用 GetDepositAddress 查。
+    # 桥不提供任何地址发放 HTTP 接口。
+    local deposit_addr reg_started_at registered_before
+    registered_before=$(rgbx_query "GetDepositAddress" "{\"data\":\"${USER_MAIN_ADDR}\"}" |
+        jq -r '.result.address // empty' 2>/dev/null || true)
+    if [ -z "${registered_before}" ]; then
+        reg_started_at=$(date +%s)
+        local reg_hash reg_bare reg_pos
+        reg_hash=$(send_main_rgbx_action "RegisterDepositScript" '{}' "${USER_MAIN_KEY}")
+        reg_bare=$(normalize_tx_hash "${reg_hash}")
+        reg_pos=$(wait_main_tx_committed "${reg_bare}")
+        assert_eq "$(main_tx_receipt_ty "${reg_bare}")" "ExecOk" "RegisterDepositScript receipt (BTC deposit case)"
+        # 官方节点按 worker 周期导入；等它真正进入 watch 集再让用户付款。
+        local i
+        for ((i = 0; i < 60; i++)); do
+            if para1_logs_since "${reg_started_at}" | grep -q "watch set grown.*userID=${USER_MAIN_ADDR}"; then
+                break
+            fi
+            sleep 1
+        done
+    fi
+    for ((i = 0; i < 60; i++)); do
+        deposit_addr=$(rgbx_query "GetDepositAddress" "{\"data\":\"${USER_MAIN_ADDR}\"}" |
+            jq -r '.result.address // empty' 2>/dev/null || true)
+        [ -n "${deposit_addr}" ] && break
+        sleep 1
+    done
     assert_non_empty "${deposit_addr}" \
-        "deposit address empty from ${bridge_deposit_url} (is neutrino.depositAddressListen configured and reachable?)"
+        "on-chain deposit address empty for ${USER_MAIN_ADDR} (RegisterDepositScript/GetDepositAddress)"
 
     # 跨节点 watch 集传播（有界 best-effort 等待）：
     #

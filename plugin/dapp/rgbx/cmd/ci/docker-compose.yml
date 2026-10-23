@@ -34,12 +34,10 @@ services:
     volumes:
       - ./btcd-data:/btcd:ro
       - para1-data:/root/paradatadir
-    # 17001：P2WSH 充值地址发放入口（neutrino.depositAddressListen）——桥要先 watch 用户的派生
-    # 脚本才看得见充值，所以地址必须**向桥要**，E2E 用 BRIDGE_DEPOSIT_URL（默认 127.0.0.1:17001）
-    # 从这里领。只有官方节点开这个监听，故只发布 para1。
-    # 17000 不再发布：sign-psbt 测试端点在容器内只绑 127.0.0.1，E2E 用 `compose exec` 访问。
-    ports:
-      - "17001:17001"
+    # 17000 is not published: the test-only sign-psbt endpoint binds 127.0.0.1 inside the
+    # container and the E2E reaches it with `compose exec`. Deposit addresses are registered on
+    # chain, so the bridge exposes no address-issuance port.
+    ports: []
 
   para2:
     platform: ${RGBX_CI_PLATFORM:-linux/amd64}
