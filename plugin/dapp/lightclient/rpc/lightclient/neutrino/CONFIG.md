@@ -468,12 +468,15 @@ P2WSH 充值地址上线后，用户的充值**不再进主池**（钱停在各�
 
 ### 4.4 `[rpc.sub.light.neutrino.rgb20]`
 
-RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentListen` / `contracts` /
-`changeAddress` / `consignmentPublish` / `transportEndpoint` / `transportGateway`）见
+RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `contracts` / `changeAddress` /
+`consignmentPublish` / `transportEndpoint` / `transportGateway` / `gatewayToken`）见
 `RGB_USDT_INTEGRATION.md` 与 4.4.7；本节描述充值重试行为（4.4.1–4.4.2）、精度落链
-（4.4.3）、链上 CLI 金额口径（4.4.4）与**提现手续费**（4.4.5）。额外的桥侧开关是
-`testSignPsbt`（默认 `false`）：打开后允许 E2E 的 `sign-psbt` 测试端点用 TSS 组签名**任意** PSBT
-（签名节点无从核对被签内容），**生产环境必须保持关闭**；`sign-psbt` 仅用于 E2E 模拟用户付款。
+（4.4.3）、链上 CLI 金额口径（4.4.4）与**提现手续费**（4.4.5）。
+
+**桥不提供任何对外 HTTP API**：充值请求由网关通过桥发起的 SSE 长连接推送，consignment 由桥
+轮询网关取得。唯一剩下的监听是 `testListen` + `testSignPsbt`（仅 E2E）：它只绑 loopback 或
+unix socket，提供 `sign-psbt`（用 TSS 组签任意 PSBT，签名节点无从核对），**生产环境必须两者
+都留空/关闭**。
 本节的行为都**不需要**与主链 `[exec.sub.rgbx]` 人肉对齐：链上最小确认数 N 由中继直接查链上
 （见 2.2）。
 
@@ -674,26 +677,44 @@ confirm carried no hash (no local record at confirm time, or the withdrawal is n
 
 #### 4.4.7 Standard RGB transport (`transportEndpoint` / `transportGateway`)
 
-Deposits can use the standard [RGB HTTP JSON-RPC v0.2](https://github.com/RGB-Tools/rgb-http-json-rpc)
-transport instead of the bridge's custom upload endpoint. The two keys are independent:
+Deposits use the standard [RGB HTTP JSON-RPC v0.2](https://github.com/RGB-Tools/rgb-http-json-rpc)
+transport plus the gateway's deposit-request API. The bridge never listens for inbound traffic:
 
 ```toml
 [rpc.sub.light.neutrino.rgb20]
 # Public address written into every deposit invoice's `transports` field.
 # Must be reachable by the paying wallet; TLS is normally terminated by a reverse proxy.
 transportEndpoint="rpcs://gw.example.com/0.2/json-rpc"
-# Internal address the bridge itself polls. Resolves inside the deployment network.
+# Internal address the bridge itself uses (consignment polling + the /bridge/* stream).
 transportGateway="http://gw:8080/0.2/json-rpc"
+# Bearer token for /bridge/*. Required for the deposit-request stream.
+gatewayToken="<shared secret>"
+# E2E only: loopback/unix listener for sign-psbt (requires testSignPsbt).
+testListen=""   # production: empty
 ```
 
-- `transportEndpoint` is a public string embedded in the invoice. It is not used by the bridge
-  itself. Empty means invoices carry no `transports` and delivery must happen out of band.
-- `transportGateway` is the HTTP JSON-RPC endpoint the **official node** polls. Empty disables
-  gateway polling; the custom `consignmentListen` upload endpoint (and any out-of-band delivery)
-  still works. When both are configured, the gateway is the production path.
-- The two may differ (public hostname vs internal service name) or be the same URL.
+- `transportEndpoint` is a public string embedded in the invoice; the payer delivers consignments
+  there.
+- `transportGateway` is where the bridge polls `consignment.get` and subscribes to
+  `/bridge/deposit/requests/stream` (SSE). It must be reachable *outbound* from the bridge; the
+  gateway does not need to reach the bridge.
+- `gatewayToken` authenticates `/bridge/*`. An empty token disables the deposit-request stream.
 
-Flow, once `CreateReceive` returns the sidecar's `recipient_id`:
+Deposit flow:
+
+1. The user's app posts a **signed** request to the gateway (`POST /deposit/requests`): request id,
+   chain33 address, asset symbol, amount, timestamp, compressed pubkey, DER signature over the
+   canonical message (`depositrequest` package). The gateway verifies it and stores it.
+2. The bridge consumes pending requests over the SSE stream, verifies the signature again, creates
+   the receive (`CreateReceive`), and posts the invoice back (`POST /bridge/deposit/invoices`).
+3. The app polls `GET /deposit/requests/{id}` for the invoice and pays it.
+4. The bridge polls `consignment.get(recipient_id)`. `-400` ("not found") means "not delivered yet".
+5. The mint transaction carries the signed request; the executor re-verifies it and rejects a
+   replay of the request id, so the minted recipient and amount are pinned to the user's signature.
+
+The old bridge endpoints (`/rgbx/v1/deposit`, `/rgbx/v1/consignment`) are gone.
+
+Steps 4-6 of the deposit transport:
 
 1. The bridge persists `recipient_id` on the local receive record.
 2. It polls `consignment.get(recipient_id)`. `-400` ("not found") means "not delivered yet".

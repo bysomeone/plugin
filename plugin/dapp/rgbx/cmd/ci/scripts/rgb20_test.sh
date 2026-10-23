@@ -471,6 +471,28 @@ function assert_on_chain_precision() {
 # RGB20 充值 E2E
 # =====================================================================
 
+# gateway_deposit_invoice <request_id> <amount>
+#
+# Plays the user: sign a deposit request with the user's chain33 key, post it to the gateway, and
+# wait for the official node to publish the invoice. Prints the gateway record (JSON) on success.
+function gateway_deposit_invoice() {
+    local request_id="$1" amount="$2" signed rec
+    signed=$(cd "$(repo_root)" && go run ./plugin/dapp/rgbx/cmd/rgb-deposit-sign \
+        -priv "${USER_MAIN_KEY}" -chain-title "user.p.rgbx." \
+        -request-id "${request_id}" -symbol "${RGB20_SYMBOL}" -amount "${amount}") || return 1
+    curl -sf -X POST "http://127.0.0.1:${RGB20_GATEWAY_PORT}/deposit/requests" \
+        -H 'Content-Type: application/json' -d "${signed}" >/dev/null || return 1
+    for _ in $(seq 1 30); do
+        rec=$(curl -s "http://127.0.0.1:${RGB20_GATEWAY_PORT}/deposit/requests/${request_id}")
+        if [ -n "$(echo "${rec}" | jq -r '.invoice // empty')" ]; then
+            echo "${rec}"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 # scenario_rgb20_deposit [request_id] [amount]
 #
 # request_id 默认 rgb20-dep-1；**同一进程里第二次调用必须换一个**——CreateReceive 按 requestId
@@ -484,16 +506,15 @@ function scenario_rgb20_deposit() {
     local deposit_amount="${2:-${RGB20_DEPOSIT_AMOUNT}}"
     log_step "scenario: RGB20 deposit (user pay -> sidecar settle -> TSS deposit sign -> chain33 mint) requestId=${request_id} amount=${deposit_amount}"
 
-    # 1. Go 桥 CreateReceive（para1 rgb20 HTTP）→ 侧车 invoice
-    local rec_json
-    rec_json=$(curl -s -X POST http://127.0.0.1:17000/rgbx/v1/deposit \
-        -H 'Content-Type: application/json' \
-        -d "{\"requestId\":\"${request_id}\",\"assetSymbol\":\"${RGB20_SYMBOL}\",\"amount\":${deposit_amount},\"chain33Addr\":\"${USER_MAIN_ADDR}\"}")
-    local receive_id invoice
-    receive_id=$(echo "${rec_json}" | jq -r '.data.receiveId // empty')
-    invoice=$(echo "${rec_json}" | jq -r '.data.invoice // empty')
-    assert_non_empty "${receive_id}" "rgb20 receive_id empty"
-    assert_non_empty "${invoice}" "rgb20 invoice empty"
+    # 1. 用户签名充值请求 → 网关（公开 API）→ SSE 推给官方节点 → 桥出票
+    local rec_json invoice receive_id recipient_id
+    rec_json=$(gateway_deposit_invoice "${request_id}" "${deposit_amount}") ||
+        fail "gateway did not publish an invoice for request ${request_id}"
+    receive_id=$(echo "${rec_json}" | jq -r '.receive_id // empty')
+    recipient_id=$(echo "${rec_json}" | jq -r '.recipient_id // empty')
+    assert_non_empty "${receive_id}" "rgb20 receive_id empty (gateway: ${rec_json})"
+    assert_non_empty "${invoice}" "rgb20 invoice empty (gateway: ${rec_json})"
+    assert_non_empty "${recipient_id}" "rgb20 recipient_id empty (gateway: ${rec_json})"
     log_step "  receive_id=${receive_id}"
 
     # 2. 侧车 test-sim 构建用户付款（未签 PSBT + consignment）
@@ -510,9 +531,10 @@ function scenario_rgb20_deposit() {
     [ -n "${cons_hex}" ] ||
         fail "rgb20 user_pay consignment empty; sidecar response: $(echo "${pay_json}" | head -c 600)"
 
-    # 3. Go 桥 TSS 组签名 PSBT（test sign-psbt 端点）
+    # 3. Go 桥 TSS 组签名 PSBT（test sign-psbt 端点）。桥不对外开放任何端口：测试端点只绑
+    #    para1 容器内的 127.0.0.1，所以从容器里 curl。
     local signed_psbt
-    signed_psbt=$(curl -s -X POST http://127.0.0.1:17000/rgbx/v1/sign-psbt \
+    signed_psbt=$(compose_cmd exec -T para1 curl -sf -X POST http://127.0.0.1:17000/rgbx/v1/sign-psbt \
         -H 'Content-Type: application/json' -d "{\"psbt\":\"${psbt_hex}\"}" | jq -r '.data.psbt // empty')
     assert_non_empty "${signed_psbt}" "rgb20 sign-psbt empty"
 
@@ -529,15 +551,20 @@ function scenario_rgb20_deposit() {
     local deposit_started_at
     deposit_started_at=$(date +%s)
 
-    # 4.5 上传 consignment 给 Go 桥（submitDeposit 需要；否则 pollTransfers 报
-    # "consignment not provided"，铸造不触发）。端点为 base64。侧车对已 settle 的 receive
-    # 幂等返回，故此处 200。
-    local cons_b64 cons_up
-    cons_b64=$(echo "${cons_hex}" | xxd -r -p | base64)
-    cons_up=$(curl -s -X POST http://127.0.0.1:17000/rgbx/v1/consignment \
-        -H 'Content-Type: application/json' \
-        -d "{\"receiveId\":\"${receive_id}\",\"consignment\":\"${cons_b64}\"}")
-    echo "${cons_up}" | grep -q '"code":200' || fail "rgb20 consignment upload failed: ${cons_up}"
+    # 4.5 以"用户钱包"身份把 consignment 投递到网关（标准 transport，consignment.post）。
+    # 桥自己轮询取件、校验、ACK，并在 receive 记录里保存字节（submitDeposit 需要）。
+    local txid cons_file cons_up
+    txid=$(echo "${settle_json}" | jq -r '.txid // empty')
+    assert_non_empty "${txid}" "rgb20 settle txid empty: ${settle_json}"
+    cons_file="$(mktemp "${TMPDIR:-/tmp}/rgb20-consignment.XXXXXX")"
+    echo "${cons_hex}" | xxd -r -p >"${cons_file}"
+    cons_up=$(curl -s -X POST "http://127.0.0.1:${RGB20_GATEWAY_PORT}/0.2/json-rpc" \
+        -F 'jsonrpc=2.0' -F 'id=1' -F 'method=consignment.post' \
+        -F "params={\"recipient_id\":\"${recipient_id}\",\"txid\":\"${txid}\",\"vout\":1}" \
+        -F "file=@${cons_file}")
+    rm -f "${cons_file}"
+    echo "${cons_up}" | jq -e '.result != null' >/dev/null ||
+        fail "rgb20 consignment.post failed: ${cons_up}"
 
     # 5. Go 桥 pollTransfers → submitDeposit（TSS 签 deposit）→ chain33 铸造 X.RGB20_USDT
     # 期望增量必须用**实际下单金额**（第 2 个参数），不能用默认值：冷备演练会用压过的额度调用本函数
@@ -592,10 +619,9 @@ function scenario_rgb20_consignment_hint_mismatch() {
     # R2：资产相同、金额不同（+1 最小单位即足以判别）。
     local other_amount=$(( RGB20_DEPOSIT_AMOUNT + 1 ))
     local rec2 receive2
-    rec2=$(curl -s -X POST http://127.0.0.1:17000/rgbx/v1/deposit \
-        -H 'Content-Type: application/json' \
-        -d "{\"requestId\":\"rgb20-hint-mismatch\",\"assetSymbol\":\"${RGB20_SYMBOL}\",\"amount\":${other_amount},\"chain33Addr\":\"${USER_MAIN_ADDR}\"}")
-    receive2=$(echo "${rec2}" | jq -r '.data.receiveId // empty')
+    rec2=$(gateway_deposit_invoice "rgb20-hint-mismatch" "${other_amount}") ||
+        fail "E16 could not create the second receive through the gateway"
+    receive2=$(echo "${rec2}" | jq -r '.receive_id // empty')
     assert_non_empty "${receive2}" "E16 could not create the second receive: ${rec2}"
     log_step "  R1=${RGB20_SETTLED_RECEIVE_ID} (settled, amount=${RGB20_DEPOSIT_AMOUNT}) -> R2=${receive2} (waiting, amount=${other_amount})"
 

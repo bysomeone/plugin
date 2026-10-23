@@ -192,6 +192,14 @@ USER_B_ADDR="${USER_B_ADDR:-${AUTH_ADDR2}}"
 BTCD_MINING_ADDR="mrCDrCybB6J1vRfbwM5hemdJz73FwDBC8r"
 BTC_FUNDING_WIF="${BTC_FUNDING_WIF:-}"
 USER_MAIN_ADDR="${USER_MAIN_ADDR:-14KEKbYtKKQm4wMthSK9J4La4nAiidGozt}"
+# 用户（USER_MAIN_ADDR）的 chain33 私钥：E2E 用它签充值请求（地址由该钥派生，必须匹配）。
+USER_MAIN_KEY="${USER_MAIN_KEY:-CC38546E9E659D15E6B4893F0AB32A06D103931A8230B0BDE71459D2B27D6944}"
+# 桥 ↔ 网关：/bridge/* 的 bearer token（E2E 固定值；生产由部署方生成）。
+RGB20_GATEWAY_TOKEN="${RGB20_GATEWAY_TOKEN:-e2e-bridge-token-0123456789abcd}"
+# 网关在宿主机发布的端口（E2E 的"用户钱包"是宿主机脚本）。
+RGB20_GATEWAY_PORT="${RGB20_GATEWAY_PORT:-18080}"
+# 写进 invoice 的公网 transport：E2E 的"用户钱包"是宿主机脚本，所以用宿主发布端口。
+RGB20_GATEWAY_PUBLIC_ENDPOINT="${RGB20_GATEWAY_PUBLIC_ENDPOINT:-rpc://127.0.0.1:18080/0.2/json-rpc}"
 
 # 手工放弃提现（Abandon）场景（E2E）：
 #   - ABANDON_OPERATOR_ADDR/KEY：白名单提案人（链上只按 tx.From() 比对，取本 harness 持有的
@@ -314,6 +322,9 @@ function config_para_file() {
     # （btc wallet + 充值 watch 集），也只有它需要"按需 import 用户充值脚本"这个入口；
     # 非官方节点开了也没有钱包可发行（请求会 503），只是多一个空转的监听，故这里关掉。
     local deposit_address_listen=""
+    # 网关订阅 / 测试签名端点：只有官方节点需要（充值请求由它出票；sign-psbt 是 E2E 模拟用户付款）。
+    # 非官方节点一个监听都不开 —— 这正是"桥零入站"的验证点。
+    local rgb20_gateway_block=""
     # 手工放弃提现（Abandon）的本地白名单。只有官方节点跑协调者（abandonWorker），也就只有它
     # 需要这份列表；E2E 用它同时验证"白名单受理"与"非白名单忽略"两条路径。
     local abandon_block=""
@@ -323,6 +334,13 @@ function config_para_file() {
     local sweep_block=""
     if [ "${official}" = "true" ]; then
         deposit_address_listen="0.0.0.0:17001"
+        # testListen 只绑 loopback（sign-psbt）；充值请求走桥→网关的出站 SSE。
+        rgb20_gateway_block='
+testListen="127.0.0.1:17000"
+transportGateway="http://gateway:8080/0.2/json-rpc"
+gatewayToken="'"${RGB20_GATEWAY_TOKEN}"'"
+# 写进 invoice 的公网 transport：E2E 的"用户钱包"是宿主机脚本，所以用宿主发布端口。
+transportEndpoint="'"${RGB20_GATEWAY_PUBLIC_ENDPOINT}"'"'
         abandon_block='
 abandonOperators=["'"${ABANDON_OPERATOR_ADDR}"'"]'
         sweep_block='
@@ -368,8 +386,7 @@ threshold=${TSS_THRESHOLD}
 rank=${rank}
 
 [rpc.sub.light.neutrino.rgb20]
-sidecarAddr="${RGB20_SIDECAR_ADDR}"
-consignmentListen="0.0.0.0:17000"
+sidecarAddr="${RGB20_SIDECAR_ADDR}"${rgb20_gateway_block}
 # 注意这里**没有** precision：精度不是配置，是合约声明的值（桥从侧车读、核对后回填上链）。
 # testSignPsbt 打开 E2E 的 sign-psbt 测试端点（用 TSS 组签任意 PSBT，模拟用户付款）。
 # 该能力等于"用组私钥签任意内容"，签名节点无从核对 ⇒ 生产环境必须为 false（默认关闭），
@@ -387,8 +404,29 @@ assetId="${RGB20_ASSET_ID}"
 EOF
 }
 
+# repo_root finds the repository root (nearest ancestor with go.mod). The harness runs from a
+# generated copy under build/, so the depth is not fixed.
+function repo_root() {
+    local d="${ROOT_DIR}"
+    while [ "${d}" != "/" ] && [ ! -f "${d}/go.mod" ]; do
+        d=$(dirname "${d}")
+    done
+    echo "${d}"
+}
+
+# build_gateway_binary builds the static Linux gateway used by the compose service. Building it
+# on the host (like chain33) avoids a second in-compose Go toolchain.
+function build_gateway_binary() {
+    log_step "build rgb-consignment-gateway (linux static)"
+    ( cd "$(repo_root)" && CGO_ENABLED=0 GOOS=linux GOARCH="$(go env GOARCH)" go build \
+        -o "${ROOT_DIR}/rgb-consignment-gateway" \
+        ./plugin/dapp/lightclient/rpc/lightclient/neutrino/cmd/rgb-consignment-gateway ) ||
+        fail "build rgb-consignment-gateway failed"
+}
+
 function init_env() {
     log_step "init realistic topology config (main + 4 para + btcd)"
+    build_gateway_binary
     config_main
     config_para_file chain33.para1.toml "${AUTH_ADDR1}" 0 true
     config_para_file chain33.para2.toml "${AUTH_ADDR2}" 1 false

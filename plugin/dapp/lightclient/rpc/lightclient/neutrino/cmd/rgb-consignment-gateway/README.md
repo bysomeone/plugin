@@ -27,6 +27,22 @@ responsible for validating consignments and broadcasting transactions.
 | `ack.get` | Returns `true`, `false`, or `null` (no ACK yet); `-400` if the consignment is absent. |
 | `media.post`, `media.get` | Not implemented: returns `-32601`. No media storage is provided. |
 
+## Deposit requests
+
+Besides the standard transport the gateway brokers signed deposit requests, so the bridge never
+has to listen for inbound traffic. This API is outside the RGB v0.2 protocol.
+
+| Endpoint | Auth | Behaviour |
+| --- | --- | --- |
+| `POST /deposit/requests` | public | Accepts `{request_id, chain33_addr, asset_symbol, amount, timestamp, pubkey, signature}`, verifies the signature over the canonical message (chain title, request id, address, asset, amount, timestamp) and stores it idempotently by `request_id`. |
+| `GET /deposit/requests/{id}` | public | Returns the request; once the bridge has created it, `status` is `invoiced` and `invoice` / `receive_id` / `recipient_id` are filled in. |
+| `GET /bridge/deposit/requests/stream` | bearer | Server-Sent Events stream (one `data:` JSON event per pending request). Replays every request that has no invoice yet on connect, then pushes new ones; `: ping` comments keep the connection alive. |
+| `POST /bridge/deposit/invoices` | bearer | Attaches `{request_id, invoice, receive_id, recipient_id}` to the request. A different invoice for an already-invoiced request is a `409`. |
+
+The bridge authenticates `/bridge/*` with `-bridge-token`. When the gateway terminates TLS with
+`-client-ca`, those endpoints additionally require a verified client certificate (mTLS); the token
+is still checked. `-chain-title` is required for the deposit API: it is part of the signed message.
+
 Protocol errors use the JSON-RPC error object and the v0.2 codes:
 
 | Code | Meaning |
