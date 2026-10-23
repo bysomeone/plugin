@@ -122,17 +122,21 @@ type userDepositSweepConfig struct {
 type rgb20Config struct {
 	// SidecarAddr RGB 侧车地址：unix socket 路径优先，否则 tcp host:port。
 	SidecarAddr string `json:"sidecarAddr"`
-	// ConsignmentListen consignment 上传/充值请求 HTTP 监听地址。空则不开 HTTP。
-	ConsignmentListen string `json:"consignmentListen"`
+	// TestListen 仅 E2E 使用的监听地址（127.0.0.1:port 或 unix 路径），必须与 testSignPsbt
+	// 同时打开。生产留空：桥不提供任何 HTTP API，充值请求由桥主动从网关拉取。
+	TestListen string `json:"testListen"`
 	// TransportEndpoint 写进充值 invoice 的**公网**标准 transport endpoint，例如
 	// `rpcs://gw.example.com/0.2/json-rpc`。空 = invoice 不携带 transports。
 	// 这是付款方看到的地址，必须能从公网访问（TLS 通常由反向代理终止）。
 	TransportEndpoint string `json:"transportEndpoint"`
-	// TransportGateway 桥轮询 consignment 用的**内网** RGB HTTP JSON-RPC 网关地址，
+	// TransportGateway 桥轮询 consignment 用的 RGB HTTP JSON-RPC 网关地址，
 	// 例如 `http://gw:8080/0.2/json-rpc`。它通常与 transportEndpoint 指向同一台网关
 	// （公网主机名 vs 内网地址），但两者是独立配置，可以不同。
-	// 空 = 不启用网关轮询（充值交付仍可走 consignmentListen 的自定义上传端点）。
+	// 空 = 不启用网关轮询（充值交付只能走后门/手动，不再有自定义上传端点）。
 	TransportGateway string `json:"transportGateway"`
+	// GatewayToken /bridge/* 接口的 bearer token（充值请求 SSE 流 + invoice 回写）。
+	// 与 transportGateway 同时配置才会订阅充值请求。
+	GatewayToken string `json:"gatewayToken"`
 	// Contracts RGB20 资产合约列表。
 	Contracts []rgb20Contract `json:"contracts"`
 	// ChangeAddress 提现找零地址（TSS P2WPKH 地址）；留空则由 TSS 地址自动填充。

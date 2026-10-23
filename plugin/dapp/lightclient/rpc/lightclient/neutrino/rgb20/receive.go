@@ -16,6 +16,9 @@ const (
 
 var (
 	receiveBucket = []byte("rgb20-receive")
+	// receiveRequestIndexBucket maps a signed deposit request id -> receive id (idempotency for
+	// the gateway's at-least-once stream).
+	receiveRequestIndexBucket = []byte("rgb20-receive-request")
 	// txidBucket 保存 "已知 RGB txid" 集合，key=txid，value=receiveId。
 	// btcwallet.analyzeTransaction 分类时先查该集合以跳过 BTC 充值路径（BL-5）。
 	txidBucket = []byte("rgb20-known-txid")
@@ -36,6 +39,10 @@ type ReceiveRecord struct {
 	// GatewayAck 网关 ACK 结果："" = 尚未 ACK，"true"/"false" = 已按该值 ACK。
 	// 持久化它让重复轮询幂等：ACK 过的 receive 不再重复取件/校验/ACK。
 	GatewayAck string `json:"gatewayAck,omitempty"`
+	// 用户签名充值请求。铸造交易会带上它们，链上再次验签并把收款地址/金额钉死在这份请求上。
+	RequestPubKeyHex    string `json:"requestPubKey,omitempty"`
+	RequestSignatureHex string `json:"requestSignature,omitempty"`
+	RequestTimestamp    int64  `json:"requestTimestamp,omitempty"`
 	// Consignment 用户上传/代理交付的 consignment（settle 后由 http 或 proxy 写入）。
 	Consignment []byte `json:"consignment"`
 	Txid        string `json:"txid"` // 付款 BTC 交易（结算后）
@@ -72,7 +79,26 @@ func (r *ReceiveStore) Put(rec *ReceiveRecord) error {
 	if rec.CreatedAt == 0 {
 		rec.CreatedAt = time.Now().Unix()
 	}
-	return r.store.Put(receiveBucket, []byte(rec.ReceiveID), mustJSON(rec))
+	if err := r.store.Put(receiveBucket, []byte(rec.ReceiveID), mustJSON(rec)); err != nil {
+		return err
+	}
+	// Index the signed request id so a replayed gateway event does not create a second receive.
+	if rec.RequestID != "" {
+		return r.store.Put(receiveRequestIndexBucket, []byte(rec.RequestID), []byte(rec.ReceiveID))
+	}
+	return nil
+}
+
+// GetByRequestID returns the receive created for a signed deposit request id.
+func (r *ReceiveStore) GetByRequestID(requestID string) (*ReceiveRecord, error) {
+	if requestID == "" {
+		return nil, fmt.Errorf("empty request id")
+	}
+	receiveID, err := r.store.Get(receiveRequestIndexBucket, []byte(requestID))
+	if err != nil {
+		return nil, err
+	}
+	return r.Get(string(receiveID))
 }
 
 // Get 按 receive_id 读取充值记录。

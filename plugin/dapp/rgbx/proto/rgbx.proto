@@ -225,6 +225,12 @@ message depositAsset {
     btcTxProof txProof        = 4;
     // RGB20 分支的 TSS 阈值签名（DER，对 C=sha256(types.Encode(DepositAsset{thresholdSig:nil}))）
     bytes      thresholdSig   = 5;
+    // 用户签名的充值请求（仅 RGB20 分支要求）。铸造的收款地址与金额钉死在这份签名上，
+    // 桥/网关都无法改收款人；requestId 用于防重放。字段含义见 depositrequest 包。
+    string     requestId           = 6;
+    int64      requestTimestamp    = 7;
+    bytes      requestPubkey       = 8;
+    bytes      requestSignature    = 9;
 }
 
 message withdrawAsset {

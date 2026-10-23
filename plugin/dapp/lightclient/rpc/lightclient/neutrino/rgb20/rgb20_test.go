@@ -407,12 +407,12 @@ func Test_Deposit_Attribution(t *testing.T) {
 	adapter, cleanup := newTestAdapter(t, mock, bridge)
 	defer cleanup()
 
-	rec, err := adapter.DepositFlow(context.Background(), &DepositRequest{
+	rec, err := adapter.DepositFlow(context.Background(), signedDepositRequest(t, &DepositRequest{
 		RequestID:   "req-1",
 		AssetSymbol: "RGB20_USDT",
 		Amount:      1000,
 		Chain33Addr: "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk",
-	})
+	}))
 	require.NoError(t, err)
 	require.Equal(t, "created", rec.Status)
 	require.NotEmpty(t, rec.Invoice)
@@ -452,12 +452,12 @@ func Test_Deposit_FirstAttribution_SubmitsFreshTxid(t *testing.T) {
 	adapter, cleanup := newTestAdapter(t, mock, bridge)
 	defer cleanup()
 
-	rec, err := adapter.DepositFlow(context.Background(), &DepositRequest{
+	rec, err := adapter.DepositFlow(context.Background(), signedDepositRequest(t, &DepositRequest{
 		RequestID:   "req-1",
 		AssetSymbol: "RGB20_USDT",
 		Amount:      1000,
 		Chain33Addr: "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk",
-	})
+	}))
 	require.NoError(t, err)
 
 	// 用户付款并交付 consignment → 侧车 settle，返回含付款 txid 的状态

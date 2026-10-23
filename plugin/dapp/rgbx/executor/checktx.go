@@ -668,6 +668,13 @@ func (r *rgbx) checkDeposit(txHash string, deposit *rtypes.DepositAsset) error {
 			elog.Error("checkDeposit rgb20 verifyThresholdSig", "txHash", txHash, "symbol", deposit.GetAssetSymbol(), "err", err)
 			return err
 		}
+		// The mint must carry the user's signed request: it is what binds the recipient and
+		// amount to the user (the invoice was issued off chain).
+		if err := r.checkDepositRequest(deposit); err != nil {
+			elog.Error("checkDeposit rgb20 deposit request", "txHash", txHash,
+				"symbol", deposit.GetAssetSymbol(), "err", err)
+			return err
+		}
 	} else {
 		// 硬切：充值只认 P2WSH 派生脚本（金额 + 归属一次判定），不再有 OP_RETURN 承诺。
 		if err = r.validateDepositTxContent(txHash, deposit, btcTx); err != nil {

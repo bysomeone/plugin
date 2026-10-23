@@ -22,6 +22,13 @@ func decodeHex(s string) ([]byte, error) {
 	return hex.DecodeString(strings.TrimSpace(s))
 }
 
+// decodeHexBestEffort decodes hex stored on a receive record (already validated when the signed
+// request was accepted). Invalid input yields nil, which the chain rejects rather than guesses.
+func decodeHexBestEffort(s string) []byte {
+	b, _ := hex.DecodeString(strings.TrimPrefix(strings.TrimSpace(s), "0x"))
+	return b
+}
+
 // mustJSON 序列化为 JSON；失败时 panic（内部状态编码不应失败）。
 func mustJSON(v interface{}) []byte {
 	b, err := json.Marshal(v)

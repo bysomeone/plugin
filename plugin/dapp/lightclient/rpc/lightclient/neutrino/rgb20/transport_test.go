@@ -76,12 +76,12 @@ func newTransportTestAdapter(t *testing.T, mock *MockSidecar, cfg func(*Config))
 
 func newPendingReceive(t *testing.T, adapter *Adapter) *ReceiveRecord {
 	t.Helper()
-	rec, err := adapter.DepositFlow(context.Background(), &DepositRequest{
+	rec, err := adapter.DepositFlow(context.Background(), signedDepositRequest(t, &DepositRequest{
 		RequestID:   "req-1",
 		AssetSymbol: "RGB20_USDT",
 		Amount:      1000,
 		Chain33Addr: "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk",
-	})
+	}))
 	require.NoError(t, err)
 	require.NotEmpty(t, rec.RecipientID, "sidecar must return the invoice's recipient_id")
 	return rec
@@ -103,10 +103,10 @@ func TestCreateReceive_PassesTransportEndpointAndStoresRecipientID(t *testing.T)
 	})
 	defer cleanup()
 
-	rec, err := adapter.DepositFlow(context.Background(), &DepositRequest{
+	rec, err := adapter.DepositFlow(context.Background(), signedDepositRequest(t, &DepositRequest{
 		RequestID: "req-1", AssetSymbol: "RGB20_USDT", Amount: 1000,
 		Chain33Addr: "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk",
-	})
+	}))
 	require.NoError(t, err)
 	require.Equal(t, "rpcs://gw.example.com/0.2/json-rpc", gotEndpoint)
 	require.Equal(t, "bcrt:beneficiary", rec.RecipientID)

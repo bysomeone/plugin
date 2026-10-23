@@ -57,6 +57,8 @@ type neutrinoClient struct {
 	chain33Api        client.QueueProtocolAPI
 	mainChainGrpc     types.Chain33Client
 	cfg               config
+	// chainTitle 本链 Title（取自 Chain33Config）：充值请求的签名消息包含它，桥出票前验签用。
+	chainTitle string
 	commitAddressType int32
 	commitAddr        string
 	commitKey         crypto.PrivKey
@@ -126,6 +128,7 @@ func (n *neutrinoClient) Init(ctx context.Context, q queue.Queue, cfg *lightclie
 	subCfg, _ := json.Marshal(cfg.Neutrino)
 	types.MustDecode(subCfg, &n.cfg)
 	chainCfg := q.GetConfig()
+	n.chainTitle = chainCfg.GetTitle()
 	n.mainChainGrpc, err = grpcclient.NewMainChainClient(chainCfg, "")
 	if err != nil {
 		panic("init main chain grpc client err:" + err.Error())
@@ -179,13 +182,15 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 		return nil
 	}
 	rgbCfg := rgb20.Config{
-		SidecarAddr:       n.cfg.Rgb20.SidecarAddr,
-		ConsignmentListen: n.cfg.Rgb20.ConsignmentListen,
-		ChangeAddress:     n.cfg.Rgb20.ChangeAddress,
+		SidecarAddr:   n.cfg.Rgb20.SidecarAddr,
+		TestListen:    n.cfg.Rgb20.TestListen,
+		ChangeAddress: n.cfg.Rgb20.ChangeAddress,
 		MinConfirmations:  n.cfg.BlockConfirmations,
 		// 标准 transport：invoice 里写公网 endpoint，桥自己轮询内网 gateway。
 		TransportEndpoint: n.cfg.Rgb20.TransportEndpoint,
 		TransportGateway:  n.cfg.Rgb20.TransportGateway,
+		GatewayToken:      n.cfg.Rgb20.GatewayToken,
+		ChainTitle:        n.chainTitle,
 		// 无上下文的测试签名（E2E 的 sign-psbt 端点）：按配置透传，默认关闭。
 		TestSignPsbt: n.cfg.Rgb20.TestSignPsbt,
 		// 头链保留深度 B：头链只提交到 best - B，充值提交前的本地深度门控据此把链上判据换算成本地判据。

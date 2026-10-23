@@ -1,13 +1,44 @@
 package rgb20
 
 import (
+	"encoding/hex"
 	"errors"
 	"math"
 	"testing"
 
+	"github.com/33cn/chain33/common/address"
+	"github.com/33cn/plugin/plugin/dapp/rgbx/depositrequest"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/stretchr/testify/require"
 )
+
+// signedDepositRequest fills the signed-request fields of a test deposit request.
+func signedDepositRequest(t *testing.T, req *DepositRequest) *DepositRequest {
+	t.Helper()
+	pub, sig, ts := testSignedRequest(t, req.RequestID, req.Amount)
+	req.RequestPubKeyHex, req.RequestSignatureHex, req.RequestTimestamp = pub, sig, ts
+	return req
+}
+
+// testSignedRequest fills the record's signed deposit request. These unit tests never execute
+// the chain; the chain-side verification lives in the executor tests.
+func testSignedRequest(t *testing.T, requestID string, amount int64) (pubHex, sigHex string, timestamp int64) {
+	t.Helper()
+	priv, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+	pub := priv.PubKey().SerializeCompressed()
+	req := depositrequest.Request{
+		RequestID:   requestID,
+		Chain33Addr: address.PubKeyToAddr(-1, pub),
+		AssetSymbol: "RGB20_USDT",
+		Amount:      amount,
+		Timestamp:   1_700_000_000,
+	}
+	sig := ecdsa.Sign(priv, depositrequest.MessageHash("test-chain", req)).Serialize()
+	return hex.EncodeToString(pub), hex.EncodeToString(sig), req.Timestamp
+}
 
 /*
  * 充值正常路径的配套修复的测试：
@@ -54,17 +85,21 @@ func newDepositTestAdapter(t *testing.T, bridge Chain33Bridge, store KVStore) *A
 func seedSettledReceive(t *testing.T, a *Adapter, receiveID, txid string, amount int64) *ReceiveRecord {
 	t.Helper()
 	seal := FormatOutpoint(txid, 0)
+	pubHex, sigHex, ts := testSignedRequest(t, "req-"+receiveID, amount)
 	rec := &ReceiveRecord{
-		ReceiveID:   receiveID,
-		RequestID:   "req-" + receiveID,
-		AssetSymbol: "RGB20_USDT",
-		Chain33Addr: "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk",
-		Amount:      amount,
-		Status:      ReceiveStatusSettled,
-		Consignment: []byte("consignment-bytes"),
-		Txid:        txid,
-		Vout:        0,
-		Seal:        seal,
+		ReceiveID:           receiveID,
+		RequestID:           "req-" + receiveID,
+		AssetSymbol:         "RGB20_USDT",
+		Chain33Addr:         "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk",
+		Amount:              amount,
+		Status:              ReceiveStatusSettled,
+		Consignment:         []byte("consignment-bytes"),
+		RequestPubKeyHex:    pubHex,
+		RequestSignatureHex: sigHex,
+		RequestTimestamp:    ts,
+		Txid:                txid,
+		Vout:                0,
+		Seal:                seal,
 	}
 	require.NoError(t, a.receives.Put(rec))
 	require.NoError(t, a.seals.Add(&Seal{

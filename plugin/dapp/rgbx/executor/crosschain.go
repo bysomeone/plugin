@@ -160,6 +160,11 @@ func (r *rgbx) Exec_Deposit(deposit *rtypes.DepositAsset, tx *types.Transaction,
 			elog.Error("Exec_Deposit verifyThresholdSig", "txHash", hex.EncodeToString(txHash), "symbol", symbol, "err", err)
 			return nil, err
 		}
+		if err := r.checkDepositRequest(deposit); err != nil {
+			elog.Error("Exec_Deposit deposit request", "txHash", hex.EncodeToString(txHash),
+				"symbol", symbol, "err", err)
+			return nil, err
+		}
 	}
 	// 防双铸标记 + 台账记录都要用到"解析后 btc 交易的规范 txid（E1 口径）"，因此在铸造前先解析：
 	//   - 台账的 operationId 以该 txid 为原像之一（types.MintOperationID）；
@@ -209,6 +214,10 @@ func (r *rgbx) Exec_Deposit(deposit *rtypes.DepositAsset, tx *types.Transaction,
 		Key:   formatDepositUsedTxIDKey(txID),
 		Value: []byte("used"),
 	})
+	// RGB20: burn the request id so the same signed request cannot mint twice.
+	if rtypes.IsRgb20CrossChainAsset(info) {
+		receipt.KV = append(receipt.KV, depositRequestUsedKV(deposit))
+	}
 	receipt.KV = append(receipt.KV, operationKVs...)
 	// Numeric mint limit: account the mint against the rolling window only after the mint
 	// succeeded, so the counter follows the same commit/rollback path as the minted supply.
