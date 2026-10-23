@@ -706,6 +706,21 @@ Failure semantics:
 - The gateway's `txid` is advisory; the settled outpoint comes from the sidecar. A mismatch is
   logged at WARN and does not change the ACK.
 
+Withdrawals use the same transport in the opposite direction (the bridge is the payer):
+
+1. The user's invoice is parsed by the sidecar (`ParseInvoice`), which returns its `transports`
+   and `recipient_id`.
+2. Every `rpc://` / `rpcs://` transport is normalised to `http://` / `https://` and tried in
+   order until one accepts `consignment.post(recipient_id, txid, vout)` with the consignment as
+   the multipart `file` part. Other transport kinds (`rest`, `ws`, …) are skipped with a WARN.
+3. The bridge then polls `ack.get(recipient_id)` for up to two minutes. `true` is logged at INFO,
+   `false` at ERROR, and a missing verdict at WARN. The verdict does not gate the BTC broadcast:
+   the consignment already embeds the anchoring transaction, so a late recipient can still
+   validate it.
+4. Delivery is retried with exponential backoff (5s → 5min) until one endpoint accepts the post.
+   An invoice with no usable transport falls back to `consignmentPublish.url`; with no URL
+   configured the consignment is only kept locally (WARN).
+
 ## 5. Bitcoin 节点关键配置项
 
 以下示例使用 `bitcoin.conf` 格式说明关键配置（btcd/bitcoin-core 参数名有差异时，以节点实现文档为准）：
