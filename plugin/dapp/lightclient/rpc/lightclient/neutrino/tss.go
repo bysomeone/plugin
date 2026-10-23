@@ -941,22 +941,19 @@ func (t *tssService) signPsbtTestOnly(psbtBytes []byte) ([]byte, error) {
 
 // sweepSignFeeRate 签名节点核对扫集手续费区间时用的**上界参考费率**（sat/vB）。
 //
-// 与提现不同，扫集没有链上 pending 可作真值，费率只能取本地配置。协调者按动态估算出价
-// （估算值不会超过 userDepositSweep.maxFeeRate），所以核对上界取 maxFeeRate；未配置
-// maxFeeRate（<=0）时沿用 feeRate（原有口径）。取值偏大只会放松上界（对签名的币安全影响很小：
-// 输出已经全部被钉回主池，能被"多付"的只有矿工费），取值偏小则可能误拒合法的扫集。
-// 0 = 跳过区间检查（输出不离开桥这条仍然强制）。
+// 与提现不同，扫集没有链上 pending 可作真值。上界读链上治理配置的
+// withdrawMaxFeeRateSatPerVbyte（与协调者选费率时用的是同一个值，见 bridgeconfig.go），
+// 因此各节点天然一致，不会因为本地配置不同而拒签合法扫集。取值偏大只会放松上界（对签名的
+// 币安全影响很小：输出已经全部被钉回主池，能被"多付"的只有矿工费），取值偏小则可能误拒合法扫集。
 //
-// **共识性参数**：各节点的 maxFeeRate（回退时为 feeRate）必须一致，否则签名节点可能拒签
-// 一笔合法扫集。
+// 治理未设置（链上值为 0）或查询从未成功过时回退到内置默认值 defaultSweepMaxFeeRate ——
+// 这是一个有界的安全默认，也是协调者同一情形下采用的上限，签名端不会因此拒签合法交易。
+// 0 = 跳过区间检查（输出不离开桥这条仍然强制）；只有 client 未初始化时才返回 0。
 func (t *tssService) sweepSignFeeRate() uint32 {
 	if t == nil || t.client == nil {
 		return 0
 	}
-	if maxFeeRate := t.client.cfg.UserDepositSweep.MaxFeeRate; maxFeeRate > 0 {
-		return uint32(maxFeeRate)
-	}
-	return uint32(t.client.cfg.UserDepositSweep.FeeRate)
+	return t.client.withdrawMaxFeeRateSatPerVbyte()
 }
 
 // signSweepPsbt 协调者侧发起扫集签名：先在自己这里过一遍 ValidateSweepPsbt，再发布 btc-sweep

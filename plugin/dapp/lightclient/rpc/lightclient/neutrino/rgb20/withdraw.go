@@ -93,7 +93,7 @@ type ValidateWithdrawRequest struct {
 	// FeeRate sat/vB：签名节点据此核对提现交易手续费在合理范围（防桥自有费输入被超收）。
 	FeeRate int64
 	// ExpectedPayout 本笔提现**应当发给用户的精确资产金额** = 链上 pending 金额 − 该资产配置的
-	// 提现手续费（见 Config.Contracts[].WithdrawFee / Adapter.ExpectedWithdrawPayout）。
+	// 提现手续费（见 Adapter.WithdrawFeeFor / Adapter.ExpectedWithdrawPayout）。
 	//
 	// >0 时与「PSBT + consignment 体现的、离开桥控制的资产」**精确比对**，多给少给都拒：多给 =
 	// 桥替用户垫了手续费（本功能要解决的就是它），少给 = 超收用户。之所以用精确相等而不是容忍区间：
@@ -638,7 +638,7 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 	if cov.Leaving > req.ExpectedAmount {
 		return fmt.Errorf("withdraw payout exceeds pending amount: payout=%d pending=%d", cov.Leaving, req.ExpectedAmount)
 	}
-	// 提现手续费（桥侧配置，见 Contract.WithdrawFee）：发给用户的资产必须**精确等于**
+	// 提现手续费（链上治理配置，见 Adapter.WithdrawFeeFor）：发给用户的资产必须**精确等于**
 	// `链上 pending − 手续费`。这条比上面的上界更严：发票按"完整提现额"开（前端没按手续费扣减）
 	// 时，Leaving == pending 不会被上界拦住，只有这里会拒 —— 而它正是"桥替用户垫矿工费"的形态。
 	if req.ExpectedPayout > 0 && cov.Leaving != req.ExpectedPayout {
@@ -652,7 +652,7 @@ func (a *Adapter) ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error {
 	// 被花 seal 面额（可支配额）必须覆盖提现额：这里核对的是资产侧（RGB 状态守恒，被花 seal 的
 	// 面额合计 = 发给用户的 + 找零回桥的），与手续费无关。BTC 侧的「桥可支配的 BTC ≥ 离开桥控制
 	// 的输出 + 矿工费」由上面的手续费检查独立核对 —— 提现收的资产手续费是**补偿**桥垫付的那笔
-	// BTC 矿工费（见 Contract.WithdrawFee），不改变这里核对的金额关系。
+	// BTC 矿工费（见 Adapter.WithdrawFeeFor），不改变这里核对的金额关系。
 	if cov.Spendable < req.ExpectedAmount {
 		return fmt.Errorf("withdraw amount exceeds sealed balance: sealed=%d expected=%d", cov.Spendable, req.ExpectedAmount)
 	}

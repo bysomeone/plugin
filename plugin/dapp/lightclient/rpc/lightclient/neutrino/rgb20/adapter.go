@@ -50,22 +50,14 @@ type Config struct {
 // Contract 一个 RGB20 资产的合约注册项。
 //
 // 精度不在这里：它是合约声明的事实（ContractPrecisions 从侧车读），不是可以手填的配置。
+// 提现手续费也不在这里：它读链上 rgbx 治理配置的 rgb20WithdrawFee（按 symbol），见
+// Adapter.WithdrawFeeFor。
 type Contract struct {
 	Symbol        string `json:"symbol"`        // chain33 侧资产符号，如 RGB20_USDT（Registry 索引键）
 	SidecarSymbol string `json:"sidecarSymbol"` // 侧车发行资产符号，如 USDT；空则回退 Symbol
 	AssetID       string `json:"assetId"`       // rgb:...
 	MinDeposit    int64  `json:"minDeposit"`    // 最小充值（最小单位）
 	MinWithdraw   int64  `json:"minWithdraw"`   // 最小提现（最小单位）
-	// WithdrawFee 每笔提现收取的固定手续费，单位是**该资产的最小单位**（与链上记录的精度同口径）。
-	//
-	// 为什么提现要收手续费：RGB20 提现本身就是一笔普通 BTC 交易，矿工费只能用 BTC 付，而这笔 BTC
-	// 出自桥的主池 —— 不收手续费就是桥替每个提现用户垫矿工费、持续透支。手续费不上链（链上配置升级
-	// 太重），由桥侧配置，前端据这个值提示用户按 `提现额 − 手续费` 生成 invoice。
-	//
-	// 它同时是校验门槛的取值来源：桥核对该笔提现实际发给用户的资产金额必须**精确等于**
-	// `链上 pending 金额 − WithdrawFee`（见 Adapter.ExpectedWithdrawPayout 与
-	// ValidateWithdrawRequest.ExpectedPayout）。<=0（默认）= 不收取，也不做该金额比对。
-	WithdrawFee int64 `json:"withdrawFee"`
 }
 
 // sidecarAssetSymbol 返回调用侧车 RPC 时使用的资产符号。
@@ -247,6 +239,10 @@ type Adapter struct {
 	reg      *Registry
 	cfg      Config
 	bridge   Chain33Bridge
+	// withdrawFeeSource 返回某链上资产符号的提现手续费（该资产最小单位，0 = 未配置）。
+	// 由 neutrino 主包注入（读链上 rgbx 治理配置的 rgb20WithdrawFee，按 symbol）；
+	// nil 时一律返回 0 = 不收取、也不做金额精确比对（旧的宽松口径）。
+	withdrawFeeSource func(symbol string) int64
 	// depositSigs 已签充值的落盘产物（签名轮次的产出：提交失败/深度不够时只重发，见 deposit.go 与
 	// depositsig.go）。
 	depositSigs *DepositSignatureStore
@@ -391,27 +387,31 @@ func (a *Adapter) ReceiveStore() *ReceiveStore { return a.receives }
 func (a *Adapter) Seals() *SealIndex           { return a.seals }
 func (a *Adapter) Registry() *Registry         { return a.reg }
 
-// WithdrawFeeFor 返回某个链上资产符号配置的提现手续费（该资产的最小单位）。
-// 未注册该符号或未配置（0）都返回 0 = 不收取、也不做金额比对。
+// SetWithdrawFeeSource 注入提现手续费的取值来源（由 neutrino 主包接上链上 BridgeConfig）。
+// fn 返回该资产最小单位的手续费；0 表示未配置（不收取，也不做金额精确比对）。
+func (a *Adapter) SetWithdrawFeeSource(fn func(symbol string) int64) { a.withdrawFeeSource = fn }
+
+// WithdrawFeeFor 返回某个链上资产符号的提现手续费（该资产的最小单位）。
+//
+// 值来自注入的链上配置读取器（rgbx 治理的 rgb20WithdrawFee，按 symbol）。未注入、该符号
+// 没有配置、治理未设置（0）都返回 0 = 不收取、也不做金额比对（保持旧的宽松口径）。
 func (a *Adapter) WithdrawFeeFor(symbol string) int64 {
-	contract, ok := a.reg.Get(symbol)
-	if !ok {
+	if a.withdrawFeeSource == nil {
 		return 0
 	}
-	return contract.WithdrawFee
+	return a.withdrawFeeSource(symbol)
 }
 
 // ExpectedWithdrawPayout 算出本笔提现**应当发到用户手里**的精确资产金额，即
-// `链上 pending 金额 − 该资产配置的提现手续费`（见 Contract.WithdrawFee）。
+// `链上 pending 金额 − 该资产的手续费`（见 WithdrawFeeFor）。
 //
 //	configured=false：该资产没有配置手续费（0 / 未注册 / 非正数）⇒ **不做**金额精确比对，
 //	  调用方保持"只判上界（发给用户的资产 ≤ pending）"的原有行为。0 = 跳过检查这一口径与
-//	  userDepositSweep.feeRate 一致：节点配置缺失不该把合法提现全拒。
+//	  userDepositSweep.feeRate 一致：节点配置缺失（或链上治理查询暂时失败）不该把合法提现全拒。
 //	err != nil：链上 pending 金额连手续费都不够（应发金额 ≤ 0）⇒ 这笔提现必须被拒绝，
 //	  调用方原样上抛。
 //
-// 协调者与签名节点用**同一个**函数取值（各自读自己的配置），口径必须一致，否则签名节点会拒掉
-// 协调者的合法提现（与 sweep 的费率同一取向）。
+// 协调者与签名节点用**同一个**函数取值（各自读链上同一份治理配置），口径天然一致。
 func (a *Adapter) ExpectedWithdrawPayout(symbol string, pendingAmount int64) (int64, bool, error) {
 	fee := a.WithdrawFeeFor(symbol)
 	if fee <= 0 {

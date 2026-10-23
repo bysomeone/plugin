@@ -101,20 +101,9 @@ type userDepositSweepConfig struct {
 	//
 	// 每轮扫集前会向 btcd 估算动态费率（estimatesmartfee，6 个确认目标）：估算值低于本值时
 	// 仍用本值，避免费率过低导致扫集长期不上链；估算失败 / 节点无估算（regtest 常态）时也回退到本值。
-	//
-	// 它同时是签名节点核对扫集手续费区间的回退费率（见 tssService.sweepSignFeeRate，未配置
-	// MaxFeeRate 时使用）：扫集没有链上 pending 可作真值，费率只能取本地配置。因此各节点的
-	// 这个值应当一致，否则签名节点可能拒签一笔合法扫集（费率上界按各节点自己的值算）。
 	FeeRate int `json:"feeRate"`
-	// MaxFeeRate 扫集费率的**硬上限**（sat/vB）。<=0 用默认值（defaultSweepMaxFeeRate）。
-	//
-	// 动态估算值超过这个上限时**本轮跳过扫集**（不会降级到上限继续扫，下一轮再看），
-	// 日志 INFO 给出估算值与上限。扫集只是 UTXO 整理，不值得为它付离谱的矿工费。
-	//
-	// 它同时是签名节点核对扫集手续费区间时用的**上界参考值**（见 tssService.sweepSignFeeRate）：
-	// 协调者按动态估算出价、且估算值不会超过本值，所以核对上界取本值才不会误拒合法扫集。
-	// 这是**共识性参数**：各节点的 maxFeeRate 必须一致，否则签名节点可能拒签一笔合法扫集。
-	MaxFeeRate int `json:"maxFeeRate"`
+	// 费率上限不在这里：它读链上的 withdrawMaxFeeRateSatPerVbyte（rgbx 治理配置），
+	// 见 bridgeconfig.go。上限是共识性参数，放在本地配置会让各节点对同一笔扫集给出不同结论。
 	// MinConfirmations 只归集达到该确认数的充值 UTXO。<=0 用默认值（defaultSweepMinConfirmations）。
 	MinConfirmations int `json:"minConfirmations"`
 }
@@ -164,20 +153,8 @@ type rgb20Contract struct {
 	AssetID       string `json:"assetId"`       // rgb:...
 	MinDeposit    int64  `json:"minDeposit"`    // 最小充值（最小单位）
 	MinWithdraw   int64  `json:"minWithdraw"`   // 最小提现（最小单位）
-	// WithdrawFee 每笔提现收取的固定手续费，单位是**该资产的最小单位**（min units），与链上记录的
-	// 该资产精度同一口径（precision 从链上 crossChainInfo 读，见 CONFIG.md §4.4.3）。
-	//
-	// 为什么要它：RGB20 提现本身就是一笔普通 BTC 交易，矿工费只能用 BTC 付，而这笔 BTC 出自桥的
-	// 主池 —— 不收手续费就是桥替每个提现用户垫矿工费。手续费**不上链**（链上配置升级太重），
-	// 由桥侧配置 + 前端据此提示用户：生成 invoice 时金额填 `提现额 − 手续费`。
-	//
-	// 桥的校验（精确相等，不留容忍区间）：该笔实际发给用户的资产必须**等于**
-	// `链上 pending 金额 − WithdrawFee`，否则拒绝构建结果（不签名、不广播），错误信息给出期望值、
-	// 实际值与差额。<=0（默认）= 不收取，也不做该金额比对（见 rgb20.Contract.WithdrawFee）。
-	//
-	// **跨节点一致性**：每个签名节点都用自己这份配置做同样的比对，所以各节点的取值必须一致
-	// （与 userDepositSweep.feeRate 同一取向），否则签名节点会拒掉协调者的合法提现。
-	WithdrawFee int64 `json:"withdrawFee"`
+	// WithdrawFee 不在这里：每笔提现的固定手续费读链上 rgbx 治理配置的 rgb20WithdrawFee
+	// （按 symbol，见 bridgeconfig.go）。放在本地配置会让各签名节点对同一笔提现给出不同结论。
 }
 
 type btcRPCConfig struct {
