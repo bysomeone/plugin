@@ -553,6 +553,36 @@ function scenario_cold_backup_restore() {
 
     log_step "cold backup/restore drill PASSED: state restored byte-for-byte and the bridge still mints+burns"
     log_step "artifact kept at ${package} (harness output dir; not a deliverable — the durable copy is off-host)"
+
+    # G7 探针：删掉 btcwallet.db（保留其余数据）再起官方节点，证明"新钱包 + 非空链"会明确告警，
+    # 而不是静默漏掉历史充值。放在最后：它会让 para1 的钱包变成新建的，破坏后续场景的前提。
+    scenario_wallet_birthday_guard
+}
+
+# G7 探针（对应 #63 的 B 臂）：只删 btcwallet.db，保留 neutrino 头链与其余状态。
+# 新钱包的生日 = 现在，而链已经很高 —— 停桥期间（或钱包被误删期间）的充值不在钱包 tx store 里，
+# 桥的重放读的是钱包 store，因此这些充值永远发现不了。代码在首次链通知时打印 ALERT；本探针断言它真的出现。
+function scenario_wallet_birthday_guard() {
+    log_step "scenario: a fresh btcwallet.db on a non-empty chain must raise the birthday alarm (G7 probe)"
+    local vol
+    vol=$(drill_volume_name para1)
+    compose_cmd stop para1 >/dev/null
+    compose_cmd run --rm --no-deps -T --entrypoint sh -v "${vol}:/data" gateway \
+        -c 'test -d /data/lightclient && rm -f /data/lightclient/btcwallet.db && echo removed' >/dev/null ||
+        fail "failed to remove btcwallet.db from volume ${vol} (the probe cannot run)"
+
+    local started_at i logs
+    started_at=$(date +%s)
+    compose_cmd start para1 >/dev/null
+    for ((i = 0; i < 120; i++)); do
+        logs=$(para1_logs_since "${started_at}" 2>/dev/null || true)
+        if echo "${logs}" | grep -q "wallet birthday cannot cover chain history"; then
+            log_step "PASS: birthday guard fired: $(echo "${logs}" | grep -m1 'wallet birthday cannot cover chain history')"
+            return 0
+        fi
+        sleep 1
+    done
+    fail "the birthday guard did not fire after removing btcwallet.db: a fresh wallet on a non-empty chain would silently miss deposits (para1 log tail: $(para1_logs_since "${started_at}" | tail -5))"
 }
 
 function run_backup_drill_all() {
