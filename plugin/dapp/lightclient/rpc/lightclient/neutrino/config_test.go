@@ -66,6 +66,15 @@ func Test_config(t *testing.T) {
 	require.Equal(t, n.cfg.NetName, n.neutrinoCfg.ChainParams.Name)
 }
 
+func TestMainChainConfirmations(t *testing.T) {
+	// 未配置时用默认值；配置后与本链 BTC 的确认数互不影响。
+	require.Equal(t, uint32(defaultMainChainConfirmations), (config{}).mainChainConfirmations())
+	require.Equal(t, uint32(2), (config{MainChainConfirmations: 2}).mainChainConfirmations())
+	both := config{BlockConfirmations: 12, MainChainConfirmations: 2}
+	require.Equal(t, uint32(2), both.mainChainConfirmations())
+	require.Equal(t, uint32(12), both.BlockConfirmations)
+}
+
 // TestBtcRPCConfig tests the btcRPCConfig.toConnConfig method
 func TestBtcRPCConfig(t *testing.T) {
 	tests := []struct {

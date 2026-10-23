@@ -224,11 +224,18 @@ best >= H + B + N - 1          （等价于：提交后链上可见深度 >= N�
   - 含义：BTC 区块同步轮询间隔基准（秒）
   - 默认行为：未设置时采用实现默认值
 - `blockConfirmations` (uint32)
-  - 含义：BTC 确认数门限
-  - 影响：区块头提交、pending 拉取、充值/提现确认时机
+  - 含义：**BTC** 确认数门限
+  - 影响：BTC 钱包待确认、区块头提交深度、扫集默认确认数
   - 说明（头链保留深度 B）：中继提交头链时只提交到 `best - B`，因此"提交那一刻链上可见的 tip"
     也由它决定。**B 与链上 `[exec.sub.rgbx].minBtcConfirmations`（N）是同一个门控的两个参数**：
     中继提交充值前要求 `best >= H + B + N - 1`（见 2.2.1），改动任一个都会改变充值到账时延。
+  - 注意：它**不**决定本链 pending 的等待深度（见 `mainChainConfirmations`）。
+  - 默认行为：未设置时为 6。
+- `mainChainConfirmations` (uint32)
+  - 含义：本链（chain33）pending（提现请求、充值/提现确认）的等待深度
+  - 影响：中继只处理 `主链高度 - N + 1` 及之前的 pending；给本链重组留回退窗口
+  - 说明：与 BTC 的 `blockConfirmations` 是两个独立旋钮。BTC 一块约 10 分钟、本链一块数秒，
+    一个值不可能同时合适；此前两者共用 `blockConfirmations`，按 BTC 配置会让本链白等。
   - 默认行为：未设置时为 6。
 - `maxUtxoRescanTime` (int64)
   - 含义：UTXO 重扫超时（单位：小时）
@@ -801,6 +808,8 @@ peerblockfilters=1
   `810000` → `810001`、testnet3 `2344474` → `2344475`；没有锚点的网络 → `1`），配套关系由中继启动期
   断言自动校验（不同源会 fail-closed 并打印链上锚点与它期望的起点）
 - `blockConfirmations` 符合环境安全要求（测试可低，生产应高）
+- `mainChainConfirmations` 与本链的出块速度和重组风险匹配（默认 6）：它只影响本链 pending 的
+  等待深度，与 BTC 的 `blockConfirmations` 无关
 - 链上 `[exec.sub.rgbx].minBtcConfirmations`（N）符合上线要求（默认 6）：它就是充值到账延迟
   （≈ N 个 BTC 块）与重组风险的那个旋钮；中继**不需要**配任何镜像值，它直接查链上（见 2.2）
 - `btcRPC.host/user/pass/TLS` 与 BTC 节点一致
@@ -852,6 +861,7 @@ netName="regtest"
 connectPeers=["127.0.0.1:18444"]
 btcBlockInterval=2
 blockConfirmations=1
+mainChainConfirmations=6
 maxUtxoRescanTime=60
 
 [rpc.sub.light.neutrino.btcRPC]
