@@ -71,7 +71,7 @@ func (n *neutrinoClient) sweepSettings() sweepSettings {
 		interval:         time.Second * defaultSweepIntervalSeconds,
 		minUtxos:         defaultSweepMinUtxos,
 		feeRate:          defaultSweepFeeRate,
-		maxFeeRate:       defaultSweepMaxFeeRate,
+		maxFeeRate:       n.withdrawMaxFeeRateSatPerVbyte(),
 		minConfirmations: defaultSweepMinConfirmations,
 	}
 	if c.IntervalSeconds > 0 {
@@ -82,9 +82,6 @@ func (n *neutrinoClient) sweepSettings() sweepSettings {
 	}
 	if c.FeeRate > 0 {
 		s.feeRate = uint32(c.FeeRate)
-	}
-	if c.MaxFeeRate > 0 {
-		s.maxFeeRate = uint32(c.MaxFeeRate)
 	}
 	if c.MinConfirmations > 0 {
 		s.minConfirmations = uint32(c.MinConfirmations)
@@ -145,7 +142,9 @@ func (n *neutrinoClient) sweepWorker() {
 		case <-n.ctx.Done():
 			return
 		case <-ticker.C:
-			n.sweepOnce(s)
+			// 每轮重算：费率上限来自链上治理配置，会在运行期间变化（reader 自带 TTL 缓存，
+			// 不会每轮都打主链查询）。
+			n.sweepOnce(n.sweepSettings())
 		}
 	}
 }

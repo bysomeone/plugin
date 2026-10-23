@@ -156,11 +156,13 @@ RGB20_BITCOIND_PASS="${RGB20_BITCOIND_PASS:-${BTCD_RPC_PASS:-1314}}"
 RGB20_BITCOIND_CERT="${RGB20_BITCOIND_CERT:-/btcd/rpc.cert}"
 RGB20_DEPOSIT_AMOUNT="${RGB20_DEPOSIT_AMOUNT:-1000000}"   # 1.0 USDT (min units)
 RGB20_WITHDRAW_AMOUNT="${RGB20_WITHDRAW_AMOUNT:-500000}"  # 0.5 USDT
-# 每笔 RGB20 提现收取的固定手续费（该资产最小单位，`[[...rgb20.contracts]].withdrawFee`）。
+# 每笔 RGB20 提现收取的固定手续费（该资产最小单位）。**不再写进桥的 TOML**：唯一权威是链上
+# rgbx 治理配置的 rgb20WithdrawFee（`bridge-config-apply` + autonomy 审批 → `bridge-config-approve`，
+# 见 CONFIG.md §4.4.5）。本地配置会让每个签名节点各有一份，漏配/配错就给出不同结论。
 #
-# 提现本身是一笔普通 BTC 交易，矿工费只能用 BTC 付、由桥的主池垫付，所以桥按资产收一笔固定手续费
-# 补偿（不上链，桥侧配置）。用户侧口径：发票金额必须是 `提现额 − 手续费`（前端按配置提示），
-# 桥核对**实际发给用户的资产**是否精确等于 `链上 pending − 手续费`，不等即拒（不签名、不广播）。
+# 这个变量表示本 harness **期望**链上生效的值，rgb20_test.sh 用它构造"发票扣手续费"的金额。
+# 当前 harness 没有配置 autonomy 治理流程，该值不会自动上链；跑依赖手续费的场景前，需要先由治理
+# 提案把它设到链上（否则链上值为 0 = 不收取、也不做金额精确比对）。
 #
 # CI 用非零值（0 会让本场景失去判别力：0 = 不校验，退回"只判上界"的旧行为），但要远小于各场景的
 # 提现额（最小的一笔是 RGB20_TRUNCATION_WITHDRAW_AMOUNT），否则手续费会把应发金额算成 0 而被拒。
@@ -195,7 +197,7 @@ USER_MAIN_ADDR="${USER_MAIN_ADDR:-14KEKbYtKKQm4wMthSK9J4La4nAiidGozt}"
 #   - ABANDON_OPERATOR_ADDR/KEY：白名单提案人（链上只按 tx.From() 比对，取本 harness 持有的
 #     AUTH_ADDR1；它在主链有余额可付手续费）；
 #   - RGB20_ABANDON_WITHDRAW_AMOUNT：被放弃的提现额（min units）。它排在 fee-mismatch 场景之后，
-#     用户此时只剩 20000，且放弃会原额退回，故取 10000（> withdrawFee 1000，能被桥构建）。
+#     用户此时只剩 20000，且放弃会原额退回，故取 10000（> 链上手续费 1000，能被桥构建）。
 #   - DEPOSIT_BIND_*：#78 充值地址绑定场景的被测账户与充值额（sats）。
 ABANDON_OPERATOR_ADDR="${ABANDON_OPERATOR_ADDR:-${AUTH_ADDR1}}"
 ABANDON_OPERATOR_KEY="${ABANDON_OPERATOR_KEY:-${AUTH_KEY1}}"
@@ -381,10 +383,7 @@ sidecarSymbol="${RGB20_SIDECAR_SYMBOL}"
 # 合约身份（#58）：充值路径强校验 consignment 的 asset_id == 这个值，空值 = 拒收所有充值。
 # 空占位是**故意**的：合约运行期才发行，发行后由 apply_rgb20_asset_id_and_restart 回填。
 assetId="${RGB20_ASSET_ID}"
-# 提现手续费（该资产最小单位）：桥核对"实际发给用户的资产 == 链上 pending − 这个值"，
-# 不等即拒（不签名、不广播）。0 = 不收取、也不做该金额比对。4 个 para 必须同值（每个签名节点
-# 各自用自己的配置独立核对，见 CONFIG.md §4.4.5）。
-withdrawFee=${RGB20_WITHDRAW_FEE}
+# 提现手续费不在这里：读链上 rgbx 治理配置的 rgb20WithdrawFee（按 symbol），见 CONFIG.md §4.4.5。
 EOF
 }
 

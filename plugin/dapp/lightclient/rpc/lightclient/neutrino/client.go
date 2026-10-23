@@ -72,6 +72,9 @@ type neutrinoClient struct {
 	lock              sync.RWMutex
 	chain33FeeRate    int64
 	withdrawReqChan   chan *rtypes.PendingTx
+	// bridgeConfig 链上桥配置（rgbx 治理）的带缓存读取器。nil 表示未初始化，取值函数
+	// 一律回退到内置默认值（见 bridgeconfig.go）。
+	bridgeConfig *bridgeConfigReader
 
 	// paymentMu 串行化"付款签名/广播"与"受理放弃提现"，杜绝两者之间的检查-落盘竞态：
 	// 受理方持有它重新确认 hasSignedPayment 后再写 abandoning；付款方持有它重新确认未被放弃后
@@ -127,6 +130,8 @@ func (n *neutrinoClient) Init(ctx context.Context, q queue.Queue, cfg *lightclie
 	if err != nil {
 		panic("init main chain grpc client err:" + err.Error())
 	}
+	// 链上桥配置（rgbx 治理）：费率上限与 RGB20 提现手续费都从这里读，见 bridgeconfig.go。
+	n.bridgeConfig = newBridgeConfigReader(n.queryBridgeConfig, defaultBridgeConfigTTL)
 	n.tss = newTssService(n)
 	err = n.initNeutrinoConfig(chainCfg)
 	if err != nil {
@@ -196,7 +201,6 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 			AssetID:       c.AssetID,
 			MinDeposit:    c.MinDeposit,
 			MinWithdraw:   c.MinWithdraw,
-			WithdrawFee:   c.WithdrawFee,
 		})
 	}
 	adapter, err := rgb20.NewAdapter(rgbCfg, rgb20.NewWalletStore(n.neutrinoCfg.Database))
@@ -204,6 +208,9 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 		return err
 	}
 	adapter.SetBridge(n) // n 实现 rgb20.Chain33Bridge
+	// 提现手续费的唯一来源是链上 rgbx 治理配置（rgb20WithdrawFee，按 symbol），
+	// 不再有本地 rgb20.contracts[].withdrawFee。
+	adapter.SetWithdrawFeeSource(n.rgb20WithdrawFeeForSymbol)
 	n.rgb20 = adapter
 	log.Info("initRgb20Adapter", "sidecarAddr", n.cfg.Rgb20.SidecarAddr,
 		"contracts", len(rgbCfg.Contracts))

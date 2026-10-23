@@ -9,10 +9,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// 本文件覆盖「提现手续费」（桥侧可配置、不上链）：桥按 `链上 pending − 配置手续费` 精确核对
-// **实际发给用户**的资产金额，不等则拒绝（不签名、不广播）。
+// 本文件覆盖「提现手续费」（链上 rgbx 治理配置，按资产 symbol）：桥按 `链上 pending − 手续费`
+// 精确核对**实际发给用户**的资产金额，不等则拒绝（不签名、不广播）。
 //
-// 经济动机见 Contract.WithdrawFee：RGB20 提现本身就是一笔普通 BTC 交易，矿工费只能用 BTC 付，
+// 经济动机见 Adapter.WithdrawFeeFor：RGB20 提现本身就是一笔普通 BTC 交易，矿工费只能用 BTC 付，
 // 而它出自桥的主池 —— 不校验就等于桥替用户垫矿工费。
 
 const (
@@ -25,11 +25,18 @@ func Test_ExpectedWithdrawPayout(t *testing.T) {
 	adapter, err := NewAdapter(Config{
 		SidecarAddr: "/tmp/nonexistent.sock",
 		Contracts: []Contract{
-			{Symbol: "RGB20_USDT", WithdrawFee: testWithdrawFee},
+			{Symbol: "RGB20_USDT"},
 			{Symbol: "RGB20_NOFEE"},
 		},
 	}, newMemStore())
 	require.NoError(t, err)
+	// 手续费来自链上治理配置（由 neutrino 主包注入）；这里直接注入即可测换算。
+	adapter.SetWithdrawFeeSource(func(symbol string) int64 {
+		if symbol == "RGB20_USDT" {
+			return testWithdrawFee
+		}
+		return 0
+	})
 
 	t.Run("fee configured: payout is pending minus fee", func(t *testing.T) {
 		payout, configured, err := adapter.ExpectedWithdrawPayout("RGB20_USDT", testWithdrawPending)
@@ -140,9 +147,12 @@ func Test_Withdraw_RejectsInvoiceWithoutTheFeeDeducted(t *testing.T) {
 	bridge := &fakeBridge{}
 	adapter, cleanup := newTestAdapter(t, mock, bridge)
 	defer cleanup()
-	// 配好手续费的部署（newTestAdapter 的 fixture 没配）。
-	adapter.Registry().Register(&Contract{
-		Symbol: "RGB20_USDT", AssetID: mockSidecarAssetID, MinWithdraw: 100, WithdrawFee: testWithdrawFee,
+	// 配好手续费的部署（newTestAdapter 的 fixture 没配；手续费由链上治理配置注入）。
+	adapter.SetWithdrawFeeSource(func(symbol string) int64 {
+		if symbol == "RGB20_USDT" {
+			return testWithdrawFee
+		}
+		return 0
 	})
 
 	psbtBytes := buildAnchoredWithdrawPSBT(t, stickySealA)

@@ -3,7 +3,9 @@ package neutrino
 import (
 	"errors"
 	"testing"
+	"time"
 
+	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/btcjson"
 	"github.com/stretchr/testify/require"
 )
@@ -21,14 +23,16 @@ func feeRateResult(rate float64) *btcjson.EstimateSmartFeeResult {
 	return &btcjson.EstimateSmartFeeResult{FeeRate: &rate}
 }
 
-// TestSweepSettings_MaxFeeRate 未配置时折成默认上限，配置时取配置值。
+// TestSweepSettings_MaxFeeRate 上限未配置链上值时用内置默认值，配置时取链上值。
 func TestSweepSettings_MaxFeeRate(t *testing.T) {
 	n := &neutrinoClient{}
 	s := n.sweepSettings()
 	require.Equal(t, uint32(defaultSweepMaxFeeRate), s.maxFeeRate)
 	require.Equal(t, uint32(defaultSweepFeeRate), s.feeRate)
 
-	n.cfg.UserDepositSweep.MaxFeeRate = 80
+	n.bridgeConfig = newBridgeConfigReader(func(string) (*rtypes.BridgeConfigApply, error) {
+		return &rtypes.BridgeConfigApply{WithdrawMaxFeeRateSatPerVbyte: 80}, nil
+	}, time.Minute)
 	n.cfg.UserDepositSweep.FeeRate = 5
 	s = n.sweepSettings()
 	require.Equal(t, uint32(80), s.maxFeeRate)
@@ -145,29 +149,21 @@ func TestSweepFeeRateEstimator_NoRPCClient(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestSweepSignFeeRate 签名核对口径：maxFeeRate 有效时取它，否则回退 feeRate（0 仍表示跳过）。
+// TestSweepSignFeeRate 签名核对口径：读链上 withdrawMaxFeeRateSatPerVbyte；
+// 未配置/查询失败时回退到内置默认上限（不再取本地 feeRate）。
 func TestSweepSignFeeRate(t *testing.T) {
-	tests := []struct {
-		name       string
-		maxFeeRate int
-		feeRate    int
-		want       uint32
-	}{
-		{name: "maxFeeRate takes precedence", maxFeeRate: 50, feeRate: 2, want: 50},
-		{name: "falls back to feeRate when maxFeeRate unset", maxFeeRate: 0, feeRate: 3, want: 3},
-		{name: "zero keeps skip semantics", maxFeeRate: 0, feeRate: 0, want: 0},
-		{name: "negative maxFeeRate falls back", maxFeeRate: -1, feeRate: 4, want: 4},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			client := &neutrinoClient{}
-			client.cfg.UserDepositSweep.MaxFeeRate = tt.maxFeeRate
-			client.cfg.UserDepositSweep.FeeRate = tt.feeRate
-			svc := &tssService{client: client}
-			require.Equal(t, tt.want, svc.sweepSignFeeRate())
-		})
-	}
-
+	// nil service / 未初始化的 client 仍返回 0（跳过区间检查）。
 	require.Equal(t, uint32(0), (*tssService)(nil).sweepSignFeeRate())
 	require.Equal(t, uint32(0), (&tssService{}).sweepSignFeeRate())
+
+	// 没有 reader（未初始化）时回退到内置默认值。
+	require.Equal(t, uint32(defaultSweepMaxFeeRate),
+		(&tssService{client: &neutrinoClient{}}).sweepSignFeeRate())
+
+	// 链上值优先生效。
+	client := &neutrinoClient{}
+	client.bridgeConfig = newBridgeConfigReader(func(string) (*rtypes.BridgeConfigApply, error) {
+		return &rtypes.BridgeConfigApply{WithdrawMaxFeeRateSatPerVbyte: 42}, nil
+	}, time.Minute)
+	require.Equal(t, uint32(42), (&tssService{client: client}).sweepSignFeeRate())
 }
