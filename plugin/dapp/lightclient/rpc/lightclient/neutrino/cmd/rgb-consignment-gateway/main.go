@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
@@ -46,13 +48,18 @@ func main() {
 
 func parseConfig(args []string, getenv func(string) string) (config, error) {
 	cfg := config{
-		listen:     envString(getenv, "RGB_GATEWAY_LISTEN", defaultListen),
-		dataDir:    envString(getenv, "RGB_GATEWAY_DATA_DIR", defaultDataDir),
-		path:       envString(getenv, "RGB_GATEWAY_PATH", defaultPath),
-		maxSize:    defaultMaxSize,
-		ttl:        defaultTTL,
-		rateLimit:  defaultRateLimit,
-		trustProxy: false,
+		listen:      envString(getenv, "RGB_GATEWAY_LISTEN", defaultListen),
+		dataDir:     envString(getenv, "RGB_GATEWAY_DATA_DIR", defaultDataDir),
+		path:        envString(getenv, "RGB_GATEWAY_PATH", defaultPath),
+		maxSize:     defaultMaxSize,
+		ttl:         defaultTTL,
+		rateLimit:   defaultRateLimit,
+		trustProxy:  false,
+		chainTitle:  envString(getenv, "RGB_GATEWAY_CHAIN_TITLE", ""),
+		bridgeToken: envString(getenv, "RGB_GATEWAY_BRIDGE_TOKEN", ""),
+		tlsCert:     envString(getenv, "RGB_GATEWAY_TLS_CERT", ""),
+		tlsKey:      envString(getenv, "RGB_GATEWAY_TLS_KEY", ""),
+		clientCA:    envString(getenv, "RGB_GATEWAY_CLIENT_CA", ""),
 	}
 	var err error
 	if cfg.maxSize, err = envInt64(getenv, "RGB_GATEWAY_MAX_SIZE", cfg.maxSize); err != nil {
@@ -76,6 +83,14 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	fs.DurationVar(&cfg.ttl, "ttl", cfg.ttl, "how long consignments are retained")
 	fs.IntVar(&cfg.rateLimit, "rate-limit", cfg.rateLimit, "requests per client IP per minute (0 disables)")
 	fs.BoolVar(&cfg.trustProxy, "trust-proxy", cfg.trustProxy, "use X-Forwarded-For/X-Real-IP from a trusted reverse proxy")
+	fs.StringVar(&cfg.chainTitle, "chain-title", cfg.chainTitle,
+		"chain title signed into deposit requests (empty disables the deposit API)")
+	fs.StringVar(&cfg.bridgeToken, "bridge-token", cfg.bridgeToken,
+		"shared secret for the /bridge/* endpoints (empty disables the bridge API)")
+	fs.StringVar(&cfg.tlsCert, "tls-cert", cfg.tlsCert, "TLS certificate file (empty serves plain HTTP)")
+	fs.StringVar(&cfg.tlsKey, "tls-key", cfg.tlsKey, "TLS private key file")
+	fs.StringVar(&cfg.clientCA, "client-ca", cfg.clientCA,
+		"CA bundle that must have signed the bridge client certificate (enables mTLS)")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}
@@ -107,6 +122,21 @@ func (c config) validate() error {
 	if c.rateLimit < 0 {
 		return errors.New("rate-limit must not be negative")
 	}
+	if strings.ContainsAny(c.chainTitle, "\r\n") {
+		return errors.New("chain-title must not contain a newline (it is part of the signed message)")
+	}
+	if (c.chainTitle == "") != (c.bridgeToken == "") {
+		return errors.New("chain-title and bridge-token must be configured together")
+	}
+	if c.bridgeToken != "" && len(c.bridgeToken) < 16 {
+		return errors.New("bridge-token must be at least 16 characters")
+	}
+	if (c.tlsCert == "") != (c.tlsKey == "") {
+		return errors.New("tls-cert and tls-key must be configured together")
+	}
+	if c.clientCA != "" && c.tlsCert == "" {
+		return errors.New("client-ca requires the gateway to terminate TLS (tls-cert/tls-key)")
+	}
 	return nil
 }
 
@@ -135,13 +165,41 @@ func run(cfg config, logger *log.Logger) error {
 	go g.cleanupLoop(ctx)
 
 	errCh := make(chan error, 1)
-	go func() {
-		errCh <- srv.Serve(ln)
-	}()
+	if cfg.tlsCert == "" {
+		go func() {
+			errCh <- srv.Serve(ln)
+		}()
+	} else {
+		tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
+		if cfg.clientCA != "" {
+			pool := x509.NewCertPool()
+			pem, err := os.ReadFile(cfg.clientCA)
+			if err != nil {
+				return fmt.Errorf("read client CA: %w", err)
+			}
+			if !pool.AppendCertsFromPEM(pem) {
+				return fmt.Errorf("client CA %s contains no certificates", cfg.clientCA)
+			}
+			tlsCfg.ClientCAs = pool
+			// Request and verify a certificate when one is presented; /bridge/* rejects callers
+			// without a verified chain. The public endpoints stay reachable without a client cert.
+			tlsCfg.ClientAuth = tls.VerifyClientCertIfGiven
+		}
+		srv.TLSConfig = tlsCfg
+		go func() {
+			errCh <- srv.ServeTLS(ln, cfg.tlsCert, cfg.tlsKey)
+		}()
+	}
 
 	logger.Printf("starting rgb-consignment-gateway %s (RGB HTTP JSON-RPC %s)", softwareVersion, protocolVersion)
 	logger.Printf("config listen=%s path=%s data-dir=%s max-size=%d ttl=%s rate-limit=%d/min trust-proxy=%t",
 		ln.Addr().String(), cfg.path, g.store.dir, cfg.maxSize, cfg.ttl, cfg.rateLimit, cfg.trustProxy)
+	if cfg.chainTitle != "" {
+		logger.Printf("deposit API enabled chain-title=%q bridge-auth=%s mTLS=%t",
+			cfg.chainTitle, authMode(cfg), cfg.clientCA != "")
+	} else {
+		logger.Printf("deposit API disabled (chain-title/bridge-token not configured)")
+	}
 
 	select {
 	case err := <-errCh:
@@ -176,9 +234,21 @@ func (g *gateway) cleanupLoop(ctx context.Context) {
 			} else if n > 0 {
 				g.logger.Printf("cleanup removed %d expired consignments", n)
 			}
+			if n, err := g.deposits.cleanup(g.cfg.ttl); err != nil {
+				g.logger.Printf("deposit cleanup: %v", err)
+			} else if n > 0 {
+				g.logger.Printf("cleanup removed %d expired deposit requests", n)
+			}
 			g.limiter.sweep()
 		}
 	}
+}
+
+func authMode(cfg config) string {
+	if cfg.clientCA != "" {
+		return "mTLS+token"
+	}
+	return "token"
 }
 
 func cleanupInterval(ttl time.Duration) time.Duration {

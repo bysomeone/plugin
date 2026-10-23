@@ -34,14 +34,26 @@ type config struct {
 	ttl        time.Duration
 	rateLimit  int
 	trustProxy bool
+
+	// chainTitle is the chain title signed into every deposit request.
+	chainTitle string
+	// bridgeToken authenticates the bridge on /bridge/* endpoints. Empty disables the bridge
+	// API (deposit requests cannot be served without it).
+	bridgeToken string
+	// Optional TLS termination. When clientCA is set, /bridge/* additionally requires a
+	// verified client certificate (mTLS).
+	tlsCert  string
+	tlsKey   string
+	clientCA string
 }
 
 type gateway struct {
-	cfg     config
-	store   *store
-	limiter *rateLimiter
-	logger  *log.Logger
-	started time.Time
+	cfg      config
+	store    *store
+	deposits *depositStore
+	limiter  *rateLimiter
+	logger   *log.Logger
+	started  time.Time
 }
 
 func newGateway(cfg config, logger *log.Logger) (*gateway, error) {
@@ -52,18 +64,29 @@ func newGateway(cfg config, logger *log.Logger) (*gateway, error) {
 	if err != nil {
 		return nil, err
 	}
+	deposits, err := openDepositStore(cfg.dataDir)
+	if err != nil {
+		return nil, err
+	}
 	return &gateway{
-		cfg:     cfg,
-		store:   st,
-		limiter: newRateLimiter(cfg.rateLimit, time.Minute),
-		logger:  logger,
-		started: time.Now(),
+		cfg:      cfg,
+		store:    st,
+		deposits: deposits,
+		limiter:  newRateLimiter(cfg.rateLimit, time.Minute),
+		logger:   logger,
+		started:  time.Now(),
 	}, nil
 }
 
 func (g *gateway) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(g.cfg.path, g.handleRPC)
+	// Deposit requests: the user posts a signed request and polls for its invoice; the bridge
+	// consumes requests over SSE and posts invoices back.
+	mux.HandleFunc("/deposit/requests", g.handleDepositRequestPost)
+	mux.HandleFunc("/deposit/requests/", g.handleDepositRequestGet)
+	mux.HandleFunc("/bridge/deposit/requests/stream", g.requireBridgeAuth(g.handleBridgeStream))
+	mux.HandleFunc("/bridge/deposit/invoices", g.requireBridgeAuth(g.handleBridgeInvoice))
 	return mux
 }
 
