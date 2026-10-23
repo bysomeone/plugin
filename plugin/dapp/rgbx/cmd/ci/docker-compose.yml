@@ -34,12 +34,11 @@ services:
     volumes:
       - ./btcd-data:/btcd:ro
       - para1-data:/root/paradatadir
-    # RGB20（Phase 5）：官方节点 rgb20 适配器 HTTP（充值请求 + consignment 上传 + 测试 sign-psbt）。
     # 17001：P2WSH 充值地址发放入口（neutrino.depositAddressListen）——桥要先 watch 用户的派生
     # 脚本才看得见充值，所以地址必须**向桥要**，E2E 用 BRIDGE_DEPOSIT_URL（默认 127.0.0.1:17001）
     # 从这里领。只有官方节点开这个监听，故只发布 para1。
+    # 17000 不再发布：sign-psbt 测试端点在容器内只绑 127.0.0.1，E2E 用 `compose exec` 访问。
     ports:
-      - "17000:17000"
       - "17001:17001"
 
   para2:
@@ -80,6 +79,33 @@ services:
     volumes:
       - ./btcd-data:/btcd:ro
       - para4-data:/root/paradatadir
+
+  # Consignment gateway + deposit-request broker. The only HTTP service users and the bridge
+  # talk to: 18080 is the host-facing side (E2E's "user wallet" is a host script), 8080 is the
+  # compose-internal side used by para1 (consignment polling + the /bridge/* stream).
+  gateway:
+    image: alpine:3.20
+    depends_on:
+      - para1
+    entrypoint:
+      - /rgb-consignment-gateway
+      - -listen
+      - 0.0.0.0:8080
+      - -data-dir
+      - /data
+      - -path
+      - /0.2/json-rpc
+      - -chain-title
+      - user.p.rgbx.
+      - -bridge-token
+      - ${RGB20_GATEWAY_TOKEN:-e2e-bridge-token-0123456789abcd}
+      - -rate-limit
+      - "0"
+    volumes:
+      - ./rgb-consignment-gateway:/rgb-consignment-gateway:ro
+      - gateway-data:/data
+    ports:
+      - "18080:8080"
 
   btcd:
     platform: ${RGBX_CI_PLATFORM:-linux/amd64}
@@ -126,3 +152,4 @@ volumes:
   para2-data:
   para3-data:
   para4-data:
+  gateway-data:
