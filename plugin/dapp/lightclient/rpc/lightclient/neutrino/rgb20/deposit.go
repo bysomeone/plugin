@@ -79,6 +79,8 @@ func (a *Adapter) CreateReceive(ctx context.Context, req *DepositRequest) (*Rece
 		AssetSymbol:      contract.sidecarAssetSymbol(),
 		Amount:           req.Amount,
 		MinConfirmations: minConfs,
+		// 公网 transport endpoint 写进 invoice；空则不写 transports。
+		TransportEndpoint: a.cfg.TransportEndpoint,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sidecar CreateReceive: %w", err)
@@ -91,9 +93,16 @@ func (a *Adapter) CreateReceive(ctx context.Context, req *DepositRequest) (*Rece
 		Amount:      req.Amount,
 		Status:      ReceiveStatusCreated,
 		Invoice:     rsp.Invoice,
+		// 标准 transport 的收件标识：侧车从 invoice 解析后返回，Go 不解析 RGB。
+		RecipientID: rsp.RecipientId,
 	}
 	if err := a.receives.Put(rec); err != nil {
 		return nil, err
+	}
+	if a.cfg.TransportGateway != "" && rec.RecipientID == "" {
+		// 明确失败可见性：网关轮询需要 recipient_id；拿不到就永远取不到这笔充值。
+		log.Error("CreateReceive: sidecar returned an empty recipient_id; the transport gateway cannot poll this receive",
+			"receiveId", rec.ReceiveID, "gateway", a.cfg.TransportGateway)
 	}
 	return rec, nil
 }

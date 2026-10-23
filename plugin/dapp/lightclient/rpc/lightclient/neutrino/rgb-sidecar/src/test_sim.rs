@@ -188,6 +188,7 @@ impl SimulateExt for RgbEngine {
             asset.asset_id.parse()?,
             crate::invoice::ifa_schema_id(),
             amount as u64,
+            None,
         )
         .map_err(Into::into)
     }

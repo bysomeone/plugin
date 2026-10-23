@@ -114,6 +114,15 @@ type rgb20Config struct {
 	SidecarAddr string `json:"sidecarAddr"`
 	// ConsignmentListen consignment 上传/充值请求 HTTP 监听地址。空则不开 HTTP。
 	ConsignmentListen string `json:"consignmentListen"`
+	// TransportEndpoint 写进充值 invoice 的**公网**标准 transport endpoint，例如
+	// `rpcs://gw.example.com/0.2/json-rpc`。空 = invoice 不携带 transports。
+	// 这是付款方看到的地址，必须能从公网访问（TLS 通常由反向代理终止）。
+	TransportEndpoint string `json:"transportEndpoint"`
+	// TransportGateway 桥轮询 consignment 用的**内网** RGB HTTP JSON-RPC 网关地址，
+	// 例如 `http://gw:8080/0.2/json-rpc`。它通常与 transportEndpoint 指向同一台网关
+	// （公网主机名 vs 内网地址），但两者是独立配置，可以不同。
+	// 空 = 不启用网关轮询（充值交付仍可走 consignmentListen 的自定义上传端点）。
+	TransportGateway string `json:"transportGateway"`
 	// Contracts RGB20 资产合约列表。
 	Contracts []rgb20Contract `json:"contracts"`
 	// ChangeAddress 提现找零地址（TSS P2WPKH 地址）；留空则由 TSS 地址自动填充。

@@ -462,7 +462,8 @@ P2WSH 充值地址上线后，用户的充值**不再进主池**（钱停在各�
 ### 4.4 `[rpc.sub.light.neutrino.rgb20]`
 
 RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentListen` / `contracts` /
-`changeAddress` / `consignmentPublish`）见 `RGB_USDT_INTEGRATION.md`；本节描述充值重试行为（4.4.1–4.4.2）、精度落链
+`changeAddress` / `consignmentPublish` / `transportEndpoint` / `transportGateway`）见
+`RGB_USDT_INTEGRATION.md` 与 4.4.7；本节描述充值重试行为（4.4.1–4.4.2）、精度落链
 （4.4.3）、链上 CLI 金额口径（4.4.4）与**提现手续费**（4.4.5）。额外的桥侧开关是
 `testSignPsbt`（默认 `false`）：打开后允许 E2E 的 `sign-psbt` 测试端点用 TSS 组签名**任意** PSBT
 （签名节点无从核对被签内容），**生产环境必须保持关闭**；`sign-psbt` 仅用于 E2E 模拟用户付款。
@@ -663,6 +664,47 @@ Ordering and failure semantics:
 Query the registered value with `rgbx get-withdraw-consignment --tx-hash <burn hex>` (returns the
 sha256 hex), or `GetWithdrawConsignmentHash` over JSON-RPC. It returns `ErrNotFound` when the
 confirm carried no hash (no local record at confirm time, or the withdrawal is not an RGB20 one).
+
+#### 4.4.7 Standard RGB transport (`transportEndpoint` / `transportGateway`)
+
+Deposits can use the standard [RGB HTTP JSON-RPC v0.2](https://github.com/RGB-Tools/rgb-http-json-rpc)
+transport instead of the bridge's custom upload endpoint. The two keys are independent:
+
+```toml
+[rpc.sub.light.neutrino.rgb20]
+# Public address written into every deposit invoice's `transports` field.
+# Must be reachable by the paying wallet; TLS is normally terminated by a reverse proxy.
+transportEndpoint="rpcs://gw.example.com/0.2/json-rpc"
+# Internal address the bridge itself polls. Resolves inside the deployment network.
+transportGateway="http://gw:8080/0.2/json-rpc"
+```
+
+- `transportEndpoint` is a public string embedded in the invoice. It is not used by the bridge
+  itself. Empty means invoices carry no `transports` and delivery must happen out of band.
+- `transportGateway` is the HTTP JSON-RPC endpoint the **official node** polls. Empty disables
+  gateway polling; the custom `consignmentListen` upload endpoint (and any out-of-band delivery)
+  still works. When both are configured, the gateway is the production path.
+- The two may differ (public hostname vs internal service name) or be the same URL.
+
+Flow, once `CreateReceive` returns the sidecar's `recipient_id`:
+
+1. The bridge persists `recipient_id` on the local receive record.
+2. It polls `consignment.get(recipient_id)`. `-400` ("not found") means "not delivered yet".
+3. A returned consignment goes through the existing `ProvideConsignment` path (sidecar
+   validation + settlement).
+4. Accepted: `ack.post(recipient_id, true)`. Rejected: `ack.post(recipient_id, false)`.
+   The ACK result is persisted, so repeated polling is idempotent.
+
+Failure semantics:
+
+- Validation failure (sidecar answered and refused) → `ack.post(false)`. The bridge never ACKs
+  true for a consignment the sidecar did not accept.
+- Gateway unreachable / HTTP 5xx / sidecar `Unavailable` → **no ACK at all**; the round is retried
+  with exponential backoff from 5s up to 60s. This never blocks settlement or other receives.
+- `ack.post` repeating the same value is idempotent (the gateway answers `false`); a conflicting
+  value (`-100`) is logged as an ERROR.
+- The gateway's `txid` is advisory; the settled outpoint comes from the sidecar. A mismatch is
+  logged at WARN and does not change the ACK.
 
 ## 5. Bitcoin 节点关键配置项
 

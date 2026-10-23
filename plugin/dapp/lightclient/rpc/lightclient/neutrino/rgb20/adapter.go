@@ -17,6 +17,15 @@ type Config struct {
 	SidecarAddr string
 	// ConsignmentListen consignment 上传/充值请求 HTTP 监听地址。空则不开 HTTP。
 	ConsignmentListen string
+	// TransportEndpoint 写进充值 invoice 的公网标准 transport endpoint
+	// （如 `rpcs://gw.example.com/0.2/json-rpc`）。空 = invoice 不携带 transports。
+	TransportEndpoint string
+	// TransportGateway 桥轮询 consignment 的内网 RGB HTTP JSON-RPC 网关地址
+	// （如 `http://gw:8080/0.2/json-rpc`）。空 = 不启用网关轮询。
+	//
+	// 与 TransportEndpoint 相互独立：前者是付款方看到的公网字符串，后者是桥自己使用的
+	// 内网地址；两者可以相同，也可以经不同的入口指向同一台网关。
+	TransportGateway string
 	// ChangeAddress 提现找零地址（TSS P2WPKH 地址）。
 	ChangeAddress string
 	// Contracts 注册的 RGB20 资产合约。
@@ -349,6 +358,21 @@ func (a *Adapter) Start(ctx context.Context) error {
 		}
 		a.wg.Add(1)
 		go a.pollTransfers()
+		if a.cfg.TransportGateway != "" {
+			// 生产路径以网关为主；自定义上传端点（若同时配置）仍然保留。
+			if a.cfg.TransportEndpoint == "" {
+				log.Warn("rgb20 transportGateway is configured without transportEndpoint: invoices will not advertise a transport, so payers must learn the delivery address out of band",
+					"gateway", a.cfg.TransportGateway)
+			}
+			a.wg.Add(1)
+			go a.runTransportGatewayPolling()
+		} else {
+			if a.cfg.TransportEndpoint != "" {
+				log.Warn("rgb20 transportEndpoint is configured but transportGateway is empty: invoices advertise a gateway this node will not poll; deposits must be delivered out of band",
+					"endpoint", a.cfg.TransportEndpoint)
+			}
+			log.Info("rgb20 transportGateway not configured; using the custom consignment upload endpoint only")
+		}
 		if a.cfg.ConsignmentListen != "" {
 			a.wg.Add(1)
 			go a.serveHTTP(a.cfg.ConsignmentListen)

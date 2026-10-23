@@ -128,6 +128,7 @@ fn failed_broadcast_is_replayed_not_rebuilt() -> Result<()> {
         asset.asset_id.parse()?,
         InflatableFungibleAsset::schema().schema_id(),
         WITHDRAW as u64,
+        None,
     )?;
     let tss_addr = engine.tss_address().to_string();
 
@@ -257,6 +258,7 @@ fn failed_broadcast_is_replayed_not_rebuilt() -> Result<()> {
         asset.asset_id.parse()?,
         InflatableFungibleAsset::schema().schema_id(),
         WITHDRAW as u64,
+        None,
     )?;
     let err = engine
         .build_withdrawal(SYMBOL, WITHDRAW, &other_invoice, &tss_addr, FEE_RATE, &[seal_outpoint.to_string()])
@@ -330,6 +332,7 @@ fn build_archive_is_pruned_only_after_finalize_and_confirmation() -> Result<()> 
         asset.asset_id.parse()?,
         InflatableFungibleAsset::schema().schema_id(),
         WITHDRAW as u64,
+        None,
     )?;
     let tss_addr = engine.tss_address().to_string();
     // 保留窗口设成 0：确认即可裁 —— 让测试不必造 144 个块。
@@ -435,6 +438,7 @@ fn legacy_ledger_builds_are_migrated_to_the_archive() -> Result<()> {
         asset.asset_id.parse()?,
         InflatableFungibleAsset::schema().schema_id(),
         WITHDRAW as u64,
+        None,
     )?;
     let tss_addr = engine.tss_address().to_string();
     let first = engine.build_withdrawal(SYMBOL, WITHDRAW, &user_invoice, &tss_addr, FEE_RATE, &[])?;

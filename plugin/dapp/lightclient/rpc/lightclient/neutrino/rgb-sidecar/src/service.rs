@@ -107,13 +107,15 @@ impl RgbSidecar for RgbSidecarService {
     ) -> Result<Response<ReceiveData>, Status> {
         let req = request.into_inner();
         let mut engine = self.engine.lock().await;
-        let (invoice, receive_id) = engine
-            .create_receive(&req.asset_symbol, req.amount)
+        let endpoint = (!req.transport_endpoint.is_empty()).then_some(req.transport_endpoint.as_str());
+        let created = engine
+            .create_receive(&req.asset_symbol, req.amount, endpoint)
             .map_err(err)?;
         Ok(Response::new(ReceiveData {
-            invoice,
-            receive_id,
+            invoice: created.invoice,
+            receive_id: created.receive_id,
             seal_script: engine.tss_script().to_bytes(),
+            recipient_id: created.recipient_id,
         }))
     }
 
@@ -394,6 +396,28 @@ impl RgbSidecar for RgbSidecarService {
             commitment_type: if has_opret { "opret".to_string() } else { String::new() },
             asset_id: String::new(),
             seal_output_index: if seal_output_index == u32::MAX { 0 } else { seal_output_index },
+        }))
+    }
+
+    async fn parse_invoice(
+        &self,
+        request: Request<ParseInvoiceRequest>,
+    ) -> Result<Response<ParsedInvoiceResponse>, Status> {
+        let req = request.into_inner();
+        let parsed = crate::invoice::parse_invoice(&req.invoice)
+            .map_err(|e| Status::invalid_argument(format!("{e}")))?;
+        Ok(Response::new(ParsedInvoiceResponse {
+            contract_id: parsed.contract_id.map(|id| id.to_string()).unwrap_or_default(),
+            schema_id: parsed.schema_id.map(|id| id.to_string()).unwrap_or_default(),
+            amount: parsed.amount.map(|a| a.value() as i64).unwrap_or_default(),
+            witness_script: parsed
+                .witness_script
+                .map(|script| script.to_bytes())
+                .unwrap_or_default(),
+            secret_seal: parsed.secret_seal.map(|seal| seal.to_string()).unwrap_or_default(),
+            transports: parsed.transports,
+            expiry: parsed.expiry.unwrap_or_default(),
+            assignment_name: parsed.assignment_name.unwrap_or_default(),
         }))
     }
 }

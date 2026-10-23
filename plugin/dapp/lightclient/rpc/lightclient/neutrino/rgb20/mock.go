@@ -111,8 +111,9 @@ func (m *MockSidecar) CreateReceive(_ context.Context, req *pb.CreateReceiveRequ
 		AssetId:   fmt.Sprintf("rgb:asset-%s", req.AssetSymbol),
 	}
 	return &pb.ReceiveData{
-		Invoice:   fmt.Sprintf("rgb:invoice-%d", m.receiveCounter),
-		ReceiveId: rid,
+		Invoice:     fmt.Sprintf("rgb:invoice-%d", m.receiveCounter),
+		ReceiveId:   rid,
+		RecipientId: fmt.Sprintf("bcrt:%s", rid),
 	}, nil
 }
 

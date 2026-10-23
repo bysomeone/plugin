@@ -30,6 +30,12 @@ type ReceiveRecord struct {
 	Amount      int64  `json:"amount"`      // 请求金额（资产最小单位）
 	Status      string `json:"status"`
 	Invoice     string `json:"invoice"`
+	// RecipientID 标准 RGB HTTP JSON-RPC 的收件标识（invoice 的 beneficiary 标识，由侧车返回）。
+	// 网关轮询 consignment.get(recipient_id) 用它取回付款方投递的 consignment。
+	RecipientID string `json:"recipientId,omitempty"`
+	// GatewayAck 网关 ACK 结果："" = 尚未 ACK，"true"/"false" = 已按该值 ACK。
+	// 持久化它让重复轮询幂等：ACK 过的 receive 不再重复取件/校验/ACK。
+	GatewayAck string `json:"gatewayAck,omitempty"`
 	// Consignment 用户上传/代理交付的 consignment（settle 后由 http 或 proxy 写入）。
 	Consignment []byte `json:"consignment"`
 	Txid        string `json:"txid"` // 付款 BTC 交易（结算后）

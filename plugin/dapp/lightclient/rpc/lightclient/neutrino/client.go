@@ -183,6 +183,9 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 		ConsignmentListen: n.cfg.Rgb20.ConsignmentListen,
 		ChangeAddress:     n.cfg.Rgb20.ChangeAddress,
 		MinConfirmations:  n.cfg.BlockConfirmations,
+		// 标准 transport：invoice 里写公网 endpoint，桥自己轮询内网 gateway。
+		TransportEndpoint: n.cfg.Rgb20.TransportEndpoint,
+		TransportGateway:  n.cfg.Rgb20.TransportGateway,
 		// 无上下文的测试签名（E2E 的 sign-psbt 端点）：按配置透传，默认关闭。
 		TestSignPsbt: n.cfg.Rgb20.TestSignPsbt,
 		// 头链保留深度 B：头链只提交到 best - B，充值提交前的本地深度门控据此把链上判据换算成本地判据。

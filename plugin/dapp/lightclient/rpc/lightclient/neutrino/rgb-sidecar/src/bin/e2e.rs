@@ -150,7 +150,8 @@ async fn main() -> Result<()> {
     println!("E2E: issued USDT {} genesis_seal={}", asset.asset_id, genesis.outpoint);
 
     // 3. CreateReceive 1 USDT.
-    let (invoice, receive_id) = engine.create_receive("USDT", 100_000_000)?; // 1.0 USDT
+    let created = engine.create_receive("USDT", 100_000_000, None)?; // 1.0 USDT
+    let (invoice, receive_id) = (created.invoice, created.receive_id);
     println!("E2E: create_receive {receive_id}");
 
     // 4. Simulated user pays: spend genesis (100) -> 1 to invoice, 99 change to user script.
@@ -189,6 +190,7 @@ async fn main() -> Result<()> {
         asset.asset_id.parse()?,
         InflatableFungibleAsset::schema().schema_id(),
         50_000_000, // 0.5 USDT
+        None,
     )?;
     let w = engine.build_withdrawal("USDT", 50_000_000, &user_invoice, &tss_addr, 2, &[])?;
     println!("E2E: build_withdrawal txid={} inputs={}", w.txid, w.input_amounts.len());
