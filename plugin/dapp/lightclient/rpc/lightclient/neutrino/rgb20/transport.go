@@ -30,7 +30,7 @@ const (
 // can drive the loop without HTTP).
 type transportGateway interface {
 	ConsignmentGet(ctx context.Context, recipientID string) (*ConsignmentResult, error)
-	AckPost(ctx context.Context, recipientID string, ack bool) (bool, error)
+	AckPost(ctx context.Context, recipientID, txid string, ack bool) (bool, error)
 }
 
 // runTransportGatewayPolling polls the gateway until the adapter stops. Failures back off
@@ -118,7 +118,7 @@ func (a *Adapter) pollTransportReceive(ctx context.Context, gw transportGateway,
 		}
 		log.Error("rgb20 transport: sidecar rejected the consignment, recording ACK false",
 			"receiveId", rec.ReceiveID, "txid", res.TxID, "err", err)
-		return a.recordTransportAck(ctx, gw, rec, false)
+		return a.recordTransportAck(ctx, gw, rec, res.TxID, false)
 	}
 	// The sidecar is the authority on the settled outpoint. The gateway's txid is advisory; a
 	// mismatch is worth surfacing but must not turn a successfully validated transfer into a NACK.
@@ -126,13 +126,19 @@ func (a *Adapter) pollTransportReceive(ctx context.Context, gw transportGateway,
 		log.Warn("rgb20 transport: gateway txid differs from the settled outpoint",
 			"receiveId", rec.ReceiveID, "gatewayTxid", res.TxID, "settledTxid", st.Txid)
 	}
-	return a.recordTransportAck(ctx, gw, rec, true)
+	settledTxid := ""
+	if st != nil {
+		settledTxid = st.Txid
+	}
+	return a.recordTransportAck(ctx, gw, rec, settledTxid, true)
 }
 
 // recordTransportAck posts the ACK and persists it. A repeated ACK with the same value is
 // idempotent at the gateway (it answers false); once persisted, the receive is never polled again.
-func (a *Adapter) recordTransportAck(ctx context.Context, gw transportGateway, rec *ReceiveRecord, ack bool) error {
-	created, err := gw.AckPost(ctx, rec.RecipientID, ack)
+func (a *Adapter) recordTransportAck(ctx context.Context, gw transportGateway, rec *ReceiveRecord,
+	txid string, ack bool) error {
+
+	created, err := gw.AckPost(ctx, rec.RecipientID, txid, ack)
 	if err != nil {
 		return fmt.Errorf("ack.post(%t): %w", ack, err)
 	}

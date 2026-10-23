@@ -435,7 +435,11 @@ func (g *gateway) ackPost(p *params) (any, *rpcError) {
 	if rerr != nil {
 		return nil, rerr
 	}
-	created, err := g.store.postAck(recipient, ack)
+	txid, rerr := optionalTxIDParam(p)
+	if rerr != nil {
+		return nil, rerr
+	}
+	created, err := g.store.postAck(recipient, txid, ack)
 	switch {
 	case errors.Is(err, errNotFound):
 		return nil, rpcErrorf(-300, "Missing ACK")
@@ -453,7 +457,11 @@ func (g *gateway) ackGet(p *params) (any, *rpcError) {
 	if rerr != nil {
 		return nil, rerr
 	}
-	ack, err := g.store.getAck(recipient)
+	txid, rerr := optionalTxIDParam(p)
+	if rerr != nil {
+		return nil, rerr
+	}
+	ack, err := g.store.getAck(recipient, txid)
 	switch {
 	case errors.Is(err, errNotFound):
 		return nil, rpcErrorf(-400, "Consignment file not found")
@@ -545,6 +553,20 @@ func txIDParam(p *params) (string, *rpcError) {
 	raw, ok := p.lookup("txid")
 	if !ok {
 		return "", rpcErrorf(-304, "Missing TXID")
+	}
+	var txid string
+	if err := json.Unmarshal(raw, &txid); err != nil || !validTxID(txid) {
+		return "", rpcErrorf(-203, "Invalid TXID")
+	}
+	return strings.ToLower(txid), nil
+}
+
+// optionalTxIDParam is txIDParam for methods where the txid narrows an
+// otherwise recipient-scoped call (several consignments may share a recipient).
+func optionalTxIDParam(p *params) (string, *rpcError) {
+	raw, ok := p.lookup("txid")
+	if !ok {
+		return "", nil
 	}
 	var txid string
 	if err := json.Unmarshal(raw, &txid); err != nil || !validTxID(txid) {

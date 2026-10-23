@@ -179,12 +179,20 @@ func (c *TransportClient) ConsignmentGet(ctx context.Context, recipientID string
 
 // AckPost records the validation outcome for recipientID. The gateway's `created` flag is
 // returned as-is: false means the same ACK value was already recorded (an idempotent repeat).
-func (c *TransportClient) AckPost(ctx context.Context, recipientID string, ack bool) (bool, error) {
+//
+// txid is optional. Several consignments may share a recipient_id (an address-based invoice
+// uses the recipient's script as its beneficiary), so naming the txid keeps the ACK attached to
+// the consignment that was actually validated.
+func (c *TransportClient) AckPost(ctx context.Context, recipientID, txid string, ack bool) (bool, error) {
 	if recipientID == "" {
 		return false, errors.New("recipient_id empty")
 	}
+	params := map[string]any{"recipient_id": recipientID, "ack": ack}
+	if txid != "" {
+		params["txid"] = txid
+	}
 	var created bool
-	err := c.call(ctx, "ack.post", map[string]any{"recipient_id": recipientID, "ack": ack}, &created)
+	err := c.call(ctx, "ack.post", params, &created)
 	if err != nil {
 		return false, err
 	}

@@ -109,25 +109,25 @@ func TestStorePostAckPersistence(t *testing.T) {
 	_, err = s1.post("recipient", testTxID, nil, []byte("data"))
 	require.NoError(t, err)
 
-	created, err := s1.postAck("recipient", false)
+	created, err := s1.postAck("recipient", "", false)
 	require.NoError(t, err)
 	require.True(t, created)
 
-	created, err = s1.postAck("recipient", false)
+	created, err = s1.postAck("recipient", "", false)
 	require.NoError(t, err)
 	require.False(t, created)
 
-	_, err = s1.postAck("recipient", true)
+	_, err = s1.postAck("recipient", "", true)
 	require.ErrorIs(t, err, errAckConflict)
 
 	s2, err := openStore(dir, time.Hour, testLogger())
 	require.NoError(t, err)
-	ack, err := s2.getAck("recipient")
+	ack, err := s2.getAck("recipient", "")
 	require.NoError(t, err)
 	require.NotNil(t, ack)
 	assert.False(t, *ack)
 
-	_, err = s2.getAck("missing")
+	_, err = s2.getAck("missing", "")
 	require.ErrorIs(t, err, errNotFound)
 }
 

@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -19,8 +20,13 @@ var (
 	errAckConflict  = errors.New("ack cannot be changed")
 )
 
-// entry is the on-disk metadata record for one recipient_id. The consignment
+// entry is the on-disk metadata record for one consignment. The consignment
 // bytes live in a separate content-addressed blob; this record is the index.
+//
+// Several consignments may share one recipient_id: an address-based RGB
+// invoice uses the recipient's script as its beneficiary, so every invoice to
+// the same script yields the same recipient_id. They are kept as a queue and
+// delivered oldest-first.
 type entry struct {
 	RecipientID string    `json:"recipient_id"`
 	TxID        string    `json:"txid"`
@@ -44,7 +50,8 @@ type store struct {
 	logger *log.Logger
 	now    func() time.Time
 
-	entries map[string]*entry
+	// entries maps recipient_id to that recipient's queue, oldest first.
+	entries map[string][]*entry
 
 	// orphanGCBlocked is set when an index file failed to load. Deleting
 	// blobs then could destroy data referenced by the unreadable index.
@@ -70,7 +77,7 @@ func openStore(dir string, ttl time.Duration, logger *log.Logger) (*store, error
 		ttl:     ttl,
 		logger:  logger,
 		now:     time.Now,
-		entries: make(map[string]*entry),
+		entries: make(map[string][]*entry),
 	}
 	if s.logger == nil {
 		s.logger = log.New(os.Stderr, "", log.LstdFlags)
@@ -125,10 +132,10 @@ func (s *store) load() error {
 			s.orphanGCBlocked = true
 			continue
 		}
-		if prev, ok := s.entries[e.RecipientID]; ok && !e.CreatedAt.After(prev.CreatedAt) {
-			continue
-		}
-		s.entries[e.RecipientID] = &e
+		s.entries[e.RecipientID] = append(s.entries[e.RecipientID], &e)
+	}
+	for _, queue := range s.entries {
+		sort.Slice(queue, func(i, j int) bool { return queue[i].CreatedAt.Before(queue[j].CreatedAt) })
 	}
 	return nil
 }
@@ -158,8 +165,10 @@ func validTxID(txid string) bool {
 	return validHash(txid)
 }
 
-func (s *store) indexPath(recipientID string) string {
-	sum := sha256.Sum256([]byte(recipientID))
+// indexPath is one file per (recipient_id, txid): a recipient may have several
+// outstanding consignments, each with its own ACK.
+func (s *store) indexPath(recipientID, txid string) string {
+	sum := sha256.Sum256([]byte(recipientID + "\x00" + txid))
 	return filepath.Join(s.index, hex.EncodeToString(sum[:])+".json")
 }
 
@@ -173,8 +182,9 @@ func (s *store) expired(e *entry, now time.Time) bool {
 
 // post stores data for recipientID. It returns true on the first upload and
 // false when the exact same content is uploaded again. A different file for
-// an existing recipientID is rejected with errFileConflict. An expired entry
-// is replaced, so a recipient ID can be reused after its TTL.
+// the same (recipientID, txid) is rejected with errFileConflict; a different
+// txid is queued behind the existing consignments. Expired entries are
+// dropped first, so a recipient ID can be reused after its TTL.
 func (s *store) post(recipientID, txid string, vout *uint32, data []byte) (bool, error) {
 	sum := sha256.Sum256(data)
 	hash := hex.EncodeToString(sum[:])
@@ -183,17 +193,16 @@ func (s *store) post(recipientID, txid string, vout *uint32, data []byte) (bool,
 	defer s.mu.Unlock()
 
 	now := s.now()
-	if prev, ok := s.entries[recipientID]; ok {
-		if !s.expired(prev, now) {
-			if prev.Hash == hash {
-				return false, nil
-			}
-			return false, errFileConflict
+	queue := s.pruneLocked(recipientID, now)
+	for _, prev := range queue {
+		if prev.TxID != txid {
+			continue
 		}
-		if err := os.Remove(s.indexPath(recipientID)); err != nil && !os.IsNotExist(err) {
-			return false, fmt.Errorf("remove expired index: %w", err)
+		s.entries[recipientID] = queue
+		if prev.Hash == hash {
+			return false, nil
 		}
-		delete(s.entries, recipientID)
+		return false, errFileConflict
 	}
 
 	if err := s.writeBlob(hash, data); err != nil {
@@ -210,65 +219,133 @@ func (s *store) post(recipientID, txid string, vout *uint32, data []byte) (bool,
 	if err := s.writeIndex(e); err != nil {
 		return false, err
 	}
-	s.entries[recipientID] = e
+	s.entries[recipientID] = append(queue, e)
 	return true, nil
 }
 
+// get returns the oldest consignment for recipientID that has not been ACKed.
 func (s *store) get(recipientID string) (entry, []byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.entries[recipientID]
-	if !ok || s.expired(e, s.now()) {
-		return entry{}, nil, errNotFound
+	now := s.now()
+	for _, e := range s.entries[recipientID] {
+		if s.expired(e, now) || e.Ack != nil {
+			continue
+		}
+		data, err := os.ReadFile(s.blobPath(e.Hash))
+		if err != nil {
+			return entry{}, nil, fmt.Errorf("read consignment blob: %w", err)
+		}
+		out := *e
+		out.Vout = copyUint32(e.Vout)
+		out.Ack = copyBool(e.Ack)
+		return out, data, nil
 	}
-	data, err := os.ReadFile(s.blobPath(e.Hash))
-	if err != nil {
-		return entry{}, nil, fmt.Errorf("read consignment blob: %w", err)
-	}
-	out := *e
-	out.Vout = copyUint32(e.Vout)
-	out.Ack = copyBool(e.Ack)
-	return out, data, nil
+	return entry{}, nil, errNotFound
 }
 
 // getAck returns (nil, nil) when the consignment exists but has not been
-// acknowledged yet.
-func (s *store) getAck(recipientID string) (*bool, error) {
+// acknowledged yet. With txid empty, the newest consignment's ACK is returned.
+func (s *store) getAck(recipientID, txid string) (*bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.entries[recipientID]
-	if !ok || s.expired(e, s.now()) {
+	now := s.now()
+	queue := s.entries[recipientID]
+	var target *entry
+	for _, e := range queue {
+		if s.expired(e, now) {
+			continue
+		}
+		if txid != "" {
+			if e.TxID == txid {
+				target = e
+				break
+			}
+			continue
+		}
+		target = e
+	}
+	if target == nil {
 		return nil, errNotFound
 	}
-	return copyBool(e.Ack), nil
+	return copyBool(target.Ack), nil
 }
 
-func (s *store) postAck(recipientID string, ack bool) (bool, error) {
+// postAck records an ACK. With txid set it targets that consignment; otherwise
+// it targets the oldest un-ACKed one (the one get would have returned).
+func (s *store) postAck(recipientID, txid string, ack bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.entries[recipientID]
-	if !ok || s.expired(e, s.now()) {
+	now := s.now()
+	var target, firstUnacked, newest *entry
+	for _, e := range s.entries[recipientID] {
+		if s.expired(e, now) {
+			continue
+		}
+		newest = e
+		if txid != "" {
+			if e.TxID == txid {
+				target = e
+				break
+			}
+			continue
+		}
+		if e.Ack == nil && firstUnacked == nil {
+			firstUnacked = e
+		}
+	}
+	if txid == "" {
+		// Prefer the next un-ACKed consignment; if every one is already ACKed, fall back to the
+		// newest so repeating the same ACK is idempotent and a different value is a conflict.
+		target = firstUnacked
+		if target == nil {
+			target = newest
+		}
+	}
+	if target == nil {
 		return false, errNotFound
 	}
-	if e.Ack != nil {
-		if *e.Ack == ack {
+	if target.Ack != nil {
+		if *target.Ack == ack {
 			return false, nil
 		}
 		return false, errAckConflict
 	}
-	e.Ack = &ack
-	if err := s.writeIndex(e); err != nil {
-		e.Ack = nil
+	target.Ack = &ack
+	if err := s.writeIndex(target); err != nil {
+		target.Ack = nil
 		return false, err
 	}
 	return true, nil
 }
 
-// cleanup removes expired index records, their ACKs, and any blob no longer
-// referenced by a live record.
+// pruneLocked drops expired entries for one recipient and returns the live
+// queue. Callers must hold the mutex.
+func (s *store) pruneLocked(recipientID string, now time.Time) []*entry {
+	queue := s.entries[recipientID]
+	kept := queue[:0]
+	for _, e := range queue {
+		if s.expired(e, now) {
+			if err := os.Remove(s.indexPath(e.RecipientID, e.TxID)); err != nil && !os.IsNotExist(err) {
+				s.logger.Printf("remove expired index: %v", err)
+			}
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if len(kept) == 0 {
+		delete(s.entries, recipientID)
+		return nil
+	}
+	s.entries[recipientID] = kept
+	return kept
+}
+
+// cleanup removes expired index records and any blob no longer referenced by a
+// live record.
 func (s *store) cleanup() (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -278,15 +355,10 @@ func (s *store) cleanup() (int, error) {
 func (s *store) cleanupLocked() (int, error) {
 	now := s.now()
 	removed := 0
-	for id, e := range s.entries {
-		if !s.expired(e, now) {
-			continue
-		}
-		if err := os.Remove(s.indexPath(id)); err != nil && !os.IsNotExist(err) {
-			return removed, fmt.Errorf("remove expired index: %w", err)
-		}
-		delete(s.entries, id)
-		removed++
+	for id := range s.entries {
+		before := len(s.entries[id])
+		s.pruneLocked(id, now)
+		removed += before - len(s.entries[id])
 	}
 	if s.orphanGCBlocked {
 		return removed, nil
@@ -298,9 +370,11 @@ func (s *store) cleanupLocked() (int, error) {
 }
 
 func (s *store) gcOrphansLocked() error {
-	referenced := make(map[string]struct{}, len(s.entries))
-	for _, e := range s.entries {
-		referenced[e.Hash] = struct{}{}
+	referenced := make(map[string]struct{})
+	for _, queue := range s.entries {
+		for _, e := range queue {
+			referenced[e.Hash] = struct{}{}
+		}
 	}
 	files, err := os.ReadDir(s.blobs)
 	if err != nil {
@@ -335,7 +409,7 @@ func (s *store) writeIndex(e *entry) error {
 	if err != nil {
 		return fmt.Errorf("encode index: %w", err)
 	}
-	return writeFileAtomic(s.tmp, s.index, filepath.Base(s.indexPath(e.RecipientID)), data)
+	return writeFileAtomic(s.tmp, s.index, filepath.Base(s.indexPath(e.RecipientID, e.TxID)), data)
 }
 
 // writeFileAtomic writes data to a temporary file, fsyncs it, then renames it

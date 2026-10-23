@@ -37,7 +37,7 @@ func (f *fakeTransportGateway) ConsignmentGet(_ context.Context, recipientID str
 
 const strings111 = "1111111111111111111111111111111111111111111111111111111111111111"
 
-func (f *fakeTransportGateway) AckPost(_ context.Context, _ string, ack bool) (bool, error) {
+func (f *fakeTransportGateway) AckPost(_ context.Context, _, _ string, ack bool) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.ackErr != nil {
