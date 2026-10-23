@@ -296,4 +296,8 @@ message ParsedInvoiceResponse {
   repeated string transports = 6;      // invoice 携带的 transport endpoint（原样字符串）
   int64 expiry = 7;                    // UTC unix 时间戳；0 = 无过期时间
   string assignment_name = 8;          // 如 assetOwner；空 = invoice 未指定
+  // 标准 transport 的 recipient_id（invoice 的 beneficiary 标识，含链名前缀），
+  // `consignment.post` / `consignment.get` 的路由键。与收款侧 `CreateReceive` 返回的
+  // 是同一个值。
+  string recipient_id = 9;
 }

@@ -411,14 +411,17 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 		log.Error("Withdraw save consignment; confirm will carry no consignment hash",
 			"chain33Hash", hex.EncodeToString(req.Chain33TxHash), "err", err)
 	}
-	// 上传的字节与确认交易登记的哈希必须同源：优先发布**已保存/已存在**的那一份
+	// 交付的字节与确认交易登记的哈希必须同源：优先发布**已保存/已存在**的那一份
 	// （写入冲突时保留的是旧字节，链上哈希也由它算出）；本地完全没有记录（存储故障）
 	// 时才退回本次构建结果，尽力完成交付——此时确认哈希为空。
 	publishBytes := rsp.Consignment
 	if saved, err := a.GetWithdrawConsignment(req.Chain33TxHash); err == nil && len(saved) > 0 {
 		publishBytes = saved
 	}
-	a.publishConsignmentAsync(req.Chain33TxHash, publishBytes)
+	// 标准 transport：按用户 invoice 的 transports 投递并等待 ACK；invoice 没带可用 transport
+	// 时回退到 consignmentPublish.url（见 withdrawdelivery.go）。两条路都是旁路，不阻塞广播。
+	a.deliverWithdrawConsignmentAsync(req.Chain33TxHash, publishBytes, req.RecipientInvoice,
+		fin.Txid, fin.RecipientSealOutpoint)
 
 	// 广播。
 	if err := a.bridge.BroadcastTx(signedPsbt, fin.Txid); err != nil {

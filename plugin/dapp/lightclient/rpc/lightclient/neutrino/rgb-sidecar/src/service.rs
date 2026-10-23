@@ -418,6 +418,8 @@ impl RgbSidecar for RgbSidecarService {
             transports: parsed.transports,
             expiry: parsed.expiry.unwrap_or_default(),
             assignment_name: parsed.assignment_name.unwrap_or_default(),
+            recipient_id: crate::invoice::recipient_id(&req.invoice)
+                .map_err(|e| Status::invalid_argument(format!("{e}")))?,
         }))
     }
 }
