@@ -321,7 +321,6 @@ function config_para_file() {
     # 用户 BTC 充值地址发放 HTTP（P2WSH C2）。只有官方节点（para1）跑真正的 BTC 桥
     # （btc wallet + 充值 watch 集），也只有它需要"按需 import 用户充值脚本"这个入口；
     # 非官方节点开了也没有钱包可发行（请求会 503），只是多一个空转的监听，故这里关掉。
-    local deposit_address_listen=""
     # 网关订阅 / 测试签名端点：只有官方节点需要（充值请求由它出票；sign-psbt 是 E2E 模拟用户付款）。
     # 非官方节点一个监听都不开 —— 这正是"桥零入站"的验证点。
     local rgb20_gateway_block=""
@@ -333,7 +332,6 @@ function config_para_file() {
     # 最小，好让扫集在场景里立刻发生；生产默认是 5 笔 / 300s / 6 确认（见 lightclient config.go）。
     local sweep_block=""
     if [ "${official}" = "true" ]; then
-        deposit_address_listen="0.0.0.0:17001"
         # testListen 只绑 loopback（sign-psbt）；充值请求走桥→网关的出站 SSE。
         rgb20_gateway_block='
 testListen="127.0.0.1:17000"
@@ -370,10 +368,7 @@ blockConfirmations=1
 # E2E 的链高度推进不像生产那样连续；本链确认深度保持 1（与拆分前的行为一致），
 # 否则依赖"提交后尽快被桥看到"的场景（如 #70 unlock）会等不到深度。
 mainChainConfirmations=1
-maxUtxoRescanTime=60
-# 充值地址发放入口（空 = 不开启）。E2E 脚本按 127.0.0.1:17001 领地址，见 docker-compose.yml
-# 里 para1 的 17001 端口发布与 scripts/btc_test.sh 的 BRIDGE_DEPOSIT_URL。
-depositAddressListen="${deposit_address_listen}"${abandon_block}${sweep_block}
+maxUtxoRescanTime=60${abandon_block}${sweep_block}
 
 [rpc.sub.light.neutrino.btcRPC]
 host="${BTC_RPC_ADDR}"
