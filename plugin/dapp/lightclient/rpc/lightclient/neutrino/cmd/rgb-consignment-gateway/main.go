@@ -16,6 +16,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	// Registers the btc address driver so deposit-request signature verification can derive the
+	// chain33 address from the signing key (the executor has the same registration).
+	_ "github.com/33cn/chain33/system/address/btc"
 )
 
 const (
