@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -15,31 +16,43 @@ import (
 
 var log = log15.New("module", "rgb20")
 
-// httpRequest 充值请求 HTTP 体。
-type httpRequest struct {
-	RequestID   string `json:"requestId"`
-	AssetSymbol string `json:"assetSymbol"`
-	Amount      int64  `json:"amount"`
-	Chain33Addr string `json:"chain33Addr"`
-}
-
 type httpResponse struct {
 	Code    int         `json:"code"`
 	Message string      `json:"message"`
 	Data    interface{} `json:"data,omitempty"`
 }
 
-// serveHTTP 启动 consignment 上传与充值请求 HTTP 服务。
-func (a *Adapter) serveHTTP(listen string) {
+// serveTestHTTP 是 **仅 E2E** 使用的本地测试监听：只提供 sign-psbt（用 TSS 组签任意 PSBT，
+// 模拟用户付款）。生产不配置 testListen，桥不提供任何 HTTP API。
+//
+// 地址必须是 loopback 或 unix socket：该端点等价于"用 TSS 组私钥签任意内容"，绝不能落在
+// 外部可达的网卡上。
+func (a *Adapter) serveTestHTTP(listen string) {
 	defer a.wg.Done()
+	if !testListenIsLocal(listen) {
+		log.Error("rgb20 test listener refused: address must be loopback or a unix socket", "listen", listen)
+		return
+	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/rgbx/v1/consignment", a.handleConsignmentUpload)
-	mux.HandleFunc("/rgbx/v1/deposit", a.handleDepositRequest)
-	// 测试专用：用 TSS 对 PSBT 签名（Phase 5 E2E 的用户付款 PSBT 由链上 TSS 组签）。
 	mux.HandleFunc("/rgbx/v1/sign-psbt", a.handleSignPsbt)
-	srv := &http.Server{
-		Addr:    listen,
-		Handler: mux,
+	srv := &http.Server{Handler: mux}
+
+	var ln net.Listener
+	var err error
+	if strings.HasPrefix(listen, "unix://") || strings.HasPrefix(listen, "/") {
+		path := strings.TrimPrefix(listen, "unix://")
+		if strings.HasPrefix(path, "/") {
+			// A stale socket file is expected after a crash; removing it is safe because we are
+			// about to bind the same path.
+			_ = os.Remove(path)
+		}
+		ln, err = net.Listen("unix", path)
+	} else {
+		ln, err = net.Listen("tcp", listen)
+	}
+	if err != nil {
+		log.Error("rgb20 test listener", "listen", listen, "err", err)
+		return
 	}
 	go func() {
 		<-a.ctx.Done()
@@ -47,91 +60,31 @@ func (a *Adapter) serveHTTP(listen string) {
 		defer cancel()
 		_ = srv.Shutdown(ctx)
 	}()
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Error("rgb20 http server", "listen", listen, "err", err)
+	log.Info("rgb20 test listener started (sign-psbt only)", "listen", listen)
+	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+		log.Error("rgb20 test listener", "listen", listen, "err", err)
 	}
 }
 
-// handleConsignmentUpload 上传 consignment：按 receive_id 交付并触发侧车结算。
-// POST /rgbx/v1/consignment  body: {"receiveId":"...","consignment":"<base64>"}
-func (a *Adapter) handleConsignmentUpload(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeHTTP(w, httpResponse{Code: http.StatusMethodNotAllowed, Message: "method not allowed"})
-		return
+// testListenIsLocal accepts loopback TCP addresses and unix sockets only.
+func testListenIsLocal(listen string) bool {
+	if strings.HasPrefix(listen, "unix://") || strings.HasPrefix(listen, "/") {
+		return true
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+	host, _, err := net.SplitHostPort(listen)
 	if err != nil {
-		writeHTTP(w, httpResponse{Code: http.StatusBadRequest, Message: "read body: " + err.Error()})
-		return
+		return false
 	}
-	var req struct {
-		ReceiveID   string `json:"receiveId"`
-		Consignment string `json:"consignment"` // base64
+	switch host {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
 	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeHTTP(w, httpResponse{Code: http.StatusBadRequest, Message: "bad json: " + err.Error()})
-		return
-	}
-	if req.ReceiveID == "" || req.Consignment == "" {
-		writeHTTP(w, httpResponse{Code: http.StatusBadRequest, Message: "receiveId and consignment required"})
-		return
-	}
-	consignment := decodeBase64(req.Consignment)
-	if len(consignment) == 0 {
-		writeHTTP(w, httpResponse{Code: http.StatusBadRequest, Message: "invalid consignment base64"})
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-	st, err := a.ProvideConsignment(ctx, consignment, req.ReceiveID)
-	if err != nil {
-		writeHTTP(w, httpResponse{Code: http.StatusInternalServerError, Message: "provide consignment: " + err.Error()})
-		return
-	}
-	writeHTTP(w, httpResponse{Code: http.StatusOK, Message: "ok", Data: st})
 }
 
-// handleDepositRequest 发起充值请求。
-// POST /rgbx/v1/deposit body: {"requestId":"...","assetSymbol":"RGB20_USDT","amount":100,"chain33Addr":"..."}
-func (a *Adapter) handleDepositRequest(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeHTTP(w, httpResponse{Code: http.StatusMethodNotAllowed, Message: "method not allowed"})
-		return
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		writeHTTP(w, httpResponse{Code: http.StatusBadRequest, Message: "read body: " + err.Error()})
-		return
-	}
-	req := &httpRequest{}
-	if err := json.Unmarshal(body, req); err != nil {
-		writeHTTP(w, httpResponse{Code: http.StatusBadRequest, Message: "bad json: " + err.Error()})
-		return
-	}
-	if req.RequestID == "" {
-		req.RequestID = fmt.Sprintf("req-%d", time.Now().UnixNano())
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-	rec, err := a.DepositFlow(ctx, &DepositRequest{
-		RequestID:   req.RequestID,
-		AssetSymbol: strings.ToUpper(req.AssetSymbol),
-		Amount:      req.Amount,
-		Chain33Addr: req.Chain33Addr,
-	})
-	if err != nil {
-		writeHTTP(w, httpResponse{Code: http.StatusInternalServerError, Message: "create receive: " + err.Error()})
-		return
-	}
-	writeHTTP(w, httpResponse{Code: http.StatusOK, Message: "ok", Data: rec})
-}
-
-// handleSignPsbt 测试专用：用 TSS 组对 PSBT 签名（E2E 驱动用，非生产 RPC）。
-// POST /rgbx/v1/sign-psbt  body: {"psbt":"<hex>"}  →  {"psbt":"<hex signed>"}
-//
-// 该端点签的是**任意** PSBT（没有 chain33 提现上下文，签名节点无从核对），等于"用 TSS 组私钥
-// 签任意内容"，所以必须由 [rpc.sub.light.neutrino.rgb20].testSignPsbt 显式打开（默认关闭），
-// 生产环境调用一律 403。
+// handleSignPsbt 仅 E2E 使用：用 TSS 组对 PSBT 签名（无提现上下文，签名节点无从核对）。
+// 必须由 [rpc.sub.light.neutrino.rgb20].testSignPsbt 显式打开（默认关闭），否则 403。
 func (a *Adapter) handleSignPsbt(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeHTTP(w, httpResponse{Code: http.StatusMethodNotAllowed, Message: "method not allowed"})

@@ -28,12 +28,16 @@ var errAssetContractMismatch = errors.New("deposit asset contract mismatch")
 // 不可信 ⇒ 拒绝"。
 var errAssetIdUnconfigured = errors.New("contract assetId not configured")
 
-// DepositRequest 充值请求（用户经桥 HTTP API 发起）。
+// DepositRequest 充值请求（来自网关推送的用户签名请求）。
 type DepositRequest struct {
-	RequestID   string // 桥侧请求 ID
+	RequestID   string // 用户签名的请求 ID（网关的幂等键）
 	AssetSymbol string // RGB20 资产符号（如 RGB20_USDT）
 	Amount      int64  // 请求金额（资产最小单位）
 	Chain33Addr string // 用户 Chain33 地址（铸造目标）
+	// 用户签名（hex）。铸造交易会带上它们，链上再次验签；桥在出票前已经验过一次。
+	RequestPubKeyHex    string
+	RequestSignatureHex string
+	RequestTimestamp    int64
 }
 
 // DepositSignPayload rgb20-deposit 签名轮次消息（BL-3/HR-6）。
@@ -94,7 +98,10 @@ func (a *Adapter) CreateReceive(ctx context.Context, req *DepositRequest) (*Rece
 		Status:      ReceiveStatusCreated,
 		Invoice:     rsp.Invoice,
 		// 标准 transport 的收件标识：侧车从 invoice 解析后返回，Go 不解析 RGB。
-		RecipientID: rsp.RecipientId,
+		RecipientID:         rsp.RecipientId,
+		RequestPubKeyHex:    req.RequestPubKeyHex,
+		RequestSignatureHex: req.RequestSignatureHex,
+		RequestTimestamp:    req.RequestTimestamp,
 	}
 	if err := a.receives.Put(rec); err != nil {
 		return nil, err
@@ -269,10 +276,20 @@ func (a *Adapter) submitDeposit(rec *ReceiveRecord) error {
 	}
 
 	// 4) 签名轮次（一整轮 CGGMP 签名，代价最高的那一步）。
+	// 用户签名请求：链上铸造会再次验签并把它钉在收款地址/金额上；缺了它这条充值注定被拒，
+	// 所以在这里（签名之前）就 fail-closed。
+	if rec.RequestID == "" || rec.RequestSignatureHex == "" || rec.RequestPubKeyHex == "" {
+		return fmt.Errorf("receive %s carries no signed deposit request; refusing to sign a mint the chain will reject",
+			rec.ReceiveID)
+	}
 	dep := &rtypes.DepositAsset{
-		Amount:         rec.Amount,
-		DepositAddress: rec.Chain33Addr,
-		AssetSymbol:    rec.AssetSymbol,
+		Amount:           rec.Amount,
+		DepositAddress:   rec.Chain33Addr,
+		AssetSymbol:      rec.AssetSymbol,
+		RequestId:        rec.RequestID,
+		RequestTimestamp: rec.RequestTimestamp,
+		RequestPubkey:    decodeHexBestEffort(rec.RequestPubKeyHex),
+		RequestSignature: decodeHexBestEffort(rec.RequestSignatureHex),
 		TxProof: &rtypes.BtcTxProof{
 			TxData:      proof.TxData,
 			BlockHash:   proof.BlockHash,
@@ -525,9 +542,13 @@ func (a *Adapter) BuildDepositSignMessage(rec *ReceiveRecord, consignment []byte
 		return nil, fmt.Errorf("nil receive record")
 	}
 	dep := &rtypes.DepositAsset{
-		Amount:         rec.Amount,
-		DepositAddress: rec.Chain33Addr,
-		AssetSymbol:    rec.AssetSymbol,
+		Amount:           rec.Amount,
+		DepositAddress:   rec.Chain33Addr,
+		AssetSymbol:      rec.AssetSymbol,
+		RequestId:        rec.RequestID,
+		RequestTimestamp: rec.RequestTimestamp,
+		RequestPubkey:    decodeHexBestEffort(rec.RequestPubKeyHex),
+		RequestSignature: decodeHexBestEffort(rec.RequestSignatureHex),
 		// thresholdSig 空；TxProof 由主节点通过 SPV 补齐后填入
 	}
 	return &DepositSignPayload{

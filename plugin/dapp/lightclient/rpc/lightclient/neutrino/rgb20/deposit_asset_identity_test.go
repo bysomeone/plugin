@@ -94,17 +94,21 @@ func newAssetIdentitySubmitAdapterWithStore(t *testing.T, bridge Chain33Bridge, 
 func seedSettledReceiveWithAsset(t *testing.T, a *Adapter, receiveID, txid string, amount int64, assetID string) *ReceiveRecord {
 	t.Helper()
 	seal := FormatOutpoint(txid, 0)
+	pubHex, sigHex, ts := testSignedRequest(t, "req-"+receiveID, amount)
 	rec := &ReceiveRecord{
-		ReceiveID:   receiveID,
-		RequestID:   "req-" + receiveID,
-		AssetSymbol: "RGB20_USDT",
-		Chain33Addr: "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk",
-		Amount:      amount,
-		Status:      ReceiveStatusSettled,
-		Consignment: []byte("consignment-bytes"),
-		Txid:        txid,
-		Vout:        0,
-		Seal:        seal,
+		ReceiveID:           receiveID,
+		RequestID:           "req-" + receiveID,
+		AssetSymbol:         "RGB20_USDT",
+		Chain33Addr:         "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk",
+		Amount:              amount,
+		Status:              ReceiveStatusSettled,
+		Consignment:         []byte("consignment-bytes"),
+		RequestPubKeyHex:    pubHex,
+		RequestSignatureHex: sigHex,
+		RequestTimestamp:    ts,
+		Txid:                txid,
+		Vout:                0,
+		Seal:                seal,
 	}
 	require.NoError(t, a.receives.Put(rec))
 	require.NoError(t, a.seals.Add(&Seal{
@@ -141,12 +145,12 @@ func TestDepositAssetIdentity_RejectsForeignContractAtSettlement(t *testing.T) {
 	adapter, cleanup := newAssetIdentityTestAdapter(t, mock, bridge, testRegisteredAssetID)
 	defer cleanup()
 
-	rec, err := adapter.DepositFlow(context.Background(), &DepositRequest{
+	rec, err := adapter.DepositFlow(context.Background(), signedDepositRequest(t, &DepositRequest{
 		RequestID:   "req-1",
 		AssetSymbol: "RGB20_USDT",
 		Amount:      1000,
 		Chain33Addr: "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk",
-	})
+	}))
 	require.NoError(t, err)
 
 	// 这笔结算属于**另一个**合约（同 ticker 的伪造合约）。
@@ -178,12 +182,12 @@ func TestDepositAssetIdentity_AcceptsConsignmentForTheRegisteredContract(t *test
 	adapter, cleanup := newAssetIdentityTestAdapter(t, mock, bridge, mockSidecarAssetID)
 	defer cleanup()
 
-	rec, err := adapter.DepositFlow(context.Background(), &DepositRequest{
+	rec, err := adapter.DepositFlow(context.Background(), signedDepositRequest(t, &DepositRequest{
 		RequestID:   "req-1",
 		AssetSymbol: "RGB20_USDT",
 		Amount:      1000,
 		Chain33Addr: "1JnYYeefMhWsXvZyvjCKPZK7eYQdFpzDsk",
-	})
+	}))
 	require.NoError(t, err)
 	settled, err := adapter.ProvideConsignment(context.Background(), []byte("consignment-bytes"), rec.ReceiveID)
 	require.NoError(t, err)

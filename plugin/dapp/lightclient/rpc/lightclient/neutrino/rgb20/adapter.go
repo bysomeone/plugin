@@ -15,8 +15,9 @@ import (
 type Config struct {
 	// SidecarAddr 侧车地址（unix socket 或 tcp host:port）。
 	SidecarAddr string
-	// ConsignmentListen consignment 上传/充值请求 HTTP 监听地址。空则不开 HTTP。
-	ConsignmentListen string
+	// TestListen **仅测试用**监听地址（127.0.0.1:port 或 unix 路径），且必须同时打开
+	// TestSignPsbt；生产留空。它只提供 E2E 的 sign-psbt 端点，桥不对外提供任何 HTTP API。
+	TestListen string
 	// TransportEndpoint 写进充值 invoice 的公网标准 transport endpoint
 	// （如 `rpcs://gw.example.com/0.2/json-rpc`）。空 = invoice 不携带 transports。
 	TransportEndpoint string
@@ -26,6 +27,12 @@ type Config struct {
 	// 与 TransportEndpoint 相互独立：前者是付款方看到的公网字符串，后者是桥自己使用的
 	// 内网地址；两者可以相同，也可以经不同的入口指向同一台网关。
 	TransportGateway string
+	// GatewayToken /bridge/* 接口的 bearer token（充值请求流与 invoice 回写）。
+	// 与 TransportGateway 同时配置才会订阅充值请求；空 = 不订阅（旧的自定义入口已删除）。
+	GatewayToken string
+	// ChainTitle 本链 Title：充值请求的签名消息里包含它，桥在出票前用它验签
+	// （权威校验仍在铸造时的链上执行）。必须与网关的 chain-title 一致。
+	ChainTitle string
 	// ChangeAddress 提现找零地址（TSS P2WPKH 地址）。
 	ChangeAddress string
 	// Contracts 注册的 RGB20 资产合约。
@@ -373,9 +380,21 @@ func (a *Adapter) Start(ctx context.Context) error {
 			}
 			log.Info("rgb20 transportGateway not configured; using the custom consignment upload endpoint only")
 		}
-		if a.cfg.ConsignmentListen != "" {
+		if a.cfg.TransportGateway != "" && a.cfg.GatewayToken != "" && a.cfg.ChainTitle != "" {
 			a.wg.Add(1)
-			go a.serveHTTP(a.cfg.ConsignmentListen)
+			go a.runDepositRequestStream()
+		} else if a.cfg.TransportGateway != "" {
+			log.Warn("rgb20 deposit requests disabled: gatewayToken/chainTitle not configured",
+				"gateway", a.cfg.TransportGateway)
+		}
+		if a.cfg.TestListen != "" {
+			if !a.cfg.TestSignPsbt {
+				// sign-psbt signs arbitrary PSBTs with the TSS group; never serve it implicitly.
+				log.Error("rgb20 testListen ignored: testSignPsbt is disabled")
+			} else {
+				a.wg.Add(1)
+				go a.serveTestHTTP(a.cfg.TestListen)
+			}
 		}
 		log.Info("rgb20 adapter started", "sidecar", a.cfg.SidecarAddr)
 	}()

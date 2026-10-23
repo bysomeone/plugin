@@ -6,10 +6,12 @@ import (
 	"testing"
 
 	"github.com/33cn/chain33/client/mocks"
+	"github.com/33cn/chain33/common/address"
 	"github.com/33cn/chain33/types"
 	"github.com/33cn/chain33/util"
 	ltypes "github.com/33cn/plugin/plugin/dapp/lightclient/lighttypes"
 	paratypes "github.com/33cn/plugin/plugin/dapp/paracross/types"
+	"github.com/33cn/plugin/plugin/dapp/rgbx/depositrequest"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
@@ -190,7 +192,12 @@ func Test_checkDeposit_rgb20_thresholdSig(t *testing.T) {
 	priv, err := btcec.NewPrivateKey()
 	require.NoError(t, err)
 	pub := priv.PubKey().SerializeCompressed()
-	depAddr, _ := util.Genaddress()
+	// The mint's recipient is bound to the user's signed request: derive the address from the
+	// signing key so the request verifies.
+	userPriv, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+	userPub := userPriv.PubKey().SerializeCompressed()
+	depAddr := address.PubKeyToAddr(-1, userPub)
 
 	// 构造有效的 SPV：单交易区块，header.merkleRoot == txid。
 	btcTx := wire.NewMsgTx(wire.TxVersion)
@@ -200,10 +207,24 @@ func Test_checkDeposit_rgb20_thresholdSig(t *testing.T) {
 	txData := buf.Bytes()
 	txid := btcTx.TxHash()
 
+	// User-signed deposit request (required for RGB20 mints).
+	userReq := depositrequest.Request{
+		RequestID:   "req-rgb20-1",
+		Chain33Addr: depAddr,
+		AssetSymbol: rtypes.RGB20USDTSymbol,
+		Amount:      1000,
+		Timestamp:   1_700_000_000,
+	}
+	userSig := ecdsa.Sign(userPriv, depositrequest.MessageHash(testCfg.GetTitle(), userReq)).Serialize()
+
 	dep := &rtypes.DepositAsset{
-		Amount:         1000,
-		DepositAddress: depAddr,
-		AssetSymbol:    rtypes.RGB20USDTSymbol,
+		Amount:           1000,
+		DepositAddress:   depAddr,
+		AssetSymbol:      rtypes.RGB20USDTSymbol,
+		RequestId:        userReq.RequestID,
+		RequestTimestamp: userReq.Timestamp,
+		RequestPubkey:    userPub,
+		RequestSignature: userSig,
 		TxProof: &rtypes.BtcTxProof{
 			TxData:      txData,
 			BlockHeight: 100,
@@ -238,6 +259,21 @@ func Test_checkDeposit_rgb20_thresholdSig(t *testing.T) {
 	value.Deposit = bad
 	tx.Payload = types.Encode(action)
 	require.ErrorIs(t, r.CheckTx(tx, 0), ErrInvalidThresholdSig)
+
+	// 篡改签名请求的内容（时间戳）并**重新签** thresholdSig：模拟一个控制协调者的攻击者
+	// （TSS 门禁过得去），用户签名仍然对不上 → 请求校验必须拒绝。
+	badReq := proto.Clone(dep).(*rtypes.DepositAsset)
+	badReq.RequestTimestamp++
+	badReq.ThresholdSig = ecdsa.Sign(priv, computeDepositSignMessage(badReq)).Serialize()
+	value.Deposit = badReq
+	tx.Payload = types.Encode(action)
+	require.ErrorIs(t, r.CheckTx(tx, 0), ErrInvalidDepositRequest)
+
+	// 重放：requestId 已用过。
+	require.NoError(t, state.Set(formatDepositRequestUsedKey(userReq.RequestID), []byte("used")))
+	value.Deposit = dep
+	tx.Payload = types.Encode(action)
+	require.ErrorIs(t, r.CheckTx(tx, 0), ErrDepositRequestReplay)
 }
 
 // Test_execCommitDKG_rgb20_pubkey Exec_CommitDKG 存 pubkey，形成 CrossChainInfo。
