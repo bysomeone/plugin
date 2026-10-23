@@ -201,6 +201,13 @@ func (n *neutrinoClient) tryUnlockWithdraw(p *rtypes.PendingTx) error {
 		// authority; re-signing the same message every cycle cannot change it.
 		log.Info("unlock: chain already holds a terminal state for this withdraw, stop resubmitting",
 			"txHash", hex.EncodeToString(msg.GetBurnTxHash()))
+	} else {
+		n.rgb20.RecordEvent("withdraw.unlocked", hex.EncodeToString(msg.GetBurnTxHash()), map[string]any{
+			"chain33_tx_hash": hex.EncodeToString(msg.GetBurnTxHash()),
+			"asset_symbol":    msg.GetAssetSymbol(),
+			"amount":          msg.GetAmount(),
+			"owner":           msg.GetOwner(),
+		})
 	}
 
 	// Deliberately not a terminal marker: settled/released on chain is the only terminal truth.

@@ -60,6 +60,12 @@ func (a *Adapter) deliverWithdrawConsignmentAsync(withdrawHash, consignment []by
 			// consignment still has to leave the bridge somehow.
 			log.Error("rgb20 withdraw delivery: parse invoice failed, falling back to consignmentPublish",
 				"withdrawHash", hex.EncodeToString(withdrawHash), "err", err)
+			a.RecordEvent("withdraw.consignment", hex.EncodeToString(withdrawHash), map[string]any{
+				"chain33_tx_hash": hex.EncodeToString(withdrawHash),
+				"btc_txid":        txid,
+				"channel":         "publish",
+				"reason":          "invoice parse failed: " + err.Error(),
+			})
 			a.publishConsignmentAsync(withdrawHash, consignment)
 			return
 		}
@@ -67,6 +73,13 @@ func (a *Adapter) deliverWithdrawConsignmentAsync(withdrawHash, consignment []by
 		recipientID := parsed.GetRecipientId()
 		vout := sealOutpointVout(recipientSealOutpoint)
 		if len(endpoints) > 0 && recipientID != "" {
+			a.RecordEvent("withdraw.consignment", hex.EncodeToString(withdrawHash), map[string]any{
+				"chain33_tx_hash": hex.EncodeToString(withdrawHash),
+				"btc_txid":        txid,
+				"recipient_id":    recipientID,
+				"channel":         "transport",
+				"endpoint_count":  len(endpoints),
+			})
 			deliverWithdrawWithRetry(a.ctx, endpoints, recipientID, txid, vout,
 				consignment, consignmentPublishRetryBase, maxConsignmentPublishRetryInterval,
 				defaultWithdrawAckWait, defaultWithdrawAckPoll)
@@ -78,6 +91,12 @@ func (a *Adapter) deliverWithdrawConsignmentAsync(withdrawHash, consignment []by
 		if gatewayEndpoint, ok := NormalizeTransportEndpoint(a.cfg.TransportGateway); ok && recipientID != "" {
 			log.Info("rgb20 withdraw delivery: invoice carries no usable transport; recording on the gateway",
 				"withdrawHash", hex.EncodeToString(withdrawHash), "recipientId", recipientID)
+			a.RecordEvent("withdraw.consignment", hex.EncodeToString(withdrawHash), map[string]any{
+				"chain33_tx_hash": hex.EncodeToString(withdrawHash),
+				"btc_txid":        txid,
+				"recipient_id":    recipientID,
+				"channel":         "gateway",
+			})
 			recordWithdrawConsignmentWithRetry(a.ctx, gatewayEndpoint, recipientID, txid, vout,
 				consignment, consignmentPublishRetryBase, maxConsignmentPublishRetryInterval)
 			return
@@ -85,6 +104,12 @@ func (a *Adapter) deliverWithdrawConsignmentAsync(withdrawHash, consignment []by
 		log.Info("rgb20 withdraw delivery: no transport and no gateway to record on, falling back to consignmentPublish",
 			"withdrawHash", hex.EncodeToString(withdrawHash),
 			"transports", len(parsed.GetTransports()), "recipientId", recipientID)
+		a.RecordEvent("withdraw.consignment", hex.EncodeToString(withdrawHash), map[string]any{
+			"chain33_tx_hash": hex.EncodeToString(withdrawHash),
+			"btc_txid":        txid,
+			"recipient_id":    recipientID,
+			"channel":         "publish",
+		})
 		a.publishConsignmentAsync(withdrawHash, consignment)
 	}()
 	return true

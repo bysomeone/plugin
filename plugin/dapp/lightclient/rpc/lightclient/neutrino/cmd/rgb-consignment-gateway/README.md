@@ -45,6 +45,26 @@ is still checked. `-chain-title` is required for the deposit API: it is part of 
 and must equal the bridge's chain title, which is also the rgbx executor's
 `guardianParachainTitle` (the parachain title, not the title of the chain hosting the contract).
 
+## Bridge event ledger
+
+The bridge posts audit facts the chain does not carry directly (withdrawal-to-consignment
+mapping, BTC miner fees the bridge paid, sweep funding) to an append-only ledger. The gateway
+mirrors them; it is not the authoritative ledger and never feeds them back into protocol
+decisions.
+
+| Endpoint | Auth | Behaviour |
+| --- | --- | --- |
+| `POST /bridge/events` | bearer | Accepts `{id, type, payload}`. `id` is the bridge's idempotency key: posting the same id again returns the stored sequence and does not create a second row. `payload` must be a JSON object. |
+| `GET /bridge/events?cursor=N&limit=M` (also `/bridge/events/query`) | bearer | Returns `{events, next_cursor, has_more}` with events whose `seq` is greater than `cursor`, oldest first. `limit` defaults to 200 and is capped at 1000. |
+
+Accepted event types: `deposit.settled`, `deposit.minted`, `deposit.rejected`,
+`withdraw.locked`, `withdraw.broadcast`, `withdraw.consignment`, `withdraw.settled`,
+`withdraw.unlocked`, `withdraw.bumped`, `sweep.completed`, `treasury.snapshot`.
+
+Events are stored in `<data-dir>/bridge-events/events.jsonl` and retained for
+`--events-retention` (default 90 days). Pruning rewrites the file atomically; sequence numbers
+are never reused, so a statistics backend's cursor stays valid across pruning.
+
 Protocol errors use the JSON-RPC error object and the v0.2 codes:
 
 | Code | Meaning |
@@ -102,14 +122,19 @@ Every option can be set by flag or environment variable. Flags take precedence.
 | `--ttl` | `RGB_GATEWAY_TTL` | `168h` (7 days) | Consignment retention. Expired entries are removed on startup and periodically afterwards. |
 | `--rate-limit` | `RGB_GATEWAY_RATE_LIMIT` | `60` | Requests per client IP per minute. `0` disables limiting. |
 | `--trust-proxy` | `RGB_GATEWAY_TRUST_PROXY` | `false` | Take the client IP from `X-Forwarded-For`/`X-Real-IP`. Enable only when a trusted reverse proxy sets these headers. |
+| `--chain-title` | `RGB_GATEWAY_CHAIN_TITLE` | empty | Chain title signed into deposit requests. Empty disables the deposit and bridge APIs. |
+| `--bridge-token` | `RGB_GATEWAY_BRIDGE_TOKEN` | empty | Bearer token for `/bridge/*`. Must be at least 16 characters and configured together with `--chain-title`. |
+| `--tls-cert` / `--tls-key` | `RGB_GATEWAY_TLS_CERT` / `RGB_GATEWAY_TLS_KEY` | empty | Serve TLS directly. Empty serves plain HTTP (put it behind a TLS-terminating proxy instead). |
+| `--client-ca` | `RGB_GATEWAY_CLIENT_CA` | empty | CA bundle for client certificates. When set, `/bridge/*` requires mTLS in addition to the token. Requires `--tls-cert`. |
+| `--events-retention` | `RGB_GATEWAY_EVENTS_RETENTION` | `2160h` (90 days) | How long bridge ledger events are kept. |
 
 Durations use Go syntax (`168h`, `30m`); sizes are plain bytes.
 
 ## Deployment
 
-TLS is not implemented by the gateway. Terminate TLS in a reverse proxy (nginx,
-Caddy, HAProxy) that forwards to the configured loopback address, and publish
-only the HTTPS listener. Example nginx location:
+The gateway can terminate TLS itself (`--tls-cert` / `--tls-key`), or run behind a reverse proxy
+(nginx, Caddy, HAProxy) that forwards to the configured loopback address. Publish only the HTTPS
+listener. Example nginx location:
 
 ```nginx
 location /0.2/json-rpc {

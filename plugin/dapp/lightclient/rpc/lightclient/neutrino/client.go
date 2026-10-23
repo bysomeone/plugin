@@ -201,6 +201,11 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 			Token:          n.cfg.Rgb20.ConsignmentPublish.Token,
 			TimeoutSeconds: n.cfg.Rgb20.ConsignmentPublish.TimeoutSeconds,
 		},
+		Safety: rgb20.SafetyConfig{
+			DisableDeposits:        n.cfg.Rgb20.Safety.DisableDeposits,
+			DisableWithdrawals:     n.cfg.Rgb20.Safety.DisableWithdrawals,
+			MaxPayoutMismatchBurns: n.cfg.Rgb20.Safety.MaxPayoutMismatchBurns,
+		},
 	}
 	for _, c := range n.cfg.Rgb20.Contracts {
 		rgbCfg.Contracts = append(rgbCfg.Contracts, rgb20.Contract{

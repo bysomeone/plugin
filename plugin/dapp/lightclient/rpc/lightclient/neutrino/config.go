@@ -138,6 +138,21 @@ type rgb20Config struct {
 	TestSignPsbt bool `json:"testSignPsbt"`
 	// ConsignmentPublish 提现 consignment 的外部交付配置。url 为空时只本地保存（WARN）。
 	ConsignmentPublish consignmentPublishConfig `json:"consignmentPublish"`
+	// Safety 节点本地（不参与共识）的安全开关：急停与自动熔断。链上治理管的是全局
+	// 限额与暂停；这里管"本节点是否继续接新活"，无需治理即可生效。
+	Safety rgb20SafetyConfig `json:"safety"`
+}
+
+// rgb20SafetyConfig is the node-local kill switch surface (not consensus state).
+type rgb20SafetyConfig struct {
+	// DisableDeposits stops signing/submitting new mints on this node.
+	DisableDeposits bool `json:"disableDeposits"`
+	// DisableWithdrawals stops starting new withdrawal settlements on this node.
+	// Broadcast withdrawals are still confirmed.
+	DisableWithdrawals bool `json:"disableWithdrawals"`
+	// MaxPayoutMismatchBurns trips the automatic withdrawal breaker after this many distinct
+	// burns were refused for a payout mismatch. 0 = default (3); negative disables it.
+	MaxPayoutMismatchBurns int `json:"maxPayoutMismatchBurns"`
 }
 
 // consignmentPublishConfig consignment 外部交付：POST 原始字节到外部服务。

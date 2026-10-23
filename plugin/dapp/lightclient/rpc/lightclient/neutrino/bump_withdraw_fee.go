@@ -334,6 +334,7 @@ type bumpWithdrawFeeHandlerDeps struct {
 	getAppliedRate   func([]byte) (btcutil.Amount, bool)
 	loadInputAmounts func([]byte) ([]int64, bool)
 	process          func(*withdrawRequest) error
+	recordEvent      func(kind, key string, payload map[string]any)
 }
 
 type bumpWithdrawFeeHandler struct {
@@ -433,6 +434,17 @@ func (h *bumpWithdrawFeeHandler) handle(item *rtypes.BumpWithdrawFeeItem) error 
 		"withdrawalTxHash", hex.EncodeToString(burnTxHash),
 		"requestedFeeRate", requested, "effectiveFeeRate", req.bump.effectiveFeeRate,
 		"previousFeeRate", applied, "bumpRequestTxHash", hex.EncodeToString(item.GetTxHash()))
+	if h.deps.recordEvent != nil {
+		h.deps.recordEvent("withdraw.bumped", hex.EncodeToString(burnTxHash), map[string]any{
+			"chain33_tx_hash":    hex.EncodeToString(burnTxHash),
+			"asset_symbol":       pending.GetAssetSymbol(),
+			"amount":             pending.GetAmount(),
+			"previous_fee_rate":  applied,
+			"requested_fee_rate": requested,
+			"effective_fee_rate": req.bump.effectiveFeeRate,
+			"bump_request_tx":    hex.EncodeToString(item.GetTxHash()),
+		})
+	}
 	return nil
 }
 
@@ -453,6 +465,7 @@ func (n *neutrinoClient) newBumpWithdrawFeeHandler() *bumpWithdrawFeeHandler {
 		getAppliedRate:   n.getAppliedWithdrawFeeRate,
 		loadInputAmounts: n.loadSignedWithdrawInputAmounts,
 		process:          n.processWithdrawRequest,
+		recordEvent:      n.rgb20.RecordEvent,
 	}}
 }
 

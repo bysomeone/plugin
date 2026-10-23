@@ -1933,6 +1933,36 @@ function scenario_rgbx_manual_abandon_withdraw() {
 # 入口（testcase.sh 调用）
 # =====================================================================
 
+# 网关事件账本（#81）：桥把链上拿不到的审计事实投递到网关，网关按游标提供读取。
+# 这里断言"关键生命周期的事件确实到达了网关"，而不是逐字段核对（字段形状由 Go 单测钉住）。
+# 事件投递是异步的（本地 outbox → 后台投递 → 网关确认），所以这里做有界等待。
+function scenario_bridge_event_ledger() {
+    log_step "scenario: bridge event ledger receives deposit/withdraw audit events"
+    local token="${RGB20_GATEWAY_TOKEN:-e2e-bridge-token-0123456789abcd}"
+    local url="http://127.0.0.1:${RGB20_GATEWAY_PORT}/bridge/events/query?limit=1000"
+    local types=""
+    local i
+    for ((i = 0; i < 30; i++)); do
+        types=$(curl -sf -H "Authorization: Bearer ${token}" "${url}" |
+            jq -r '.events[].type' 2>/dev/null || true)
+        if echo "${types}" | grep -qx "deposit.minted" &&
+            echo "${types}" | grep -qx "withdraw.broadcast" &&
+            echo "${types}" | grep -qx "withdraw.locked"; then
+            break
+        fi
+        sleep 1
+    done
+    for want in deposit.settled deposit.minted withdraw.locked withdraw.broadcast; do
+        echo "${types}" | grep -qx "${want}" ||
+            fail "bridge event ledger is missing ${want}; got: $(echo ${types} | tr '\n' ' ')"
+    done
+    # 账本必须只含允许的事件类型 —— 出现控制面/畸形事件说明桥发了不该发的东西。
+    local bad
+    bad=$(echo "${types}" | grep -vE '^(deposit|withdraw|sweep|treasury)\.' || true)
+    assert_eq "${bad}" "" "unexpected event types in the bridge ledger: ${bad}"
+    log_step "PASS: bridge event ledger: $(echo ${types} | sort -u | tr '\n' ' ')"
+}
+
 function run_rgb20_all() {
     run_rgb20_env
     # #78 紧跟 env：桥（官方节点）刚就绪、btcd 的 segwit 已激活，充值地址绑定 + 充值铸币
@@ -1946,6 +1976,9 @@ function run_rgb20_all() {
     scenario_rgb20_withdraw
     scenario_rgb20_two_withdrawals
     scenario_rgb20_truncation_withdraw
+    # 事件账本紧跟前面的入金/出金场景：此时 deposit.*、withdraw.locked/broadcast 都已发生，
+    # 投递是异步的，场景内部有界等待。
+    scenario_bridge_event_ledger
     run_rgb20_sidecar_smoke
     # #70 unlock: rebuilds the sidecar ledger (then restores it) to construct a permanently
     # rejected withdrawal. It must run before the fee-mismatch case: that case intentionally

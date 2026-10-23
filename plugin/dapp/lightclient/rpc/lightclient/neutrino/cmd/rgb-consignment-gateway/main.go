@@ -23,12 +23,13 @@ import (
 )
 
 const (
-	defaultListen    = "127.0.0.1:8080"
-	defaultDataDir   = "rgb-consignment-data"
-	defaultPath      = "/0.2/json-rpc"
-	defaultMaxSize   = 16 << 20
-	defaultTTL       = 7 * 24 * time.Hour
-	defaultRateLimit = 60
+	defaultListen          = "127.0.0.1:8080"
+	defaultDataDir         = "rgb-consignment-data"
+	defaultPath            = "/0.2/json-rpc"
+	defaultMaxSize         = 16 << 20
+	defaultTTL             = 7 * 24 * time.Hour
+	defaultRateLimit       = 60
+	defaultEventsRetention = 90 * 24 * time.Hour
 
 	// maxConfiguredSize keeps the multipart body limit free of overflow.
 	maxConfiguredSize = 1 << 40
@@ -52,18 +53,19 @@ func main() {
 
 func parseConfig(args []string, getenv func(string) string) (config, error) {
 	cfg := config{
-		listen:      envString(getenv, "RGB_GATEWAY_LISTEN", defaultListen),
-		dataDir:     envString(getenv, "RGB_GATEWAY_DATA_DIR", defaultDataDir),
-		path:        envString(getenv, "RGB_GATEWAY_PATH", defaultPath),
-		maxSize:     defaultMaxSize,
-		ttl:         defaultTTL,
-		rateLimit:   defaultRateLimit,
-		trustProxy:  false,
-		chainTitle:  envString(getenv, "RGB_GATEWAY_CHAIN_TITLE", ""),
-		bridgeToken: envString(getenv, "RGB_GATEWAY_BRIDGE_TOKEN", ""),
-		tlsCert:     envString(getenv, "RGB_GATEWAY_TLS_CERT", ""),
-		tlsKey:      envString(getenv, "RGB_GATEWAY_TLS_KEY", ""),
-		clientCA:    envString(getenv, "RGB_GATEWAY_CLIENT_CA", ""),
+		listen:          envString(getenv, "RGB_GATEWAY_LISTEN", defaultListen),
+		dataDir:         envString(getenv, "RGB_GATEWAY_DATA_DIR", defaultDataDir),
+		path:            envString(getenv, "RGB_GATEWAY_PATH", defaultPath),
+		maxSize:         defaultMaxSize,
+		ttl:             defaultTTL,
+		rateLimit:       defaultRateLimit,
+		trustProxy:      false,
+		chainTitle:      envString(getenv, "RGB_GATEWAY_CHAIN_TITLE", ""),
+		bridgeToken:     envString(getenv, "RGB_GATEWAY_BRIDGE_TOKEN", ""),
+		tlsCert:         envString(getenv, "RGB_GATEWAY_TLS_CERT", ""),
+		tlsKey:          envString(getenv, "RGB_GATEWAY_TLS_KEY", ""),
+		clientCA:        envString(getenv, "RGB_GATEWAY_CLIENT_CA", ""),
+		eventsRetention: defaultEventsRetention,
 	}
 	var err error
 	if cfg.maxSize, err = envInt64(getenv, "RGB_GATEWAY_MAX_SIZE", cfg.maxSize); err != nil {
@@ -76,6 +78,9 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 		return config{}, err
 	}
 	if cfg.trustProxy, err = envBool(getenv, "RGB_GATEWAY_TRUST_PROXY", cfg.trustProxy); err != nil {
+		return config{}, err
+	}
+	if cfg.eventsRetention, err = envDuration(getenv, "RGB_GATEWAY_EVENTS_RETENTION", cfg.eventsRetention); err != nil {
 		return config{}, err
 	}
 
@@ -95,6 +100,8 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 	fs.StringVar(&cfg.tlsKey, "tls-key", cfg.tlsKey, "TLS private key file")
 	fs.StringVar(&cfg.clientCA, "client-ca", cfg.clientCA,
 		"CA bundle that must have signed the bridge client certificate (enables mTLS)")
+	fs.DurationVar(&cfg.eventsRetention, "events-retention", cfg.eventsRetention,
+		"how long bridge events are retained")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}
@@ -122,6 +129,9 @@ func (c config) validate() error {
 	}
 	if c.ttl <= 0 {
 		return errors.New("ttl must be positive")
+	}
+	if c.eventsRetention <= 0 {
+		return errors.New("events-retention must be positive")
 	}
 	if c.rateLimit < 0 {
 		return errors.New("rate-limit must not be negative")
@@ -201,6 +211,7 @@ func run(cfg config, logger *log.Logger) error {
 	if cfg.chainTitle != "" {
 		logger.Printf("deposit API enabled chain-title=%q bridge-auth=%s mTLS=%t",
 			cfg.chainTitle, authMode(cfg), cfg.clientCA != "")
+		logger.Printf("bridge event ledger enabled retention=%s", cfg.eventsRetention)
 	} else {
 		logger.Printf("deposit API disabled (chain-title/bridge-token not configured)")
 	}
@@ -219,6 +230,9 @@ func run(cfg config, logger *log.Logger) error {
 	logger.Printf("shutting down")
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
+	}
+	if err := g.events.close(); err != nil {
+		logger.Printf("close bridge event ledger: %v", err)
 	}
 	return nil
 }
@@ -242,6 +256,11 @@ func (g *gateway) cleanupLoop(ctx context.Context) {
 				g.logger.Printf("deposit cleanup: %v", err)
 			} else if n > 0 {
 				g.logger.Printf("cleanup removed %d expired deposit requests", n)
+			}
+			if n, err := g.events.prune(time.Now()); err != nil {
+				g.logger.Printf("bridge event cleanup: %v", err)
+			} else if n > 0 {
+				g.logger.Printf("cleanup removed %d expired bridge events", n)
 			}
 			g.limiter.sweep()
 		}

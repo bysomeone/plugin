@@ -269,6 +269,12 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 	a.withdrawMu.Lock()
 	defer a.withdrawMu.Unlock()
 
+	if a.cfg.Safety.DisableWithdrawals {
+		return nil, fmt.Errorf("withdrawals are disabled by the local safety configuration")
+	}
+	if reason := a.breaker.tripReason(); reason != "" {
+		return nil, fmt.Errorf("withdrawals halted by the local circuit breaker: %s", reason)
+	}
 	if a.sidecar.Load() == nil {
 		return nil, fmt.Errorf("sidecar not started")
 	}
@@ -307,6 +313,18 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 	if err != nil {
 		return nil, err
 	}
+	withdrawFee := a.WithdrawFeeFor(req.AssetSymbol)
+	// Audit: the chain moved the pending amount into the lock address when the user submitted
+	// the withdraw. Recorded before any build/sign so the ledger shows the subject even if the
+	// withdrawal is later refused and unlocked.
+	a.RecordEvent("withdraw.locked", hex.EncodeToString(req.Chain33TxHash), map[string]any{
+		"chain33_tx_hash": hex.EncodeToString(req.Chain33TxHash),
+		"asset_symbol":    req.AssetSymbol,
+		"amount":          req.Amount,
+		"fee":             withdrawFee,
+		"expected_payout": expectedPayout,
+		"fee_rate":        req.FeeRate,
+	})
 
 	// E9-A：已有 sticky 记录时把它作为 input_seals 下发，侧车按这组 seal **重放**上一次的构建
 	// （同一份未签 PSBT、同一 txid）。没有它的话，重试会按当前账本（原 seal 已 consumed、找零 seal
@@ -350,6 +368,14 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 		// （retryRgb20Withdraw 的短路按落盘状态走）。而重试的代价很小 —— 只是重新构建一次 PSBT，
 		// 既不签名也不广播（拒绝点在校验之后、SignPsbt 之前）。用户资产的去向见
 		// WithdrawPayoutMismatchError 的注释（已锁定，等解锁路径）。
+		var mismatch *WithdrawPayoutMismatchError
+		if errors.As(err, &mismatch) &&
+			a.breaker.recordMismatch(hex.EncodeToString(req.Chain33TxHash)) {
+			log.Error("ALERT withdrawal circuit breaker tripped: several distinct withdrawals "+
+				"were refused for a payout mismatch; this node stops signing new withdrawals "+
+				"until it is restarted and the cause is fixed",
+				"threshold", a.cfg.Safety.MaxPayoutMismatchBurns)
+		}
 		return nil, fmt.Errorf("validate withdrawal: %w", err)
 	}
 	// sticky-seal：持久化该笔提现绑定的 seal（重试时不可改选；已有记录必须一致，绝不覆盖）。
@@ -427,6 +453,18 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 	if err := a.bridge.BroadcastTx(signedPsbt, fin.Txid); err != nil {
 		return nil, fmt.Errorf("broadcast: %w", err)
 	}
+
+	a.RecordEvent("withdraw.broadcast", hex.EncodeToString(req.Chain33TxHash), map[string]any{
+		"chain33_tx_hash": hex.EncodeToString(req.Chain33TxHash),
+		"asset_symbol":    req.AssetSymbol,
+		"amount":          req.Amount,
+		"fee":             withdrawFee,
+		"expected_payout": expectedPayout,
+		"fee_rate":        req.FeeRate,
+		"btc_txid":        fin.Txid,
+		"recipient_seal":  fin.RecipientSealOutpoint,
+		"change_seal":     fin.ChangeSealOutpoint,
+	})
 
 	return &WithdrawResult{
 		Psbt:          rsp.Psbt,

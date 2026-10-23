@@ -217,6 +217,15 @@ func (a *Adapter) onSettledTransfer(t *pb.TransferState) error {
 		if err != nil {
 			return err
 		}
+		a.RecordEvent("deposit.settled", t.ReceiveId, map[string]any{
+			"receive_id":   rec.ReceiveID,
+			"request_id":   rec.RequestID,
+			"chain33_addr": rec.Chain33Addr,
+			"asset_symbol": rec.AssetSymbol,
+			"amount":       rec.Amount,
+			"btc_txid":     rec.Txid,
+			"vout":         rec.Vout,
+		})
 	}
 	// 触发充值提交（SPV + TSS 签 deposit + 提交；已有落盘签名产物则只重发）。失败返回 error，
 	// 由 pollTransfersOnce 记录，下轮轮询继续重试（rec.Status 已是 settled，走上面的重试分支）。
@@ -243,6 +252,13 @@ func (a *Adapter) onSettledTransfer(t *pb.TransferState) error {
 func (a *Adapter) submitDeposit(rec *ReceiveRecord) error {
 	if rec == nil {
 		return fmt.Errorf("nil receive record")
+	}
+	if a.cfg.Safety.DisableDeposits {
+		if a.depositNotes.allow("local-disabled:" + rec.ReceiveID) {
+			log.Warn("submitDeposit skipped: deposits are disabled by the local safety configuration",
+				"receiveId", rec.ReceiveID)
+		}
+		return errDepositsDisabled
 	}
 	if len(rec.Consignment) == 0 {
 		return fmt.Errorf("consignment not provided for receive %s", rec.ReceiveID)
@@ -369,12 +385,21 @@ func (a *Adapter) submitSignedDeposit(rec *ReceiveRecord, art *SignedDepositArti
 				"receiveId", rec.ReceiveID, "txid", rec.Txid, "err", err)
 			return a.markDepositMinted(rec)
 		}
+		// Audit note: the chain refused this mint. The event id is keyed by receive id, so a
+		// retry that fails the same way does not add duplicates.
+		a.RecordEvent("deposit.rejected", rec.ReceiveID, map[string]any{
+			"receive_id":   rec.ReceiveID,
+			"request_id":   rec.RequestID,
+			"chain33_addr": rec.Chain33Addr,
+			"asset_symbol": rec.AssetSymbol,
+			"amount":       rec.Amount,
+			"btc_txid":     rec.Txid,
+			"reason":       err.Error(),
+		})
 		return fmt.Errorf("submit deposit: %w", err)
 	}
 	return a.markDepositMinted(rec)
-}
-
-// depositAlreadyConsumedMarker 链上"这笔付款交易已被用于铸造"的判据：rgbx 执行器按 btc-txid 去重
+} // depositAlreadyConsumedMarker 链上"这笔付款交易已被用于铸造"的判据：rgbx 执行器按 btc-txid 去重
 // （checkDeposit 查 formatDepositUsedTxIDKey，返回 ErrDuplicateDepositProof = "duplicate deposit proof"）。
 // 与 neutrino 侧提现重试按 "already confirmed" 子串把重复提交当幂等成功是同一做法（同仓既有约定）。
 const depositAlreadyConsumedMarker = "duplicate deposit proof"
@@ -396,6 +421,15 @@ func (a *Adapter) markDepositMinted(rec *ReceiveRecord) error {
 		log.Error("markDepositMinted delete signed deposit artifact", "receiveId", rec.ReceiveID,
 			"txid", rec.Txid, "err", err)
 	}
+	a.RecordEvent("deposit.minted", rec.ReceiveID, map[string]any{
+		"receive_id":   rec.ReceiveID,
+		"request_id":   rec.RequestID,
+		"chain33_addr": rec.Chain33Addr,
+		"asset_symbol": rec.AssetSymbol,
+		"amount":       rec.Amount,
+		"btc_txid":     rec.Txid,
+		"vout":         rec.Vout,
+	})
 	return nil
 }
 
@@ -405,10 +439,14 @@ var errDepositDepthPending = errors.New("deposit awaiting on-chain btc confirmat
 // errDepositGateUnavailable 门控算不出来（取不到 best / 读不到链上 N）——fail-closed，同样不提交。
 var errDepositGateUnavailable = errors.New("deposit depth gate unavailable")
 
+// errDepositsDisabled 节点本地急停：不签名、不提交新的铸造（已落盘的签名产物保留，解除后重发）。
+var errDepositsDisabled = errors.New("deposits disabled by the local safety configuration")
+
 // isDepositRetryNote 判断错误是不是"已知的等待状态"（submitDeposit 已自行限流记录，调用方别再刷屏）。
 func isDepositRetryNote(err error) bool {
 	return errors.Is(err, errDepositDepthPending) ||
-		errors.Is(err, errDepositGateUnavailable)
+		errors.Is(err, errDepositGateUnavailable) ||
+		errors.Is(err, errDepositsDisabled)
 }
 
 // --- 充值合约身份（#58）：settled/validated 的 asset_id 必须等于配置里该 symbol 声明的合约 ---
