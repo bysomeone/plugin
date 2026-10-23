@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestNormalizeTransportEndpoint(t *testing.T) {
@@ -161,6 +162,43 @@ func TestAckGet(t *testing.T) {
 			t.Fatalf("AckGet = (%v, %v), want (nil, nil)", ack, err)
 		}
 	})
+}
+
+func TestRecordWithdrawConsignmentPostsToGateway(t *testing.T) {
+	var gotRecipient, gotTxID string
+	var gotFile []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			t.Errorf("parse multipart: %v", err)
+			http.Error(w, "bad multipart", http.StatusBadRequest)
+			return
+		}
+		var params struct {
+			RecipientID string `json:"recipient_id"`
+			TxID        string `json:"txid"`
+		}
+		_ = json.Unmarshal([]byte(r.FormValue("params")), &params)
+		gotRecipient, gotTxID = params.RecipientID, params.TxID
+		f, _, err := r.FormFile("file")
+		if err == nil {
+			gotFile, _ = io.ReadAll(f)
+			_ = f.Close()
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":true}`))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	recordWithdrawConsignmentWithRetry(ctx, ts.URL, "bcrt:bcrt1qtest", testTxID, nil,
+		[]byte("withdraw-bytes"), time.Millisecond, time.Millisecond)
+
+	if gotRecipient != "bcrt:bcrt1qtest" || gotTxID != testTxID {
+		t.Fatalf("params = (%q, %q)", gotRecipient, gotTxID)
+	}
+	if string(gotFile) != "withdraw-bytes" {
+		t.Fatalf("file = %q", gotFile)
+	}
 }
 
 func TestPostConsignmentToAnyEndpointFallsThrough(t *testing.T) {

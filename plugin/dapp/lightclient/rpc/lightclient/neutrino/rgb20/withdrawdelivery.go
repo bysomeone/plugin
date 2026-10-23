@@ -65,16 +65,27 @@ func (a *Adapter) deliverWithdrawConsignmentAsync(withdrawHash, consignment []by
 		}
 		endpoints := withdrawTransportEndpoints(parsed.GetTransports())
 		recipientID := parsed.GetRecipientId()
-		if len(endpoints) == 0 || recipientID == "" {
-			log.Info("rgb20 withdraw delivery: invoice carries no usable transport, falling back to consignmentPublish",
-				"withdrawHash", hex.EncodeToString(withdrawHash),
-				"transports", len(parsed.GetTransports()), "recipientId", recipientID)
-			a.publishConsignmentAsync(withdrawHash, consignment)
+		vout := sealOutpointVout(recipientSealOutpoint)
+		if len(endpoints) > 0 && recipientID != "" {
+			deliverWithdrawWithRetry(a.ctx, endpoints, recipientID, txid, vout,
+				consignment, consignmentPublishRetryBase, maxConsignmentPublishRetryInterval,
+				defaultWithdrawAckWait, defaultWithdrawAckPoll)
 			return
 		}
-		deliverWithdrawWithRetry(a.ctx, endpoints, recipientID, txid, sealOutpointVout(recipientSealOutpoint),
-			consignment, consignmentPublishRetryBase, maxConsignmentPublishRetryInterval,
-			defaultWithdrawAckWait, defaultWithdrawAckPoll)
+		// No usable user transport: standard wallets cannot import a raw consignment, so there is
+		// no user-facing delivery to make. Record it on our gateway instead (content-addressed,
+		// retrievable by recipient_id) so it is not only in this node's local store.
+		if gatewayEndpoint, ok := NormalizeTransportEndpoint(a.cfg.TransportGateway); ok && recipientID != "" {
+			log.Info("rgb20 withdraw delivery: invoice carries no usable transport; recording on the gateway",
+				"withdrawHash", hex.EncodeToString(withdrawHash), "recipientId", recipientID)
+			recordWithdrawConsignmentWithRetry(a.ctx, gatewayEndpoint, recipientID, txid, vout,
+				consignment, consignmentPublishRetryBase, maxConsignmentPublishRetryInterval)
+			return
+		}
+		log.Info("rgb20 withdraw delivery: no transport and no gateway to record on, falling back to consignmentPublish",
+			"withdrawHash", hex.EncodeToString(withdrawHash),
+			"transports", len(parsed.GetTransports()), "recipientId", recipientID)
+		a.publishConsignmentAsync(withdrawHash, consignment)
 	}()
 	return true
 }
@@ -156,6 +167,52 @@ func deliverWithdrawWithRetry(ctx context.Context, endpoints []string, recipient
 			timer.Stop()
 			log.Warn("rgb20 withdraw delivery stopped",
 				"recipientId", recipientID, "txid", txid, "attempts", attempt, "err", err)
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// recordWithdrawConsignmentWithRetry stores the consignment on our gateway under the recipient id
+// (no ACK: the gateway is a record, not the payee). Retries until it is stored or the adapter
+// stops; a failure never blocks the withdrawal.
+func recordWithdrawConsignmentWithRetry(ctx context.Context, endpoint, recipientID, txid string,
+	vout *uint32, consignment []byte, base, max time.Duration) {
+
+	if base <= 0 {
+		base = consignmentPublishRetryBase
+	}
+	if max < base {
+		max = base
+	}
+	for attempt := 1; ; attempt++ {
+		client, err := NewTransportClient(endpoint, nil)
+		if err == nil {
+			if _, err = client.ConsignmentPost(ctx, recipientID, txid, vout, consignment); err == nil {
+				log.Info("rgb20 withdraw consignment recorded on the gateway",
+					"endpoint", endpoint, "recipientId", recipientID, "txid", txid,
+					"bytes", len(consignment), "attempts", attempt)
+				return
+			}
+		}
+		if ctx.Err() != nil {
+			log.Warn("rgb20 withdraw consignment recording stopped",
+				"recipientId", recipientID, "txid", txid, "attempts", attempt, "err", err)
+			return
+		}
+		if !IsRetryableTransportError(err) {
+			log.Error("rgb20 withdraw consignment recording refused; not retrying",
+				"recipientId", recipientID, "txid", txid, "attempts", attempt, "err", err)
+			return
+		}
+		interval := consignmentRetryInterval(base, max, attempt)
+		log.Warn("rgb20 withdraw consignment recording failed; retrying",
+			"recipientId", recipientID, "txid", txid, "attempt", attempt,
+			"retryIn", interval, "err", err)
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
 			return
 		case <-timer.C:
 		}
