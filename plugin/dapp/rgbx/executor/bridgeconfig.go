@@ -40,6 +40,10 @@ const (
 	// where apply id is the hex form of the apply transaction hash.
 	bridgeConfigApplyKeyPrefix = KeyPrefixStateDB + "bridge-config-apply-"
 
+	// bridgeConfigPendingKeyPrefix prefixes a scheduled (timelocked) loosening. One slot per
+	// record: a newer approval replaces it; a tightening approval cancels it.
+	bridgeConfigPendingKeyPrefix = KeyPrefixStateDB + "bridge-config-pending-"
+
 	// bridgeWindowKeyPrefix prefixes the rolling window counters used by the numeric limits.
 	bridgeWindowKeyPrefix = KeyPrefixStateDB + "bridge-window-"
 
@@ -52,6 +56,13 @@ const (
 	// transfer plus its BTC anchor is a few hundred vB; 2000 vB keeps the derived cap
 	// meaningful while still bounding what a single governance proposal can introduce.
 	maxRgb20WithdrawFeeLockVbytes = uint32(2000)
+
+	// bridgeConfigTimelockBlocks delays changes that loosen the bridge's protections
+	// (unpausing, raising a limit, lowering a fee). Tightening changes apply as soon as the
+	// governance approval lands. At the assumed 6s block interval this is 24 hours: enough
+	// for users and operators to see a loosening proposal before it can take effect, while a
+	// protective change is never delayed.
+	bridgeConfigTimelockBlocks = int64(14400)
 )
 
 // bridgeConfigMaskedFields maps a field-mask name to its copy operation. The same table
@@ -152,6 +163,26 @@ func formatBridgeConfigApplyKey(id string) []byte {
 	return []byte(bridgeConfigApplyKeyPrefix + strings.ToLower(id))
 }
 
+// bridgePendingConfig is the executor-private record of a governance change that loosens a
+// protection and therefore waits for bridgeConfigTimelockBlocks. It is never part of the wire
+// contract. Until ActivationHeight the previously effective config stays in force.
+type bridgePendingConfig struct {
+	Snapshot         []byte `protobuf:"bytes,1,opt,name=snapshot,proto3"`
+	ActivationHeight int64  `protobuf:"varint,2,opt,name=activationHeight,proto3"`
+	ApplyID          string `protobuf:"bytes,3,opt,name=applyId,proto3"`
+}
+
+func (m *bridgePendingConfig) Reset()         { *m = bridgePendingConfig{} }
+func (m *bridgePendingConfig) String() string { return proto.CompactTextString(m) }
+func (*bridgePendingConfig) ProtoMessage()    {}
+
+func formatBridgeConfigPendingKey(symbol string) []byte {
+	if symbol == "" {
+		return []byte(bridgeConfigPendingKeyPrefix + bridgeConfigGlobalSuffix)
+	}
+	return []byte(bridgeConfigPendingKeyPrefix + formatSymbol(symbol))
+}
+
 // formatBridgeWindowKey indexes one hourly counter bucket for (symbol, direction).
 func formatBridgeWindowKey(symbol string, kind bridgeWindowKind, bucket int64) []byte {
 	return []byte(fmt.Sprintf("%s%s-%c-%020d", bridgeWindowKeyPrefix, formatSymbol(symbol), byte(kind), bucket))
@@ -166,8 +197,34 @@ func bridgeWindowBucket(height int64) int64 {
 }
 
 // loadBridgeConfig reads an effective config record. A missing record is reported as
-// (nil, nil): "not configured" means "no restriction", not an error.
+// (nil, nil): "not configured" means "no restriction", not an error. A scheduled loosening
+// replaces the stored record once its activation height has been reached.
 func (r *rgbx) loadBridgeConfig(symbol string) (*rtypes.BridgeConfigApply, error) {
+	cfg, err := r.loadBridgeConfigRecord(symbol)
+	if err != nil {
+		return nil, err
+	}
+	if r.GetStateDB() == nil {
+		return cfg, nil
+	}
+	pending, err := r.loadBridgePendingConfig(symbol)
+	if err != nil {
+		return nil, err
+	}
+	if pending != nil && r.GetHeight() >= pending.ActivationHeight {
+		activated := &rtypes.BridgeConfigApply{}
+		if err = types.Decode(pending.Snapshot, activated); err != nil {
+			elog.Error("loadBridgeConfig decode activated pending config", "symbol", symbol, "err", err)
+			return nil, err
+		}
+		return activated, nil
+	}
+	return cfg, nil
+}
+
+// loadBridgeConfigRecord reads the stored (currently effective) config, ignoring scheduled
+// changes.
+func (r *rgbx) loadBridgeConfigRecord(symbol string) (*rtypes.BridgeConfigApply, error) {
 	if r.GetStateDB() == nil {
 		return nil, nil
 	}
@@ -184,6 +241,26 @@ func (r *rgbx) loadBridgeConfig(symbol string) (*rtypes.BridgeConfigApply, error
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// loadBridgePendingConfig reads a scheduled loosening, if any.
+func (r *rgbx) loadBridgePendingConfig(symbol string) (*bridgePendingConfig, error) {
+	if r.GetStateDB() == nil {
+		return nil, nil
+	}
+	value, err := r.GetStateDB().Get(formatBridgeConfigPendingKey(symbol))
+	if errors.Is(err, types.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	pending := &bridgePendingConfig{}
+	if err = types.Decode(value, pending); err != nil {
+		elog.Error("loadBridgePendingConfig decode", "symbol", symbol, "err", err)
+		return nil, err
+	}
+	return pending, nil
 }
 
 // loadBridgeWindowCounter reads one hourly bucket; a missing bucket counts as zero.
@@ -370,6 +447,89 @@ func mergeBridgeConfig(base, src *rtypes.BridgeConfigApply) *rtypes.BridgeConfig
 	return merged
 }
 
+// bridgeConfigTightens reports whether every difference between base and next makes the
+// bridge more conservative. It is deliberately strict: a change that loosens any field, or
+// whose direction is ambiguous, is not a tightening and must wait out the timelock.
+//
+// base == nil is the bootstrap case (the first config ever): it applies immediately, since
+// there is no previously granted protection to take away.
+func bridgeConfigTightens(base, next *rtypes.BridgeConfigApply) bool {
+	if base == nil {
+		return true
+	}
+	// Pause flags: turning a pause on is tightening; turning it off is loosening.
+	if base.GetPauseDeposit() != next.GetPauseDeposit() && !next.GetPauseDeposit() {
+		return false
+	}
+	if base.GetPauseWithdraw() != next.GetPauseWithdraw() && !next.GetPauseWithdraw() {
+		return false
+	}
+	// Enabling numeric limits is tightening; disabling them is loosening.
+	if base.GetLimitsEnabled() != next.GetLimitsEnabled() && !next.GetLimitsEnabled() {
+		return false
+	}
+	// Upper bounds: a positive limit below the old one (or under "unlimited") is tighter.
+	for _, pair := range []struct{ old, next int64 }{
+		{base.GetMaxPerTx(), next.GetMaxPerTx()},
+		{base.GetMaxPerWindow1H(), next.GetMaxPerWindow1H()},
+		{base.GetMaxPerWindow24H(), next.GetMaxPerWindow24H()},
+		{base.GetMaxMintPerWindow(), next.GetMaxMintPerWindow()},
+		{base.GetLargeDepositThreshold(), next.GetLargeDepositThreshold()},
+	} {
+		if pair.old == pair.next {
+			continue
+		}
+		if !(pair.next > 0 && (pair.old <= 0 || pair.next < pair.old)) {
+			return false
+		}
+	}
+	// Extra confirmations for large deposits: raising them is tighter.
+	if next.GetLargeDepositExtraConfirmations() < base.GetLargeDepositExtraConfirmations() {
+		return false
+	}
+	// Fee-rate cap: a tighter (lower, but configured) cap is protective.
+	if oldCap, newCap := base.GetWithdrawMaxFeeRateSatPerVbyte(), next.GetWithdrawMaxFeeRateSatPerVbyte(); oldCap != newCap {
+		if !(newCap > 0 && (oldCap == 0 || newCap < oldCap)) {
+			return false
+		}
+	}
+	// RGB20 lock size: locking more xBTC per withdrawal is more conservative.
+	if oldLock, newLock := base.GetRgb20WithdrawFeeLockVbytes(), next.GetRgb20WithdrawFeeLockVbytes(); oldLock != newLock {
+		if !(newLock > 0 && (oldLock == 0 || newLock > oldLock)) {
+			return false
+		}
+	}
+	return rgb20FeesTighten(base.GetRgb20WithdrawFee(), next.GetRgb20WithdrawFee())
+}
+
+// rgb20FeesTighten reports whether the new fee table charges at least as much as the old one.
+// Removing a symbol's fee (or dropping the whole entry) is loosening.
+func rgb20FeesTighten(oldFees, newFees []*rtypes.Rgb20WithdrawFee) bool {
+	oldBySymbol := make(map[string]int64, len(oldFees))
+	for _, fee := range oldFees {
+		if fee != nil {
+			oldBySymbol[formatSymbol(fee.GetSymbol())] = fee.GetFeeMinUnits()
+		}
+	}
+	seen := make(map[string]struct{}, len(newFees))
+	for _, fee := range newFees {
+		if fee == nil {
+			return false
+		}
+		symbol := formatSymbol(fee.GetSymbol())
+		seen[symbol] = struct{}{}
+		if fee.GetFeeMinUnits() < oldBySymbol[symbol] {
+			return false
+		}
+	}
+	for symbol := range oldBySymbol {
+		if _, ok := seen[symbol]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // checkBridgeConfigApprove performs the cheap payload checks. The autonomy query and the
 // record status check happen in Exec (they read state that may change between CheckTx and
 // block execution).
@@ -491,14 +651,40 @@ func (r *rgbx) Exec_BridgeConfigApprove(approve *rtypes.BridgeConfigApprove, _ *
 		return nil, err
 	}
 	record.Status = bridgeConfigStatusApproved
-	elog.Info("Exec_BridgeConfigApprove approved", "applyId", id, "itemId", approve.GetAutonomyItemId(),
-		"symbol", effective.GetAssetSymbol(), "limitsEnabled", effective.GetLimitsEnabled(),
-		"pauseDeposit", effective.GetPauseDeposit(), "pauseWithdraw", effective.GetPauseWithdraw())
+	recordKV := &types.KeyValue{Key: recordKey, Value: types.Encode(record)}
+	pendingKey := formatBridgeConfigPendingKey(effective.GetAssetSymbol())
+	if bridgeConfigTightens(base, effective) {
+		// Tightening (or the bootstrap config) applies now. It also cancels a loosening that
+		// was waiting out its timelock: a protective vote supersedes a pending relaxation.
+		elog.Info("Exec_BridgeConfigApprove approved", "applyId", id, "itemId", approve.GetAutonomyItemId(),
+			"symbol", effective.GetAssetSymbol(), "limitsEnabled", effective.GetLimitsEnabled(),
+			"pauseDeposit", effective.GetPauseDeposit(), "pauseWithdraw", effective.GetPauseWithdraw(),
+			"activationHeight", r.GetHeight())
+		kvs := []*types.KeyValue{
+			recordKV,
+			{Key: formatBridgeConfigKey(effective.GetAssetSymbol()), Value: types.Encode(effective)},
+		}
+		if wasPending, perr := r.loadBridgePendingConfig(effective.GetAssetSymbol()); perr != nil {
+			return nil, perr
+		} else if wasPending != nil {
+			kvs = append(kvs, &types.KeyValue{Key: pendingKey, Value: nil})
+		}
+		return &types.Receipt{Ty: types.ExecOk, KV: kvs}, nil
+	}
+	activation := r.GetHeight() + bridgeConfigTimelockBlocks
+	pending := &bridgePendingConfig{
+		Snapshot:         types.Encode(effective),
+		ActivationHeight: activation,
+		ApplyID:          id,
+	}
+	elog.Info("Exec_BridgeConfigApprove scheduled loosening after timelock", "applyId", id,
+		"itemId", approve.GetAutonomyItemId(), "symbol", effective.GetAssetSymbol(),
+		"activationHeight", activation)
 	return &types.Receipt{
 		Ty: types.ExecOk,
 		KV: []*types.KeyValue{
-			{Key: recordKey, Value: types.Encode(record)},
-			{Key: formatBridgeConfigKey(effective.GetAssetSymbol()), Value: types.Encode(effective)},
+			recordKV,
+			{Key: pendingKey, Value: types.Encode(pending)},
 		},
 	}, nil
 }

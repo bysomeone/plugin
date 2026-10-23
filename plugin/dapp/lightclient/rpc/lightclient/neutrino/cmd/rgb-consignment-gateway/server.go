@@ -45,12 +45,16 @@ type config struct {
 	tlsCert  string
 	tlsKey   string
 	clientCA string
+
+	// eventsRetention bounds how long bridge events are kept on disk.
+	eventsRetention time.Duration
 }
 
 type gateway struct {
 	cfg      config
 	store    *store
 	deposits *depositStore
+	events   *eventStore
 	limiter  *rateLimiter
 	logger   *log.Logger
 	started  time.Time
@@ -68,10 +72,15 @@ func newGateway(cfg config, logger *log.Logger) (*gateway, error) {
 	if err != nil {
 		return nil, err
 	}
+	events, err := openEventStore(cfg.dataDir, cfg.eventsRetention)
+	if err != nil {
+		return nil, err
+	}
 	return &gateway{
 		cfg:      cfg,
 		store:    st,
 		deposits: deposits,
+		events:   events,
 		limiter:  newRateLimiter(cfg.rateLimit, time.Minute),
 		logger:   logger,
 		started:  time.Now(),
@@ -87,6 +96,10 @@ func (g *gateway) handler() http.Handler {
 	mux.HandleFunc("/deposit/requests/", g.handleDepositRequestGet)
 	mux.HandleFunc("/bridge/deposit/requests/stream", g.requireBridgeAuth(g.handleBridgeStream))
 	mux.HandleFunc("/bridge/deposit/invoices", g.requireBridgeAuth(g.handleBridgeInvoice))
+	// Bridge event ledger: the bridge posts audit facts, an operator's statistics backend reads
+	// them by cursor.
+	mux.HandleFunc("/bridge/events", g.requireBridgeAuth(g.handleBridgeEvents))
+	mux.HandleFunc("/bridge/events/query", g.requireBridgeAuth(g.handleBridgeEventGet))
 	return mux
 }
 

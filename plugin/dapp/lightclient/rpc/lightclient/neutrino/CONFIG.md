@@ -595,6 +595,12 @@ chain33-cli rgbx bridge-config-apply \
 chain33-cli rgbx get-bridge-config --asset-symbol RGB20_USDT
 ```
 
+**Asymmetric timelock**：治理审批通过后，收紧方向的改动（暂停、降低限额/费率上限、提高手续费）
+立即生效；放松方向的改动（解除暂停、提高限额、降低手续费、关闭限额）要等
+`bridgeConfigTimelockBlocks`（14400 个区块，按 6s 出块约 24 小时）才自动生效，期间旧配置继续有效。
+生效是惰性的（按高度判定，不需要额外交易）；若有新的收紧提案获批，会取消尚未生效的放松配置。
+首次配置（链上还没有任何生效配置）没有可被削弱的保护，因此立即生效。
+
 **用户侧口径**：提现时用户自己开的 invoice 金额必须是 `提现额 − 手续费`（按上面的链上值）。
 侧车**不知道**手续费 —— invoice 写多少它就发多少 —— 所以这条策略只能由桥侧执守。
 
@@ -748,6 +754,49 @@ Withdrawals use the same transport in the opposite direction (the bridge is the 
    invoice's `recipient_id` (content-addressed, retrievable via `consignment.get`). If no gateway
    is configured it falls back to `consignmentPublish.url`; with neither, the consignment is only
    kept locally (WARN). The on-chain confirm still carries its sha256 either way.
+
+#### 4.4.8 Bridge event ledger (audit / statistics)
+
+The bridge posts audit facts the chain does not carry (withdrawal ↔ consignment mapping, BTC
+miner fees paid by the bridge, sweep funding) to the gateway's append-only ledger. There is no
+separate switch: when `transportGateway` and `gatewayToken` are configured, events are recorded
+automatically.
+
+- Endpoint: `POST <gateway>/bridge/events` with `{id, type, payload}`; the id is derived from
+  `(type, subject key)`, so a retry or a re-derived event collapses on the gateway.
+- Delivery is at-least-once: the event is first written to the local outbox
+  (`bridge-event-outbox` bucket in the bridge wallet DB), posted, and only deleted after the
+  gateway acknowledges it. Delivery never blocks the money path; retries back off from 2s to
+  2min, and an event the gateway refuses with a 4xx is dropped with an ERROR log.
+- Event types: `deposit.settled`, `deposit.minted`, `deposit.rejected`, `withdraw.locked`,
+  `withdraw.broadcast`, `withdraw.consignment`, `withdraw.settled`, `withdraw.unlocked`,
+  `withdraw.bumped`, `sweep.completed`.
+- The bridge never sends key material, invoice contents or consignment bytes. The gateway is a
+  mirror, not the authoritative ledger; an operator's statistics backend reads it with
+  `GET /bridge/events/query?cursor=N&limit=M`.
+
+#### 4.4.9 Node-local safety switches (`safety`)
+
+These are local, not consensus state: they only decide whether *this* node takes on new work.
+Changing them needs no governance round.
+
+```toml
+[rpc.sub.light.neutrino.rgb20.safety]
+# Stop signing/submitting new mints on this node. In-flight receives stay in the local store
+# and resume after the switch is cleared.
+disableDeposits=false
+# Stop starting new withdrawal settlements. Withdrawals that were already broadcast are still
+# confirmed (the money has already moved); unlocks are unaffected.
+disableWithdrawals=false
+# Automatic breaker: after this many DISTINCT burns were refused for a payout mismatch
+# ("transfer pays the user X but pending − fee requires Y"), this node stops signing new
+# withdrawals until it is restarted. 0 = default (3); negative disables the breaker.
+maxPayoutMismatchBurns=3
+```
+
+The breaker is deliberately not self-clearing: a systematic payout mismatch means the bridge's
+accounting or fee configuration is wrong, and an operator must look at it before payments resume.
+Retries of a single burn are counted once, so a repeatedly rejected withdrawal cannot trip it.
 
 ## 5. Bitcoin 节点关键配置项
 

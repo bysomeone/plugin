@@ -95,6 +95,13 @@ func (a *Adapter) Sweep(ctx context.Context, req *SweepRequest) (*SweepResult, e
 	if err := a.bridge.BroadcastRawTx(fin.GetRawTx(), fin.GetTxid()); err != nil {
 		return nil, fmt.Errorf("broadcast sweep %s: %w", fin.GetTxid(), err)
 	}
+	a.RecordEvent("sweep.completed", fin.GetTxid(), map[string]any{
+		"sweep_txid":  fin.GetTxid(),
+		"input_count": built.GetInputCount(),
+		"input_value": built.GetInputValue(),
+		"fee":         built.GetFee(),
+		"fee_rate":    req.FeeRate,
+	})
 	return &SweepResult{
 		Txid:       fin.GetTxid(),
 		InputCount: built.GetInputCount(),

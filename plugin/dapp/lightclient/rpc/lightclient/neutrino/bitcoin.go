@@ -703,6 +703,14 @@ func (n *neutrinoClient) retryRgb20Withdraw(p *rtypes.PendingTx, logMsg string) 
 	if !settlementAllowed(n.getWithdrawState(p.GetTxHash())) {
 		return false
 	}
+	// Node-local kill switch / automatic breaker: stop taking on new settlement work. The
+	// pending stays on chain and resumes when the operator clears the switch (or restarts after
+	// the breaker tripped); confirms of already-broadcast withdrawals are unaffected.
+	if reason := n.rgb20.WithdrawalsBlocked(); reason != "" {
+		log.Debug("withdrawalProcessor skip rgb20 settlement: locally blocked",
+			"txHash", hex.EncodeToString(p.GetTxHash()), "reason", reason)
+		return false
+	}
 	err := n.processRgb20Withdraw(p)
 	if err == nil {
 		return false
@@ -924,6 +932,11 @@ func (n *neutrinoClient) processWithdrawConfirm(confirm *confirmWithdraw) bool {
 	n.dropSignedWithdrawTx(confirm.confirmTx.GetTxHash())
 	log.Debug("processWithdrawConfirm success", "txHash", txHash,
 		"btcTxHash", confirm.btcPending.txHash.String(), "confirmHash", confirmHash)
+	n.rgb20.RecordEvent("withdraw.settled", confirmHash, map[string]any{
+		"chain33_tx_hash": confirmHash,
+		"btc_txid":        confirm.btcPending.txHash.String(),
+		"confirm_tx_hash": txHash,
+	})
 	return true
 
 }

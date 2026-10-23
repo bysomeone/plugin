@@ -61,6 +61,25 @@ type Config struct {
 	// **生产环境必须为 false**（默认 false），只有 E2E/regtest 部署显式打开。打开时协调者侧
 	// 的 HTTP 端点与签名节点侧的通知处理都会放行，并在此路径上打 WARN 日志。
 	TestSignPsbt bool
+	// Safety 节点本地（不参与共识）的安全开关。
+	Safety SafetyConfig
+}
+
+// SafetyConfig is the node-local kill switch surface. These values are not consensus state:
+// they only decide whether *this* node takes on new work, and an operator can change them
+// without a governance round. Money that has already left the bridge (broadcast withdrawals,
+// on-chain confirms) is not affected — only new settlement work stops.
+type SafetyConfig struct {
+	// DisableDeposits stops this node from signing/submitting new mints. Deposits already in
+	// flight stay in the local receive store and resume after the switch is cleared.
+	DisableDeposits bool `json:"disableDeposits"`
+	// DisableWithdrawals stops this node from starting new withdrawal settlements. Broadcast
+	// withdrawals are still confirmed (the money has already moved).
+	DisableWithdrawals bool `json:"disableWithdrawals"`
+	// MaxPayoutMismatchBurns trips the automatic withdrawal breaker once this many distinct
+	// burns were refused with a payout mismatch. 0 keeps the default (3); a negative value
+	// disables the breaker.
+	MaxPayoutMismatchBurns int `json:"maxPayoutMismatchBurns"`
 }
 
 // Contract 一个 RGB20 资产的合约注册项。
@@ -241,6 +260,12 @@ type RGB20Adapter interface {
 	ValidateWithdrawPsbt(req *ValidateWithdrawRequest) error
 	// BuildDepositSignMessage 构造 rgb20-deposit 签名消息（主节点侧）。
 	BuildDepositSignMessage(rec *ReceiveRecord, consignment []byte, blockHeight uint64, blockHash string, txIndex uint32) (*DepositSignPayload, error)
+	// RecordEvent 投递一条审计事件到网关账本（未配置网关时为空操作）。
+	RecordEvent(kind, key string, payload map[string]any)
+	// WithdrawalsBlocked 返回本地禁止新提现结算的原因（空 = 允许）。
+	WithdrawalsBlocked() string
+	// DepositsDisabled 返回本地是否禁止新的充值铸造。
+	DepositsDisabled() bool
 }
 
 // 编译期断言：*Adapter 满足 RGB20Adapter 接口。
@@ -264,6 +289,10 @@ type Adapter struct {
 	depositSigs *DepositSignatureStore
 	// depositNotes 充值重试路径的日志限流（30s 轮询会把同一个状态反复带回来，同一个 key 只报一次）。
 	depositNotes *depositNoteOnce
+	// events 网关审计账本的投递器（未配置网关时为 nil）。
+	events *eventRecorder
+	// breaker 提现自动熔断（见 withdrawBreaker）。
+	breaker *withdrawBreaker
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -299,6 +328,9 @@ func NewAdapter(cfg Config, store KVStore) (*Adapter, error) {
 	}
 	// 已签充值的落盘产物：与 receive/seal 共用同一个 KVStore（不引入新存储引擎）。
 	a.depositSigs = newDepositSignatureStore(store)
+	// 审计事件投递：与充值轮询共用 gateway 配置；未配置网关时为空，记录全部变成空操作。
+	a.events = newEventRecorder(cfg, store)
+	a.breaker = newWithdrawBreaker(cfg.Safety.MaxPayoutMismatchBurns)
 	return a, nil
 }
 
@@ -405,9 +437,38 @@ func (a *Adapter) Start(ctx context.Context) error {
 func (a *Adapter) Stop() {
 	a.cancel()
 	a.wg.Wait()
+	if a.events != nil {
+		a.events.stop()
+	}
 	if sc := a.sidecar.Load(); sc != nil {
 		_ = sc.Close()
 	}
+}
+
+// RecordEvent queues one audit event for the gateway ledger. A nil recorder (no gateway
+// configured) makes it a no-op. It never blocks the caller's money path.
+func (a *Adapter) RecordEvent(kind, key string, payload map[string]any) {
+	if a == nil {
+		return
+	}
+	a.events.record(kind, key, payload)
+}
+
+// WithdrawalsBlocked reports why this node must not start a new withdrawal settlement
+// (node-local kill switch or the automatic breaker). An empty reason means "allowed".
+func (a *Adapter) WithdrawalsBlocked() string {
+	if a == nil {
+		return ""
+	}
+	if a.cfg.Safety.DisableWithdrawals {
+		return "withdrawals are disabled by the local safety configuration"
+	}
+	return a.breaker.tripReason()
+}
+
+// DepositsDisabled reports whether the node-local kill switch rejects new mints.
+func (a *Adapter) DepositsDisabled() bool {
+	return a != nil && a.cfg.Safety.DisableDeposits
 }
 
 func (a *Adapter) Sidecar() *Sidecar { return a.sidecar.Load() }

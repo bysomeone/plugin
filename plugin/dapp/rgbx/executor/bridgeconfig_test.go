@@ -479,6 +479,70 @@ func applyAndApproveBridgeConfig(t *testing.T, r *rgbx, state kvSetter,
 	applyStateKV(t, state, approveReceipt.GetKV())
 }
 
+// advancePastBridgeTimelock moves execution past the activation height of a scheduled
+// loosening so the test can observe the promoted config.
+func advancePastBridgeTimelock(r *rgbx) {
+	r.SetEnv(r.GetHeight()+bridgeConfigTimelockBlocks+1, 0, 0)
+}
+
+func TestBridgeConfig_LooseningWaitsForTimelock(t *testing.T) {
+	r, state, api := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	api.On("QueryChain", mock.Anything).Return(&types.ReplyString{}, nil)
+	r.SetEnv(1000, 0, 0)
+	// Start from an effective config that pauses withdrawals.
+	setBridgeConfigForTest(t, state, "", &rtypes.BridgeConfigApply{PauseWithdraw: true})
+
+	// Unpausing is a loosening: approval stores a pending record, the pause stays in force.
+	applyAndApproveBridgeConfig(t, r, state, &rtypes.BridgeConfigApply{PauseWithdraw: false}, "unpause")
+	effective, err := r.loadBridgeConfig("")
+	require.NoError(t, err)
+	require.True(t, effective.GetPauseWithdraw(), "an unpause must not take effect before the timelock")
+
+	pending, err := r.loadBridgePendingConfig("")
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+	require.Equal(t, int64(1000)+bridgeConfigTimelockBlocks, pending.ActivationHeight)
+
+	// At the activation height the scheduled config becomes effective without another tx.
+	r.SetEnv(pending.ActivationHeight, 0, 0)
+	effective, err = r.loadBridgeConfig("")
+	require.NoError(t, err)
+	require.False(t, effective.GetPauseWithdraw())
+}
+
+func TestBridgeConfig_TighteningAppliesImmediatelyAndCancelsPending(t *testing.T) {
+	r, state, api := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	api.On("QueryChain", mock.Anything).Return(&types.ReplyString{}, nil)
+	r.SetEnv(2000, 0, 0)
+	setBridgeConfigForTest(t, state, "usdt", &rtypes.BridgeConfigApply{
+		AssetSymbol: "usdt", LimitsEnabled: true, MaxPerTx: 100,
+	})
+	setCrossChainInfoForTest(t, state, "usdt", rtypes.CrossChainAssetRgb20, 6, []byte{0x02})
+
+	// Schedule a loosening (raise the limit).
+	applyAndApproveBridgeConfig(t, r, state, &rtypes.BridgeConfigApply{
+		AssetSymbol: "usdt", MaxPerTx: 500, Fields: []string{rtypes.BridgeConfigFieldMaxPerTx},
+	}, "raise")
+	require.NotNil(t, mustPending(t, r, "usdt"))
+
+	// A later tightening takes effect immediately and removes the scheduled loosening.
+	applyAndApproveBridgeConfig(t, r, state, &rtypes.BridgeConfigApply{
+		AssetSymbol: "usdt", PauseWithdraw: true, Fields: []string{rtypes.BridgeConfigFieldPauseWithdraw},
+	}, "pause")
+	effective, err := r.loadBridgeConfig("usdt")
+	require.NoError(t, err)
+	require.True(t, effective.GetPauseWithdraw())
+	require.Equal(t, int64(100), effective.GetMaxPerTx(), "the scheduled raise was cancelled")
+	require.Nil(t, mustPending(t, r, "usdt"))
+}
+
+func mustPending(t *testing.T, r *rgbx, symbol string) *bridgePendingConfig {
+	t.Helper()
+	pending, err := r.loadBridgePendingConfig(symbol)
+	require.NoError(t, err)
+	return pending
+}
+
 func TestBridgeConfig_PartialMaskOnlyTouchesListedFields(t *testing.T) {
 	r, state, api := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
 	api.On("QueryChain", mock.Anything).Return(&types.ReplyString{}, nil)
@@ -500,6 +564,8 @@ func TestBridgeConfig_PartialMaskOnlyTouchesListedFields(t *testing.T) {
 		PauseWithdraw: true,
 		Fields:        []string{rtypes.BridgeConfigFieldMaxPerTx},
 	}, "mask")
+	// Raising a limit is a loosening: it waits out the timelock before it is visible.
+	advancePastBridgeTimelock(r)
 
 	effective, err := r.loadBridgeConfig("usdt")
 	require.NoError(t, err)
@@ -666,6 +732,8 @@ func TestBridgeConfig_MaskReplacesFeeListWholesale(t *testing.T) {
 		Rgb20WithdrawFee: []*rtypes.Rgb20WithdrawFee{{Symbol: "usdt", FeeMinUnits: 9}},
 		Fields:           []string{rtypes.BridgeConfigFieldRgb20WithdrawFee},
 	}, "list-replace")
+	// Dropping "other" from the list lowers the fees collected: a loosening.
+	advancePastBridgeTimelock(r)
 
 	effective, err := r.loadBridgeConfig("")
 	require.NoError(t, err)
