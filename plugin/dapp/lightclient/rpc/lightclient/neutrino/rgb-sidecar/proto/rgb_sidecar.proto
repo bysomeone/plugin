@@ -31,6 +31,7 @@ service RgbSidecar {
   rpc FinalizeSweep(FinalizeSweepRequest) returns (FinalizeSweepResponse);
   // ---- 辅助 ----
   rpc ParseBtcTx(ParseBtcTxRequest) returns (ParseBtcTxResponse);
+  rpc ParseInvoice(ParseInvoiceRequest) returns (ParsedInvoiceResponse);
 }
 
 // ================= 充值 =================
@@ -40,11 +41,19 @@ message CreateReceiveRequest {
   int64 amount = 2;                    // 请求金额（资产最小单位）
   repeated string transport_endpoints = 3;
   uint32 min_confirmations = 4;
+  // 写入 invoice 的标准 transport endpoint（如 `rpcs://gw.example.com/0.2/json-rpc`）。
+  // 空 = 不写 transports（invoice 只含 beneficiary，付款方需另知交付地址）。
+  // （字段 3 是历史遗留的复数形式，未被使用；本字段是唯一生效的入口。）
+  string transport_endpoint = 5;
 }
 message ReceiveData {
   string invoice = 1;
   string receive_id = 2;
   bytes seal_script = 3;               // 该 receive 对应的 seal 脚本（单脚本钱包下= TSS 脚本）
+  // 标准 RGB HTTP JSON-RPC 的 recipient_id：invoice 的 beneficiary 标识
+  // （`<chain-net>:<beneficiary>`，与 invoice 里的 beneficiary 逐字一致）。
+  // 由侧车从 invoice 解析，Go 侧不解析 RGB。
+  string recipient_id = 4;
 }
 
 message ProvideConsignmentRequest {
@@ -270,4 +279,21 @@ message ParseBtcTxResponse {
   string commitment_type = 2;          // "opret" | "tapret" | ""
   string asset_id = 3;
   uint32 seal_output_index = 4;
+}
+
+// ParseInvoice 是 invoice 的**只读解析**（侧车解析、调用方不做 RGB 解析）。
+// transports / expiry / assignment_name 是标准 invoice 的字段，提现侧后续需要它们；
+// 本契约只解析并返回，不改变任何状态。
+message ParseInvoiceRequest {
+  string invoice = 1;
+}
+message ParsedInvoiceResponse {
+  string contract_id = 1;              // rgb:...；空 = invoice 未指定
+  string schema_id = 2;                // rgb:sch:...；空 = invoice 未指定
+  int64 amount = 3;                    // 资产最小单位；0 = invoice 未指定金额
+  bytes witness_script = 4;            // WitnessVout beneficiary 的收款脚本；BlindedSeal 时为空
+  string secret_seal = 5;              // BlindedSeal beneficiary 的密文 seal；WitnessVout 时为空
+  repeated string transports = 6;      // invoice 携带的 transport endpoint（原样字符串）
+  int64 expiry = 7;                    // UTC unix 时间戳；0 = 无过期时间
+  string assignment_name = 8;          // 如 assetOwner；空 = invoice 未指定
 }

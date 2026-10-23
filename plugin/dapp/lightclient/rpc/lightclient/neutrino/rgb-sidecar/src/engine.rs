@@ -37,7 +37,7 @@ use crate::build_store::{key_digest, BuildStore, Pruned};
 use crate::config::Config;
 use crate::invoice::{
     consignment_from_bytes, consignment_to_bytes, contract_from_bytes, network_to_chainnet,
-    parse_invoice,
+    parse_invoice, recipient_id,
 };
 use crate::ledger::{AssetRec, FinalizedWithdrawalRec, Ledger, ReceiveRec, RecordedWithdrawal};
 use crate::rpc::BtcdRpc;
@@ -87,6 +87,56 @@ impl WitnessOrdProvider for BtcdResolver {
     }
 }
 
+/// A witness resolver that serves the transactions **embedded in the consignment under
+/// validation** before falling back to the chain.
+///
+/// A transfer's terminal witness may not be broadcast yet when the consignment is handed over
+/// (the sender delivers first, broadcasts second), so a chain-only resolver reports it
+/// `Unresolved` and validation fails on a perfectly valid transfer. RGB consignments bundle the
+/// witness transactions for their terminal bundles; resolving those first (the same approach as
+/// rgb-lib's `OffchainResolver`) makes pre-broadcast validation work.
+///
+/// This is not a shortcut around consensus: [`rgbcore::validation`]'s checked resolver compares
+/// each returned transaction's id against the requested id, so an embedded transaction can only
+/// answer for its own txid. Historical bundles without an embedded transaction still go to the
+/// chain, and a tx neither embedded nor on chain stays `Unresolved` — never a fabricated proof.
+struct OffchainResolver<'a, R: ResolveWitness> {
+    embedded: HashMap<Txid, Transaction>,
+    fallback: &'a R,
+}
+
+impl<'a, R: ResolveWitness> OffchainResolver<'a, R> {
+    fn for_consignment<const TRANSFER: bool>(
+        consignment: &Consignment<TRANSFER>,
+        fallback: &'a R,
+    ) -> Self {
+        let embedded = consignment
+            .bundles
+            .iter()
+            .filter_map(|bundle| bundle.pub_witness.tx())
+            .map(|tx| (tx.compute_txid(), tx.clone()))
+            .collect();
+        Self::from_embedded(embedded, fallback)
+    }
+
+    fn from_embedded(embedded: HashMap<Txid, Transaction>, fallback: &'a R) -> Self {
+        Self { embedded, fallback }
+    }
+}
+
+impl<R: ResolveWitness> ResolveWitness for OffchainResolver<'_, R> {
+    fn resolve_witness(&self, witness_id: Txid) -> Result<WitnessStatus, WitnessResolverError> {
+        if let Some(tx) = self.embedded.get(&witness_id) {
+            return Ok(WitnessStatus::Resolved(tx.clone(), WitnessOrd::Tentative));
+        }
+        self.fallback.resolve_witness(witness_id)
+    }
+
+    fn check_chain_net(&self, chain_net: ChainNet) -> Result<(), WitnessResolverError> {
+        self.fallback.check_chain_net(chain_net)
+    }
+}
+
 /// An error that retrying can never turn into a success, because the request targets state this
 /// sidecar does not hold any more (an asset that was re-issued, an invoice written for a contract
 /// that no longer exists, ...). The gRPC layer reports it as `FAILED_PRECONDITION` so the bridge
@@ -123,6 +173,18 @@ pub struct OpenedSealInfo {
     pub outpoint: String,
     pub amount: i64,
     pub asset_id: String,
+}
+
+/// Result of creating a deposit receive.
+///
+/// `recipient_id` is the invoice's beneficiary identifier used by the RGB HTTP JSON-RPC
+/// transport; it is derived from the invoice bytes actually returned, so the bridge never
+/// parses RGB.
+#[derive(Clone, Debug)]
+pub struct ReceiveCreated {
+    pub invoice: String,
+    pub receive_id: String,
+    pub recipient_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1040,8 +1102,17 @@ impl RgbEngine {
     // Receives (deposits)
     // ===================================================================
 
-    /// Create a WitnessVout receive: returns an address-based invoice.
-    pub fn create_receive(&mut self, asset_symbol: &str, amount: i64) -> Result<(String, String)> {
+    /// Create a WitnessVout receive: returns an address-based invoice plus its standard
+    /// transport `recipient_id`.
+    ///
+    /// `transport_endpoint` (when non-empty) is embedded in the invoice so a standard wallet
+    /// knows where to deliver the consignment.
+    pub fn create_receive(
+        &mut self,
+        asset_symbol: &str,
+        amount: i64,
+        transport_endpoint: Option<&str>,
+    ) -> Result<ReceiveCreated> {
         let asset = self
             .ledger
             .asset(asset_symbol)
@@ -1054,7 +1125,9 @@ impl RgbEngine {
             contract_id,
             schema_id,
             amount as u64,
+            transport_endpoint,
         )?;
+        let recipient_id = recipient_id(&invoice)?;
 
         let receive_id = format!("rcv-{}", rand_hex(8));
         self.ledger.upsert_receive(ReceiveRec {
@@ -1070,7 +1143,7 @@ impl RgbEngine {
             secret_seal_hex: None,
         });
         self.save()?;
-        Ok((invoice, receive_id))
+        Ok(ReceiveCreated { invoice, receive_id, recipient_id })
     }
 
     // ===================================================================
@@ -1089,8 +1162,9 @@ impl RgbEngine {
     ) -> Result<ConsignmentInspection> {
         let consignment = consignment_from_bytes(bytes)?;
         let config = self.validation_config();
+        let resolver = OffchainResolver::for_consignment(&consignment, &self.resolver);
         let mut inspection = self.inspect(&consignment, expected_amount);
-        match consignment.validate(&self.resolver, &config) {
+        match consignment.validate(&resolver, &config) {
             Ok(_) => inspection.valid = true,
             Err(e) => {
                 inspection.valid = false;
@@ -1125,9 +1199,10 @@ impl RgbEngine {
         };
 
         let inspection = self.inspect(&consignment, hinted.as_ref().map(|r| r.amount_requested));
+        let resolver = OffchainResolver::for_consignment(&consignment, &self.resolver);
         let valid = consignment
             .clone()
-            .validate(&self.resolver, &config)
+            .validate(&resolver, &config)
             .map_err(|e| anyhow!("consignment invalid: {e}"))?;
 
         // ⚠️ The hint **narrows** which receive this consignment is for; it must never *skip* the
@@ -1213,7 +1288,7 @@ impl RgbEngine {
         // Accept into the RGB consensus state BEFORE updating the ledger, so the new seal's
         // assignment (opout) is queryable by later transfers/withdrawals.
         self.stock
-            .accept_transfer(valid, &self.resolver)
+            .accept_transfer(valid, &resolver)
             .map_err(|e| anyhow!("accept_transfer: {e:?}"))?;
 
         self.ledger.mark_settled(
@@ -2857,4 +2932,134 @@ fn build_retain_confirmations_from_env() -> u32 {
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(DEFAULT_BUILD_RETAIN_CONFIRMATIONS)
+}
+
+#[cfg(test)]
+mod offchain_resolver_tests {
+    use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, Transaction, TxOut};
+
+    /// A chain view with nothing in it.
+    struct EmptyChain;
+    impl ResolveWitness for EmptyChain {
+        fn resolve_witness(&self, _: Txid) -> Result<WitnessStatus, WitnessResolverError> {
+            Ok(WitnessStatus::Unresolved)
+        }
+        fn check_chain_net(&self, _: ChainNet) -> Result<(), WitnessResolverError> { Ok(()) }
+    }
+
+    /// A chain view that answers everything with a different (wrong) transaction. The embedded
+    /// transaction must win over it.
+    struct WrongChainTx(Transaction);
+    impl ResolveWitness for WrongChainTx {
+        fn resolve_witness(&self, _: Txid) -> Result<WitnessStatus, WitnessResolverError> {
+            Ok(WitnessStatus::Resolved(self.0.clone(), WitnessOrd::Archived))
+        }
+        fn check_chain_net(&self, _: ChainNet) -> Result<(), WitnessResolverError> { Ok(()) }
+    }
+
+    struct WrongNet;
+    impl ResolveWitness for WrongNet {
+        fn resolve_witness(&self, _: Txid) -> Result<WitnessStatus, WitnessResolverError> {
+            Ok(WitnessStatus::Unresolved)
+        }
+        fn check_chain_net(&self, _: ChainNet) -> Result<(), WitnessResolverError> {
+            Err(WitnessResolverError::WrongChainNet)
+        }
+    }
+
+    fn tx(seed: u8) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![TxOut {
+                value: Amount::from_sat(seed as u64),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    fn embedded(tx: Transaction) -> HashMap<Txid, Transaction> {
+        HashMap::from([(tx.compute_txid(), tx)])
+    }
+
+    /// A terminal witness that is not on chain still resolves from the consignment's embedded
+    /// transaction (pre-broadcast deposit validation).
+    #[test]
+    fn embedded_unbroadcast_witness_resolves_without_the_chain() {
+        let tx = tx(1);
+        let resolver = OffchainResolver::from_embedded(embedded(tx.clone()), &EmptyChain);
+        match resolver.resolve_witness(tx.compute_txid()).unwrap() {
+            WitnessStatus::Resolved(actual, ord) => {
+                assert_eq!(actual, tx);
+                assert_eq!(ord, WitnessOrd::Tentative);
+            }
+            WitnessStatus::Unresolved => panic!("embedded witness must resolve"),
+        }
+    }
+
+    /// The embedded map really is built from the consignment's bundled witness transactions.
+    #[test]
+    fn bundled_witness_transactions_are_extracted() {
+        use rgbstd::containers::PubWitness;
+        use strict_encoding::StrictDumb;
+
+        let tx = tx(5);
+        let mut consignment = Consignment::<true>::strict_dumb();
+        let mut bundle = WitnessBundle::strict_dumb();
+        bundle.pub_witness = PubWitness::with(tx.clone());
+        consignment.bundles.push(bundle).ok();
+
+        let resolver = OffchainResolver::for_consignment(&consignment, &EmptyChain);
+        match resolver.resolve_witness(tx.compute_txid()).unwrap() {
+            WitnessStatus::Resolved(actual, _) => assert_eq!(actual, tx),
+            WitnessStatus::Unresolved => panic!("a bundled witness transaction must be extracted"),
+        }
+    }
+
+    /// Embedded data takes precedence over a (possibly stale/reorged) chain view.
+    #[test]
+    fn embedded_witness_wins_over_chain() {
+        let embedded_tx = tx(2);
+        let chain_tx = tx(9);
+        let chain = WrongChainTx(chain_tx);
+        let resolver = OffchainResolver::from_embedded(embedded(embedded_tx.clone()), &chain);
+        match resolver.resolve_witness(embedded_tx.compute_txid()).unwrap() {
+            WitnessStatus::Resolved(actual, _) => assert_eq!(actual, embedded_tx),
+            WitnessStatus::Unresolved => panic!("embedded witness must resolve"),
+        }
+    }
+
+    /// A witness neither embedded nor on chain stays unresolved: the resolver never fabricates a
+    /// proof for a transaction it does not have.
+    #[test]
+    fn missing_witness_is_not_fabricated() {
+        let resolver = OffchainResolver::from_embedded(HashMap::new(), &EmptyChain);
+        let unknown = tx(3).compute_txid();
+        assert_eq!(resolver.resolve_witness(unknown).unwrap(), WitnessStatus::Unresolved);
+    }
+
+    /// Historical bundles without an embedded tx fall back to the existing chain resolver, and the
+    /// chain-net check is delegated too.
+    #[test]
+    fn falls_back_to_the_chain_resolver() {
+        let chain_tx = tx(4);
+        let chain = WrongChainTx(chain_tx.clone());
+        let resolver = OffchainResolver::from_embedded(HashMap::new(), &chain);
+        match resolver.resolve_witness(chain_tx.compute_txid()).unwrap() {
+            WitnessStatus::Resolved(actual, ord) => {
+                assert_eq!(actual, chain_tx);
+                assert_eq!(ord, WitnessOrd::Archived);
+            }
+            WitnessStatus::Unresolved => panic!("chain fallback must answer"),
+        }
+        let wrong_net = OffchainResolver::from_embedded(HashMap::new(), &WrongNet);
+        assert_eq!(
+            wrong_net.check_chain_net(ChainNet::BitcoinRegtest),
+            Err(WitnessResolverError::WrongChainNet)
+        );
+    }
 }

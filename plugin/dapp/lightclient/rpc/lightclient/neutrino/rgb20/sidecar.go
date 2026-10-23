@@ -188,3 +188,11 @@ func (s *Sidecar) ParseBtcTx(ctx context.Context, req *pb.ParseBtcTxRequest) (*p
 	defer cancel()
 	return s.client.ParseBtcTx(cctx, req)
 }
+
+// ParseInvoice 让侧车解析 RGB invoice（transports / expiry / assignment_name 等），
+// Go 侧不做任何 RGB 解析。
+func (s *Sidecar) ParseInvoice(ctx context.Context, req *pb.ParseInvoiceRequest) (*pb.ParsedInvoiceResponse, error) {
+	cctx, cancel := s.ctx(ctx)
+	defer cancel()
+	return s.client.ParseInvoice(cctx, req)
+}

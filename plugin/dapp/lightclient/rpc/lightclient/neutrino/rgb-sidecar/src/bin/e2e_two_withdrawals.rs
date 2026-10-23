@@ -231,7 +231,8 @@ fn main() -> Result<()> {
         &CompressedPublicKey::from_slice(&hex_decode(&pubkey_hex(&USER_SECRET)?)?)?,
         Network::Regtest,
     );
-    let (invoice, receive_id) = engine.create_receive("USDT", DEPOSIT_AMOUNT)?;
+    let created = engine.create_receive("USDT", DEPOSIT_AMOUNT, None)?;
+    let (invoice, receive_id) = (created.invoice, created.receive_id);
     let genesis = engine
         .ledger
         .seals
@@ -268,6 +269,7 @@ fn main() -> Result<()> {
         asset.asset_id.parse()?,
         InflatableFungibleAsset::schema().schema_id(),
         WITHDRAW_AMOUNT as u64,
+        None,
     )?;
 
     let mut prev_change: Option<String> = None;

@@ -63,7 +63,8 @@ impl Harness {
     /// published on the mock node so the next deposit can use its outputs (a real node would have
     /// it on chain; the engine also caches it as a local anchor).
     fn deposit(&mut self, input: OutPoint, amount: i64) -> Result<(OutPoint, Txid)> {
-        let (invoice, receive_id) = self.engine.create_receive(SYMBOL, amount)?;
+        let created = self.engine.create_receive(SYMBOL, amount, None)?;
+        let (invoice, receive_id) = (created.invoice, created.receive_id);
         let pay = self.engine.build_transfer(
             SYMBOL,
             &[input],
@@ -101,7 +102,8 @@ fn second_deposit_of_a_different_amount_settles_its_own_amount() -> Result<()> {
     let (first_seal, _first_txid) = h.deposit(h.genesis, first_amount)?;
     // The second consignment carries the first deposit's transition; the fixture is only useful if
     // that history is really there.
-    let (second_invoice, second_receive) = h.engine.create_receive(SYMBOL, second_amount)?;
+    let created = h.engine.create_receive(SYMBOL, second_amount, None)?;
+    let (second_invoice, second_receive) = (created.invoice, created.receive_id);
     let pay = h.engine.build_transfer(
         SYMBOL,
         &[first_seal],
@@ -159,7 +161,8 @@ fn second_deposit_of_the_same_amount_does_not_reuse_the_first_outpoint() -> Resu
     let amount = 44_000;
 
     let (first_seal, first_txid) = h.deposit(h.genesis, amount)?;
-    let (second_invoice, second_receive) = h.engine.create_receive(SYMBOL, amount)?;
+    let created = h.engine.create_receive(SYMBOL, amount, None)?;
+    let (second_invoice, second_receive) = (created.invoice, created.receive_id);
     let pay = h.engine.build_transfer(
         SYMBOL,
         &[first_seal],
