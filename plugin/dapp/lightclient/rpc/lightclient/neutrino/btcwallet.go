@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/33cn/chain33/common/merkle"
@@ -156,6 +157,11 @@ type btcWallet struct {
 	selectInputsFn func(target, feeRate btcutil.Amount, sticky *UTXO) ([]*UTXO, btcutil.Amount, error)
 	// sendRawTxFn 可选：注入 sendrawtransaction 实现（默认走 rpcClient / chainClient），仅测试用。
 	sendRawTxFn func(tx *wire.MsgTx) error
+	// walletBirthday is the wallet manager's birthday; walletFreshlyCreated is true when this
+	// process created btcwallet.db instead of opening an existing one. Both feed the startup
+	// self-check that warns when a fresh wallet cannot see deposits made before it existed.
+	walletBirthday       time.Time
+	walletFreshlyCreated bool
 }
 
 type btcPendingTx struct {
@@ -224,11 +230,30 @@ func newBtcWallet(n *neutrinoClient) (*btcWallet, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	log.Info("newBtcWallet open wallet success", "wallet birthtime", w.Manager.Birthday().Unix())
+	log.Info("newBtcWallet open wallet success", "wallet birthtime", w.Manager.Birthday().Unix(),
+		"freshlyCreated", !exist)
 	bw.db = db
 	bw.Wallet = w
+	bw.walletBirthday = w.Manager.Birthday()
+	bw.walletFreshlyCreated = !exist
 	bw.chainClient = chain.NewNeutrinoClient(&bw.chainParams, n.neutrinoCS)
 	return bw, nil
+}
+
+// checkWalletBirthday reports a problem when the wallet was created by this process while the
+// chain already had history: the wallet's address manager only starts scanning from its
+// birthday, so deposits made before then are absent from the wallet store and cannot be replayed
+// by the bridge (its replay reads the wallet store, not the chain). Returns "" when there is
+// nothing to report.
+func checkWalletBirthday(fresh bool, birthday time.Time, firstChainHeight int32) string {
+	if !fresh || firstChainHeight <= 0 {
+		return ""
+	}
+	return "btcwallet.db was created fresh at birthday " + birthday.UTC().Format(time.RFC3339) +
+		" while the chain is already at height " + strconv.FormatInt(int64(firstChainHeight), 10) +
+		"; deposits made before the wallet existed are not in its store and will be missed. " +
+		"Restore btcwallet.db from a backup taken before the loss instead of letting the node " +
+		"create a new wallet."
 }
 
 func (b *btcWallet) start() error {
@@ -478,6 +503,10 @@ func (b *btcWallet) monitorTransactions() {
 			if firstProcessFlag && len(ntfn.AttachedBlocks) > 0 {
 				log.Debug("monitorTransactions first process", "height", ntfn.AttachedBlocks[0].Height, "rescanHeight", rescanHeight)
 				firstProcessFlag = false
+				if warning := checkWalletBirthday(b.walletFreshlyCreated, b.walletBirthday,
+					ntfn.AttachedBlocks[0].Height); warning != "" {
+					log.Error("ALERT wallet birthday cannot cover chain history: " + warning)
+				}
 				if ntfn.AttachedBlocks[0].Height > rescanHeight {
 					go b.rescanWalletTxs(rescanHeight, ntfn.AttachedBlocks[0].Height-1, rescanChan)
 				} else {
