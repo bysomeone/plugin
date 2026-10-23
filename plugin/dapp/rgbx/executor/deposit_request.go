@@ -3,6 +3,7 @@ package executor
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/33cn/chain33/types"
 	"github.com/33cn/plugin/plugin/dapp/rgbx/depositrequest"
@@ -44,10 +45,13 @@ func (r *rgbx) checkDepositRequest(deposit *rtypes.DepositAsset) error {
 		elog.Error("checkDepositRequest missing request")
 		return ErrInvalidDepositRequest
 	}
-	api := r.GetAPI()
-	if api == nil || api.GetConfig() == nil {
-		elog.Error("checkDepositRequest chain config unavailable")
-		return ErrInvalidDepositRequest
+	// The signed domain is the bridge's parachain title, not this chain's own Title: the bridge
+	// runs on the parachain (e.g. user.p.rgbx.) while the rgbx contract executes here. Both sides
+	// get the same string from this config (guardianParachainTitle), so they agree without a
+	// second mirror setting.
+	chainTitle := strings.TrimSpace(rgbxCfg.GuardianParachainTitle)
+	if chainTitle == "" {
+		chainTitle = defaultGuardianParachainTitle
 	}
 	req := depositrequest.Request{
 		RequestID:   deposit.GetRequestId(),
@@ -56,7 +60,7 @@ func (r *rgbx) checkDepositRequest(deposit *rtypes.DepositAsset) error {
 		Amount:      deposit.GetAmount(),
 		Timestamp:   deposit.GetRequestTimestamp(),
 	}
-	if err := depositrequest.Verify(api.GetConfig().GetTitle(), req,
+	if err := depositrequest.Verify(chainTitle, req,
 		deposit.GetRequestPubkey(), deposit.GetRequestSignature()); err != nil {
 		elog.Error("checkDepositRequest verify", "requestId", req.RequestID,
 			"addr", req.Chain33Addr, "symbol", req.AssetSymbol, "amount", req.Amount, "err", err)

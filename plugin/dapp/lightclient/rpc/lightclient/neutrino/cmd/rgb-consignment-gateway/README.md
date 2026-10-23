@@ -41,7 +41,9 @@ has to listen for inbound traffic. This API is outside the RGB v0.2 protocol.
 
 The bridge authenticates `/bridge/*` with `-bridge-token`. When the gateway terminates TLS with
 `-client-ca`, those endpoints additionally require a verified client certificate (mTLS); the token
-is still checked. `-chain-title` is required for the deposit API: it is part of the signed message.
+is still checked. `-chain-title` is required for the deposit API: it is part of the signed message
+and must equal the bridge's chain title, which is also the rgbx executor's
+`guardianParachainTitle` (the parachain title, not the title of the chain hosting the contract).
 
 Protocol errors use the JSON-RPC error object and the v0.2 codes:
 
