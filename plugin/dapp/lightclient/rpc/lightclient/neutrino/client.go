@@ -52,13 +52,13 @@ func newClient() lightclient.Lighter {
 }
 
 type neutrinoClient struct {
-	ctx               context.Context
-	qclient           queue.Client
-	chain33Api        client.QueueProtocolAPI
-	mainChainGrpc     types.Chain33Client
-	cfg               config
+	ctx           context.Context
+	qclient       queue.Client
+	chain33Api    client.QueueProtocolAPI
+	mainChainGrpc types.Chain33Client
+	cfg           config
 	// chainTitle 本链 Title（取自 Chain33Config）：充值请求的签名消息包含它，桥出票前验签用。
-	chainTitle string
+	chainTitle        string
 	commitAddressType int32
 	commitAddr        string
 	commitKey         crypto.PrivKey
@@ -182,10 +182,10 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 		return nil
 	}
 	rgbCfg := rgb20.Config{
-		SidecarAddr:   n.cfg.Rgb20.SidecarAddr,
-		TestListen:    n.cfg.Rgb20.TestListen,
-		ChangeAddress: n.cfg.Rgb20.ChangeAddress,
-		MinConfirmations:  n.cfg.BlockConfirmations,
+		SidecarAddr:      n.cfg.Rgb20.SidecarAddr,
+		TestListen:       n.cfg.Rgb20.TestListen,
+		ChangeAddress:    n.cfg.Rgb20.ChangeAddress,
+		MinConfirmations: n.cfg.BlockConfirmations,
 		// 标准 transport：invoice 里写公网 endpoint，桥自己轮询内网 gateway。
 		TransportEndpoint: n.cfg.Rgb20.TransportEndpoint,
 		TransportGateway:  n.cfg.Rgb20.TransportGateway,

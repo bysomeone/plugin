@@ -519,16 +519,14 @@ func TestRestartRecovery(t *testing.T) {
 	_, resp = postMultipart(t, ts2, consignmentFields("persisted", testTxID, nil), consignment, true)
 	requireResult(t, resp, false)
 
-	_, resp = rpcCall(t, ts2, "consignment.get", map[string]any{"recipient_id": "persisted"})
-	require.Nil(t, resp.Error)
-	var got struct {
-		Consignment string `json:"consignment"`
-	}
-	require.NoError(t, json.Unmarshal(resp.Result, &got))
-	assert.Equal(t, string(consignment), mustDecodeBase64String(t, got.Consignment))
-
+	// The ACK is durable. The consignment itself is consumed once ACKed (a recipient may have
+	// several outstanding consignments under one recipient_id, so get returns the next
+	// undelivered one, not a file that was already validated).
 	_, resp = rpcCall(t, ts2, "ack.get", map[string]any{"recipient_id": "persisted"})
 	requireResult(t, resp, true)
+	_, resp = rpcCall(t, ts2, "consignment.get", map[string]any{"recipient_id": "persisted"})
+	require.NotNil(t, resp.Error)
+	assert.Equal(t, -400, resp.Error.Code)
 }
 
 func TestContentAddressedDedup(t *testing.T) {

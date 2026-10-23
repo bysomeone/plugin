@@ -367,6 +367,9 @@ netName="${BTC_NETWORK}"
 connectPeers=["${BTC_P2P_ADDR}"]
 btcBlockInterval=2
 blockConfirmations=1
+# E2E 的链高度推进不像生产那样连续；本链确认深度保持 1（与拆分前的行为一致），
+# 否则依赖"提交后尽快被桥看到"的场景（如 #70 unlock）会等不到深度。
+mainChainConfirmations=1
 maxUtxoRescanTime=60
 # 充值地址发放入口（空 = 不开启）。E2E 脚本按 127.0.0.1:17001 领地址，见 docker-compose.yml
 # 里 para1 的 17001 端口发布与 scripts/btc_test.sh 的 BRIDGE_DEPOSIT_URL。

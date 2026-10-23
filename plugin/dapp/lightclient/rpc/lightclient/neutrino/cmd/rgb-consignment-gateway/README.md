@@ -22,7 +22,7 @@ responsible for validating consignments and broadcasting transactions.
 | --- | --- |
 | `server.info` | Returns `protocol_version: "0.2"`, the server version and uptime in seconds. |
 | `consignment.post` | Stores the uploaded bytes. First upload returns `true`; the identical file returns `false`; a different file for an existing `recipient_id` returns `-101`. |
-| `consignment.get` | Returns `{consignment, txid, vout?}` with the consignment base64-encoded; `-400` if absent. |
+| `consignment.get` | Returns the oldest not-yet-ACKed consignment for the recipient as `{consignment, txid, vout?}` (base64); `-400` if none. Several consignments may share one `recipient_id` (address-based invoices do); they are delivered in order, and an ACK consumes the one returned. |
 | `ack.post` | Records an ACK/NACK. First post returns `true`; the same value returns `false`; a different value returns `-100`; no consignment returns `-300`. |
 | `ack.get` | Returns `true`, `false`, or `null` (no ACK yet); `-400` if the consignment is absent. |
 | `media.post`, `media.get` | Not implemented: returns `-32601`. No media storage is provided. |

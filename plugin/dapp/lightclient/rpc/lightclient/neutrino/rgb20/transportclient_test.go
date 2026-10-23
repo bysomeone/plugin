@@ -118,10 +118,10 @@ func TestTransportClient_AckPost(t *testing.T) {
 		return c, nil
 	})
 	c := newTestTransportClient(t, srv.URL)
-	first, err := c.AckPost(context.Background(), "bcrt:recipient", true)
+	first, err := c.AckPost(context.Background(), "bcrt:recipient", "", true)
 	require.NoError(t, err)
 	require.True(t, first)
-	second, err := c.AckPost(context.Background(), "bcrt:recipient", true)
+	second, err := c.AckPost(context.Background(), "bcrt:recipient", "", true)
 	require.NoError(t, err)
 	require.False(t, second)
 	mu.Lock()
@@ -133,7 +133,7 @@ func TestTransportClient_ProtocolErrorIsNotRetryable(t *testing.T) {
 	srv := newJSONRPCServer(t, func(string, map[string]any) (any, *TransportRPCError) {
 		return nil, &TransportRPCError{Code: -100, Message: "Cannot change ACK"}
 	})
-	_, err := newTestTransportClient(t, srv.URL).AckPost(context.Background(), "r", false)
+	_, err := newTestTransportClient(t, srv.URL).AckPost(context.Background(), "r", "", false)
 	require.Error(t, err)
 	var rpcErr *TransportRPCError
 	require.ErrorAs(t, err, &rpcErr)
@@ -167,7 +167,7 @@ func TestTransportClient_EmptyRecipient(t *testing.T) {
 	c := newTestTransportClient(t, "http://127.0.0.1:1/0.2/json-rpc")
 	_, err := c.ConsignmentGet(context.Background(), "")
 	require.Error(t, err)
-	_, err = c.AckPost(context.Background(), "", true)
+	_, err = c.AckPost(context.Background(), "", "", true)
 	require.Error(t, err)
 }
 
