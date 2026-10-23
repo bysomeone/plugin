@@ -215,7 +215,7 @@ func Test_checkDeposit_rgb20_thresholdSig(t *testing.T) {
 		Amount:      1000,
 		Timestamp:   1_700_000_000,
 	}
-	userSig := ecdsa.Sign(userPriv, depositrequest.MessageHash(testCfg.GetTitle(), userReq)).Serialize()
+	userSig := ecdsa.Sign(userPriv, depositrequest.MessageHash(rgbxCfg.GuardianParachainTitle, userReq)).Serialize()
 
 	dep := &rtypes.DepositAsset{
 		Amount:           1000,
