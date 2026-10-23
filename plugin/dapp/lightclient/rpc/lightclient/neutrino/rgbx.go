@@ -63,7 +63,7 @@ func (r *rgbx) start(cli *neutrinoClient) {
 	log.Debug("init rgbx service start")
 	r.client = cli
 	r.commitTxKey = cli.getCommitKey()
-	r.requiredConfs = int64(cli.cfg.BlockConfirmations)
+	r.requiredConfs = int64(cli.cfg.mainChainConfirmations())
 
 	// 获取 rgbx 确认高度。RGB20 场景下主链 grpc GetConfirmedHeight（QueryChain）在并发/时序下
 	// 可能 hang（与 getCrossChainInfo 同因），跳过不影响 RGB20 充值/提现主流程

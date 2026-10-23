@@ -22,6 +22,10 @@ import (
 // keep in memory if no size is specified.
 const defaultBlockCacheSize = 20 * 1024 * 1024 //20 MB
 
+// defaultMainChainConfirmations 是主链（chain33）pending 的默认等待深度。
+// 取 6 与拆分前的既有行为一致；主链出块远快于 BTC，这个值通常只要几秒。
+const defaultMainChainConfirmations = 6
+
 type config struct {
 
 	// IsOfficialNode 是否为官方主节点。配置键显式写成 isOfficialNode（CONFIG.md 与 CI 的写法）；
@@ -53,8 +57,14 @@ type config struct {
 
 	// BtcBlockInterval 区块时间间隔，second
 	BtcBlockInterval uint32 `json:"btcBlockInterval"`
-	// BlockConfirmations 区块确认数
+	// BlockConfirmations BTC 确认数门限：钱包待确认、中继提交头链的保留深度（只提交到
+	// best-N）、扫集默认确认数。它**不**决定本链 pending 的等待深度 —— 那是
+	// MainChainConfirmations。BTC 一块约 10 分钟，本链一块数秒，两者必须分开配置。
 	BlockConfirmations uint32 `json:"blockConfirmations"`
+	// MainChainConfirmations 本链（chain33）pending 的等待深度：拉取 pending 时只处理
+	// 主链高度 − N + 1 之前的记录，给本链重组留出回退窗口。<=0 用默认值
+	// （defaultMainChainConfirmations）。
+	MainChainConfirmations uint32 `json:"mainChainConfirmations"`
 	// MaxUtxoRescanTime, utxo 检索最大时长，hour, 0为永不超时
 	MaxUtxoRescanTime int64 `json:"maxUtxoRescanTime"`
 	// BtcFullNodeRPC 可选，比特币全节点 RPC 配置，用于查询 block 构造SPV
@@ -228,6 +238,14 @@ type tssConfig struct {
 	// 关闭时 fail-closed 拒绝启动（panic）—— 不一致的节点能"参与签名"但产出链上不认，是静默失灵。
 	// 只在为了临时把节点拉起来做冷修时打开，修好必须改回 false。
 	AllowShareMismatch bool `json:"allowShareMismatch"`
+}
+
+// mainChainConfirmations 返回本链 pending 的等待深度（未配置时用默认值）。
+func (c config) mainChainConfirmations() uint32 {
+	if c.MainChainConfirmations == 0 {
+		return defaultMainChainConfirmations
+	}
+	return c.MainChainConfirmations
 }
 
 func (c config) getChainParams() chaincfg.Params {
