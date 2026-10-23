@@ -1735,6 +1735,17 @@ function scenario_rgbx_deposit_address_binding() {
 # 后续场景；后面唯一还会读 RGB20 余额的只有备份演练（它自己重新充值）。
 function scenario_rgbx_manual_abandon_withdraw() {
     log_step "scenario: manual abandon (chain-33 proposal -> local whitelist -> TSS Unlock -> released)"
+
+    # The "never payable but retryable" withdrawal is built from a fee-less invoice, which needs
+    # a non-zero on-chain rgb20WithdrawFee. Without governance seeding the fee is 0, the invoice
+    # is valid, and the withdraw would simply be paid — skip rather than assert the impossible.
+    local abandon_fee
+    abandon_fee=$(rgbx_query "GetBridgeConfig" "{\"data\":\"${RGB20_SYMBOL}\"}" |
+        jq -r '[.result.rgb20WithdrawFee[]? | select((.symbol | ascii_upcase) == "'"${RGB20_SYMBOL}"'") | .feeMinUnits] | first // 0' 2>/dev/null)
+    if [ -z "${abandon_fee}" ] || [ "${abandon_fee}" -le 0 ] 2>/dev/null; then
+        log_step "SKIP: on-chain rgb20WithdrawFee is ${abandon_fee:-0} (governance not seeded); cannot construct an unpayable withdrawal for the abandon flow"
+        return 0
+    fi
     local operator="${ABANDON_OPERATOR_ADDR:-${AUTH_ADDR1}}"
     local operator_key="${ABANDON_OPERATOR_KEY:-${AUTH_KEY1}}"
     local amount="${RGB20_ABANDON_WITHDRAW_AMOUNT:-10000}"
