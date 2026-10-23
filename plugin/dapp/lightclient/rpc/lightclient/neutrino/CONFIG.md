@@ -746,8 +746,11 @@ Withdrawals use the same transport in the opposite direction (the bridge is the 
    the consignment already embeds the anchoring transaction, so a late recipient can still
    validate it.
 4. Delivery is retried with exponential backoff (5s → 5min) until one endpoint accepts the post.
-   An invoice with no usable transport falls back to `consignmentPublish.url`; with no URL
-   configured the consignment is only kept locally (WARN).
+   An invoice with no usable transport cannot be delivered to a standard wallet at all (wallets
+   do not import raw files), so the bridge records the consignment on its own gateway under the
+   invoice's `recipient_id` (content-addressed, retrievable via `consignment.get`). If no gateway
+   is configured it falls back to `consignmentPublish.url`; with neither, the consignment is only
+   kept locally (WARN). The on-chain confirm still carries its sha256 either way.
 
 ## 5. Bitcoin 节点关键配置项
 
