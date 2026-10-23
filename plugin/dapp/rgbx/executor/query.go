@@ -260,6 +260,31 @@ func (r *rgbx) Query_GetWithdrawFinalState(req *types.ReqString) (types.Message,
 	return &types.ReplyString{Data: string(value)}, nil
 }
 
+// Query_GetWithdrawConsignmentHash returns the hex sha256 of the RGB20 consignment the bridge
+// delivered for a withdrawal burn. The payload is the burn's chain33 transaction hash in hex.
+//
+// Not every settled withdrawal has one: the bridge submits Confirm even when it has no local
+// consignment record (settlement must never wait on delivery), so ErrNotFound here means "no
+// hash was registered", not "the withdrawal does not exist".
+func (r *rgbx) Query_GetWithdrawConsignmentHash(req *types.ReqString) (types.Message, error) {
+	burnTxHash, err := decodeBurnTxHash(req.GetData())
+	if err != nil {
+		return nil, err
+	}
+	value, err := r.GetStateDB().Get(formatWithdrawConsignmentKey(burnTxHash))
+	if errors.Is(err, types.ErrNotFound) {
+		return nil, types.ErrNotFound
+	}
+	if err != nil {
+		elog.Error("Query_GetWithdrawConsignmentHash get db", "burnTxHash", req.GetData(), "err", err)
+		return nil, err
+	}
+	if len(value) == 0 {
+		return nil, types.ErrNotFound
+	}
+	return &types.ReplyString{Data: hex.EncodeToString(value)}, nil
+}
+
 // Query_GetCrossChainLockAddress returns the shared address that holds the assets of unsettled
 // withdrawals for a cross-chain asset. The payload is the chain33 asset symbol (e.g. RGB20_USDT).
 //

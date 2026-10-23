@@ -3,6 +3,7 @@ package rgb20
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,8 @@ type Config struct {
 	Contracts []Contract
 	// MinConfirmations 充值铸造所需 BTC 确认数（默认与桥的 blockConfirmations 对齐）。
 	MinConfirmations uint32
+	// ConsignmentPublish 提现 consignment 的外部交付配置（空 url = 只本地保存）。
+	ConsignmentPublish ConsignmentPublishConfig
 	// HeaderRelayConfirmations 中继提交头链时**保留的确认深度** B
 	// （= [rpc.sub.light.neutrino].blockConfirmations，默认 6）。
 	//
@@ -254,6 +257,9 @@ type Adapter struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	// publishClient consignment 上传复用的 HTTP 客户端（超时来自配置）。
+	publishClient *http.Client
+
 	// withdrawMu 提现串行（一次只处理一笔，避免并发花同一 seal）。
 	withdrawMu sync.Mutex
 	// stickySealMu 串行 sticky seal 记录的「读-比对-写」（两个调用方各自都在提现串行区内，
@@ -276,6 +282,8 @@ func NewAdapter(cfg Config, store KVStore) (*Adapter, error) {
 		ctx:          ctx,
 		cancel:       cancel,
 		depositNotes: newDepositNoteOnce(),
+		// 上传是旁路：客户端只服务 consignment 交付，超时按配置（默认 10s）。
+		publishClient: &http.Client{Timeout: cfg.ConsignmentPublish.timeout()},
 	}
 	// 已签充值的落盘产物：与 receive/seal 共用同一个 KVStore（不引入新存储引擎）。
 	a.depositSigs = newDepositSignatureStore(store)

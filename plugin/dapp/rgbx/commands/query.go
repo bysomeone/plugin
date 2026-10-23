@@ -272,6 +272,30 @@ func listOperations(cmd *cobra.Command, _ []string) {
 	}, reply, false)
 }
 
+// getWithdrawConsignmentCMD returns the consignment hash registered by an RGB20 withdrawal's
+// Confirm. The burn hash is the chain33 transaction hash of the withdrawal (0x prefix allowed).
+func getWithdrawConsignmentCMD() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "get-withdraw-consignment",
+		Short:   "get the consignment sha256 registered for an RGB20 withdrawal burn",
+		Run:     getWithdrawConsignment,
+		Example: "get-withdraw-consignment --tx-hash 0x...",
+	}
+	cmd.Flags().String("tx-hash", "", "chain33 withdrawal (burn) transaction hash in hex")
+	markRequired(cmd, "tx-hash")
+	return cmd
+}
+
+func getWithdrawConsignment(cmd *cobra.Command, _ []string) {
+	txHash, _ := cmd.Flags().GetString("tx-hash")
+	if txHash == "" {
+		_, _ = fmt.Fprintln(os.Stderr, "tx hash is required")
+		return
+	}
+	reply := &types.ReplyString{}
+	sendQueryRPC(cmd, "GetWithdrawConsignmentHash", &types.ReqString{Data: txHash}, reply, false)
+}
+
 func listPendingTxByFromCMD() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "listPendingTxByFrom",

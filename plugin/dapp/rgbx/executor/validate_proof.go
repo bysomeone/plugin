@@ -65,6 +65,14 @@ func merkleProof2String(merkleProof [][]byte) string {
 }
 
 func (r *rgbx) checkWithdrawConfirm(txHash, confirmHash string, confirm *rtypes.ConfirmTx, pendingTx *rtypes.PendingTx) error {
+	// consignment 哈希只可能是"空"或一份 consignment 的 sha256（32 字节）。先把这条最便宜的
+	// 结构判据挡在前面：任何其它长度都不是摘要，不必往下走（也不该被当成"某个哈希"落库）。
+	if hash := confirm.GetConsignmentHash(); len(hash) != 0 && len(hash) != rtypes.ConsignmentHashLen {
+		elog.Error("checkWithdrawConfirm invalid consignment hash length", "txHash", txHash,
+			"confirmHash", confirmHash, "burnTxHash", hex.EncodeToString(confirm.GetTxHash()),
+			"consignmentHashLen", len(hash), "expectLen", rtypes.ConsignmentHashLen)
+		return ErrInvalidConsignmentHash
+	}
 	// S3：同一笔提现 burn 只允许进入一个终态。键命中（settled 或 released）即拒绝：
 	// settled = 已放款，released = 已通过 Unlock 退回，两者都不允许再结算。
 	// 该守卫落在合约级 statedb（共识状态）上，而不是 LocalDB 的 pending.Confirmed 标记：
@@ -89,6 +97,14 @@ func (r *rgbx) checkWithdrawConfirm(txHash, confirmHash string, confirm *rtypes.
 		elog.Error("checkWithdrawConfirm getCrossChainInfo", "txHash", txHash, "confirmHash", confirmHash,
 			"symbol", pendingTx.GetAssetSymbol(), "err", err)
 		return ErrGetCrossChainInfo
+	}
+	// consignment 只属于 RGB20 提现：BTC 类提现的放款证明里没有 consignment，带哈希只能是
+	// 桥侧把两个分支搞混了，拒绝（否则会为一个不存在的交付物记账）。
+	if len(confirm.GetConsignmentHash()) > 0 && !rtypes.IsRgb20CrossChainAsset(info) {
+		elog.Error("checkWithdrawConfirm consignment hash on non-rgb20 asset", "txHash", txHash,
+			"confirmHash", confirmHash, "symbol", pendingTx.GetAssetSymbol(),
+			"burnTxHash", hex.EncodeToString(confirm.GetTxHash()))
+		return ErrConsignmentHashNotAllowed
 	}
 	// RGB20 分支：跳过链上 OP_RETURN 承诺与链上金额校验（H4：提现 correlation 走 txid↔pending 映射）。
 	if !rtypes.IsRgb20CrossChainAsset(info) {

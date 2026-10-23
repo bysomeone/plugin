@@ -275,6 +275,40 @@ func (r *rgbx) confirmWithdrawSettlement(confirm *rtypes.ConfirmTx, txHash, conf
 		return nil, err
 	}
 	receipt.KV = append(receipt.KV, burnedKV)
+	// RGB20 提现：把桥交付的 consignment 哈希登记到共识状态，供按提现哈希查询。
+	// 空哈希 = 桥本地没有该笔的 consignment（提现照常结算，只是没有可查询的交付凭证）。
+	// 非空时再核一次资产类别与长度（纵深防御；CheckTx 已按同一判据拒绝）：哈希只描述
+	// RGB20 的 consignment，给 BTC 类提现记账等于凭空造出一份不存在的交付物。
+	if consignmentHash := confirm.GetConsignmentHash(); len(consignmentHash) > 0 {
+		if len(consignmentHash) != rtypes.ConsignmentHashLen {
+			elog.Error("confirmWithdrawSettlement invalid consignment hash length", "txHash", txHash,
+				"confirmHash", confirmHash, "consignmentHashLen", len(consignmentHash),
+				"expectLen", rtypes.ConsignmentHashLen)
+			return nil, ErrInvalidConsignmentHash
+		}
+		info, err := r.getCrossChainInfo(withdraw.GetAssetSymbol())
+		if err != nil {
+			elog.Error("confirmWithdrawSettlement getCrossChainInfo", "txHash", txHash,
+				"confirmHash", confirmHash, "symbol", withdraw.GetAssetSymbol(), "err", err)
+			return nil, ErrGetCrossChainInfo
+		}
+		if !rtypes.IsRgb20CrossChainAsset(info) {
+			elog.Error("confirmWithdrawSettlement consignment hash on non-rgb20 asset", "txHash", txHash,
+				"confirmHash", confirmHash, "symbol", withdraw.GetAssetSymbol())
+			return nil, ErrConsignmentHashNotAllowed
+		}
+		receipt.KV = append(receipt.KV, &types.KeyValue{
+			Key:   formatWithdrawConsignmentKey(confirm.GetTxHash()),
+			Value: consignmentHash,
+		})
+		receipt.Logs = append(receipt.Logs, &types.ReceiptLog{
+			Ty: rtypes.TyWithdrawConsignmentLog,
+			Log: types.Encode(&rtypes.WithdrawConsignment{
+				BurnTxHash:      confirm.GetTxHash(),
+				ConsignmentHash: consignmentHash,
+			}),
+		})
+	}
 	return receipt, nil
 }
 

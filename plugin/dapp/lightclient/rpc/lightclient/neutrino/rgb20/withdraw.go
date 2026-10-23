@@ -3,6 +3,7 @@ package rgb20
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
@@ -23,6 +24,10 @@ var (
 	// withdrawStickySealBucket 保存 chain33 提现哈希 -> 绑定的 sticky seal outpoint。
 	withdrawStickySealBucket = []byte("rgb20-withdraw-sticky-seal")
 )
+
+// knownRgbWithdrawTxid 是已知 RGB txid 集合里"提现交易"的标记值（充值交易存的是 receiveID）。
+// 确认交易只对提现带 consignment 哈希，因此需要把提现与充值收款区分开。
+const knownRgbWithdrawTxid = "withdraw"
 
 // WithdrawRequest RGB20 提现请求（对应 rgbx Withdraw 的 pending tx）。
 type WithdrawRequest struct {
@@ -399,6 +404,21 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 			Status:      SealStatusPendingMint,
 		})
 	}
+
+	// consignment 交付：先落盘（确认交易要登记的 sha256 必须来自实际保存的字节），再异步上传。
+	// 两步都是 best-effort —— 磁盘/外部服务的异常绝不能阻塞广播与链上结算（钱已经在链上锁定）。
+	if err := a.SaveWithdrawConsignment(req.Chain33TxHash, rsp.Consignment); err != nil {
+		log.Error("Withdraw save consignment; confirm will carry no consignment hash",
+			"chain33Hash", hex.EncodeToString(req.Chain33TxHash), "err", err)
+	}
+	// 上传的字节与确认交易登记的哈希必须同源：优先发布**已保存/已存在**的那一份
+	// （写入冲突时保留的是旧字节，链上哈希也由它算出）；本地完全没有记录（存储故障）
+	// 时才退回本次构建结果，尽力完成交付——此时确认哈希为空。
+	publishBytes := rsp.Consignment
+	if saved, err := a.GetWithdrawConsignment(req.Chain33TxHash); err == nil && len(saved) > 0 {
+		publishBytes = saved
+	}
+	a.publishConsignmentAsync(req.Chain33TxHash, publishBytes)
 
 	// 广播。
 	if err := a.bridge.BroadcastTx(signedPsbt, fin.Txid); err != nil {
@@ -909,7 +929,7 @@ func (a *Adapter) GetChain33HashByTxid(txid string) ([]byte, error) {
 
 // putKnownWithdrawTxid 将提现交易 txid 记为已知 RGB txid（排除 BTC 提现路径）。
 func (a *Adapter) putKnownWithdrawTxid(txid string) error {
-	return a.store.Put(txidBucket, []byte(txid), []byte("withdraw"))
+	return a.store.Put(txidBucket, []byte(txid), []byte(knownRgbWithdrawTxid))
 }
 
 // refreshSealStatuses 用侧车的 seal 视图**双向**对齐本地 SealIndex。

@@ -81,6 +81,47 @@ func (n *neutrinoClient) SignSweepPsbt(psbtBytes []byte) ([]byte, error) {
 	return n.tss.signSweepPsbt(psbtBytes)
 }
 
+// attachRgb20ConsignmentHash 为 RGB20 提现的确认交易填入 consignment 哈希（sha256，32 字节）。
+//
+// 哈希必须来自**本地实际保存的 consignment 字节**（见 rgb20.Adapter.WithdrawConsignmentHash）：
+// 前端/审计用它把链上登记值与外部服务收到的那份交付物对上。本地没有记录（落盘失败、数据目录
+// 被清、从旧快照恢复）时只记 ERROR 并让哈希留空 —— 确认照常提交，结算绝不能等交付。
+//
+// 判据是 txid 的提现标记（不是 IsKnownRgbTxid：后者也含充值收款），BTC 提现不走这里。
+func (n *neutrinoClient) attachRgb20ConsignmentHash(confirm *rtypes.ConfirmTx, btcPending *btcPendingTx) {
+	if n == nil {
+		return
+	}
+	attachRgb20ConsignmentHashFrom(confirm, btcPending, n.rgb20)
+}
+
+// rgb20ConsignmentSource 是「某笔 RGB20 提现的 consignment 交付事实」的最小查询面。
+// *rgb20.Adapter 实现它；抽出来是为了让确认载荷的组装可单测（不需要跑完整提现）。
+type rgb20ConsignmentSource interface {
+	IsRgb20WithdrawTxid(txid string) bool
+	WithdrawConsignmentHash(chain33Hash []byte) []byte
+}
+
+func attachRgb20ConsignmentHashFrom(confirm *rtypes.ConfirmTx, btcPending *btcPendingTx,
+	src rgb20ConsignmentSource) {
+
+	if src == nil || confirm == nil || btcPending == nil {
+		return
+	}
+	if !src.IsRgb20WithdrawTxid(btcPending.txHash.String()) {
+		return
+	}
+	hash := src.WithdrawConsignmentHash(btcPending.chain33WithdrawTxHash)
+	if len(hash) != rtypes.ConsignmentHashLen {
+		log.Error("buildWithdrawConfirm rgb20 consignment hash unavailable; submitting confirm without it",
+			"btcTxid", btcPending.txHash.String(),
+			"chain33Hash", hex.EncodeToString(btcPending.chain33WithdrawTxHash),
+			"hashLen", len(hash))
+		return
+	}
+	confirm.ConsignmentHash = hash
+}
+
 // BroadcastRawTx 广播一笔已定稿的原始交易（扫集用）。
 //
 // 广播是幂等的：本笔可能已经在本节点可见（上一次广播其实成功了但回包丢失），节点会以

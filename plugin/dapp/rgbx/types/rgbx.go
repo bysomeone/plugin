@@ -105,6 +105,13 @@ const (
 	// TyBumpWithdrawFeeLog 提现加价请求（链上只存证 + 发事件）的回执日志。必须追加在末尾：
 	// log id 会写进回执，插在中间会改变既有 log 的编号。
 	TyBumpWithdrawFeeLog
+	// TyWithdrawConsignmentLog RGB20 提现确认时登记 consignment 哈希的回执日志。
+	// 必须追加在末尾：log id 会写进回执，插在中间会改变既有 log 的编号。
+	TyWithdrawConsignmentLog
+
+	// ConsignmentHashLen 是 RGB20 提现 consignment 的 sha256 摘要长度（字节）。
+	// 链上只接受空值或该长度：长度不符的哈希不可能是对一份 consignment 的 sha256。
+	ConsignmentHashLen = 32
 
 	NameAssetLog         = "AssetLog"
 	NamePendingTxLog     = "PendingTxLog"
@@ -121,6 +128,8 @@ const (
 	NameDepositScriptLog = "DepositScriptLog"
 	// NameBumpWithdrawFeeLog 回执里记录一条已被链上存证的提现加价请求。
 	NameBumpWithdrawFeeLog = "BumpWithdrawFeeLog"
+	// NameWithdrawConsignmentLog 回执里记录一次 RGB20 提现 confirm 登记的 consignment 哈希。
+	NameWithdrawConsignmentLog = "WithdrawConsignmentLog"
 )
 
 var (
@@ -152,11 +161,12 @@ var (
 		TyPendingTxLog: {Ty: reflect.TypeOf(PendingTx{}), Name: NamePendingTxLog},
 		TyCommitDKGLog: {Ty: reflect.TypeOf(types.ReqAddrs{}), Name: NameCommitDKGLog},
 		// 回填日志带的是载荷（symbol + precision），比"只留一条 KV"更适合按区块核对链上精度。
-		TyCrossChainMetaLog:  {Ty: reflect.TypeOf(CrossChainAssetMeta{}), Name: NameCrossChainMetaLog},
-		TyUnlockAssetLog:     {Ty: reflect.TypeOf(UnlockAsset{}), Name: NameUnlockAssetLog},
-		TyAbandonWithdrawLog: {Ty: reflect.TypeOf(AbandonWithdrawItem{}), Name: NameAbandonWithdrawLog},
-		TyDepositScriptLog:   {Ty: reflect.TypeOf(DepositScriptItem{}), Name: NameDepositScriptLog},
-		TyBumpWithdrawFeeLog: {Ty: reflect.TypeOf(BumpWithdrawFeeItem{}), Name: NameBumpWithdrawFeeLog},
+		TyCrossChainMetaLog:      {Ty: reflect.TypeOf(CrossChainAssetMeta{}), Name: NameCrossChainMetaLog},
+		TyUnlockAssetLog:         {Ty: reflect.TypeOf(UnlockAsset{}), Name: NameUnlockAssetLog},
+		TyAbandonWithdrawLog:     {Ty: reflect.TypeOf(AbandonWithdrawItem{}), Name: NameAbandonWithdrawLog},
+		TyDepositScriptLog:       {Ty: reflect.TypeOf(DepositScriptItem{}), Name: NameDepositScriptLog},
+		TyBumpWithdrawFeeLog:     {Ty: reflect.TypeOf(BumpWithdrawFeeItem{}), Name: NameBumpWithdrawFeeLog},
+		TyWithdrawConsignmentLog: {Ty: reflect.TypeOf(WithdrawConsignment{}), Name: NameWithdrawConsignmentLog},
 	}
 )
 
