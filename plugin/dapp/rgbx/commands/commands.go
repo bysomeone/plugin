@@ -54,6 +54,7 @@ func Cmd() *cobra.Command {
 		listBumpWithdrawFeeRequestsCMD(),
 		getDepositAddressCMD(),
 		listDepositRegistrationsCMD(),
+		getWithdrawConsignmentCMD(),
 	)
 	return cmd
 }

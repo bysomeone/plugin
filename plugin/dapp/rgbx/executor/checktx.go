@@ -81,6 +81,13 @@ var (
 	ErrGetGuardianNodeAddress   = errors.New("get guardian node address error")
 	ErrGetDkgConfirmations      = errors.New("get dkg confirmations error")
 	ErrInvalidDkgAddress        = errors.New("invalid dkg address")
+	// ErrInvalidConsignmentHash the Confirm carries a consignment hash that is neither empty nor
+	// a 32-byte sha256. Any other length cannot be the digest of a consignment.
+	ErrInvalidConsignmentHash = errors.New("invalid consignment hash")
+	// ErrConsignmentHashNotAllowed a non-empty consignment hash was attached to a withdrawal
+	// whose on-chain asset is not an RGB20 cross-chain asset (BTC-class payouts have no
+	// consignment; accepting one would record a hash that means nothing).
+	ErrConsignmentHashNotAllowed = errors.New("consignment hash not allowed for this asset")
 	// ErrWithdrawAlreadyConfirmed 同一笔提现 burn 已被结算（放款）过（S3）。
 	// 文案保留 "already confirmed" 子串：桥侧重试路径按该子串把重复提交视为幂等成功
 	// （neutrino commitWithdrawConfirm 对含 "already confirmed" 的错误不再重试）。

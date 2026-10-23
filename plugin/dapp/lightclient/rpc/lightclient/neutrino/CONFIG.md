@@ -462,7 +462,7 @@ P2WSH 充值地址上线后，用户的充值**不再进主池**（钱停在各�
 ### 4.4 `[rpc.sub.light.neutrino.rgb20]`
 
 RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `consignmentListen` / `contracts` /
-`changeAddress`）见 `RGB_USDT_INTEGRATION.md`；本节描述充值重试行为（4.4.1–4.4.2）、精度落链
+`changeAddress` / `consignmentPublish`）见 `RGB_USDT_INTEGRATION.md`；本节描述充值重试行为（4.4.1–4.4.2）、精度落链
 （4.4.3）、链上 CLI 金额口径（4.4.4）与**提现手续费**（4.4.5）。额外的桥侧开关是
 `testSignPsbt`（默认 `false`）：打开后允许 E2E 的 `sign-psbt` 测试端点用 TSS 组签名**任意** PSBT
 （签名节点无从核对被签内容），**生产环境必须保持关闭**；`sign-psbt` 仅用于 E2E 模拟用户付款。
@@ -602,6 +602,46 @@ withdrawFee=1000        # 每笔提现收 1000 个最小单位；<=0 或省略 =
 签名节点会拒掉协调者的合法提现。这与 §4.1 的 `userDepositSweep.feeRate` 是同一取向的取舍：
 `0`（未配置）= 跳过该项比对（该资产"发出额 ≤ pending"的上界判据仍然生效），而**不是**把提现全拒
 —— 节点配置缺失不该升级成桥停摆。
+
+#### 4.4.6 Consignment delivery (`[rpc.sub.light.neutrino.rgb20.consignmentPublish]`)
+
+Every RGB20 withdrawal produces a consignment that the recipient (or a service acting for it)
+needs in order to claim the transferred asset. The bridge persists it and delivers it out of band:
+
+```toml
+[rpc.sub.light.neutrino.rgb20.consignmentPublish]
+url="https://consignment.example.com/ingest"
+token="..."          # optional; sent as Authorization: Bearer <token>
+timeoutSeconds=10    # optional; per-attempt timeout (default 10)
+```
+
+Service contract (one POST per delivery attempt):
+
+- body: the raw consignment bytes, unchanged;
+- `Content-Type: application/octet-stream`;
+- `X-Consignment-Hash`: `sha256(consignment)` in lowercase hex;
+- `X-Withdraw-Hash`: the chain33 withdrawal (burn) transaction hash in lowercase hex;
+- `Authorization: Bearer <token>` when `token` is configured;
+- any 2xx is success; every other status or network error is a failure.
+
+Ordering and failure semantics:
+
+- The raw consignment is saved locally first (walletdb bucket `rgb20-withdraw-consignment`, key =
+  the burn hash, value = the exact bytes). A storage failure is logged at ERROR and does **not**
+  fail the withdrawal.
+- Upload runs asynchronously and never blocks broadcast or settlement. Failures retry with
+  exponential backoff from 5 seconds up to a 5-minute cap; every failure is logged at WARN.
+- When the withdrawal `Confirm` is built, its `consignmentHash` is `sha256` of the bytes actually
+  stored locally. With no local record the bridge logs ERROR and submits the confirm with an empty
+  hash: the on-chain payout is never blocked by delivery, and nothing is registered.
+- Empty `url`: the bridge only saves locally and logs WARN; no upload is attempted. Local saving
+  and the confirm hash still work.
+- Consumers should treat `(X-Withdraw-Hash, X-Consignment-Hash)` as the idempotency key: retries
+  may deliver the same bytes more than once.
+
+Query the registered value with `rgbx get-withdraw-consignment --tx-hash <burn hex>` (returns the
+sha256 hex), or `GetWithdrawConsignmentHash` over JSON-RPC. It returns `ErrNotFound` when the
+confirm carried no hash (no local record at confirm time, or the withdrawal is not an RGB20 one).
 
 ## 5. Bitcoin 节点关键配置项
 

@@ -187,6 +187,10 @@ message confirmTx {
     bool              timeout              = 6;
     utxoSpendingProof utxoProof            = 7;
     btcTxProof        btcTxProof           = 8;
+    // consignmentHash 是 RGB20 提现交付的 consignment 的 sha256（32 字节）。
+    // 仅当 pending 资产是 RGB20 类时允许非空；BTC 类提现必须为空。空表示桥本地没有该笔
+    // 提现的 consignment 记录（确认照常提交，结算不受影响）。
+    bytes             consignmentHash      = 9;
 }
 
 message btcTxProof {
@@ -421,6 +425,13 @@ message bumpWithdrawFeeItem {
 
 message bumpWithdrawFeeList {
     repeated bumpWithdrawFeeItem items = 1;
+}
+
+// withdrawConsignment 是 RGB20 提现确认结算的回执日志：登记「哪笔 burn ↔ 哪份 consignment」，
+// 便于按区块核对链上登记的值。
+message withdrawConsignment {
+    bytes burnTxHash       = 1;
+    bytes consignmentHash  = 2;
 }
 
 service rgbx {}

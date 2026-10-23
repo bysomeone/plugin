@@ -133,6 +133,23 @@ type rgb20Config struct {
 	// 该能力等价于"用 TSS 组私钥签任意 PSBT"（签名节点无从核对被签内容），**生产必须为 false**
 	// （默认 false），只有 E2E/regtest 部署显式打开。
 	TestSignPsbt bool `json:"testSignPsbt"`
+	// ConsignmentPublish 提现 consignment 的外部交付配置。url 为空时只本地保存（WARN）。
+	ConsignmentPublish consignmentPublishConfig `json:"consignmentPublish"`
+}
+
+// consignmentPublishConfig consignment 外部交付：POST 原始字节到外部服务。
+//
+// 契约（与 CONFIG.md §4.4.6 一致）：
+//   - body = 原始 consignment 字节；
+//   - Content-Type: application/octet-stream；
+//   - X-Consignment-Hash: consignment 的 sha256 hex；
+//   - X-Withdraw-Hash: chain33 提现（burn）交易哈希 hex；
+//   - token 非空时 Authorization: Bearer <token>；
+//   - 2xx = 成功，其余按指数退避重试（上限 5 分钟），绝不阻塞提现。
+type consignmentPublishConfig struct {
+	URL            string `json:"url"`
+	Token          string `json:"token"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
 }
 
 // rgb20Contract RGB20 资产合约注册项。

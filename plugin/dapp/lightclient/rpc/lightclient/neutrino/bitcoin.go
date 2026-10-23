@@ -859,7 +859,7 @@ func (n *neutrinoClient) buildWithdrawConfirm(btcPending *btcPendingTx, pendingT
 		return nil
 	}
 	minPendingHeight := n.rgbx.pendingCache.getMinPendingHeight()
-	return &rtypes.ConfirmTx{
+	confirm := &rtypes.ConfirmTx{
 		ActionType:           rtypes.TyWithdrawAsset,
 		ConfirmedBlockHeight: minPendingHeight - 1,
 		TxBlockHeight:        pendingTxBlockIndex.GetBlockHeight(),
@@ -873,6 +873,8 @@ func (n *neutrinoClient) buildWithdrawConfirm(btcPending *btcPendingTx, pendingT
 			MerkleProof: spv.GetBranchProof(),
 		},
 	}
+	n.attachRgb20ConsignmentHash(confirm, btcPending)
+	return confirm
 }
 
 func (n *neutrinoClient) processWithdrawConfirm(confirm *confirmWithdraw) bool {

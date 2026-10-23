@@ -37,6 +37,11 @@ const (
 	withdrawFinalKeyPrefix = KeyPrefixStateDB + "withdraw-final-"
 	// confirmUsedKeyPrefix Confirm 结算（mint / transfer 两类 utxo 花费确认）已消费集合前缀（E14）。
 	confirmUsedKeyPrefix = KeyPrefixStateDB + "confirm-used-"
+	// withdrawConsignmentKeyPrefix indexes the RGB20 consignment hash registered by a withdrawal
+	// Confirm (RGB20 payouts only). key = prefix + sha256(burnTxHash), value = the 32-byte sha256
+	// of the consignment bytes the bridge delivered. Same fixed-length shape as
+	// formatWithdrawFinalKey so the burn identity is stable across reorgs.
+	withdrawConsignmentKeyPrefix = KeyPrefixStateDB + "withdraw-consignment-"
 	// operationRecordKeyPrefix 全局操作台账的单条**不可变**记录前缀（S2）：
 	// key = 前缀 + 32 字节 operationId，value = types.Encode(operationRecord)。
 	operationRecordKeyPrefix = KeyPrefixStateDB + "oprec-"
@@ -115,6 +120,14 @@ func formatWithdrawFinalKey(burnTxHash []byte) []byte {
 func formatConfirmUsedKey(confirmTxHash []byte) []byte {
 	hash := sha256.Sum256(confirmTxHash)
 	return append([]byte(confirmUsedKeyPrefix), hash[:]...)
+}
+
+// formatWithdrawConsignmentKey 按提现 burn 交易哈希索引该笔 RGB20 提现交付的 consignment 哈希。
+// 与 formatWithdrawFinalKey 同一身份（burn 的 chain33 交易哈希）与同一形状（先 sha256 再拼接）：
+// 两个键回答的是同一笔 burn 的两个问题——"结算了吗"与"交付的是哪份 consignment"。
+func formatWithdrawConsignmentKey(burnTxHash []byte) []byte {
+	hash := sha256.Sum256(burnTxHash)
+	return append([]byte(withdrawConsignmentKeyPrefix), hash[:]...)
 }
 
 // formatSymbol 归一化 symbol：symbol 是资产的唯一身份（asset key / account key / CrossChainInfo key），
