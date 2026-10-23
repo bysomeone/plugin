@@ -133,6 +133,14 @@ bootstrap（链上还没有任何 BTC 头）时，首个头的父块必须正好
   - **中继侧如何使用 N（N 的单一真相）**：中继**不镜像**这个值，而是经 lightclient 执行器的只读查询
     `GetRgbxMinBtcConfirmations` 直接读链上生效值（执行器读的就是本节这一段配置，取值口径一致）。
     中继不做本地副本 ⇒ 不存在"两处配置人肉配套"，改这里并重启主链即对中继生效。
+
+**本链重组（运营假设，#75）**：生产主链 bityuan 使用 ticket 共识，且平行链只用于桥，主链重组深度预期
+远小于 `mainChainConfirmations`（默认 6）。因此**本链侧不做重组检测/自动暂停**，把
+`mainChainConfirmations` 当作回退窗口；BTC 侧重由 N/B 保护（见 2.2.1）。
+
+如果真的出现超过 `mainChainConfirmations` 的深重组，桥不会自动停：运维应立即用链上治理
+`pauseDeposit`/`pauseWithdraw`（或节点本地 `rgb20.safety.disable*`）急停，人工核对回滚后的 pending /
+confirm 与侧车账本，再按 `WITHDRAW_LOCK_MODEL.md` 处置受影响的提现。自动检测与自动暂停列为后续增强。
     - 中继读不到 N（主链未就绪、或主链执行器还是旧版本、没有这个查询）→ **不提交充值**（fail-closed，
       限流 WARN，下个轮询周期重试）：算不出深度就不提交，绝不用猜测值凑门控。
     - CI 里把 N 配成 `1`（`rgbx/cmd/ci/docker-compose.sh`）：那是为了让 E2E 的"1 个后续块即确认"时序
@@ -237,6 +245,17 @@ best >= H + B + N - 1          （等价于：提交后链上可见深度 >= N�
   - 说明：与 BTC 的 `blockConfirmations` 是两个独立旋钮。BTC 一块约 10 分钟、本链一块数秒，
     一个值不可能同时合适；此前两者共用 `blockConfirmations`，按 BTC 配置会让本链白等。
   - 默认行为：未设置时为 6。
+
+**确认深度分层（S5）**：三层各自独立配置，各管一件事，不要互相替代：
+
+| 层 | 配置 | 管什么 | 谁裁决 |
+| --- | --- | --- | --- |
+| 源链事件深度 | `[exec.sub.rgbx].minBtcConfirmations`（N） | 充值证明/提现确认所在的 BTC 区块在 canonical 头链上的最小深度 | 链上执行器（共识） |
+| 头链保留深度 | `blockConfirmations`（B） | 中继提交头链只到 `best - B`，决定"提交那一刻链上可见 tip" | 本地节点 |
+| 大额额外深度 | 治理配置 `largeDepositThreshold` / `largeDepositExtraConfirmations` | 超过阈值的单笔充值再额外等待的 BTC 块数 | 链上执行器（共识） |
+
+中继侧的本地门控把三者合成一个判据（见 2.2.1）。**不要**用改 B 来调整到账延迟：B 同时是头链保留
+深度与充值通知的确认数，改它会同时改变两件事。
 - `maxUtxoRescanTime` (int64)
   - 含义：UTXO 重扫超时（单位：小时）
   - 特性：0 表示不超时；内部会转为秒
