@@ -510,6 +510,7 @@ function scenario_rgb20_deposit() {
     local rec_json invoice receive_id recipient_id
     rec_json=$(gateway_deposit_invoice "${request_id}" "${deposit_amount}") ||
         fail "gateway did not publish an invoice for request ${request_id}"
+    invoice=$(echo "${rec_json}" | jq -r '.invoice // empty')
     receive_id=$(echo "${rec_json}" | jq -r '.receive_id // empty')
     recipient_id=$(echo "${rec_json}" | jq -r '.recipient_id // empty')
     assert_non_empty "${receive_id}" "rgb20 receive_id empty (gateway: ${rec_json})"
