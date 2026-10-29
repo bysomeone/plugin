@@ -153,6 +153,67 @@ func TestBridgeEventValidation(t *testing.T) {
 	}
 }
 
+func TestEventReadTokenIsReadOnly(t *testing.T) {
+	g, err := newGateway(config{
+		listen:      "127.0.0.1:0",
+		dataDir:     t.TempDir(),
+		path:        "/0.2/json-rpc",
+		maxSize:     1 << 20,
+		ttl:         time.Hour,
+		rateLimit:   0,
+		chainTitle:  testChainTitle,
+		bridgeToken: testBridgeTok,
+		eventsToken: "readonly-token-0123456789",
+	}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("newGateway: %v", err)
+	}
+	ts := httptest.NewServer(g.handler())
+	t.Cleanup(ts.Close)
+
+	do := func(method, path, token, body string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(method, ts.URL+path, bytes.NewBufferString(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	// The read-only token may query (empty ledger is fine)...
+	resp := do(http.MethodGet, "/bridge/events?limit=1", "readonly-token-0123456789", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("read-only GET status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	// ...but must not append.
+	resp = do(http.MethodPost, "/bridge/events", "readonly-token-0123456789",
+		`{"id":"x","type":"sweep.completed","payload":{}}`)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("read-only POST status %d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+	// The bridge token keeps full access.
+	resp = do(http.MethodPost, "/bridge/events", testBridgeTok,
+		`{"id":"x","type":"sweep.completed","payload":{}}`)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("bridge POST status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+	// An unknown token is rejected.
+	resp = do(http.MethodGet, "/bridge/events", "wrong-token-0123456789", "")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unknown token status %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
 func TestEventStorePrunesExpiredEventsAndKeepsCursorMonotonic(t *testing.T) {
 	dir := t.TempDir()
 	st, err := openEventStore(dir, 24*time.Hour)

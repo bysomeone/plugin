@@ -62,6 +62,7 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 		trustProxy:      false,
 		chainTitle:      envString(getenv, "RGB_GATEWAY_CHAIN_TITLE", ""),
 		bridgeToken:     envString(getenv, "RGB_GATEWAY_BRIDGE_TOKEN", ""),
+		eventsToken:     envString(getenv, "RGB_GATEWAY_EVENTS_TOKEN", ""),
 		tlsCert:         envString(getenv, "RGB_GATEWAY_TLS_CERT", ""),
 		tlsKey:          envString(getenv, "RGB_GATEWAY_TLS_KEY", ""),
 		clientCA:        envString(getenv, "RGB_GATEWAY_CLIENT_CA", ""),
@@ -96,6 +97,8 @@ func parseConfig(args []string, getenv func(string) string) (config, error) {
 		"chain title signed into deposit requests (empty disables the deposit API)")
 	fs.StringVar(&cfg.bridgeToken, "bridge-token", cfg.bridgeToken,
 		"shared secret for the /bridge/* endpoints (empty disables the bridge API)")
+	fs.StringVar(&cfg.eventsToken, "events-token", cfg.eventsToken,
+		"read-only token for the audit ledger (GET /bridge/events only; empty disables it)")
 	fs.StringVar(&cfg.tlsCert, "tls-cert", cfg.tlsCert, "TLS certificate file (empty serves plain HTTP)")
 	fs.StringVar(&cfg.tlsKey, "tls-key", cfg.tlsKey, "TLS private key file")
 	fs.StringVar(&cfg.clientCA, "client-ca", cfg.clientCA,
@@ -144,6 +147,17 @@ func (c config) validate() error {
 	}
 	if c.bridgeToken != "" && len(c.bridgeToken) < 16 {
 		return errors.New("bridge-token must be at least 16 characters")
+	}
+	if c.eventsToken != "" {
+		if c.bridgeToken == "" {
+			return errors.New("events-token requires bridge-token (the ledger lives behind the bridge API)")
+		}
+		if len(c.eventsToken) < 16 {
+			return errors.New("events-token must be at least 16 characters")
+		}
+		if c.eventsToken == c.bridgeToken {
+			return errors.New("events-token must differ from bridge-token (it is read-only)")
+		}
 	}
 	if (c.tlsCert == "") != (c.tlsKey == "") {
 		return errors.New("tls-cert and tls-key must be configured together")
@@ -211,7 +225,8 @@ func run(cfg config, logger *log.Logger) error {
 	if cfg.chainTitle != "" {
 		logger.Printf("deposit API enabled chain-title=%q bridge-auth=%s mTLS=%t",
 			cfg.chainTitle, authMode(cfg), cfg.clientCA != "")
-		logger.Printf("bridge event ledger enabled retention=%s", cfg.eventsRetention)
+		logger.Printf("bridge event ledger enabled retention=%s read-only-token=%t",
+			cfg.eventsRetention, cfg.eventsToken != "")
 	} else {
 		logger.Printf("deposit API disabled (chain-title/bridge-token not configured)")
 	}
