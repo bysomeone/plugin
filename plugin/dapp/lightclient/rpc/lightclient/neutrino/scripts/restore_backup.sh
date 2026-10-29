@@ -15,9 +15,18 @@
 # 建议先只读地核一遍再动现场（产物可恢复性 + 参数是否被接受）：
 #   restore_backup.sh --dry-run --archive <包> --target <同样的 label=path> ...
 #
+# 单节点恢复（从**整组包**里只还原一个节点，其余节点保持不动）：
+#   restore_backup.sh --archive <整组包> --only para2 --target para2=/var/lib/chain33/para2 ...
+# `--only <label>`（可重复，或 RESTORE_ONLY）只影响**落盘**：整包仍然完整校验（manifest、逐文件
+# sha256、必需成员），未选中的 label 不需要 --target、也不会被写入。选中的 label 不在包里即失败；
+# 给的 label 一个都不匹配即失败。`extra/<label>` 同理：只有该 label 被选中时才需要
+# RESTORE_EXTRA_TARGETS，未选中的 extra 不落盘。与 --dry-run 组合时同样校验整包，但只列出
+# 将要落盘的 label。不给 --only 时行为与原来完全一致（每个 label 都必须有 --target）。
+#
 # 环境变量：
 #   RESTORE_ARCHIVE       必填。cold_backup.sh 的产物（.tar），或它解开的那个目录（staging 形式）
-#   RESTORE_TARGETS       必填。多行 `label=path`；label 必须与包里的源 label 一一对应
+#   RESTORE_TARGETS       不给 --only 时必填。多行 `label=path`；label 必须与包里的源 label 一一对应
+#   RESTORE_ONLY          可选。多行（或空白分隔）的 label 列表，等价于重复传 `--only <label>`
 #   RESTORE_REPLACE       `refuse`（默认）| `move-aside` | `clear`：目标目录已存在且**非空**时怎么办
 #                           refuse      = 直接失败（最安全，要求运维先自己清）
 #                           move-aside  = 把现有目录整体改名成 <path>.pre-restore-<tag>（可回滚）
@@ -30,11 +39,13 @@
 #   RESTORE_STOPPED_CHECK_CMD  **生产必设**：断言写者已停的钩子。不给、又不用 --trust-caller-stopped
 #                         显式认领，脚本会拒绝落盘（"复核只证明文件对得上，证明不了没有进程在写"）
 #   RESTORE_SKIP_POST_VERIFY  可选。=1 时跳过"落盘后复核"（**不推荐**，只在排查脚本本身时用）
-# 参数：--archive <path> | --target <label=path>（可重复）| --required <label:relpath>（可重复）
-#       | --replace <policy> | --dry-run | --trust-caller-stopped | --no-stop | --no-start | -h
+# 参数：--archive <path> | --target <label=path>（可重复）| --only <label>（可重复）
+#       | --required <label:relpath>（可重复）| --replace <policy> | --dry-run
+#       | --trust-caller-stopped | --no-stop | --no-start | -h
 #
-# `--dry-run` 是**只读的完整校验**：解析参数 → 读包 → 逐文件核对 → 必需成员在位 → 每个 label 都有目标，
-# 然后退出、不碰任何目标。用途：破坏性步骤（清卷/清目录）之前先证明"后续能执行"，别毁完才发现参数不对
+# `--dry-run` 是**只读的完整校验**：解析参数 → 读包 → 逐文件核对 → 必需成员在位 → 将要落盘的
+# 每个 label 都有目标（不给 --only 时就是全部 label），然后退出、不碰任何目标。用途：破坏性步骤
+# （清卷/清目录）之前先证明"后续能执行"，别毁完才发现参数不对
 # ——CI 演练就是这么用的（backup_test.sh 的 drill_preflight_restore）。
 #
 # 注意：解开时按 tar 默认保留 uid/gid/mode（chain33 与侧车在生产都以该数据目录的属主身份跑；
@@ -71,6 +82,7 @@ declare -a TARGET_LABELS=()
 declare -a TARGET_PATHS=()
 declare -a EXTRA_TARGET_LABELS=()
 declare -a EXTRA_TARGET_PATHS=()
+declare -a ONLY_LABELS=()
 
 usage() {
     grep '^#' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' | sed '/^退出码/,$d'
@@ -102,6 +114,32 @@ target_path_for() {
     return 1
 }
 
+# --only <label>：选择**要落盘**的 label（可重复）。空列表 = 全部（原有行为）。
+add_only() {
+    local label="$1"
+    [ -n "${label}" ] || die "--only/RESTORE_ONLY entry must not be empty"
+    local i
+    for ((i = 0; i < ${#ONLY_LABELS[@]}; i++)); do
+        [ "${ONLY_LABELS[i]}" != "${label}" ] || return 0
+    done
+    ONLY_LABELS+=("${label}")
+}
+
+# is_selected <label>：该 label 是否要落盘。没有 --only 时恒为真（行为与原来一致）。
+is_selected() {
+    local label="$1"
+    if [ ${#ONLY_LABELS[@]} -eq 0 ]; then
+        return 0
+    fi
+    local i
+    for ((i = 0; i < ${#ONLY_LABELS[@]}; i++)); do
+        if [ "${ONLY_LABELS[i]}" = "${label}" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
     --archive)
@@ -110,6 +148,10 @@ while [ "$#" -gt 0 ]; do
         ;;
     --target)
         add_target "$2"
+        shift 2
+        ;;
+    --only)
+        add_only "$2"
         shift 2
         ;;
     --required)
@@ -174,13 +216,27 @@ if [ -n "${RESTORE_EXTRA_TARGETS:-}" ]; then
     done <<<"${RESTORE_EXTRA_TARGETS}"
 fi
 
+if [ -n "${RESTORE_ONLY:-}" ]; then
+    # 多行、空白分隔、`#` 注释都可以（label 里不会出现空白）。
+    while IFS= read -r _line; do
+        _line="${_line#"${_line%%[![:space:]]*}"}"
+        [ -n "${_line}" ] || continue
+        case "${_line}" in \#*) continue ;; esac
+        for _l in ${_line}; do
+            add_only "${_l}"
+        done
+    done <<<"${RESTORE_ONLY}"
+fi
+
 : "${RESTORE_REPLACE:=refuse}"
 case "${RESTORE_REPLACE}" in
 refuse | move-aside | clear) ;;
 *) die "RESTORE_REPLACE must be refuse|move-aside|clear, got: ${RESTORE_REPLACE}" ;;
 esac
 : "${RESTORE_ARCHIVE:?RESTORE_ARCHIVE (or --archive) is required}"
-[ ${#TARGET_LABELS[@]} -gt 0 ] || die "RESTORE_TARGETS (or --target) is required"
+if [ ${#ONLY_LABELS[@]} -eq 0 ]; then
+    [ ${#TARGET_LABELS[@]} -gt 0 ] || die "RESTORE_TARGETS (or --target) is required (or pass --only <label> to restore a subset of the package)"
+fi
 
 # --- 停机窗口守护（与冷备同一套约定：只关自己开的窗口） ---
 _started=0
@@ -243,16 +299,61 @@ done < <(manifest_source_labels "${MANIFEST}")
 
 [ ${#PKG_LABELS[@]} -gt 0 ] || die "the manifest lists no file at all (empty/corrupt package?)"
 
-for _l in "${PKG_LABELS[@]}"; do
-    if ! target_path_for "${_l}" >/dev/null; then
-        die "package contains label '${_l}' but no target was given for it (add --target ${_l}=<dir>)"
+# 包里的 extra 单文件（`extra/<label>`）也有自己的 label：`--only` 可以点名它们。
+declare -a PKG_EXTRA_LABELS=()
+while IFS= read -r _el; do
+    [ -n "${_el}" ] || continue
+    PKG_EXTRA_LABELS+=("${_el}")
+done < <(manifest_extra_entries "${MANIFEST}" | awk -F'\t' '{print $3}' | sed 's|^extra/||' | LC_ALL=C sort -u)
+
+# --only 的校验：点名的每个 label 必须在包里（源 label 或 extra/<label>）。
+# 「给了但一个都不匹配」在这里就不可能静默通过——每个未命中的名字都会报错。
+if [ ${#ONLY_LABELS[@]} -gt 0 ]; then
+    _extra_desc="none"
+    if [ ${#PKG_EXTRA_LABELS[@]} -gt 0 ]; then
+        _extra_desc="${PKG_EXTRA_LABELS[*]}"
     fi
+    for _ol in "${ONLY_LABELS[@]}"; do
+        _found=0
+        for _pl in "${PKG_LABELS[@]}"; do
+            if [ "${_pl}" = "${_ol}" ]; then
+                _found=1
+                break
+            fi
+        done
+        if [ "${_found}" = "0" ] && [ ${#PKG_EXTRA_LABELS[@]} -gt 0 ]; then
+            for _pl in "${PKG_EXTRA_LABELS[@]}"; do
+                if [ "${_pl}" = "${_ol}" ]; then
+                    _found=1
+                    break
+                fi
+            done
+        fi
+        [ "${_found}" = "1" ] ||
+            die "--only '${_ol}' is not in the package (source labels: ${PKG_LABELS[*]}; extra: ${_extra_desc})"
+    done
+    log_info "--only: restoring [${ONLY_LABELS[*]}] only; the whole package is still verified"
+fi
+
+for _l in "${PKG_LABELS[@]}"; do
+    if is_selected "${_l}"; then
+        if ! target_path_for "${_l}" >/dev/null; then
+            if [ ${#ONLY_LABELS[@]} -eq 0 ]; then
+                die "package contains label '${_l}' but no target was given for it (add --target ${_l}=<dir>)"
+            fi
+            die "selected label '${_l}' has no target (add --target ${_l}=<dir>)"
+        fi
+    fi
+    # 整包完整性**始终**逐 label 核验（选中与否都一样）—— 坏包不得先毁现场。
     [ -f "${PKG_DIR}/${_l}.tar.gz" ] || die "package is missing ${_l}.tar.gz"
     _vdest="${WORK}/verify-${_l}"
     mkdir -p "${_vdest}"
     tar -C "${_vdest}" -xzf "${PKG_DIR}/${_l}.tar.gz" || die "cannot extract ${_l}.tar.gz (corrupt package?)"
     verify_tree_against_manifest "${MANIFEST}" "${_l}" "${_vdest}" ||
         die "package verification FAILED for ${_l}: refusing to touch the target directory"
+    if ! is_selected "${_l}"; then
+        log_info "not selected by --only: ${_l} (verified, will NOT be restored)"
+    fi
 done
 
 # 关键成员 = **包里的清单（随包走，恢复方不需要记得当初传了什么）** ∪ **本次命令行/env 追加的要求**。
@@ -274,10 +375,57 @@ for _l in "${PKG_LABELS[@]}"; do
 done
 log_info "package verified: ${#PKG_LABELS[@]} label(s), all members match size+sha256"
 
+# extra 单文件同样受 --only 约束：只有其 label 被选中时才落盘；选中的 extra 必须有落点。
+declare -a RESTORE_EXTRA_IDX=()
+for ((_i = 0; _i < ${#EXTRA_TARGET_LABELS[@]}; _i++)); do
+    if is_selected "${EXTRA_TARGET_LABELS[_i]}"; then
+        RESTORE_EXTRA_IDX+=("${_i}")
+    fi
+done
+if [ ${#ONLY_LABELS[@]} -gt 0 ]; then
+    for _ol in "${ONLY_LABELS[@]}"; do
+        _is_pkg_extra=0
+        if [ ${#PKG_EXTRA_LABELS[@]} -gt 0 ]; then
+            for _pl in "${PKG_EXTRA_LABELS[@]}"; do
+                if [ "${_pl}" = "${_ol}" ]; then
+                    _is_pkg_extra=1
+                    break
+                fi
+            done
+        fi
+        [ "${_is_pkg_extra}" = "1" ] || continue
+        _has_target=0
+        for ((_i = 0; _i < ${#EXTRA_TARGET_LABELS[@]}; _i++)); do
+            if [ "${EXTRA_TARGET_LABELS[_i]}" = "${_ol}" ]; then
+                _has_target=1
+                break
+            fi
+        done
+        [ "${_has_target}" = "1" ] ||
+            die "extra file '${_ol}' was selected by --only but has no RESTORE_EXTRA_TARGETS entry (add ${_ol}=<path>)"
+    done
+fi
+
+_selected_count=0
+for _l in "${PKG_LABELS[@]}"; do
+    if is_selected "${_l}"; then
+        _selected_count=$((_selected_count + 1))
+    fi
+done
+if [ "${_selected_count}" -eq 0 ] && [ ${#RESTORE_EXTRA_IDX[@]} -eq 0 ]; then
+    die "--only selected nothing to restore (no matching source label with a target, no extra target)"
+fi
+
 if [ "${DRY_RUN}" = "1" ]; then
     log_info "--dry-run: package is good; not touching any target"
     for _l in "${PKG_LABELS[@]}"; do
-        log_info "  would restore ${_l} -> $(target_path_for "${_l}")"
+        if is_selected "${_l}"; then
+            log_info "  would restore ${_l} -> $(target_path_for "${_l}")"
+        fi
+    done
+    for ((_i = 0; _i < ${#RESTORE_EXTRA_IDX[@]}; _i++)); do
+        _idx="${RESTORE_EXTRA_IDX[_i]}"
+        log_info "  would restore extra ${EXTRA_TARGET_LABELS[_idx]} -> ${EXTRA_TARGET_PATHS[_idx]}"
     done
     exit 0
 fi
@@ -308,6 +456,9 @@ fi
 # =====================================================================
 _backup_tag=$(manifest_header "${MANIFEST}" tag)
 for _l in "${PKG_LABELS[@]}"; do
+    if ! is_selected "${_l}"; then
+        continue
+    fi
     _target=$(target_path_for "${_l}")
     _exists_nonempty=0
     if [ -d "${_target}" ] && [ "$(count_source_files "${_target}")" -gt 0 ]; then
@@ -337,7 +488,12 @@ for _l in "${PKG_LABELS[@]}"; do
 done
 
 # 包里带的 extra 单文件（`extra/<label>`）：先核校验和，再按 RESTORE_EXTRA_TARGETS 放回。
+# --only 生效时，未选中的 extra 不落盘（它的 label 不在选中集合里）。
 for ((_i = 0; _i < ${#EXTRA_TARGET_LABELS[@]}; _i++)); do
+    if ! is_selected "${EXTRA_TARGET_LABELS[_i]}"; then
+        log_info "not selected by --only: extra ${EXTRA_TARGET_LABELS[_i]} (will NOT be restored)"
+        continue
+    fi
     _src="${PKG_DIR}/extra/${EXTRA_TARGET_LABELS[_i]}"
     _dst="${EXTRA_TARGET_PATHS[_i]}"
     [ -f "${_src}" ] || die "package has no extra file named '${EXTRA_TARGET_LABELS[_i]}'"
@@ -352,11 +508,16 @@ for ((_i = 0; _i < ${#EXTRA_TARGET_LABELS[@]}; _i++)); do
     log_info "restored extra file ${EXTRA_TARGET_LABELS[_i]} -> ${_dst}"
 done
 
-# 包里带了 extra 文件、调用方却没给落点：说清楚漏了什么（否则会"看起来恢复成功"）
-_missing_extra=$(manifest_extra_entries "${MANIFEST}" | awk -F'\t' '{print $3}' | wc -l | tr -d ' ')
-if [ "${_missing_extra}" -gt 0 ] && [ ${#EXTRA_TARGET_LABELS[@]} -eq 0 ]; then
-    log_warn "the package carries ${_missing_extra} extra file(s) but no RESTORE_EXTRA_TARGETS was given; they were NOT restored:"
-    manifest_extra_entries "${MANIFEST}" | awk -F'\t' '{printf "  %s (%s bytes, sha256=%s)\n", $3, $4, $5}' >&2
+# 包里带了 extra 文件、调用方却没给落点：说清楚漏了什么（否则会"看起来恢复成功"）。
+# --only 生效时不报这条：未选中的 extra 本来就是有意不落盘的。
+if [ ${#ONLY_LABELS[@]} -eq 0 ]; then
+    _missing_extra=$(manifest_extra_entries "${MANIFEST}" | awk -F'\t' '{print $3}' | wc -l | tr -d ' ')
+    if [ "${_missing_extra}" -gt 0 ] && [ ${#EXTRA_TARGET_LABELS[@]} -eq 0 ]; then
+        log_warn "the package carries ${_missing_extra} extra file(s) but no RESTORE_EXTRA_TARGETS was given; they were NOT restored:"
+        manifest_extra_entries "${MANIFEST}" | awk -F'\t' '{printf "  %s (%s bytes, sha256=%s)\n", $3, $4, $5}' >&2
+    fi
+elif [ ${#PKG_EXTRA_LABELS[@]} -gt 0 ] && [ ${#RESTORE_EXTRA_IDX[@]} -eq 0 ]; then
+    log_info "the package carries ${#PKG_EXTRA_LABELS[@]} extra file(s); none is selected by --only, so none was restored"
 fi
 
 # =====================================================================
@@ -366,6 +527,9 @@ if [ "${RESTORE_SKIP_POST_VERIFY:-0}" = "1" ]; then
     log_warn "post-restore verification SKIPPED (RESTORE_SKIP_POST_VERIFY=1)"
 else
     for _l in "${PKG_LABELS[@]}"; do
+        if ! is_selected "${_l}"; then
+            continue
+        fi
         _target=$(target_path_for "${_l}")
         verify_tree_against_manifest "${MANIFEST}" "${_l}" "${_target}" ||
             die "post-restore verification FAILED for ${_l} (${_target}): the restored tree does not match the manifest"

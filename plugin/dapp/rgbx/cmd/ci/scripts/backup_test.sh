@@ -7,6 +7,9 @@
 #   ② 还原后**能真的用**：一笔充值铸出来、一笔提现烧掉（阈值签名要成立 ⇒ B1 share 与
 #      B5 libp2p 身份都是同一代；侧车构建提现要成立 ⇒ B2 侧车状态完整）。
 #
+# 另含**单节点恢复**场景（`scenario_single_node_restore`）：从整组包布局里用 `--only para2`
+# 只还原一个 validator，其他节点与链不动，断言身份/钱包/参与签名。它排在整组场景之后。
+#
 # 销毁范围（"真的销毁"，不是做样子）：main / para1-4 / rgb-sidecar 六个数据卷的内容全部删掉
 #   - paraN 的 lightclient/（B1 share + B3 业务 bucket + btcwallet.db 生日。**注意 btcwallet.db 只有
 #     官方节点 para1 有**：IsOfficialNode 才建 neutrino ChainService + btcwallet，para2-4 是纯签名节点）
@@ -18,8 +21,8 @@
 # **不动 btcd**：regtest 每次启动无条件清链，它本来就不是可恢复对象（BACKUP_RECOVERY.md §2.4）；
 # 反过来说，一旦把 btcd 重启/清链，chain33 已提交的 BTC 头就错位了（§1.3），所以本场景全程不碰它。
 #
-# 为什么放在 testcase_entry 的**最后**：本场景会销毁并还原整个环境，失败时环境停在"已销毁"态；
-# 放最后可以让它的失败不吞掉前面已验过的用例结果。
+# 为什么放在 testcase_entry 的**最后**：本组场景会销毁并还原环境（单节点场景也会清一个 para 卷），
+# 失败时环境可能停在"已销毁"态；放最后可以让它的失败不吞掉前面已验过的用例结果。
 #
 # 与冷备脚本的分工（重要）：数据在**命名卷**里，只有容器能看见；而 compose 只有宿主能操作。
 # 所以 CI 里"停/起"由 harness 做（宿主侧），"打包/自检/还原/复核"由脚本在辅助容器里做
@@ -555,15 +558,14 @@ function scenario_cold_backup_restore() {
 
     log_step "cold backup/restore drill PASSED: state restored byte-for-byte; post-restore deposit leg: ${drill_deposit_leg}; post-restore withdraw leg: ran"
     log_step "artifact kept at ${package} (harness output dir; not a deliverable — the durable copy is off-host)"
-
-    # G7 探针：删掉 btcwallet.db（保留其余数据）再起官方节点，证明"新钱包 + 非空链"会明确告警，
-    # 而不是静默漏掉历史充值。放在最后：它会让 para1 的钱包变成新建的，破坏后续场景的前提。
-    scenario_wallet_birthday_guard
 }
 
 # G7 探针（对应 #63 的 B 臂）：只删 btcwallet.db，保留 neutrino 头链与其余状态。
 # 新钱包的生日 = 现在，而链已经很高 —— 停桥期间（或钱包被误删期间）的充值不在钱包 tx store 里，
 # 桥的重放读的是钱包 store，因此这些充值永远发现不了。代码在首次链通知时打印 ALERT；本探针断言它真的出现。
+#
+# 由 run_backup_drill_all 放在**最后**调用（在全量恢复与单节点恢复之后）：它会让 para1 的钱包变成新建的，
+# 破坏后续任何依赖 BTC 钱包/提现路径的场景前提。
 function scenario_wallet_birthday_guard() {
     log_step "scenario: a fresh btcwallet.db on a non-empty chain must raise the birthday alarm (G7 probe)"
     local vol
@@ -587,6 +589,220 @@ function scenario_wallet_birthday_guard() {
     fail "the birthday guard did not fire after removing btcwallet.db: a fresh wallet on a non-empty chain would silently miss deposits (para1 log tail: $(para1_logs_since "${started_at}" | tail -5))"
 }
 
+# =====================================================================
+# 单节点恢复（只还原一个 para；其他节点与链保持不动）
+# =====================================================================
+#
+# 与全量场景的分工：全量场景证明"整组能回来"；本场景证明 BACKUP_RECOVERY.md §3.1 的日常故障路径
+# —— 一台 para 的盘坏了，只把这台还原回备份时刻，其余节点、侧车与主链都不动。
+# 判据不是"脚本退出码 0"，而是：
+#   ① 该节点的 **TSS peer 名单完全不变**（B5：libp2p 身份私钥随包回来，节点不是"新成员"）；
+#   ② 钱包身份在位（parawallet 里的 authAccount 私钥 = para 共识签名钥 + TSS 提交钥）；
+#   ③ 它仍能参与一笔真实签名：跑一笔提现并走完链上销毁。
+#
+# 选 para2（validator）而不是 para1（官方节点）：para1 握着 btcwallet 与充值扫描路径，动它会干扰
+# 其它场景的前提；para2 只参与签名，恢复它对"身份 + 参与签名"有判别力，且不碰充值/钱包路径。
+#
+# 自包含：自己停/起 para2、自己造一份**只含 para2** 的包（独立 tag），不复用上一个场景的产物。
+function drill_para2_cli_height() {
+    local cli="$1" h
+    h=$(${cli} block last_header 2>/dev/null | jq -r '.height // empty' 2>/dev/null) || true
+    if [ -z "${h}" ]; then
+        echo "-1"
+    else
+        echo "${h}"
+    fi
+}
+
+# 有界等待 para2 追平主链。用 `net is_sync`（paracross.IsSync：本节点认为 para 链已同步到主链）
+# 而不是直接比两个链的高度：两者语义不同，等"绝对高度相等"会引入一条与主链出块节奏无关的假故障。
+# 另外要求高度至少回到恢复出来的快照高度，避免 is_sync 在刚启动的空窗里短暂为 true。
+# 上限沿用 wait_cli_ready 的写法（120 次 × 1s）。
+function drill_wait_para2_caught_up() {
+    local cli="$1" restored_height="$2"
+    local retries=120 i status now
+    status=""
+    now="-1"
+    for ((i = 0; i < retries; i++)); do
+        status=$(${cli} net is_sync 2>/dev/null | tr -d ' \r')
+        now=$(drill_para2_cli_height "${cli}")
+        if [ "${status}" = "true" ] && [ "${now}" -ge "${restored_height}" ] 2>/dev/null; then
+            log_step "para2 caught up: is_sync=true, height=${now} (restored snapshot height ${restored_height})"
+            return 0
+        fi
+        sleep 1
+    done
+    fail "para2 did not catch up after the restore (is_sync=${status:-?}, height=${now}, restored height=${restored_height}): check p2p/paracross, the node may still be replaying or unable to reach the group"
+}
+
+# 等 para2 自己重新发现全部 peer（DHT 重连是异步的；立刻取样可能少一个，把"身份没丢"误判成失败）。
+# 上限沿用 wait_para_dht_discovery 的写法（30 次 × 1s）。
+function drill_wait_para2_peers() {
+    local expected="$1"
+    local retries=30 i count
+    count=0
+    for ((i = 0; i < retries; i++)); do
+        count=$(peer_count_from_cli "${PARA2_CLI}")
+        if [ "${count}" -ge "${expected}" ] 2>/dev/null; then
+            log_step "para2 dht reconnected: ${count} peer(s) (expected >= ${expected})"
+            return 0
+        fi
+        sleep 1
+    done
+    fail "para2 did not rediscover its peers after the restore (got ${count}, expected >= ${expected}): a changed libp2p identity looks exactly like this"
+}
+
+# 只停 para2（其余五个服务保持运行；btcd 全程不碰）。
+function drill_stop_para2() {
+    log_step "stop para2 only (main/para1/para3/para4/sidecar stay up)"
+    compose_cmd stop para2 >/dev/null
+    local cid
+    cid=$(compose_cmd ps -q para2 2>/dev/null | head -n 1)
+    if [ -n "${cid}" ]; then
+        fail "para2 is still running after stop (cid=${cid}): the single-node backup would not be a cold sample"
+    fi
+    log_step "stop verified: para2 is down"
+}
+
+function drill_start_para2() {
+    compose_cmd start para2 >/dev/null
+}
+
+function scenario_single_node_restore() {
+    if [ "${RGBX_BACKUP_DRILL:-1}" != "1" ]; then
+        log_step "single-node restore drill skipped (RGBX_BACKUP_DRILL=${RGBX_BACKUP_DRILL})"
+        return 0
+    fi
+
+    log_step "scenario: single-node restore (para2 only; other nodes and the chain stay untouched; BACKUP_RECOVERY.md §3.1)"
+
+    # 自包含：不依赖上一个场景设置过的全局变量（drill_run_script 用它挂脚本目录）。
+    DRILL_SCRIPT_DIR=$(drill_scripts_dir)
+    local out_dir tag
+    out_dir="${DRILL_OUT_DIR:-${ROOT_DIR}/backup-drill}"
+    tag="${SINGLE_RESTORE_TAG:-drill-single-$(date -u +%Y%m%dT%H%M%SZ)}"
+    mkdir -p "${out_dir}"
+
+    # 只传 para2 的必需成员（`--required` 与冷备侧同名同义）。
+    local -a para2_required=()
+    local line
+    while IFS= read -r line; do
+        [ -n "${line}" ] || continue
+        para2_required+=(--required "${line}")
+    done < <(drill_required_args | grep '^para2:')
+    [ ${#para2_required[@]} -gt 0 ] || fail "no required members configured for para2 (drill_required_args is out of sync)"
+
+    # ---- 0) 基线：peer 名单 / 钱包身份 / 链高度 ----
+    local peers_before peers_before_count height_before
+    peers_before=$(collect_peer_names_from_cli "${PARA2_CLI}" | LC_ALL=C sort -u | tr '\n' ' ')
+    peers_before_count=$(peer_count_from_cli "${PARA2_CLI}")
+    [ "${peers_before_count}" -gt 0 ] || fail "para2 reports no TSS peer before the backup: cannot prove the identity set survived the restore"
+    drill_assert_wallet_identity "${PARA2_CLI}" "${AUTH_ADDR2}" "para2 before single-node backup"
+    height_before=$(drill_para2_cli_height "${PARA2_CLI}")
+    [ "${height_before}" -ge 0 ] 2>/dev/null || fail "cannot read para2 chain height before the single-node backup"
+    log_step "before: para2 peers=${peers_before_count} [${peers_before}] height=${height_before}"
+
+    # ---- 1) 停 para2 → 只备份 para2 一个 label ----
+    drill_stop_para2
+    local -a backup_argv=(
+        --out-dir /out --tag "${tag}"
+        --sources para2=/src/para2
+        --no-stop --no-start --trust-caller-stopped
+        "${para2_required[@]}"
+    )
+    local backup_rc=0
+    drill_run_script ro cold_backup.sh "${backup_argv[@]}" || backup_rc=$?
+    if [ "${backup_rc}" != "0" ]; then
+        drill_start_para2
+        fail "cold_backup.sh (para2 only) failed (rc=${backup_rc}); para2 was started again"
+    fi
+    local package="${out_dir}/bridge-backup-${tag}.tar"
+    if [ ! -f "${package}" ]; then
+        drill_start_para2
+        fail "single-label cold backup reported success but produced no package at ${package}"
+    fi
+    log_step "single-label cold backup OK: $(wc -c <"${package}" | tr -d ' ') bytes at ${package}"
+
+    # ---- 2) 破坏性步骤之前：同一组参数先只读地跑一遍 ----
+    local -a restore_argv=(
+        --archive "/out/$(basename "${package}")"
+        --only para2 --target para2=/src/para2
+        --replace clear --no-stop --no-start --trust-caller-stopped
+        "${para2_required[@]}"
+    )
+    local dry_rc=0
+    drill_run_script ro restore_backup.sh --dry-run "${restore_argv[@]}" || dry_rc=$?
+    if [ "${dry_rc}" != "0" ]; then
+        drill_start_para2
+        fail "restore --dry-run (--only para2) failed (rc=${dry_rc}) BEFORE anything was destroyed; para2 was started again and no data was wiped"
+    fi
+    log_step "preflight: restore --dry-run (--only para2) OK — package verified restorable, nothing destroyed yet"
+
+    # ---- 3) 真的销毁：只清 para2 卷 ----
+    log_step "destroy: wipe the contents of the para2 volume only"
+    if ! drill_run rw 'set -e; find /src/para2 -mindepth 1 -delete; echo destroyed' >/dev/null; then
+        drill_start_para2
+        fail "failed to wipe the para2 volume"
+    fi
+    local left
+    left=$(drill_run ro 'find /src/para2 -type f | wc -l' | tr -d ' \r')
+    if [ "${left}" != "0" ]; then
+        drill_start_para2
+        fail "destroy did not take effect: ${left} file(s) still present in the para2 volume"
+    fi
+    log_step "destroy verified: 0 file(s) left in the para2 volume"
+
+    # ---- 4) 从整组包式布局里只还原 para2（--only） ----
+    local restore_rc=0
+    drill_run_script rw restore_backup.sh "${restore_argv[@]}" || restore_rc=$?
+    if [ "${restore_rc}" != "0" ]; then
+        drill_start_para2
+        fail "single-node restore_backup.sh failed (rc=${restore_rc}); the para2 volume is in the destroyed state, para2 was started again (it needs another restore or ./docker-compose.sh reset)"
+    fi
+    log_step "single-node restore OK (package verification + post-restore verification passed)"
+
+    # ---- 5) 起 para2，等它就绪并追平主链 ----
+    drill_start_para2
+    wait_cli_ready "${PARA2_CLI}"
+    drill_wait_para2_caught_up "${PARA2_CLI}" "${height_before}"
+    wait_para_dht_discovery
+    drill_wait_para2_peers "${peers_before_count}"
+
+    # ---- 6) 断言：身份与钱包都是"还原回来的" ----
+    local peers_after peers_after_count
+    peers_after=$(collect_peer_names_from_cli "${PARA2_CLI}" | LC_ALL=C sort -u | tr '\n' ' ')
+    peers_after_count=$(peer_count_from_cli "${PARA2_CLI}")
+    log_step "after: para2 peers=${peers_after_count} [${peers_after}]"
+    assert_eq "${peers_after}" "${peers_before}" \
+        "TSS peer-name set of para2 changed across single-node restore (B5: the libp2p identity key was not restored — the node would come back as a NEW group member)"
+    # 必须在任何 seed/import 动作之前断言（证明钱包来自包里，而不是被后面的导入兜住）。
+    drill_assert_wallet_identity "${PARA2_CLI}" "${AUTH_ADDR2}" "para2 after single-node restore"
+    # 重启后 para 钱包重新上锁；与 init/全量恢复后的动作一致，解锁 + 幂等重导入 AUTH 私钥。
+    prepare_para_accounts
+    wait_bridge_signing_ready
+
+    # ---- 7) 证明 para2 真的回到了签名组：跑一笔提现并走完链上销毁 ----
+    # 金额跟当时的实际余额走（默认值会大概率 ErrInsufficientBalance，看起来像"恢复后不能提现"）。
+    local balance_after bal_units withdraw_amount
+    balance_after=$(query_rgb20_balance "${USER_MAIN_ADDR}")
+    bal_units=$(drill_balance_min_units "${balance_after}")
+    if [ "${bal_units}" -lt 2 ] 2>/dev/null; then
+        fail "balance too small to withdraw after single-node restore (${balance_after} = ${bal_units} min units): cannot demonstrate signing with para2"
+    fi
+    withdraw_amount=$((bal_units / 2))
+    if [ "${withdraw_amount}" -gt "${RGB20_WITHDRAW_AMOUNT}" ]; then
+        withdraw_amount="${RGB20_WITHDRAW_AMOUNT}"
+    fi
+    log_step "single-node-restore withdraw amount: ${withdraw_amount} min units (balance ${balance_after} = ${bal_units} min units; cap ${RGB20_WITHDRAW_AMOUNT})"
+    rgb20_withdraw_once "${withdraw_amount}" "single-node-restore"
+    : "${RGB20_LAST_WITHDRAW_HASH:?missing withdraw tx hash after rgb20_withdraw_once}"
+
+    log_step "PASS single-node restore (para2): peers ${peers_before_count} -> ${peers_after_count} (identical set); wallet ${AUTH_ADDR2} restored; withdraw burn txid=${RGB20_LAST_WITHDRAW_HASH}"
+}
+
 function run_backup_drill_all() {
     scenario_cold_backup_restore
+    scenario_single_node_restore
+    # 破坏性最强的一步放最后（新钱包会破坏后续场景的前提，见函数头注释）。
+    scenario_wallet_birthday_guard
 }
