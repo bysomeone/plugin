@@ -224,7 +224,10 @@ func (r *rgbx) confirmWithdrawSettlement(confirm *rtypes.ConfirmTx, txHash, conf
 		elog.Error("confirmWithdrawSettlement read payload", "txHash", txHash, "confirmHash", confirmHash, "err", err)
 		return nil, err
 	}
-	symbol := ensureCrossChainSymbol(withdraw.GetAssetSymbol())
+	// The payload may have been written with either accepted spelling (older state, or a
+	// withdrawal submitted before Exec normalized it); resolve it to the registered symbol
+	// before deriving the burn operation id and account.
+	symbol := r.crossChainAccountSymbol(withdraw.GetAssetSymbol())
 	// S2：Exec 侧再核一次台账记录（纵深防御）。CheckTx 已在**同一笔交易执行内**先跑过完整判据
 	//（checkWithdrawOperationLedger，含供应量闸门），这里只需要挡住"没有登记过就销毁"这一种状态，
 	// 保证供应量计数不会漏记一笔 burn —— 记录与资产必须成对出现/成对回滚。

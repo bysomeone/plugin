@@ -741,3 +741,231 @@ func TestBridgeConfig_MaskReplacesFeeListWholesale(t *testing.T) {
 	require.Equal(t, "usdt", effective.GetRgb20WithdrawFee()[0].GetSymbol())
 	require.Equal(t, int64(9), effective.GetRgb20WithdrawFee()[0].GetFeeMinUnits())
 }
+
+// A config record is stored under the original symbol; a query for the mapped spelling that
+// balances use (XBTC) must find it. When both records exist, the exact spelling wins.
+func TestBridgeConfig_QueryAcceptsMappedSpelling(t *testing.T) {
+	r, state, _ := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	setBridgeConfigForTest(t, state, "btc", &rtypes.BridgeConfigApply{AssetSymbol: "BTC", MaxPerTx: 123})
+
+	for _, spelling := range []string{"BTC", "XBTC"} {
+		msg, err := r.Query_GetBridgeConfig(&types.ReqString{Data: spelling})
+		require.NoError(t, err, "symbol=%s", spelling)
+		require.Equal(t, int64(123), msg.(*rtypes.BridgeConfigApply).GetMaxPerTx(), "symbol=%s", spelling)
+	}
+
+	setBridgeConfigForTest(t, state, "xbtc", &rtypes.BridgeConfigApply{AssetSymbol: "XBTC", MaxPerTx: 456})
+	msg, err := r.Query_GetBridgeConfig(&types.ReqString{Data: "XBTC"})
+	require.NoError(t, err)
+	require.Equal(t, int64(456), msg.(*rtypes.BridgeConfigApply).GetMaxPerTx(),
+		"an exact XBTC query must prefer the XBTC record")
+	msg, err = r.Query_GetBridgeConfig(&types.ReqString{Data: "BTC"})
+	require.NoError(t, err)
+	require.Equal(t, int64(123), msg.(*rtypes.BridgeConfigApply).GetMaxPerTx(),
+		"an exact BTC query must prefer the BTC record")
+}
+
+// A proposal made with the mapped spelling (XBTC) must be stored under the original symbol,
+// so it is the same record as one made with BTC - not a parallel config under a second key.
+func TestBridgeConfig_ApplyMappedSpellingTargetsOriginalRecord(t *testing.T) {
+	r, state, api := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	api.On("QueryChain", mock.Anything).Return(&types.ReplyString{}, nil)
+	r.SetEnv(100, 0, 0)
+	setCrossChainInfoForTest(t, state, "btc", rtypes.CrossChainAssetBtc, rtypes.BTCChainPrecision, []byte{0x02})
+
+	applyAndApproveBridgeConfig(t, r, state, &rtypes.BridgeConfigApply{
+		AssetSymbol:   "XBTC",
+		LimitsEnabled: true,
+		MaxPerTx:      1000,
+	}, "mapped-symbol")
+
+	// Stored under the original symbol only.
+	_, err := state.Get(formatBridgeConfigKey("BTC"))
+	require.NoError(t, err, "config must be stored under the original symbol")
+	_, err = state.Get(formatBridgeConfigKey("XBTC"))
+	require.ErrorIs(t, err, types.ErrNotFound, "the mapped spelling must not create a second record")
+
+	for _, spelling := range []string{"BTC", "XBTC"} {
+		cfg, err := r.loadBridgeConfig(spelling)
+		require.NoError(t, err, "symbol=%s", spelling)
+		require.Equal(t, int64(1000), cfg.GetMaxPerTx(), "symbol=%s", spelling)
+	}
+}
+
+// RGB20 fee entries are keyed by symbol inside the config. A fee proposed with the mapped
+// spelling must be stored under the original symbol, otherwise the sidecar (which looks the
+// fee up by the action's symbol) would never find it.
+func TestBridgeConfig_ApplyMappedSymbolCanonicalizesFeeEntry(t *testing.T) {
+	r, state, api := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	api.On("QueryChain", mock.Anything).Return(&types.ReplyString{}, nil)
+	r.SetEnv(100, 0, 0)
+	setCrossChainInfoForTest(t, state, "rgb20_usdt", rtypes.CrossChainAssetRgb20, 6, []byte{0x02})
+
+	applyAndApproveBridgeConfig(t, r, state, &rtypes.BridgeConfigApply{
+		Rgb20WithdrawFee: []*rtypes.Rgb20WithdrawFee{{Symbol: "XRGB20_USDT", FeeMinUnits: 1000}},
+	}, "mapped-fee")
+
+	effective, err := r.loadBridgeConfig("")
+	require.NoError(t, err)
+	require.Len(t, effective.GetRgb20WithdrawFee(), 1)
+	require.Equal(t, "RGB20_USDT", effective.GetRgb20WithdrawFee()[0].GetSymbol())
+}
+
+// ---------------------------------------------------------------------------
+// Alias spellings must not split consensus accounting.
+// ---------------------------------------------------------------------------
+
+// TestBridgeConfig_CheckWithdrawAlternateSpellingSharesCounter proves the CheckTx limit path
+// treats the original (USDT) and mapped (XUSDT) spellings as one asset: both read the same
+// rolling counter, so alternating spellings cannot reset the window.
+func TestBridgeConfig_CheckWithdrawAlternateSpellingSharesCounter(t *testing.T) {
+	r, state, from := newWithdrawConfigFixture(t, bridgeConfigTestChainCfg())
+	setBridgeConfigForTest(t, state, "", &rtypes.BridgeConfigApply{LimitsEnabled: true})
+	setBridgeConfigForTest(t, state, "usdt", &rtypes.BridgeConfigApply{LimitsEnabled: true, MaxPerWindow1H: 100})
+
+	height := blocksPerHour*2 + 5
+	r.SetEnv(height, 0, 0)
+	setBridgeWindowForTest(t, state, "USDT", bridgeWindowWithdraw, bridgeWindowBucket(height), 60)
+
+	withdraw := func(symbol string, amount int64) *rtypes.WithdrawAsset {
+		return &rtypes.WithdrawAsset{
+			Amount:          amount,
+			FeeRate:         10,
+			DestinationAddr: "rgb:utxob-test-invoice",
+			AssetSymbol:     symbol,
+		}
+	}
+
+	// 60 used + 40 = 100 (the exact limit) passes under the original spelling.
+	require.NoError(t, r.checkWithdraw(from, "tx", withdraw("USDT", 40)))
+	// The mapped spelling must see the same 60: 60 + 41 exceeds 100.
+	require.ErrorIs(t, r.checkWithdraw(from, "tx", withdraw("XUSDT", 41)), ErrBridgeWithdrawLimitExceeded)
+	require.NoError(t, r.checkWithdraw(from, "tx", withdraw("XUSDT", 40)))
+
+	// An unknown symbol is still rejected at the action boundary.
+	require.ErrorIs(t, r.checkWithdraw(from, "tx", withdraw("DOGE", 1)), ErrGetCrossChainInfo)
+}
+
+// TestBridgeConfig_ExecWithdrawAlternateSpellingSharesWindow runs both spellings through
+// Exec_Withdraw and checks (a) the window counter, (b) the burn ledger operation id.
+func TestBridgeConfig_ExecWithdrawAlternateSpellingSharesWindow(t *testing.T) {
+	r, state, _ := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	// Only the original spelling is registered.
+	setCrossChainInfoForTest(t, state, "btc", rtypes.CrossChainAssetBtc, rtypes.BTCChainPrecision,
+		newP2WSHDepositFixture(t, frozenVectorA).tssPub)
+	acc, err := r.newAccount("xbtc")
+	require.NoError(t, err)
+	_, err = acc.Mint(testCommitAddr, 1000)
+	require.NoError(t, err)
+	setBridgeConfigForTest(t, state, "", &rtypes.BridgeConfigApply{LimitsEnabled: true})
+	setBridgeConfigForTest(t, state, "BTC", &rtypes.BridgeConfigApply{LimitsEnabled: true, MaxPerWindow1H: 1000})
+
+	height := int64(77)
+	r.SetEnv(height, 0, 0)
+	bucket := bridgeWindowBucket(height)
+	withdraw := func(symbol string, amount int64) *rtypes.WithdrawAsset {
+		return &rtypes.WithdrawAsset{
+			Amount:          amount,
+			FeeRate:         10,
+			DestinationAddr: "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080",
+			AssetSymbol:     symbol,
+		}
+	}
+
+	txBtc := signedTestTx("withdraw-btc")
+	receipt, err := r.Exec_Withdraw(withdraw("BTC", 300), txBtc, 0)
+	require.NoError(t, err)
+	applyStateKV(t, state, receipt.GetKV())
+
+	txXbtc := signedTestTx("withdraw-xbtc")
+	receipt, err = r.Exec_Withdraw(withdraw("XBTC", 200), txXbtc, 1)
+	require.NoError(t, err)
+	applyStateKV(t, state, receipt.GetKV())
+
+	// One counter, keyed by the canonical symbol: 300 + 200.
+	counter, err := r.loadBridgeWindowCounter("BTC", bridgeWindowWithdraw, bucket)
+	require.NoError(t, err)
+	require.Equal(t, int64(500), counter)
+	_, err = state.Get(formatBridgeWindowKey("XBTC", bridgeWindowWithdraw, bucket))
+	require.ErrorIs(t, err, types.ErrNotFound)
+
+	// Both burn records live under the canonical account symbol (XBTC), regardless of the
+	// spelling the payer submitted.
+	for _, tx := range []*types.Transaction{txBtc, txXbtc} {
+		opID, err := rtypes.BurnOperationID(ensureCrossChainSymbol("BTC"), tx.Hash())
+		require.NoError(t, err)
+		rec := &rtypes.OperationRecord{}
+		require.NoError(t, readDB(state, formatOperationRecordKey(opID), rec))
+		require.Equal(t, "XBTC", rec.GetSymbol())
+	}
+
+	// An unknown symbol fails at Exec too (Exec must not rely on CheckTx normalizing).
+	_, err = r.Exec_Withdraw(withdraw("DOGE", 1), signedTestTx("withdraw-doge"), 2)
+	require.ErrorIs(t, err, ErrGetCrossChainInfo)
+}
+
+// TestBridgeConfig_DepositAlternateSpellingSharesMintWindow is the deposit counterpart: the
+// mint window counter, the mint account and the mint operation id all use one spelling.
+func TestBridgeConfig_DepositAlternateSpellingSharesMintWindow(t *testing.T) {
+	r, state, _ := newBridgeConfigTestExec(t, bridgeConfigTestChainCfg())
+	setCrossChainInfoForTest(t, state, "btc", rtypes.CrossChainAssetBtc, rtypes.BTCChainPrecision,
+		newP2WSHDepositFixture(t, frozenVectorA).tssPub)
+	setBridgeConfigForTest(t, state, "", &rtypes.BridgeConfigApply{LimitsEnabled: true})
+	setBridgeConfigForTest(t, state, "BTC", &rtypes.BridgeConfigApply{LimitsEnabled: true, MaxMintPerWindow: 10_000})
+
+	height := int64(1234)
+	r.SetEnv(height, 0, 0)
+	bucket := bridgeWindowBucket(height)
+	deposit := func(symbol, seed string, amount int64) (*rtypes.DepositAsset, *types.Transaction) {
+		return &rtypes.DepositAsset{
+			Amount:         amount,
+			DepositAddress: testCommitAddr,
+			AssetSymbol:    symbol,
+			TxProof:        &rtypes.BtcTxProof{TxData: canonicalBtcTxData(t, seed, amount)},
+		}, signedTestTx(seed)
+	}
+
+	btcDeposit, btcTx := deposit("BTC", "deposit-btc", 300)
+	receipt, err := r.Exec_Deposit(btcDeposit, btcTx, 0)
+	require.NoError(t, err)
+	applyStateKV(t, state, receipt.GetKV())
+
+	xbtcDeposit, xbtcTx := deposit("XBTC", "deposit-xbtc", 200)
+	receipt, err = r.Exec_Deposit(xbtcDeposit, xbtcTx, 1)
+	require.NoError(t, err)
+	applyStateKV(t, state, receipt.GetKV())
+
+	counter, err := r.loadBridgeWindowCounter("BTC", bridgeWindowMint, bucket)
+	require.NoError(t, err)
+	require.Equal(t, int64(500), counter)
+	_, err = state.Get(formatBridgeWindowKey("XBTC", bridgeWindowMint, bucket))
+	require.ErrorIs(t, err, types.ErrNotFound)
+
+	acc, err := r.newAccount("xbtc")
+	require.NoError(t, err)
+	require.Equal(t, int64(500), acc.LoadAccount(testCommitAddr).GetBalance())
+
+	for _, d := range []*rtypes.DepositAsset{btcDeposit, xbtcDeposit} {
+		txID, err := parseBtcTxIDStrict("unused", d.GetTxProof().GetTxData())
+		require.NoError(t, err)
+		opID, err := rtypes.MintOperationID(ensureCrossChainSymbol("BTC"), txID, testCommitAddr, d.GetAmount())
+		require.NoError(t, err)
+		rec := &rtypes.OperationRecord{}
+		require.NoError(t, readDB(state, formatOperationRecordKey(opID), rec))
+		require.Equal(t, "XBTC", rec.GetSymbol())
+	}
+
+	// CheckTx mint limits see the same counter for the other spelling (the limit check runs
+	// before proof validation, so a dummy proof is enough to reach it).
+	setBridgeConfigForTest(t, state, "BTC", &rtypes.BridgeConfigApply{LimitsEnabled: true, MaxMintPerWindow: 600})
+	err = r.checkDeposit("tx", &rtypes.DepositAsset{
+		Amount: 101, DepositAddress: testCommitAddr, AssetSymbol: "XBTC",
+	})
+	require.ErrorIs(t, err, ErrBridgeMintLimitExceeded)
+
+	// Unknown symbol is still rejected.
+	_, err = r.Exec_Deposit(&rtypes.DepositAsset{
+		Amount: 1, DepositAddress: testCommitAddr, AssetSymbol: "DOGE",
+	}, signedTestTx("deposit-doge"), 2)
+	require.ErrorIs(t, err, ErrGetCrossChainInfo)
+}

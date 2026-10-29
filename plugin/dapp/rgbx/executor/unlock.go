@@ -32,19 +32,34 @@ func (r *rgbx) Exec_Unlock(unlock *rtypes.UnlockAsset, tx *types.Transaction, _ 
 			"burnTxHash", hex.EncodeToString(burnTxHash), "err", err)
 		return nil, ErrWithdrawNotExist
 	}
-	if unlock.GetAssetSymbol() != withdraw.GetAssetSymbol() {
+	// Both spellings resolve to the same registered asset; compare canonically so a payload
+	// written with either spelling accepts an unlock signed with the other. The signature
+	// still binds the raw payload (verifyUnlockSig below).
+	withdrawSymbol, err := r.canonicalCrossChainSymbol(withdraw.GetAssetSymbol())
+	if err != nil {
+		elog.Error("Exec_Unlock canonical withdraw symbol", "txHash", txHash,
+			"symbol", withdraw.GetAssetSymbol(), "err", err)
+		return nil, ErrGetCrossChainInfo
+	}
+	unlockSymbol, err := r.canonicalCrossChainSymbol(unlock.GetAssetSymbol())
+	if err != nil {
+		elog.Error("Exec_Unlock canonical unlock symbol", "txHash", txHash,
+			"symbol", unlock.GetAssetSymbol(), "err", err)
+		return nil, ErrGetCrossChainInfo
+	}
+	if unlockSymbol != withdrawSymbol {
 		elog.Error("Exec_Unlock symbol mismatch", "txHash", txHash,
 			"burnTxHash", hex.EncodeToString(burnTxHash),
 			"unlockSymbol", unlock.GetAssetSymbol(), "withdrawSymbol", withdraw.GetAssetSymbol())
 		return nil, ErrOperationMismatch
 	}
-	info, err := r.getCrossChainInfo(withdraw.GetAssetSymbol())
+	info, err := r.getCrossChainInfo(withdrawSymbol)
 	if err != nil {
 		elog.Error("Exec_Unlock getCrossChainInfo", "txHash", txHash,
-			"symbol", withdraw.GetAssetSymbol(), "err", err)
+			"symbol", withdrawSymbol, "err", err)
 		return nil, ErrGetCrossChainInfo
 	}
-	symbol := ensureCrossChainSymbol(withdraw.GetAssetSymbol())
+	symbol := ensureCrossChainSymbol(withdrawSymbol)
 	opID, err := rtypes.BurnOperationID(symbol, burnTxHash)
 	if err != nil {
 		elog.Error("Exec_Unlock derive burn operation id", "txHash", txHash,
@@ -117,7 +132,7 @@ func (r *rgbx) Exec_Unlock(unlock *rtypes.UnlockAsset, tx *types.Transaction, _ 
 		Ty: rtypes.TyUnlockAssetLog,
 		Log: types.Encode(&rtypes.UnlockAsset{
 			BurnTxHash:  burnTxHash,
-			AssetSymbol: withdraw.GetAssetSymbol(),
+			AssetSymbol: withdrawSymbol,
 			Amount:      rec.GetAmount(),
 			Owner:       rec.GetOwner(),
 		}),

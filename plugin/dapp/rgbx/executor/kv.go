@@ -2,6 +2,7 @@ package executor
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -139,6 +140,56 @@ func formatWithdrawConsignmentKey(burnTxHash []byte) []byte {
 // isValidSymbolCharset 校验，ToUpper 在该字符集上是单射。
 func formatSymbol(symbol string) string {
 	return strings.ToUpper(symbol)
+}
+
+// crossChainAssetPrefix returns the mapping prefix used to derive a cross-chain asset's
+// transfer symbol ("BTC" -> "XBTC"). The authoritative value is the node config; the "X"
+// fallback only applies before initCfg has run (unit tests build the executor directly).
+func crossChainAssetPrefix() string {
+	if prefix := strings.TrimSpace(rgbxCfg.CrossChainAssetPrefix); prefix != "" {
+		return formatSymbol(prefix)
+	}
+	return "X"
+}
+
+// symbolSpellings returns the record keys to try for an asset symbol, exact spelling first.
+//
+// A cross-chain asset has two spellings: the ORIGINAL symbol used for queries, actions and
+// governance records (BTC, RGB20_USDT), and the mapped symbol used for balances and transfers
+// (XBTC, XRGB20_USDT). Reads accept either. The exact spelling is tried first so that, if both
+// spellings exist as distinct records, an explicit query never gets silently redirected to the
+// other record. The empty symbol is returned as-is: it addresses the bridge's global config.
+func symbolSpellings(symbol string) []string {
+	normalized := formatSymbol(strings.TrimSpace(symbol))
+	if normalized == "" {
+		return []string{""}
+	}
+	prefix := crossChainAssetPrefix()
+	if strings.HasPrefix(normalized, prefix) {
+		if original := strings.TrimPrefix(normalized, prefix); original != "" {
+			return []string{normalized, original}
+		}
+		return []string{normalized}
+	}
+	return []string{normalized, prefix + normalized}
+}
+
+// readSymbolRecord reads the first record found for any spelling of symbol (exact first) and
+// returns the spelling that matched. A missing record is types.ErrNotFound.
+func readSymbolRecord(kdb db.KV, keyFor func(string) []byte, symbol string) (string, []byte, error) {
+	if kdb == nil {
+		return "", nil, types.ErrNotFound
+	}
+	for _, spelling := range symbolSpellings(symbol) {
+		value, err := kdb.Get(keyFor(spelling))
+		if err == nil {
+			return spelling, value, nil
+		}
+		if !errors.Is(err, types.ErrNotFound) {
+			return "", nil, err
+		}
+	}
+	return "", nil, types.ErrNotFound
 }
 
 // formatOperationRecordKey 按 32 字节全局 operationId 索引单条台账记录（S2）。

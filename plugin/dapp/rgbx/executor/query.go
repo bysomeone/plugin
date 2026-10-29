@@ -106,11 +106,18 @@ func (r *rgbx) Query_GetPendingTx(req *rtypes.ReqGetPendingTx) (types.Message, e
 	return reply, nil
 }
 
+// Query_GetCrossChainInfo returns the record of a cross-chain asset.
+//
+// Both spellings of the symbol are accepted (BTC and XBTC, RGB20_USDT and XRGB20_USDT): the
+// record is stored under the ORIGINAL symbol, while balances and transfers use the mapped one.
+// The exact spelling is tried first, so an explicit query for one spelling never silently
+// returns a different record when both exist. A missing record returns an empty structure
+// (the existing contract) rather than an error.
 func (r *rgbx) Query_GetCrossChainInfo(req *types.ReqString) (types.Message, error) {
 
 	symbol := req.GetData()
-	v, err := r.GetStateDB().Get(formatCrossChainInfoKey(symbol))
 	reply := &rtypes.CrossChainInfo{}
+	_, value, err := readSymbolRecord(r.GetStateDB(), formatCrossChainInfoKey, symbol)
 	if errors.Is(err, types.ErrNotFound) {
 		return reply, nil
 	}
@@ -119,7 +126,7 @@ func (r *rgbx) Query_GetCrossChainInfo(req *types.ReqString) (types.Message, err
 		return nil, err
 	}
 
-	err = types.Decode(v, reply)
+	err = types.Decode(value, reply)
 	if err != nil {
 		elog.Error("Query_GetCrossChainInfo", "symbol", symbol, "decode err", err)
 		return nil, err

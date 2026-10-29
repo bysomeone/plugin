@@ -8,6 +8,7 @@ import (
 	"github.com/33cn/chain33/types"
 	paratypes "github.com/33cn/plugin/plugin/dapp/paracross/types"
 	rtypes "github.com/33cn/plugin/plugin/dapp/rgbx/types"
+	"github.com/golang/protobuf/proto"
 )
 
 const defaultGuardianParachainTitle = "user.p.rgbxguardians."
@@ -147,9 +148,18 @@ func (r *rgbx) Exec_Deposit(deposit *rtypes.DepositAsset, tx *types.Transaction,
 			"symbol", deposit.GetAssetSymbol(), "amount", deposit.GetAmount(), "err", err)
 		return nil, err
 	}
-	symbol := ensureCrossChainSymbol(deposit.GetAssetSymbol())
+	// Exec re-decodes the original action and never relies on CheckTx having normalized it:
+	// resolve both accepted spellings to the registered symbol here too, so the operation id,
+	// ledger, mint account and window counter all use one key space.
+	canonical, err := r.canonicalCrossChainSymbol(deposit.GetAssetSymbol())
+	if err != nil {
+		elog.Error("Exec_Deposit canonical symbol", "txHash", hex.EncodeToString(txHash),
+			"symbol", deposit.GetAssetSymbol(), "err", err)
+		return nil, err
+	}
+	symbol := ensureCrossChainSymbol(canonical)
 	// 类别取**链上登记**值（不再看 symbol 字面量）。
-	info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
+	info, err := r.getCrossChainInfo(canonical)
 	if err != nil {
 		elog.Error("Exec_Deposit getCrossChainInfo", "txHash", hex.EncodeToString(txHash), "symbol", symbol, "err", err)
 		return nil, ErrGetCrossChainInfo
@@ -245,7 +255,15 @@ func (r *rgbx) Exec_Withdraw(withdraw *rtypes.WithdrawAsset, tx *types.Transacti
 			"symbol", withdraw.GetAssetSymbol(), "err", err)
 		return nil, err
 	}
-	symbol := ensureCrossChainSymbol(withdraw.GetAssetSymbol())
+	// Exec re-decodes the original action: canonicalize here as well, so the lock transfer,
+	// burn operation id, ledger record, pending payload and window counter all agree.
+	canonical, err := r.canonicalCrossChainSymbol(withdraw.GetAssetSymbol())
+	if err != nil {
+		elog.Error("Exec_Withdraw canonical symbol", "txHash", hex.EncodeToString(txHash),
+			"symbol", withdraw.GetAssetSymbol(), "err", err)
+		return nil, err
+	}
+	symbol := ensureCrossChainSymbol(canonical)
 	accDB, err := r.newAccount(symbol)
 	if err != nil {
 		return nil, err
@@ -287,9 +305,13 @@ func (r *rgbx) Exec_Withdraw(withdraw *rtypes.WithdrawAsset, tx *types.Transacti
 		receipt.KV = append(receipt.KV, windowKV)
 	}
 
+	// 存进共识状态的是**归一后**的 payload：后续 confirm / unlock / bump 都按这个符号
+	// 取台账与账户，不能随提交时用了哪种拼写而分叉。txhash 仍由原始交易决定，不受影响。
+	withdrawPayload := proto.Clone(withdraw).(*rtypes.WithdrawAsset)
+	withdrawPayload.AssetSymbol = canonical
 	receipt.KV = append(receipt.KV, &types.KeyValue{
 		Key:   formatPayloadKey(txHash),
-		Value: types.Encode(withdraw),
+		Value: types.Encode(withdrawPayload),
 	})
 	receipt.Logs = append(receipt.Logs, &types.ReceiptLog{
 		Ty: rtypes.TyPendingTxLog,
@@ -300,7 +322,7 @@ func (r *rgbx) Exec_Withdraw(withdraw *rtypes.WithdrawAsset, tx *types.Transacti
 			TxIndex:       int64(index),
 			TxHash:        txHash,
 			FromAddress:   tx.From(),
-			AssetSymbol:   formatSymbol(withdraw.GetAssetSymbol()),
+			AssetSymbol:   canonical,
 			TargetAddress: withdraw.GetDestinationAddr(),
 			Amount:        withdraw.GetAmount(),
 			FeeRate:       withdraw.GetFeeRate(),
