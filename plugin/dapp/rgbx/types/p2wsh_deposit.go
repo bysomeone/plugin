@@ -35,7 +35,7 @@ import (
  *   - 因此地址是 (chain33 地址, TSS 群公钥) 的确定性函数，**执行器侧无需 bech32、
  *     无需网络参数**即可重建（只比 program/pkScript，不比地址串）。
  *   - tssPub 一变（re-keygen），所有用户地址全废 —— 这是"上线后禁止 re-DKG、
- *     只许 refresh"硬约束的由来（见 TECHNICAL.md）。
+ *     只许 refresh"硬约束的由来（见 docs/rgbx-bridge/01-系统设计.md）。
  */
 
 const (

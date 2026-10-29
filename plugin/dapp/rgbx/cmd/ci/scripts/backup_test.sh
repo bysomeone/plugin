@@ -520,6 +520,7 @@ function scenario_cold_backup_restore() {
     # 每次 BuildWithdrawal 内部的 sync() 都可能改变 seal 生命周期，旧读数的额度可能已经花不出去。
     minted_after=$(drill_minted_total_stable)
     log_step "post-restore deposit quota (live read): minted=${minted_after}, seals=$(drill_minted_seals_desc)"
+    local drill_deposit_leg="skipped (restored ledger had 0 minted seals)"
     if [ "${minted_after}" -gt 0 ] 2>/dev/null; then
         local drill_deposit_amount="${RGB20_DEPOSIT_AMOUNT}"
         if [ "${drill_deposit_amount}" -gt "${minted_after}" ]; then
@@ -528,6 +529,7 @@ function scenario_cold_backup_restore() {
         fi
         # requestId 必须与主套件那次区分开：CreateReceive 按 requestId 幂等，复用会拿到旧 receive。
         scenario_rgb20_deposit "rgb20-drill-post-restore" "${drill_deposit_amount}"
+        drill_deposit_leg="ran (${drill_deposit_amount} min units)"
     else
         log_step "post-restore deposit leg SKIPPED: restored ledger has 0 minted seals, and the test-sim payer spends the bridge's own seals (fixture limitation, no production analogue — a real user pays from their own wallet). COVERAGE: the deposit path after restore is NOT covered by this drill; the withdraw leg below is."
     fi
@@ -551,7 +553,7 @@ function scenario_cold_backup_restore() {
     log_step "post-restore withdraw amount: ${withdraw_after} min units (restored balance ${balance_after} = ${bal_units} min units; cap ${RGB20_WITHDRAW_AMOUNT})"
     rgb20_withdraw_once "${withdraw_after}" "post-restore"
 
-    log_step "cold backup/restore drill PASSED: state restored byte-for-byte and the bridge still mints+burns"
+    log_step "cold backup/restore drill PASSED: state restored byte-for-byte; post-restore deposit leg: ${drill_deposit_leg}; post-restore withdraw leg: ran"
     log_step "artifact kept at ${package} (harness output dir; not a deliverable — the durable copy is off-host)"
 
     # G7 探针：删掉 btcwallet.db（保留其余数据）再起官方节点，证明"新钱包 + 非空链"会明确告警，
