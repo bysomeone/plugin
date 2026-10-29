@@ -485,9 +485,9 @@ P2WSH 充值地址上线后，用户的充值**不再进主池**（钱停在各�
 ### 4.4 `[rpc.sub.light.neutrino.rgb20]`
 
 RGB20（跨链 USDT）桥的侧车/合约配置（`sidecarAddr` / `contracts` / `changeAddress` /
-`consignmentPublish` / `transportEndpoint` / `transportGateway` / `gatewayToken`）见
-`RGB_USDT_INTEGRATION.md` 与 4.4.7；本节描述充值重试行为（4.4.1–4.4.2）、精度落链
-（4.4.3）、链上 CLI 金额口径（4.4.4）与**提现手续费**（4.4.5）。
+`consignmentPublish` / `transportEndpoint` / `transportGateway` / `gatewayToken` /
+`gatewayMetricsInterval`）见 4.4.7 与 `docs/rgbx-bridge/` 的交付文档；本节描述充值重试行为
+（4.4.1–4.4.2）、精度落链（4.4.3）、链上 CLI 金额口径（4.4.4）与**提现手续费**（4.4.5）。
 
 **桥不提供任何对外 HTTP API**：充值请求由网关通过桥发起的 SSE 长连接推送，consignment 由桥
 轮询网关取得。唯一剩下的监听是 `testListen` + `testSignPsbt`（仅 E2E）：它只绑 loopback 或
@@ -711,6 +711,9 @@ transportEndpoint="rpcs://gw.example.com/0.2/json-rpc"
 transportGateway="http://gw:8080/0.2/json-rpc"
 # Bearer token for /bridge/*. Required for the deposit-request stream.
 gatewayToken="<shared secret>"
+# Push runtime metrics to the gateway every 30s. Go duration; empty = default 30s,
+# "0s" (or any non-positive value) disables pushing.
+gatewayMetricsInterval="30s"
 # E2E only: loopback/unix listener for sign-psbt (requires testSignPsbt).
 testListen=""   # production: empty
 ```
@@ -721,6 +724,11 @@ testListen=""   # production: empty
   `/bridge/deposit/requests/stream` (SSE). It must be reachable *outbound* from the bridge; the
   gateway does not need to reach the bridge.
 - `gatewayToken` authenticates `/bridge/*`. An empty token disables the deposit-request stream.
+- `gatewayMetricsInterval` is how often the bridge POSTs a runtime snapshot to
+  `<transportGateway>/bridge/metrics` (only when `transportGateway` and `gatewayToken` are set).
+  Counters are process-lifetime totals and reset on restart; the gateway keeps only the latest
+  snapshot per node in memory and renders it at its unauthenticated `GET /metrics`. A push failure
+  is logged at WARN and retried on the next interval; it never affects deposits or withdrawals.
 
 Deposit flow:
 
@@ -789,10 +797,11 @@ automatically.
   2min, and an event the gateway refuses with a 4xx is dropped with an ERROR log.
 - Event types: `deposit.settled`, `deposit.minted`, `deposit.rejected`, `withdraw.locked`,
   `withdraw.broadcast`, `withdraw.consignment`, `withdraw.settled`, `withdraw.unlocked`,
-  `withdraw.bumped`, `sweep.completed`.
+  `withdraw.bumped`, `sweep.completed`, `treasury.snapshot` (reserved).
 - The bridge never sends key material, invoice contents or consignment bytes. The gateway is a
   mirror, not the authoritative ledger; an operator's statistics backend reads it with
-  `GET /bridge/events/query?cursor=N&limit=M`.
+  `GET /bridge/events/query?cursor=N&limit=M`. The gateway can be started with a separate
+  read-only `--events-token` so the audit backend never holds the bridge's write secret.
 
 #### 4.4.9 Node-local safety switches (`safety`)
 
@@ -819,7 +828,8 @@ Retries of a single burn are counted once, so a repeatedly rejected withdrawal c
 
 ## 5. Bitcoin 节点关键配置项
 
-以下示例使用 `bitcoin.conf` 格式说明关键配置（btcd/bitcoin-core 参数名有差异时，以节点实现文档为准）：
+以下示例使用 `bitcoin.conf` 格式说明关键配置（btcd/bitcoin-core 参数名有差异时，以节点实现文档为准）。
+示例值为占位符，生产必须替换为强随机凭据：
 
 ```ini
 # 网络（与 Chain33 的 btcNetName/netName 保持一致）
@@ -832,8 +842,8 @@ rpcbind=0.0.0.0
 rpcport=18443
 
 # RPC 认证（需与 rpc.sub.light.neutrino.btcRPC.user/pass 一致）
-rpcuser=root
-rpcpassword=1314
+rpcuser=<rpc-user>
+rpcpassword=<strong-password>
 
 # TLS / 证书（若启用 TLS，证书路径需与 Neutrino certFile 对应）
 # 常见做法是由节点自动生成证书；若禁用 TLS 则需与 disableTLS=true 匹配
@@ -955,8 +965,8 @@ maxUtxoRescanTime=60
 
 [rpc.sub.light.neutrino.btcRPC]
 host="127.0.0.1:18443"
-user="root"
-pass="1314"
+user="<rpc-user>"          # 示例值，生产必须替换为强随机凭据
+pass="<strong-password>"
 disableTLS=false
 certFile="/path/to/rpc.cert"
 

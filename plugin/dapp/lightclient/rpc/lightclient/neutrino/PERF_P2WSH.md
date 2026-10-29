@@ -237,7 +237,7 @@
 | 项 | 做法（一句话） | 收益 | 状态 |
 |---|---|---|---|
 | **O1** watch 集回收 | 只 watch「已发放且未归零」的地址；归零即从持久化集合 + 内存集移除，配合重启重建（**上游无 remove，进程内缩不了**） | 把 M 从「历史用户数」降回「活跃用户数」 | **未做**（#52） |
-| **O2** 命中块匹配 O(输出×M) → O(输出) | (a) 上游打补丁：`ro.watchAddrs` 换 map 结构；(b) 绕开上游：本仓自己消费区块做 program 匹配（`depositScriptSet` 已是 O(1)） | (a) M=1e4：**3.78 s → ~0.1 ms（~4×10⁴ 倍）** [实测对照] | **未做**（#52，报告列为**最该先做**） |
+| **O2** 命中块匹配 O(输出×M) → O(输出) | (a) 上游打补丁：`ro.watchAddrs` 换 map 结构；(b) 绕开上游：本仓自己消费区块做 program 匹配（`depositScriptSet` 已是 O(1)） | (a) M=1e4：**3.78 s → ~0.1 ms（~4×10⁴ 倍）** [实测对照] | **上游已修、等发版**（见下方状态） |
 | **O3** 侧车账本分层 + 压缩 + 裁剪 | `withdrawal_builds` 拆成每笔一文件（`builds/<sha256(seal集合)>.json`）+ 大字段压缩 + 已 finalize 且确认 ≥144 块才裁（留墓碑）+ 注册表 append | 1e4 save **384.4→22.0 ms**、文件 **208→8.65 MB**；状态变更速率 **2.6/s → ~45/s** | **已完成** `e8d24558b` |
 | **O4** 侧车 UTXO 发现改「逐块扫输出 + 本地索引」 | 主路径读块做 program 匹配（O(1)/块），`searchrawtransactions` 只用于新注册地址的**限定窗口回填**；顺手把 `get_block_count()` 提出循环 | 一次 `build_sweep` **~30,000 RPC（144 s）→ ~0**；全局锁占用分钟级→毫秒级 | **未做**（#52） |
 | **O5** 侧车注册表改增量写 | `user_scripts/` 每用户一个文件（或 append-only 日志），替代每次全量 `serde_json::to_vec_pretty` | n=5e3 注册 **19.3 s → ~0.1 s**（O(N²)→O(1)） | **未做**（#52，最便宜） |
@@ -248,6 +248,15 @@
 **排期建议（报告结论，主会话认同）**：先 **O2 + O1**（唯一 10⁴~10⁵ 倍差距、硬件救不了）→
 再 **O3**（已做）→ O4 → O5 → O6/O7。**排在 CGGMP 之后**（CGGMP 在改主树，且基准文件需在能编译的树上才能提交）。
 来源：`reactive-brewing-sedgewick.md:352`（#52 推迟到系统开发完成后，顺序 O1+O2 → O4 → O5 → O6/O7）。
+
+**O2 上游状态（2026-10-29）**：lightninglabs/neutrino#396 已由 PR #340 以 completed 关闭，其中
+`rescan: cache watched address scripts`（commit `206618cb`）在地址注册时缓存脚本、按集合查找，正是这里的修法 (a)。
+当前**没有包含该提交的 release**（最新 tag v0.18.0 早 94 个提交），因此**不 pin master**：它同时复活了
+rescan actor/FSM 管线（#409/#412/#413/#415），从 v0.16.0 跨 234 个提交，需要单独的兼容测试。
+
+触发条件与步骤：出现包含 `206618cb` 的 tag → 升级 `go.mod` 的 `lightninglabs/neutrino` → 跑
+`go test ./plugin/dapp/lightclient/...`、全量 E2E、以及本文件的 P2WSH 基准（`BenchmarkNeutrinoPaysWatchedAddr`
+应出现数量级下降）→ 关闭 O2。在此之前 O2 保持未做；本记录与项目 memory 是跨会话的跟踪依据。
 
 ### 4.3 硬件扩展拐点
 
