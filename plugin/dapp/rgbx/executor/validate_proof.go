@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/33cn/chain33/common/merkle"
 	"github.com/33cn/chain33/types"
@@ -238,13 +239,67 @@ func (r *rgbx) validateWithdrawTxContent(txHash string, pendingTx *rtypes.Pendin
 	return nil
 }
 
+// getCrossChainInfo reads the registered record for a cross-chain asset. It accepts both the
+// original and the mapped spelling (exact spelling first), so governance and action paths that
+// were handed either spelling resolve to the same record. The canonical key is the original
+// symbol written by CommitDKG; this function only widens the lookup, it never rewrites it.
 func (r *rgbx) getCrossChainInfo(symbol string) (*rtypes.CrossChainInfo, error) {
 	if symbol == "" {
 		symbol = rtypes.BTCSymbol
 	}
 	info := &rtypes.CrossChainInfo{}
-	err := readDB(r.GetStateDB(), formatCrossChainInfoKey(symbol), info)
-	return info, err
+	_, value, err := readSymbolRecord(r.GetStateDB(), formatCrossChainInfoKey, symbol)
+	if err != nil {
+		return info, err
+	}
+	if err = types.Decode(value, info); err != nil {
+		return info, err
+	}
+	return info, nil
+}
+
+// canonicalCrossChainSymbol resolves either accepted spelling of a cross-chain asset (BTC /
+// XBTC, RGB20_USDT / XRGB20_USDT) to the symbol stored in its registered CrossChainInfo
+// record, i.e. the original symbol written by CommitDKG. The exact spelling is tried first.
+//
+// Every consensus key derived from one action's symbol must go through this value before it is
+// built: operation ids, the burn/lock ledger, pending payloads and the rolling bridge-limit
+// counters. Otherwise a payer could submit the original and mapped spellings alternately and
+// split one asset's accounting across two key spaces, bypassing the per-tx / window limits.
+//
+// A symbol with no registered record yields ErrGetCrossChainInfo, the same error the action
+// boundaries already return when the asset is unknown (fail-closed).
+func (r *rgbx) canonicalCrossChainSymbol(symbol string) (string, error) {
+	trimmed := strings.TrimSpace(symbol)
+	if trimmed == "" {
+		return "", ErrGetCrossChainInfo
+	}
+	matched, value, err := readSymbolRecord(r.GetStateDB(), formatCrossChainInfoKey, trimmed)
+	if err != nil {
+		return "", ErrGetCrossChainInfo
+	}
+	info := &rtypes.CrossChainInfo{}
+	if err = types.Decode(value, info); err != nil {
+		return "", ErrGetCrossChainInfo
+	}
+	if canonical := formatSymbol(info.GetAssetSymbol()); canonical != "" {
+		return canonical, nil
+	}
+	// A record written without AssetSymbol (not produced by CommitDKG) still has a
+	// canonical key: the spelling that matched.
+	return matched, nil
+}
+
+// crossChainAccountSymbol resolves a payload/action symbol to the account symbol used for
+// balances, transfers and the operation ledger (e.g. BTC -> XBTC, XBTC -> XBTC). Registered
+// assets go through the canonical record spelling first, so both spellings collapse onto one
+// account. An unregistered symbol falls back to ensureCrossChainSymbol: production paths
+// reject it before it can touch state, and direct (legacy) callers keep their previous key.
+func (r *rgbx) crossChainAccountSymbol(symbol string) string {
+	if canonical, err := r.canonicalCrossChainSymbol(symbol); err == nil {
+		return ensureCrossChainSymbol(canonical)
+	}
+	return ensureCrossChainSymbol(symbol)
 }
 
 func (r *rgbx) decodeBtcAddressScript(addr string) ([]byte, error) {

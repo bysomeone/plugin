@@ -714,12 +714,28 @@ func withdrawAsset(cmd *cobra.Command, _ []string) {
 	// 本地发行/铸造的资产在 rgbxAsset 上。先查跨链记录，没有才回落到资产记录 ——
 	// 跨链符号不可能有 rgbxAsset 记录（充值铸造不写它，checkMint 也拒绝跨链符号）。
 	//
+	// 跨链资产有两个拼写：记录/查询/治理用原始符号（BTC / RGB20_USDT），余额与转账用映射符号
+	// （XBTC / XRGB20_USDT）。这里两种都试（先试调用方给的那个，执行器内部也是这个顺序），
+	// 否则 `-s XBTC` 会查到空记录、精度解析失败。交易里的 assetSymbol 仍原样使用调用方的写法：
+	// 动作语义不在这里改变。
+	//
 	// 两次查询都走**静默**版本：本命令的 stdout 是 tx 哈希（脚本与用户都按它取值），
 	// 内部查询把 JSON 混进 stdout 会让调用方把成功当成失败。
+	aliases := crossChainSymbolAliases(symbol)
+	if len(aliases) == 0 {
+		aliases = []string{symbol}
+	}
 	crossChain := &rtypes.CrossChainInfo{}
-	if err := sendQueryRPCSilent(cmd, "GetCrossChainInfo", &types.ReqString{Data: symbol}, crossChain); err != nil && !isRecordNotFound(err) {
-		_, _ = fmt.Fprintf(os.Stderr, "cannot read the asset's cross chain record from the node: %v\n", err)
-		return
+	for _, spelling := range aliases {
+		reply := &rtypes.CrossChainInfo{}
+		if err := sendQueryRPCSilent(cmd, "GetCrossChainInfo", &types.ReqString{Data: spelling}, reply); err != nil && !isRecordNotFound(err) {
+			_, _ = fmt.Fprintf(os.Stderr, "cannot read the asset's cross chain record from the node: %v\n", err)
+			return
+		}
+		if !crossChainInfoAbsent(reply) {
+			crossChain = reply
+			break
+		}
 	}
 	chainAsset := &rtypes.RgbxAsset{}
 	if crossChainInfoAbsent(crossChain) {

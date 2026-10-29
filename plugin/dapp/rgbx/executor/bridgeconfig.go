@@ -223,12 +223,12 @@ func (r *rgbx) loadBridgeConfig(symbol string) (*rtypes.BridgeConfigApply, error
 }
 
 // loadBridgeConfigRecord reads the stored (currently effective) config, ignoring scheduled
-// changes.
+// changes. Both spellings of an asset symbol are accepted (exact first); see symbolSpellings.
 func (r *rgbx) loadBridgeConfigRecord(symbol string) (*rtypes.BridgeConfigApply, error) {
 	if r.GetStateDB() == nil {
 		return nil, nil
 	}
-	value, err := r.GetStateDB().Get(formatBridgeConfigKey(symbol))
+	_, value, err := readSymbolRecord(r.GetStateDB(), formatBridgeConfigKey, symbol)
 	if errors.Is(err, types.ErrNotFound) {
 		return nil, nil
 	}
@@ -243,12 +243,12 @@ func (r *rgbx) loadBridgeConfigRecord(symbol string) (*rtypes.BridgeConfigApply,
 	return cfg, nil
 }
 
-// loadBridgePendingConfig reads a scheduled loosening, if any.
+// loadBridgePendingConfig reads a scheduled loosening, if any (both spellings accepted).
 func (r *rgbx) loadBridgePendingConfig(symbol string) (*bridgePendingConfig, error) {
 	if r.GetStateDB() == nil {
 		return nil, nil
 	}
-	value, err := r.GetStateDB().Get(formatBridgeConfigPendingKey(symbol))
+	_, value, err := readSymbolRecord(r.GetStateDB(), formatBridgeConfigPendingKey, symbol)
 	if errors.Is(err, types.ErrNotFound) {
 		return nil, nil
 	}
@@ -294,6 +294,21 @@ func (r *rgbx) bumpBridgeWindowCounter(symbol string, kind bridgeWindowKind, amo
 		Key:   formatBridgeWindowKey(symbol, kind, bucket),
 		Value: types.Encode(&types.Int64{Data: current + amount}),
 	}, nil
+}
+
+// bridgeLimitSymbol returns the canonical spelling used for the bridge-limit state keys
+// (config record, rolling counters). Registered assets resolve to the symbol stored in their
+// CrossChainInfo record, so the original and mapped spellings share one counter.
+//
+// An unregistered symbol keeps its formatSymbol spelling: these checks deliberately run before
+// the action's registration check so that a paused bridge still reports the pause, and a
+// transaction whose asset was never registered is rejected by the action boundary before it can
+// touch consensus state anyway.
+func (r *rgbx) bridgeLimitSymbol(symbol string) string {
+	if canonical, err := r.canonicalCrossChainSymbol(symbol); err == nil {
+		return canonical
+	}
+	return formatSymbol(symbol)
 }
 
 // exceedsLimit reports whether existing+amount goes over limit. limit <= 0 means unlimited.
@@ -419,6 +434,46 @@ func (r *rgbx) checkRgb20WithdrawFees(fees []*rtypes.Rgb20WithdrawFee) error {
 		}
 	}
 	return nil
+}
+
+// canonicalizeBridgeConfigSymbols maps the spellings of the apply's asset (and of every RGB20
+// fee entry) onto the spelling the asset is registered under, so a proposal made with the
+// mapped symbol (XBTC) and one made with the original (BTC) address the same record. The apply
+// is cloned; the caller's payload is not mutated. Validation has already established that every
+// referenced asset exists.
+func (r *rgbx) canonicalizeBridgeConfigSymbols(apply *rtypes.BridgeConfigApply) (*rtypes.BridgeConfigApply, error) {
+	if apply.GetAssetSymbol() == "" && len(apply.GetRgb20WithdrawFee()) == 0 {
+		return apply, nil
+	}
+	out := proto.Clone(apply).(*rtypes.BridgeConfigApply)
+	resolve := func(symbol string) (string, error) {
+		matched, _, err := readSymbolRecord(r.GetStateDB(), formatCrossChainInfoKey, symbol)
+		if err != nil {
+			return "", err
+		}
+		// Keep the caller's spelling when it is already the registered one (so "usdt" stays
+		// "usdt"); only replace a mapped spelling with the record's original. The stored key is
+		// case-normalized either way, so both spellings address the same record.
+		if formatSymbol(symbol) == matched {
+			return symbol, nil
+		}
+		return matched, nil
+	}
+	if out.GetAssetSymbol() != "" {
+		symbol, err := resolve(out.GetAssetSymbol())
+		if err != nil {
+			return nil, err
+		}
+		out.AssetSymbol = symbol
+	}
+	for _, fee := range out.GetRgb20WithdrawFee() {
+		symbol, err := resolve(fee.GetSymbol())
+		if err != nil {
+			return nil, err
+		}
+		fee.Symbol = symbol
+	}
+	return out, nil
 }
 
 // mergeBridgeConfig returns the config that should become effective when src is applied on
@@ -557,6 +612,11 @@ func normalizeBridgeConfigApplyID(id string) (string, error) {
 // transaction hash. Nothing becomes effective here; bridgeConfigApprove is required.
 func (r *rgbx) Exec_BridgeConfigApply(apply *rtypes.BridgeConfigApply, tx *types.Transaction, _ int) (*types.Receipt, error) {
 	if err := r.checkBridgeConfigApply(apply); err != nil {
+		return nil, err
+	}
+	apply, err := r.canonicalizeBridgeConfigSymbols(apply)
+	if err != nil {
+		elog.Error("Exec_BridgeConfigApply canonicalize symbols", "symbol", apply.GetAssetSymbol(), "err", err)
 		return nil, err
 	}
 	id := hex.EncodeToString(tx.Hash())
@@ -711,7 +771,7 @@ func (r *rgbx) checkWithdrawBridgeConfig(withdraw *rtypes.WithdrawAsset) error {
 		elog.Error("checkWithdrawBridgeConfig withdrawals paused")
 		return ErrBridgeWithdrawPaused
 	}
-	symbol := formatSymbol(withdraw.GetAssetSymbol())
+	symbol := r.bridgeLimitSymbol(withdraw.GetAssetSymbol())
 	// An empty symbol is the global record itself; it never carries per-asset limits.
 	if symbol == "" {
 		return nil
@@ -772,7 +832,7 @@ func (r *rgbx) withdrawWindowKV(withdraw *rtypes.WithdrawAsset) (*types.KeyValue
 	if err != nil {
 		return nil, err
 	}
-	symbol := formatSymbol(withdraw.GetAssetSymbol())
+	symbol := r.bridgeLimitSymbol(withdraw.GetAssetSymbol())
 	if symbol == "" {
 		return nil, nil
 	}
@@ -801,7 +861,7 @@ func (r *rgbx) checkDepositPaused(deposit *rtypes.DepositAsset) error {
 		elog.Error("checkDeposit bridge deposits paused")
 		return ErrBridgeDepositPaused
 	}
-	symbol := formatSymbol(deposit.GetAssetSymbol())
+	symbol := r.bridgeLimitSymbol(deposit.GetAssetSymbol())
 	if symbol == "" {
 		return nil
 	}
@@ -823,7 +883,7 @@ func (r *rgbx) checkDepositPaused(deposit *rtypes.DepositAsset) error {
 // chain can enforce it. A withdrawal delay would have to be honoured by the bridge before it
 // signs, which the chain cannot verify, so there is deliberately no withdrawal counterpart.
 func (r *rgbx) depositExtraConfirmations(deposit *rtypes.DepositAsset) (int64, error) {
-	symbol := formatSymbol(deposit.GetAssetSymbol())
+	symbol := r.bridgeLimitSymbol(deposit.GetAssetSymbol())
 	if symbol == "" {
 		return 0, nil
 	}
@@ -846,7 +906,7 @@ func (r *rgbx) checkDepositMintLimit(deposit *rtypes.DepositAsset) error {
 	if err != nil {
 		return err
 	}
-	symbol := formatSymbol(deposit.GetAssetSymbol())
+	symbol := r.bridgeLimitSymbol(deposit.GetAssetSymbol())
 	if symbol == "" {
 		return nil
 	}
@@ -876,7 +936,7 @@ func (r *rgbx) depositWindowKV(deposit *rtypes.DepositAsset) (*types.KeyValue, e
 	if err != nil {
 		return nil, err
 	}
-	symbol := formatSymbol(deposit.GetAssetSymbol())
+	symbol := r.bridgeLimitSymbol(deposit.GetAssetSymbol())
 	if symbol == "" {
 		return nil, nil
 	}
@@ -891,8 +951,11 @@ func (r *rgbx) depositWindowKV(deposit *rtypes.DepositAsset) (*types.KeyValue, e
 }
 
 // Query_GetBridgeConfig returns the effective config. An empty request symbol addresses the
-// global record. A missing record returns an empty config (defaults = unlimited) instead of
-// an error, matching GetCrossChainInfo.
+// global record. Both spellings of an asset symbol are accepted (BTC / XBTC, RGB20_USDT /
+// XRGB20_USDT), with the exact spelling taking precedence; governance is stored under the
+// asset's original symbol regardless of the spelling used in the proposal. A missing record
+// returns an empty config (defaults = unlimited) instead of an error, matching
+// GetCrossChainInfo.
 func (r *rgbx) Query_GetBridgeConfig(req *types.ReqString) (types.Message, error) {
 	symbol := req.GetData()
 	cfg, err := r.loadBridgeConfig(symbol)

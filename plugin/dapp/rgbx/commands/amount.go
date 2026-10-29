@@ -16,6 +16,39 @@ import (
 // 对不上 —— 因此"链上还没有该资产的跨链记录"时回落到这个常量是安全的，不是猜测。
 const btcWithdrawDecimals = 8
 
+// defaultCrossChainAssetPrefix is the mapping prefix documented for cross-chain symbols
+// ("BTC" -> "XBTC"). The executor's authoritative prefix lives in node config; the CLI uses
+// this constant only to derive the other spelling of a caller-supplied symbol when a lookup
+// that came back empty is retried.
+const defaultCrossChainAssetPrefix = "X"
+
+// crossChainSymbolAliases returns the spellings to try for a caller-supplied symbol, most
+// exact first: the symbol as typed, then the other spelling (original <-> mapped). It mirrors
+// the executor's lookup order, which also prefers the exact spelling, so a query for either
+// spelling finds the same record and never redirects an exact hit.
+func crossChainSymbolAliases(symbol string) []string {
+	normalized := strings.ToUpper(strings.TrimSpace(symbol))
+	if normalized == "" {
+		return nil
+	}
+	prefix := defaultCrossChainAssetPrefix
+	if original := strings.TrimPrefix(normalized, prefix); original != normalized && original != "" {
+		return []string{normalized, original}
+	}
+	return []string{normalized, prefix + normalized}
+}
+
+// isBtcSymbol reports whether either spelling of symbol is BTC. BTC's precision is a chain
+// constant, so the fallback must also recognize the mapped spelling "XBTC" used by balances.
+func isBtcSymbol(symbol string) bool {
+	for _, spelling := range crossChainSymbolAliases(symbol) {
+		if spelling == rtypes.BTCSymbol {
+			return true
+		}
+	}
+	return false
+}
+
 // crossChainInfoAbsent 判断节点是否**没有**该符号的跨链资产记录。
 //
 // 判据落在记录内容上：执行器的 Query_GetCrossChainInfo 对不存在的 symbol 返回空结构体 +
@@ -76,7 +109,7 @@ func resolveWithdrawDecimals(symbol string, crossChain *rtypes.CrossChainInfo, a
 		}
 		return int(asset.GetPrecision()), nil
 	}
-	if strings.EqualFold(symbol, rtypes.BTCSymbol) {
+	if isBtcSymbol(symbol) {
 		return btcWithdrawDecimals, nil
 	}
 	return 0, fmt.Errorf("cannot determine the precision of asset %q: the node returned no cross chain record "+

@@ -174,7 +174,9 @@ func (r *rgbx) bumpBurnedOperationSupply(symbol string, amount int64) (*types.Ke
 // 让今天的合法提现变得更难，也不会挡住今天能挡的攻击之外的东西。
 func (r *rgbx) checkWithdrawOperationLedger(confirmTxHash []byte, withdraw *rtypes.WithdrawAsset) error {
 
-	symbol := ensureCrossChainSymbol(withdraw.GetAssetSymbol())
+	// The payload may carry either accepted spelling (e.g. state written before Exec started
+	// normalizing); the operation id was registered under the canonical account symbol.
+	symbol := r.crossChainAccountSymbol(withdraw.GetAssetSymbol())
 	opID, err := rtypes.BurnOperationID(symbol, confirmTxHash)
 	if err != nil {
 		elog.Error("checkWithdrawOperationLedger derive burn opID", "symbol", symbol,

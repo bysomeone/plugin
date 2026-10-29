@@ -141,3 +141,52 @@ func TestRgbx_Query_GetCrossChainInfo(t *testing.T) {
 	_, err = r.Query(funcName, types.Encode(&types.ReqString{Data: "bad"}))
 	require.Error(t, err)
 }
+
+// The record is stored under the ORIGINAL symbol (BTC), while balances and transfers use the
+// mapped spelling (XBTC). A query for either spelling must find the same record.
+func TestRgbx_Query_GetCrossChainInfo_AcceptsMappedSpelling(t *testing.T) {
+	r := newRgbx().(*rgbx)
+	dir, state, _ := util.CreateTestDB()
+	defer util.CloseTestDB(dir, state)
+	api := &mocks.QueueProtocolAPI{}
+	api.On("GetConfig").Return(types.NewChain33Config(types.GetDefaultCfgstring()))
+	r.SetAPI(api)
+	r.SetStateDB(state)
+
+	info := &rtypes.CrossChainInfo{AssetSymbol: "BTC", TssAddress: "tb1qoriginal", Precision: 8}
+	require.NoError(t, state.Set(formatCrossChainInfoKey("btc"), types.Encode(info)))
+
+	for _, spelling := range []string{"BTC", "btc", "XBTC", "xbtc"} {
+		msg, err := r.Query_GetCrossChainInfo(&types.ReqString{Data: spelling})
+		require.NoError(t, err, "symbol=%s", spelling)
+		require.Equal(t, "tb1qoriginal", msg.(*rtypes.CrossChainInfo).GetTssAddress(),
+			"symbol=%s must resolve to the original record", spelling)
+	}
+}
+
+// If both spellings exist as separate records, an explicit query must get the exact one: the
+// alias must never silently mask a distinct record.
+func TestRgbx_Query_GetCrossChainInfo_ExactSpellingWins(t *testing.T) {
+	r := newRgbx().(*rgbx)
+	dir, state, _ := util.CreateTestDB()
+	defer util.CloseTestDB(dir, state)
+	api := &mocks.QueueProtocolAPI{}
+	api.On("GetConfig").Return(types.NewChain33Config(types.GetDefaultCfgstring()))
+	r.SetAPI(api)
+	r.SetStateDB(state)
+
+	require.NoError(t, state.Set(formatCrossChainInfoKey("btc"),
+		types.Encode(&rtypes.CrossChainInfo{AssetSymbol: "BTC", TssAddress: "tb1qoriginal"})))
+	require.NoError(t, state.Set(formatCrossChainInfoKey("xbtc"),
+		types.Encode(&rtypes.CrossChainInfo{AssetSymbol: "XBTC", TssAddress: "tb1qmapped"})))
+
+	msg, err := r.Query_GetCrossChainInfo(&types.ReqString{Data: "XBTC"})
+	require.NoError(t, err)
+	require.Equal(t, "tb1qmapped", msg.(*rtypes.CrossChainInfo).GetTssAddress(),
+		"an exact XBTC query must prefer the XBTC record")
+
+	msg, err = r.Query_GetCrossChainInfo(&types.ReqString{Data: "BTC"})
+	require.NoError(t, err)
+	require.Equal(t, "tb1qoriginal", msg.(*rtypes.CrossChainInfo).GetTssAddress(),
+		"an exact BTC query must prefer the BTC record")
+}

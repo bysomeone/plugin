@@ -502,13 +502,20 @@ func (r *rgbx) checkWithdraw(fromAddr, txHash string, withdraw *rtypes.WithdrawA
 		return err
 	}
 
-	symbol := ensureCrossChainSymbol(withdraw.GetAssetSymbol())
+	// 两套拼写（BTC / XBTC）必须先归一到登记记录里的原始符号：账户、台账与限额键都只认
+	// 这一个拼写，否则交替提交两种拼写会把同一资产拆成两套计数、绕过限额。
+	canonical, err := r.canonicalCrossChainSymbol(withdraw.GetAssetSymbol())
+	if err != nil {
+		elog.Error("checkWithdraw canonical symbol", "txHash", txHash, "symbol", withdraw.GetAssetSymbol(), "err", err)
+		return err
+	}
+	symbol := ensureCrossChainSymbol(canonical)
 
 	// 走哪条分支看**链上登记的资产类别**（不再看 symbol 字面量）：类别未知 / 记录缺失都
 	// fail-closed（早拒比事后卡住好，而且拿错类别会把 RGB20 提现按 BTC 地址解码处理）。
-	info, err := r.getCrossChainInfo(withdraw.GetAssetSymbol())
+	info, err := r.getCrossChainInfo(canonical)
 	if err != nil {
-		elog.Error("checkWithdraw getCrossChainInfo", "txHash", txHash, "symbol", withdraw.GetAssetSymbol(), "err", err)
+		elog.Error("checkWithdraw getCrossChainInfo", "txHash", txHash, "symbol", canonical, "err", err)
 		return ErrGetCrossChainInfo
 	}
 
@@ -559,8 +566,9 @@ func (r *rgbx) checkWithdraw(fromAddr, txHash string, withdraw *rtypes.WithdrawA
 	//
 	// tssPub 取自链上 CrossChainInfo（fail-closed：读不到 / 没带 pubkey 都拒 —— 同一份信息
 	// 在提现确认（validateWithdrawTxContent）那里也是必需的，早拒比事后卡住好）。
-	// 注意 info 用**原始** symbol 查：CrossChainInfo 的 key 是 formatSymbol(raw)（"btc" → "BTC"），
-	// 而上面的 symbol 已经过 ensureCrossChainSymbol（"btc" → "XBTC"）—— 用后者查不到。
+	// 注意 info 用**归一后的原始** symbol 查（canonical）：CrossChainInfo 的 key 是登记时的
+	// 原始符号（"btc" → "BTC"），而上面的 symbol 已经过 ensureCrossChainSymbol（"btc" → "XBTC"）
+	// —— 用后者查不到。
 	tssPub, err := rtypes.ParseDepositTssPubKey(info.GetPubkey())
 	if err != nil {
 		elog.Error("checkWithdraw invalid tss pubkey", "txHash", txHash, "symbol", symbol,
@@ -655,10 +663,16 @@ func (r *rgbx) checkDeposit(txHash string, deposit *rtypes.DepositAsset) error {
 		return err
 	}
 	// 走哪条分支看**链上登记的资产类别**（见 types.CrossChainAssetKind），不再看 symbol 字面量：
-	// 类别未知 / 记录缺失都 fail-closed。
-	info, err := r.getCrossChainInfo(deposit.GetAssetSymbol())
+	// 类别未知 / 记录缺失都 fail-closed。先把两套拼写归一到登记符号，后续 Exec 才用同一个
+	// 拼写派生台账/限额键。
+	canonical, err := r.canonicalCrossChainSymbol(deposit.GetAssetSymbol())
 	if err != nil {
-		elog.Error("checkDeposit getCrossChainInfo", "txHash", txHash, "symbol", deposit.GetAssetSymbol(), "err", err)
+		elog.Error("checkDeposit canonical symbol", "txHash", txHash, "symbol", deposit.GetAssetSymbol(), "err", err)
+		return err
+	}
+	info, err := r.getCrossChainInfo(canonical)
+	if err != nil {
+		elog.Error("checkDeposit getCrossChainInfo", "txHash", txHash, "symbol", canonical, "err", err)
 		return ErrGetCrossChainInfo
 	}
 	// RGB20 分支：跳过链上 OP_RETURN 承诺与链上金额校验（RGB 金额在 consignment 内，由侧车验证），
@@ -853,23 +867,35 @@ func (r *rgbx) checkUnlock(txHash string, unlock *rtypes.UnlockAsset) error {
 			"burnTxHash", hex.EncodeToString(burnTxHash), "err", err)
 		return ErrWithdrawNotExist
 	}
-	// Byte-for-byte equality on purpose: do NOT normalize with formatSymbol. The digest binds
-	// the raw value, so normalization here would widen the set of signatures accepted for a
-	// given withdrawal.
-	if unlock.GetAssetSymbol() != withdraw.GetAssetSymbol() {
+	// Compare the two accepted spellings in canonical form: the withdrawal payload may be
+	// stored with either, and both resolve to the same registered asset. The signature still
+	// binds the raw payload (verifyUnlockSig below), so this only decides "same asset".
+	withdrawSymbol, err := r.canonicalCrossChainSymbol(withdraw.GetAssetSymbol())
+	if err != nil {
+		elog.Error("checkUnlock canonical withdraw symbol", "txHash", txHash,
+			"symbol", withdraw.GetAssetSymbol(), "err", err)
+		return ErrGetCrossChainInfo
+	}
+	unlockSymbol, err := r.canonicalCrossChainSymbol(unlock.GetAssetSymbol())
+	if err != nil {
+		elog.Error("checkUnlock canonical unlock symbol", "txHash", txHash,
+			"symbol", unlock.GetAssetSymbol(), "err", err)
+		return ErrGetCrossChainInfo
+	}
+	if unlockSymbol != withdrawSymbol {
 		elog.Error("checkUnlock symbol mismatch", "txHash", txHash,
 			"burnTxHash", hex.EncodeToString(burnTxHash),
 			"unlockSymbol", unlock.GetAssetSymbol(), "withdrawSymbol", withdraw.GetAssetSymbol())
 		return ErrOperationMismatch
 	}
 	// Fail-closed: the group public key is required to verify the signature.
-	info, err := r.getCrossChainInfo(withdraw.GetAssetSymbol())
+	info, err := r.getCrossChainInfo(withdrawSymbol)
 	if err != nil {
 		elog.Error("checkUnlock getCrossChainInfo", "txHash", txHash,
-			"symbol", withdraw.GetAssetSymbol(), "err", err)
+			"symbol", withdrawSymbol, "err", err)
 		return ErrGetCrossChainInfo
 	}
-	symbol := ensureCrossChainSymbol(withdraw.GetAssetSymbol())
+	symbol := ensureCrossChainSymbol(withdrawSymbol)
 	opID, err := rtypes.BurnOperationID(symbol, burnTxHash)
 	if err != nil {
 		elog.Error("checkUnlock derive burn operation id", "txHash", txHash,

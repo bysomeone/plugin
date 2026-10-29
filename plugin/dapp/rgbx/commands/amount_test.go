@@ -313,3 +313,32 @@ func Test_resolveWithdrawDecimals_FromQueriedRecords(t *testing.T) {
 		require.False(t, crossChainInfoAbsent(chainCrossChainInfo(rtypes.CrossChainAssetBtc, 8)))
 	})
 }
+
+// 余额/转账用映射符号（XBTC），所以 withdraw 也必须接受它：先按给出的拼写查，查不到再按
+// 另一种拼写查（与执行器的顺序一致），交易里的 assetSymbol 保持调用方写法不变。
+func Test_crossChainSymbolAliases(t *testing.T) {
+	require.Equal(t, []string{"BTC", "XBTC"}, crossChainSymbolAliases("BTC"))
+	require.Equal(t, []string{"BTC", "XBTC"}, crossChainSymbolAliases("btc"))
+	require.Equal(t, []string{"XBTC", "BTC"}, crossChainSymbolAliases("XBTC"))
+	require.Equal(t, []string{"XRGB20_USDT", "RGB20_USDT"}, crossChainSymbolAliases("XRGB20_USDT"))
+	require.Equal(t, []string{"RGB20_USDT", "XRGB20_USDT"}, crossChainSymbolAliases("RGB20_USDT"))
+	require.Empty(t, crossChainSymbolAliases("  "))
+}
+
+func Test_resolveWithdrawDecimals_AcceptsMappedBtcSymbol(t *testing.T) {
+	// bytes 口径的 BTC 常量必须认得映射拼写：节点没有（或还查不到）跨链记录时，
+	// `withdraw -s XBTC` 仍应按 8 位换算，而不是报"无法确定精度"。
+	got, err := resolveWithdrawDecimals("XBTC", &rtypes.CrossChainInfo{}, &rtypes.RgbxAsset{})
+	require.NoError(t, err)
+	require.Equal(t, 8, got)
+
+	// 有跨链记录时同样成立（记录里存的是原始符号 BTC 的精度）。
+	got, err = resolveWithdrawDecimals("XBTC",
+		chainCrossChainInfo(rtypes.CrossChainAssetBtc, rtypes.BTCChainPrecision), &rtypes.RgbxAsset{})
+	require.NoError(t, err)
+	require.Equal(t, 8, got)
+
+	// 映射拼写不等于"任何 X 开头的符号都按 BTC 处理"：RGB20 资产仍要求链上记录。
+	_, err = resolveWithdrawDecimals("XRGB20_USDT", &rtypes.CrossChainInfo{}, &rtypes.RgbxAsset{})
+	require.Error(t, err)
+}

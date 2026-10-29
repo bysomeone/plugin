@@ -200,12 +200,15 @@ func Test_rgbx_checkUnlock(t *testing.T) {
 		require.ErrorIs(t, f.r.checkUnlock("tx", msg), ErrOperationAmountMismatch)
 	})
 
-	t.Run("symbol case must match exactly", func(t *testing.T) {
+	t.Run("symbol spelling is canonicalized", func(t *testing.T) {
+		// Both accepted spellings resolve to the registered asset, so an unlock signed with
+		// the other spelling of the same asset must be accepted (the signature still binds the
+		// raw payload; only the "same asset" comparison is normalized).
 		f := newUnlockFixture(t)
 		msg := cloneUnlock(t, f.priv, f.msg)
 		msg.AssetSymbol = formatSymbol(f.msg.AssetSymbol)
 		msg.UnlockSig = signUnlockMsg(t, f.priv, msg)
-		require.ErrorIs(t, f.r.checkUnlock("tx", msg), ErrOperationMismatch)
+		require.NoError(t, f.r.checkUnlock("tx", msg))
 	})
 
 	t.Run("unknown burn rejected", func(t *testing.T) {
