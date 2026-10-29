@@ -8,6 +8,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/33cn/chain33/common/merkle"
@@ -162,6 +163,9 @@ type btcWallet struct {
 	// self-check that warns when a fresh wallet cannot see deposits made before it existed.
 	walletBirthday       time.Time
 	walletFreshlyCreated bool
+	// birthdayOnce makes the birthday alert fire at most once, whether it is detected at
+	// startup from the persisted header tip or on the first block notification.
+	birthdayOnce sync.Once
 }
 
 type btcPendingTx struct {
@@ -256,6 +260,20 @@ func checkWalletBirthday(fresh bool, birthday time.Time, firstChainHeight int32)
 		"create a new wallet."
 }
 
+// alertFreshWalletBehindChain logs the birthday alert when this process created the wallet
+// while the chain already has blocks, at most once per btcWallet. A zero or unknown height
+// leaves the check to the first block notification.
+func (b *btcWallet) alertFreshWalletBehindChain(chainHeight int32) {
+	if !b.walletFreshlyCreated || chainHeight <= 0 {
+		return
+	}
+	b.birthdayOnce.Do(func() {
+		if warning := checkWalletBirthday(true, b.walletBirthday, chainHeight); warning != "" {
+			log.Error("ALERT wallet birthday cannot cover chain history: " + warning)
+		}
+	})
+}
+
 func (b *btcWallet) start() error {
 	if err := b.chainClient.Start(); err != nil {
 		log.Error("btcwallet chainclient start error", "err", err)
@@ -263,6 +281,12 @@ func (b *btcWallet) start() error {
 	}
 
 	b.Wallet.Start()
+	// Check right away when the node already has a header tip: a fresh wallet on a chain
+	// with history is already wrong, and the next block notification (which also checks)
+	// may not arrive for a long time. On regtest no block arrives unless the harness mines.
+	if _, height, err := b.chainClient.GetBestBlock(); err == nil {
+		b.alertFreshWalletBehindChain(height)
+	}
 	// 从这里起钱包才真的在 watch：把"导入 + 订阅"装上，watch 集的载入/补齐（见 deposit_address.go）
 	// 会通过它把脚本真正导进钱包。非官方节点不装（它没有可 watch 的钱包）。
 	b.client.depositImporter = func(witnessScripts [][]byte) error {
@@ -503,10 +527,7 @@ func (b *btcWallet) monitorTransactions() {
 			if firstProcessFlag && len(ntfn.AttachedBlocks) > 0 {
 				log.Debug("monitorTransactions first process", "height", ntfn.AttachedBlocks[0].Height, "rescanHeight", rescanHeight)
 				firstProcessFlag = false
-				if warning := checkWalletBirthday(b.walletFreshlyCreated, b.walletBirthday,
-					ntfn.AttachedBlocks[0].Height); warning != "" {
-					log.Error("ALERT wallet birthday cannot cover chain history: " + warning)
-				}
+				b.alertFreshWalletBehindChain(ntfn.AttachedBlocks[0].Height)
 				if ntfn.AttachedBlocks[0].Height > rescanHeight {
 					go b.rescanWalletTxs(rescanHeight, ntfn.AttachedBlocks[0].Height-1, rescanChan)
 				} else {
