@@ -53,6 +53,15 @@ func (r *rgbx) ExecLocal_Withdraw(_ *rtypes.WithdrawAsset, tx *types.Transaction
 	for _, log := range receiptData.Logs {
 		if log.Ty == rtypes.TyPendingTxLog {
 			r.addPendingTxKV(dbSet, log.Log, index)
+			// Index the record by tx hash as well: get-withdraw-status receives only the
+			// burn hash, and scanning all pending records to find it would be unbounded.
+			dbSet.KV = append(dbSet.KV, &types.KeyValue{
+				Key: formatPendingTxHashKey(tx.Hash()),
+				Value: types.Encode(&rtypes.TxBlockIndex{
+					BlockHeight: r.GetHeight(),
+					TxIndex:     int64(index),
+				}),
+			})
 
 			list := &rtypes.TxBlockIndexList{}
 			err := readDB(r.GetLocalDB(), formatPendingTxFromKey(from), list)
@@ -85,6 +94,12 @@ func (r *rgbx) ExecLocal_Confirm(confirm *rtypes.ConfirmTx, tx *types.Transactio
 		err := readDB(r.GetLocalDB(), formatPendingTxKey(confirm.TxBlockHeight, confirm.TxIndex), pending)
 		if err != nil && !errors.Is(err, types.ErrNotFound) {
 			return nil, err
+		}
+		// The pending record is terminal now; drop the hash index with it (both KVs roll
+		// back together via addAutoRollBack).
+		if err == nil && len(pending.GetTxHash()) > 0 {
+			dbSet.KV = append(dbSet.KV, &types.KeyValue{
+				Key: formatPendingTxHashKey(pending.GetTxHash()), Value: nil})
 		}
 		if err == nil && pending.GetFromAddress() != "" {
 			list := &rtypes.TxBlockIndexList{}

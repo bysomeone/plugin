@@ -280,9 +280,19 @@ func formatAssetKey(symbol string) []byte {
 const pendingTxKeyPrefix = KeyPrefixLocalDB + "pendtx-"
 const pendingTxByFromPrefix = KeyPrefixLocalDB + "pendbyfrom-"
 
+// pendingTxByHashPrefix indexes a pending record by its chain33 transaction hash, so a query
+// that only has the hash (get-withdraw-status) does not have to scan every pending record.
+// The value is a txBlockIndex pointing at the record stored under pendingTxKeyPrefix.
+// Records written before this index existed have no entry; callers treat that as "unknown".
+const pendingTxByHashPrefix = KeyPrefixLocalDB + "pendhash-"
+
 func formatPendingTxKey(height, txIndex int64) []byte {
 
 	return []byte(pendingTxKeyPrefix + dapp.HeightIndexStr(height, txIndex))
+}
+
+func formatPendingTxHashKey(txHash []byte) []byte {
+	return append([]byte(pendingTxByHashPrefix), txHash...)
 }
 
 func formatPendingTxFromKey(fromAddr string) []byte {

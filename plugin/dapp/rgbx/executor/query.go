@@ -292,8 +292,103 @@ func (r *rgbx) Query_GetWithdrawConsignmentHash(req *types.ReqString) (types.Mes
 	return &types.ReplyString{Data: hex.EncodeToString(value)}, nil
 }
 
-// Query_GetCrossChainLockAddress returns the shared address that holds the assets of unsettled
-// withdrawals for a cross-chain asset. The payload is the chain33 asset symbol (e.g. RGB20_USDT).
+// Withdrawal status values returned by deriveWithdrawStatus.
+const (
+	withdrawStatusPending  = "pending"
+	withdrawStatusSettled  = "settled"
+	withdrawStatusReleased = "released"
+	withdrawStatusUnknown  = "unknown"
+)
+
+// deriveWithdrawStatus resolves the single status string shown to callers.
+//
+// The consensus terminal state is authoritative. When there is none, a local pending record
+// means the burn exists and is still waiting; without either signal the outcome is unknown
+// (e.g. the node has no local pending index for a burn that was already processed).
+func deriveWithdrawStatus(hasPending bool, finalState string) string {
+	switch finalState {
+	case withdrawStatusSettled:
+		return withdrawStatusSettled
+	case withdrawStatusReleased:
+		return withdrawStatusReleased
+	}
+	if hasPending {
+		return withdrawStatusPending
+	}
+	return withdrawStatusUnknown
+}
+
+// loadLocalPendingTxByHash finds the node's local pending record for a chain33 tx hash.
+// A missing hash index or a record already tombstoned by Confirm both return (nil, nil):
+// local pending data is supplementary, never the source of a final verdict.
+func (r *rgbx) loadLocalPendingTxByHash(txHash []byte) (*rtypes.PendingTx, error) {
+	if len(txHash) == 0 || r.GetLocalDB() == nil {
+		return nil, nil
+	}
+	index := &rtypes.TxBlockIndex{}
+	err := readDB(r.GetLocalDB(), formatPendingTxHashKey(txHash), index)
+	if errors.Is(err, types.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	pending := &rtypes.PendingTx{}
+	err = readDB(r.GetLocalDB(), formatPendingTxKey(index.GetBlockHeight(), index.GetTxIndex()), pending)
+	if errors.Is(err, types.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if pending.GetConfirmed() {
+		return nil, nil
+	}
+	return pending, nil
+}
+
+// Query_GetWithdrawStatus answers "how did this withdrawal end?" in one call.
+//
+// The verdict comes from consensus state: the terminal key written by Confirm (settled) or
+// Unlock (released). The local pending record and the registered consignment hash are
+// supplementary fields; neither can turn a burn into settled or released.
+func (r *rgbx) Query_GetWithdrawStatus(req *types.ReqString) (types.Message, error) {
+	burnTxHash, err := decodeBurnTxHash(req.GetData())
+	if err != nil {
+		return nil, err
+	}
+	reply := &rtypes.WithdrawStatus{}
+
+	pending, err := r.loadLocalPendingTxByHash(burnTxHash)
+	if err != nil {
+		elog.Error("Query_GetWithdrawStatus load local pending", "burnTxHash", req.GetData(), "err", err)
+		return nil, err
+	}
+	reply.Pending = pending
+
+	value, err := r.GetStateDB().Get(formatWithdrawFinalKey(burnTxHash))
+	if err == nil {
+		reply.FinalState = string(value)
+	} else if !errors.Is(err, types.ErrNotFound) {
+		elog.Error("Query_GetWithdrawStatus get final state", "burnTxHash", req.GetData(), "err", err)
+		return nil, err
+	}
+
+	consignment, err := r.GetStateDB().Get(formatWithdrawConsignmentKey(burnTxHash))
+	if err == nil {
+		if len(consignment) > 0 {
+			reply.ConsignmentHash = hex.EncodeToString(consignment)
+		}
+	} else if !errors.Is(err, types.ErrNotFound) {
+		elog.Error("Query_GetWithdrawStatus get consignment", "burnTxHash", req.GetData(), "err", err)
+		return nil, err
+	}
+
+	reply.Status = deriveWithdrawStatus(pending != nil, reply.GetFinalState())
+	return reply, nil
+}
+
+// Query_GetCrossChainLockAddress returns the shared address that holds the assets of unsettled// withdrawals for a cross-chain asset. The payload is the chain33 asset symbol (e.g. RGB20_USDT).
 //
 // Read-only: it derives the same deterministic address the executor transfers into on Withdraw
 // and out of on Unlock. Operators (and the E2E that checks the refund) use it to observe the

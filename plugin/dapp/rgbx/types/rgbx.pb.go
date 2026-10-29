@@ -3274,6 +3274,170 @@ func (x *WithdrawConsignment) GetConsignmentHash() []byte {
 	return nil
 }
 
+// withdrawStatus is the single-query withdrawal outcome. The terminal state is read from
+// consensus state (settled / released); the local pending record is supplementary and may be
+// absent on nodes that do not have it indexed.
+type WithdrawStatus struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	// Local pending record, present only when this node's local pending index has it.
+	Pending *PendingTx `protobuf:"bytes,1,opt,name=pending,proto3" json:"pending,omitempty"`
+	// Consensus terminal state: "settled", "released", or empty when not final yet.
+	FinalState string `protobuf:"bytes,2,opt,name=finalState,proto3" json:"finalState,omitempty"`
+	// Consignment sha256 (hex) registered by the confirm transaction; empty if none.
+	ConsignmentHash string `protobuf:"bytes,3,opt,name=consignmentHash,proto3" json:"consignmentHash,omitempty"`
+	// Derived status: pending / settled / released / unknown.
+	Status string `protobuf:"bytes,4,opt,name=status,proto3" json:"status,omitempty"`
+}
+
+func (x *WithdrawStatus) Reset() {
+	*x = WithdrawStatus{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_rgbx_proto_msgTypes[40]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *WithdrawStatus) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WithdrawStatus) ProtoMessage() {}
+
+func (x *WithdrawStatus) ProtoReflect() protoreflect.Message {
+	mi := &file_rgbx_proto_msgTypes[40]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WithdrawStatus.ProtoReflect.Descriptor instead.
+func (*WithdrawStatus) Descriptor() ([]byte, []int) {
+	return file_rgbx_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *WithdrawStatus) GetPending() *PendingTx {
+	if x != nil {
+		return x.Pending
+	}
+	return nil
+}
+
+func (x *WithdrawStatus) GetFinalState() string {
+	if x != nil {
+		return x.FinalState
+	}
+	return ""
+}
+
+func (x *WithdrawStatus) GetConsignmentHash() string {
+	if x != nil {
+		return x.ConsignmentHash
+	}
+	return ""
+}
+
+func (x *WithdrawStatus) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+// effectiveBridgeConfig is the merged view of the global and per-asset governance records,
+// using the same rules the executor applies (numericLimitsEnabled, independent pause flags).
+type EffectiveBridgeConfig struct {
+	state         protoimpl.MessageState
+	sizeCache     protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+
+	// Asset symbol used for the merge; empty addresses the global record.
+	AssetSymbol string `protobuf:"bytes,1,opt,name=assetSymbol,proto3" json:"assetSymbol,omitempty"`
+	// True when at least one effective record (global or asset) exists.
+	Configured bool `protobuf:"varint,2,opt,name=configured,proto3" json:"configured,omitempty"`
+	// Merged effective values.
+	Config *BridgeConfigApply `protobuf:"bytes,3,opt,name=config,proto3" json:"config,omitempty"`
+	// Activation height of an un-activated loosening; 0 when nothing is scheduled.
+	PendingActivationHeight int64 `protobuf:"varint,4,opt,name=pendingActivationHeight,proto3" json:"pendingActivationHeight,omitempty"`
+	// RGB20 fixed withdrawal fee for this asset in its smallest unit; 0 if unconfigured.
+	WithdrawFeeMinUnits int64 `protobuf:"varint,5,opt,name=withdrawFeeMinUnits,proto3" json:"withdrawFeeMinUnits,omitempty"`
+}
+
+func (x *EffectiveBridgeConfig) Reset() {
+	*x = EffectiveBridgeConfig{}
+	if protoimpl.UnsafeEnabled {
+		mi := &file_rgbx_proto_msgTypes[41]
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		ms.StoreMessageInfo(mi)
+	}
+}
+
+func (x *EffectiveBridgeConfig) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*EffectiveBridgeConfig) ProtoMessage() {}
+
+func (x *EffectiveBridgeConfig) ProtoReflect() protoreflect.Message {
+	mi := &file_rgbx_proto_msgTypes[41]
+	if protoimpl.UnsafeEnabled && x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EffectiveBridgeConfig.ProtoReflect.Descriptor instead.
+func (*EffectiveBridgeConfig) Descriptor() ([]byte, []int) {
+	return file_rgbx_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *EffectiveBridgeConfig) GetAssetSymbol() string {
+	if x != nil {
+		return x.AssetSymbol
+	}
+	return ""
+}
+
+func (x *EffectiveBridgeConfig) GetConfigured() bool {
+	if x != nil {
+		return x.Configured
+	}
+	return false
+}
+
+func (x *EffectiveBridgeConfig) GetConfig() *BridgeConfigApply {
+	if x != nil {
+		return x.Config
+	}
+	return nil
+}
+
+func (x *EffectiveBridgeConfig) GetPendingActivationHeight() int64 {
+	if x != nil {
+		return x.PendingActivationHeight
+	}
+	return 0
+}
+
+func (x *EffectiveBridgeConfig) GetWithdrawFeeMinUnits() int64 {
+	if x != nil {
+		return x.WithdrawFeeMinUnits
+	}
+	return 0
+}
+
 var File_rgbx_proto protoreflect.FileDescriptor
 
 var file_rgbx_proto_rawDesc = []byte{
@@ -3717,8 +3881,34 @@ var file_rgbx_proto_rawDesc = []byte{
 	0x72, 0x6e, 0x54, 0x78, 0x48, 0x61, 0x73, 0x68, 0x12, 0x28, 0x0a, 0x0f, 0x63, 0x6f, 0x6e, 0x73,
 	0x69, 0x67, 0x6e, 0x6d, 0x65, 0x6e, 0x74, 0x48, 0x61, 0x73, 0x68, 0x18, 0x02, 0x20, 0x01, 0x28,
 	0x0c, 0x52, 0x0f, 0x63, 0x6f, 0x6e, 0x73, 0x69, 0x67, 0x6e, 0x6d, 0x65, 0x6e, 0x74, 0x48, 0x61,
-	0x73, 0x68, 0x32, 0x06, 0x0a, 0x04, 0x72, 0x67, 0x62, 0x78, 0x42, 0x0a, 0x5a, 0x08, 0x2e, 0x2e,
-	0x2f, 0x74, 0x79, 0x70, 0x65, 0x73, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
+	0x73, 0x68, 0x22, 0x9e, 0x01, 0x0a, 0x0e, 0x77, 0x69, 0x74, 0x68, 0x64, 0x72, 0x61, 0x77, 0x53,
+	0x74, 0x61, 0x74, 0x75, 0x73, 0x12, 0x2a, 0x0a, 0x07, 0x70, 0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67,
+	0x18, 0x01, 0x20, 0x01, 0x28, 0x0b, 0x32, 0x10, 0x2e, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x70,
+	0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67, 0x54, 0x78, 0x52, 0x07, 0x70, 0x65, 0x6e, 0x64, 0x69, 0x6e,
+	0x67, 0x12, 0x1e, 0x0a, 0x0a, 0x66, 0x69, 0x6e, 0x61, 0x6c, 0x53, 0x74, 0x61, 0x74, 0x65, 0x18,
+	0x02, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0a, 0x66, 0x69, 0x6e, 0x61, 0x6c, 0x53, 0x74, 0x61, 0x74,
+	0x65, 0x12, 0x28, 0x0a, 0x0f, 0x63, 0x6f, 0x6e, 0x73, 0x69, 0x67, 0x6e, 0x6d, 0x65, 0x6e, 0x74,
+	0x48, 0x61, 0x73, 0x68, 0x18, 0x03, 0x20, 0x01, 0x28, 0x09, 0x52, 0x0f, 0x63, 0x6f, 0x6e, 0x73,
+	0x69, 0x67, 0x6e, 0x6d, 0x65, 0x6e, 0x74, 0x48, 0x61, 0x73, 0x68, 0x12, 0x16, 0x0a, 0x06, 0x73,
+	0x74, 0x61, 0x74, 0x75, 0x73, 0x18, 0x04, 0x20, 0x01, 0x28, 0x09, 0x52, 0x06, 0x73, 0x74, 0x61,
+	0x74, 0x75, 0x73, 0x22, 0xf7, 0x01, 0x0a, 0x15, 0x65, 0x66, 0x66, 0x65, 0x63, 0x74, 0x69, 0x76,
+	0x65, 0x42, 0x72, 0x69, 0x64, 0x67, 0x65, 0x43, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x12, 0x20, 0x0a,
+	0x0b, 0x61, 0x73, 0x73, 0x65, 0x74, 0x53, 0x79, 0x6d, 0x62, 0x6f, 0x6c, 0x18, 0x01, 0x20, 0x01,
+	0x28, 0x09, 0x52, 0x0b, 0x61, 0x73, 0x73, 0x65, 0x74, 0x53, 0x79, 0x6d, 0x62, 0x6f, 0x6c, 0x12,
+	0x1e, 0x0a, 0x0a, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x75, 0x72, 0x65, 0x64, 0x18, 0x02, 0x20,
+	0x01, 0x28, 0x08, 0x52, 0x0a, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x75, 0x72, 0x65, 0x64, 0x12,
+	0x30, 0x0a, 0x06, 0x63, 0x6f, 0x6e, 0x66, 0x69, 0x67, 0x18, 0x03, 0x20, 0x01, 0x28, 0x0b, 0x32,
+	0x18, 0x2e, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x62, 0x72, 0x69, 0x64, 0x67, 0x65, 0x43, 0x6f,
+	0x6e, 0x66, 0x69, 0x67, 0x41, 0x70, 0x70, 0x6c, 0x79, 0x52, 0x06, 0x63, 0x6f, 0x6e, 0x66, 0x69,
+	0x67, 0x12, 0x38, 0x0a, 0x17, 0x70, 0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67, 0x41, 0x63, 0x74, 0x69,
+	0x76, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x48, 0x65, 0x69, 0x67, 0x68, 0x74, 0x18, 0x04, 0x20, 0x01,
+	0x28, 0x03, 0x52, 0x17, 0x70, 0x65, 0x6e, 0x64, 0x69, 0x6e, 0x67, 0x41, 0x63, 0x74, 0x69, 0x76,
+	0x61, 0x74, 0x69, 0x6f, 0x6e, 0x48, 0x65, 0x69, 0x67, 0x68, 0x74, 0x12, 0x30, 0x0a, 0x13, 0x77,
+	0x69, 0x74, 0x68, 0x64, 0x72, 0x61, 0x77, 0x46, 0x65, 0x65, 0x4d, 0x69, 0x6e, 0x55, 0x6e, 0x69,
+	0x74, 0x73, 0x18, 0x05, 0x20, 0x01, 0x28, 0x03, 0x52, 0x13, 0x77, 0x69, 0x74, 0x68, 0x64, 0x72,
+	0x61, 0x77, 0x46, 0x65, 0x65, 0x4d, 0x69, 0x6e, 0x55, 0x6e, 0x69, 0x74, 0x73, 0x32, 0x06, 0x0a,
+	0x04, 0x72, 0x67, 0x62, 0x78, 0x42, 0x0a, 0x5a, 0x08, 0x2e, 0x2e, 0x2f, 0x74, 0x79, 0x70, 0x65,
+	0x73, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
 }
 
 var (
@@ -3733,7 +3923,7 @@ func file_rgbx_proto_rawDescGZIP() []byte {
 	return file_rgbx_proto_rawDescData
 }
 
-var file_rgbx_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
+var file_rgbx_proto_msgTypes = make([]protoimpl.MessageInfo, 42)
 var file_rgbx_proto_goTypes = []interface{}{
 	(*RgbxAction)(nil),            // 0: types.RgbxAction
 	(*RegisterDepositScript)(nil), // 1: types.registerDepositScript
@@ -3775,6 +3965,8 @@ var file_rgbx_proto_goTypes = []interface{}{
 	(*BumpWithdrawFeeItem)(nil),   // 37: types.bumpWithdrawFeeItem
 	(*BumpWithdrawFeeList)(nil),   // 38: types.bumpWithdrawFeeList
 	(*WithdrawConsignment)(nil),   // 39: types.withdrawConsignment
+	(*WithdrawStatus)(nil),        // 40: types.withdrawStatus
+	(*EffectiveBridgeConfig)(nil), // 41: types.effectiveBridgeConfig
 }
 var file_rgbx_proto_depIdxs = []int32{
 	10, // 0: types.RgbxAction.mint:type_name -> types.mintAsset
@@ -3802,11 +3994,13 @@ var file_rgbx_proto_depIdxs = []int32{
 	29, // 22: types.txBlockIndexList.blockIndexList:type_name -> types.txBlockIndex
 	31, // 23: types.operationRecords.records:type_name -> types.operationRecord
 	37, // 24: types.bumpWithdrawFeeList.items:type_name -> types.bumpWithdrawFeeItem
-	25, // [25:25] is the sub-list for method output_type
-	25, // [25:25] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	21, // 25: types.withdrawStatus.pending:type_name -> types.pendingTx
+	4,  // 26: types.effectiveBridgeConfig.config:type_name -> types.bridgeConfigApply
+	27, // [27:27] is the sub-list for method output_type
+	27, // [27:27] is the sub-list for method input_type
+	27, // [27:27] is the sub-list for extension type_name
+	27, // [27:27] is the sub-list for extension extendee
+	0,  // [0:27] is the sub-list for field type_name
 }
 
 func init() { file_rgbx_proto_init() }
@@ -4295,6 +4489,30 @@ func file_rgbx_proto_init() {
 				return nil
 			}
 		}
+		file_rgbx_proto_msgTypes[40].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*WithdrawStatus); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
+		file_rgbx_proto_msgTypes[41].Exporter = func(v interface{}, i int) interface{} {
+			switch v := v.(*EffectiveBridgeConfig); i {
+			case 0:
+				return &v.state
+			case 1:
+				return &v.sizeCache
+			case 2:
+				return &v.unknownFields
+			default:
+				return nil
+			}
+		}
 	}
 	file_rgbx_proto_msgTypes[0].OneofWrappers = []interface{}{
 		(*RgbxAction_Mint)(nil),
@@ -4317,7 +4535,7 @@ func file_rgbx_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: file_rgbx_proto_rawDesc,
 			NumEnums:      0,
-			NumMessages:   40,
+			NumMessages:   42,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

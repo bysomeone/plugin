@@ -440,4 +440,33 @@ message withdrawConsignment {
     bytes consignmentHash  = 2;
 }
 
+// withdrawStatus is the single-query withdrawal outcome. The terminal state is read from
+// consensus state (settled / released); the local pending record is supplementary and may be
+// absent on nodes that do not have it indexed.
+message withdrawStatus {
+    // Local pending record, present only when this node's local pending index has it.
+    pendingTx pending = 1;
+    // Consensus terminal state: "settled", "released", or empty when not final yet.
+    string finalState = 2;
+    // Consignment sha256 (hex) registered by the confirm transaction; empty if none.
+    string consignmentHash = 3;
+    // Derived status: pending / settled / released / unknown.
+    string status = 4;
+}
+
+// effectiveBridgeConfig is the merged view of the global and per-asset governance records,
+// using the same rules the executor applies (numericLimitsEnabled, independent pause flags).
+message effectiveBridgeConfig {
+    // Asset symbol used for the merge; empty addresses the global record.
+    string assetSymbol = 1;
+    // True when at least one effective record (global or asset) exists.
+    bool configured = 2;
+    // Merged effective values.
+    bridgeConfigApply config = 3;
+    // Activation height of an un-activated loosening; 0 when nothing is scheduled.
+    int64 pendingActivationHeight = 4;
+    // RGB20 fixed withdrawal fee for this asset in its smallest unit; 0 if unconfigured.
+    int64 withdrawFeeMinUnits = 5;
+}
+
 service rgbx {}
