@@ -1,22 +1,14 @@
 # 关键状态的备份与恢复
 
-> **任务 #27**（`LAUNCH_READINESS.md` 二「上线前必须」第一项）。本轮只做**现状盘点 + 规划**，不含实现。
->
-> 基线：plugin `feat-rgb-usdt-integration`。盘点开始时 HEAD = `38a6cc0f5`，**盘点期间仓库在并发推进**
-> （另有 agent 在提交，HEAD 已到 `1b65b6ff2`）；本文所有关键事实在 `1b65b6ff2` 上**复核过一遍**
-> —— 期间落地的提交（`b5e7af71c` 声明式合约、`1b65b6ff2` 充值 consignment 合约身份校验）
-> **没有新增任何持久化 bucket**（✅ `git show 1b65b6ff2 | grep -i bucket` 无命中）。
-> chain33 `feat/tss-alice-cggmp` @ `36fb0fd21`。
-> 盘点方式：只读浏览代码/配置（`neutrino/**`、`rgb20/**`、`plugin/dapp/rgbx/**`、chain33 `system/crypto/tss/**`、
-> `cmd/ci/docker-compose*.yml`，以及 cargo registry 里的 `rgb-ops-0.11.1-rc.11` / `rgb-strict-encoding-1.0.2`）。
->
+本文是备份范围、恢复路径与缺口的技术依据：说明哪些状态必须备份、丢了会怎样、如何恢复，以及已知缺口。
+
 > **证据标记**（全文遵守，请勿把推断当事实引用）：
 >
 > | 标记 | 含义 |
 > |---|---|
 > | ✅ | **读代码确认**：本文件给出 `文件:行`，可直接复核 |
 > | ⚠️ | **推断**：由确认的事实推出，但推导链的一段没有直接代码证据 |
-> | ❓ | **未确认**：本轮没查清，写在这里是为了不让人误以为已结论 |
+> | ❓ | **未确认**：本文没有查清，写在这里是为了不让人误以为已结论 |
 >
 > 相关文档（不重复，只引用）：`CONFIG.md` §4.3.1–4.3.3 已详述「share ↔ 链上组公钥自检」与
 > 「只许 refresh、不许 re-DKG」；本文只补**备份/恢复的运维面**。
@@ -29,28 +21,28 @@
 
 | # | 状态 | 为什么不可放弃 |
 |---|---|---|
-| **B1** | 每节点 TSS 密钥材料（`neutrino.db` 的 `rgbx-tss` bucket） | 丢够份额（当前 `threshold=3`）＝ **旧地址下的资金永久花不出去**。re-DKG 换群公钥，链上 `CrossChainInfo` 写死不可改 ⇒ 修不回来 |
+| **B1** | 每节点 TSS 密钥材料（`neutrino.db` 的 `rgbx-tss` bucket） | 丢够份额（`threshold=3`）＝ **旧地址下的资金永久花不出去**。re-DKG 换群公钥，链上 `CrossChainInfo` 写死不可改 ⇒ 修不回来 |
 | **B2** | 侧车 `/data`（`ledger.json` + `stock/`） | RGB 是**客户端验证**，资产状态链上查不出来 ⇒ 侧车状态**不可从链重建** |
 | **B3** | 每节点中继本地库（`neutrino.db` 的 `rgb20-*` / `rgbx-*` bucket） | 业务台账；**多数可自愈或重建**，但 `rgb20-receive` 是 consignment 原文的全仓唯一留存 ⇒ 单独列为必须 |
 | **B4** | 主链（`main`）自己的 `datadir` | `main` 在 compose 里**只有 1 个节点**：它是 `CrossChainInfo` / 已铸供应量 / 操作台账的**唯一持有者** |
 | **B5** | 每节点的 **libp2p 身份私钥**（`system/p2p/dht/addrbook.go` 的 `privkey` 记录，落在节点 datadir 的 addrbook 库里） | TSS 认的身份就是 **libp2p peer id**，且由传输层认证（`cggmp/errors.go:16` 的 `errMissingPeerID`）。**只恢复 share、不恢复这个私钥 ⇒ 节点回来时 peer id 变了，组内不认它**，恢复就不是"换台机器"而是"换了个成员"。详见下方 §2.1 |
 
-**§2.1 为什么 B5 必须进清单（2026-09-21 补，源于"换机器要不要重新组网"的讨论）**
+**§2.1 为什么 B5 必须进清单**
 
 TSS 协议层一切寻址都用 peer id：`pm.SelfID()` / `pm.PeerIDs()`（`cggmp/api.go:105/131`），消息里带的 peer id 由**传输层认证**（不是发送方自称）。所以：
 
 - **换机器 = 无损**，只要同时恢复两样：**(a) TSS share**（B1）与 **(b) libp2p 身份私钥**（B5）。peer id 由私钥派生（`addrbook.go:122-142`），私钥不变则 peer id 不变 ⇒ 对 TSS 而言**组网配置根本没变**（同一批 ID、同一份 bks、同样的份额），不需要任何重新组网动作。
-- **只恢复 (a)、丢了 (b) ⇒ 节点回来是个新成员**，旧组不认它，得走加节点/重组流程（见 `LAUNCH_READINESS.md` 的 addshare 一节）。
+- **只恢复 (a)、丢了 (b) ⇒ 节点回来是个新成员**，旧组不认它，得走加节点/重组流程（见 `docs/rgbx-bridge/01-系统设计.md` 的 TSS 生命周期说明）。
 - ⇒ **备份清单把这两样按同一等级对待**：它们是"恢复一个节点"的两个必需件，缺一不可。
 
 **风险分级一句话**：B1 丢 = 完蛋（资金锁死，不可逆）；B2 丢 = 完蛋（资产认知与 consignment 消失，
-不可逆）；B3 丢 = 麻烦（可自愈 + 需重扫，服务降级）；B4 丢 = **完蛋**（生产与 CI 同为单主节点，`main-data` 是主链唯一样本）。
+不可逆）；B3 丢 = 麻烦（可自愈 + 需重扫，服务降级）；B4 丢 = **完蛋**（单主节点时 `main-data` 是主链唯一样本）。
 
-**最刺眼的两条现状问题**（第 4 节展开）：
+**主要缺口**（第 4 节展开；其中 stock 一项已由 G2 修复）：
 
-- 侧车 `stock/*.dat` 的写**不是原子的**（`File::create` 直接写目标文件，无 tmp/rename/fsync），
-  而 `stock.dat` 损坏时 `Stock::load` 失败会被**静默降级成空 Stock**——不报错、不 panic、
-  侧车照常起来（`engine.rs:230-236`）。
+- ~~侧车 `stock/*.dat` 的写不是原子的，`Stock::load` 失败会静默降级成空 Stock~~ —— **已修复
+  （缺口 G2，2026-10-24）**：三份文件改为 tmp → `fsync` → `rename` → 目录 `fsync` 原子写入，
+  载入失败或文件集不完整会**拒绝启动**并报出路径、大小与原因（`store.rs`、`engine.rs`）。见 §4 G2。
 - `AssetRec.genesis_consignment_hex` **只写不读**（写：`engine.rs:728`；读：只有测试），
   且 `issue_usdt` 只打印 `asset_id` 不打印 genesis hex（`bin/issue_usdt.rs:196`）。
 
@@ -58,8 +50,8 @@ TSS 协议层一切寻址都用 peer id：`pm.SelfID()` / `pm.PeerIDs()`（`cggm
 
 ## 1. 部署拓扑（先说清楚东西在哪，否则表的路径没有意义）
 
-`cmd/ci/docker-compose.yml` + `docker-compose-rgb20.yml`（**CI 拓扑**；生产拓扑未定稿，
-差异会直接改变风险分级，见 §2.5 与 §6 ❓3）：
+`cmd/ci/docker-compose.yml` + `docker-compose-rgb20.yml`（**CI 拓扑**；生产拓扑不同会直接改变风险分级，
+见 §2.5 与 §6 ❓3）：
 
 ```
 main    (1 个)  卷 main-data   →  /root/datadir     主链（rgbx/lightclient 合约状态在这里）
@@ -104,9 +96,9 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 | 路径 | 内容 | 写入方式 |
 |---|---|---|
 | `/data/ledger.json` | 热账本：`assets` / `seals` / `receives` / `settled_by_outpoint` / `finalized_withdrawals`（✅ `ledger.rs:130-143`） | **原子**：tmp → `fsync` → `rename` → 目录 `fsync`（✅ `ledger.rs:202,317-331`） |
-| `/data/stock/stash.dat` | `MemStash`：schemata / **geneses** / bundles / witnesses / **secret_seals** / type_system / libs（✅ rgb-ops `src/persistence/memory.rs:80-92`） | **非原子**：`fs::File::create` + 流式 encode（✅ rgb-strict-encoding `src/traits.rs:397-406`） |
-| `/data/stock/state.dat` | `MemState`：witnesses / invalid_ops / **contracts（合约状态本体）**（✅ 同上 `:289-297`） | 同上，非原子 |
-| `/data/stock/index.dat` | `MemIndex`：op↔bundle↔contract 索引 / **terminal_index（SecretSeal → Opout）**（✅ 同上 `:913-925`） | 同上，非原子 |
+| `/data/stock/stash.dat` | `MemStash`：schemata / **geneses** / bundles / witnesses / **secret_seals** / type_system / libs（✅ rgb-ops `src/persistence/memory.rs:80-92`） | **原子**：tmp → `fsync` → `rename` → 目录 `fsync`（✅ `store.rs` `AtomicFsBinStore` → `ledger::write_atomic`） |
+| `/data/stock/state.dat` | `MemState`：witnesses / invalid_ops / **contracts（合约状态本体）**（✅ 同上 `:289-297`） | 同上，原子 |
+| `/data/stock/index.dat` | `MemIndex`：op↔bundle↔contract 索引 / **terminal_index（SecretSeal → Opout）**（✅ 同上 `:913-925`） | 同上，原子（三份文件逐个提交，彼此之间不是事务；中途崩溃会留下不完整文件集 → **拒绝启动**，见 G2） |
 | `/data/builds/<sha256(seal集)>.json` | 提现构建归档（PSBT + consignment + fascia 的 deflate），**重放同一笔提现的唯一依据**（✅ `build_store.rs:138,160`） | 每笔一个文件，一次写、可裁剪 |
 | `/data/user_scripts.json` | 用户 P2WSH 充值脚本 watch 集（program ↔ witnessScript + userID）（✅ `config.rs:147`、`wallet.rs:259,290`） | 非原子（`fs::write` 语义，未细查） |
 
@@ -124,7 +116,7 @@ db, err := openWalletDB(dbPath, "neutrino.db")
   为门，`--datadir` 挡不住；✅ `docker-compose.yml:89-96` 的注释 + `docker-compose.sh:341-348`）。
   ⇒ **CI 的 BTC 链本就设计成可丢弃**，不备份。
 - **btcd（生产）**：生产应接真实 Bitcoin 网络，链数据可从网络重同步 ⇒ 也不需要备份
-  （⚠️ 推断：生产拓扑未定稿）。
+  （⚠️ 推断，以生产实际部署为准）。
 
 ---
 
@@ -143,7 +135,7 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 | **能否靠重跑修复** | ❌ **不能**。唯一「换材料不换公钥」的机制是 CGGMP `ProcessRefresh`（= 删掉 `cggmp-refresh-result` 后全员重启补跑），但它**只能换 refresh 那一半**，`cggmp-dkg-result` 本身（含 share 与群公钥）丢了就没了 |
 | **必须备份** | **P0，最高优先级** |
 | **建议方式 / 频率** | DKG+refresh 落盘后**立刻一次**（这是一次性关键资产，之后不再变，除非跑 refresh）；变更（走 refresh）后重做一次 |
-| **由谁持有** | **每个 para 的运维方各自持有自己的那份**，且**不得三份同处**（当前 `threshold=3`，3 份 = 直接可花，✅ `LAUNCH_READINESS.md:70`）。⚠️ 建议至少一份离线冷备 |
+| **由谁持有** | **每个 para 的运维方各自持有自己的那份**，且**不得三份同处**（`threshold=3`，3 份 = 直接可花）。⚠️ 建议至少一份离线冷备 |
 
 > ✅ **链上不含 share**：`CrossChainInfo` 只写 `tssAddress` / `pubkey`（✅ `rgbx/executor/crosschain.go:52-62`），
 > 链上只有「群公钥」与「DKG 确认集合」。⇒ **share 在链上没有任何副本**。
@@ -160,7 +152,7 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 - **能救**：揪出「share 与链不是同一代」（re-DKG 后、从别的环境恢复后）——避免节点「参与签名但不被认」的静默失灵。
 - **救不了**：它读的是 `cggmp-dkg-result` 里的**组公钥**（✅ `client.go:473-491` `loadTssGroupPubKeyFromDB`），
   并**不校验 share 本身是否完好**。⇒ 一条 `cggmp-dkg-result` 记录**JSON 可解析、share 字段被截断/改坏**，
-  自检会放过（⚠️ 推断：`groupPubKeyFromDKG` 只解群公钥字段）。**没有「share 可用性」的自检**（缺口 G2）。
+  自检会放过（⚠️ 推断：`groupPubKeyFromDKG` 只解群公钥字段）。**没有「share 可用性」的自检**（不属于 G2；share 可用性至今无自动检查）。
 
 ### 2.2 B2 · 侧车 `/data`（全桥唯一一份）
 
@@ -169,8 +161,8 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 | **存放位置** | 卷 `rgb-sidecar-data` → `/data`（`RGB_SIDECAR_DATA_DIR`）。文件清单见 §1.2 |
 | **丢失后果** | **不可逆**。RGB 是客户端验证：链上**只有**金额/承诺，没有资产状态 ⇒ 侧车状态**不可从链重建**。丢了以后：① 桥不知道任何 seal 的归属与余额；② 提现无法构造（`build_transfer` 要 `asset(symbol)` + Stock 里的合约状态）；③ 用户手上的 consignment 仍有效，但桥这边对不上账 |
 | **必须备份** | **P0**。且**必须成套**（`ledger.json` + `stock/` + `builds/` + `user_scripts.json`）—— ⚠️ 单独拿一份没有意义，因为 `stock/*` 与 `ledger.json` 之间有跨文件一致性（§4 G4） |
-| **建议方式 / 频率** | 状态随每笔充值/提现变更 ⇒ **每日 + 每次大额操作前**；若做在线快照须先解决 G4 |
-| **由谁持有** | 桥上运维方。因为是单点，**必须异地复制**（⚠️ 建议 3-2-1：本地 + 异地，至少一份离线） |
+| **建议方式 / 频率** | 状态随每笔充值/提现变更 ⇒ **每日 + 每次大额操作前**；侧车不提供在线一致性快照，必须用「停侧车 → 打包 → 起」的冷备 |
+| **由谁持有** | 桥上运维方。因为是单点，**必须至少保留一份异地或离线副本**（见 `docs/rgbx-bridge/02-2-备份与恢复.md` §2） |
 
 #### 2.2.1 `genesis_consignment_hex`：只写不读 —— **明确的缺口**
 
@@ -191,7 +183,9 @@ db, err := openWalletDB(dbPath, "neutrino.db")
   但**侧车没有把它们暴露成任何入口**（proto 里没有），所以「有数据、没工具」，与「没数据」在运维上等价。）
 - **声明式引入的外部资产**（`RGB_SIDECAR_CONTRACTS` 文件里的 `genesisConsignment` /
   `genesisConsignmentFile`，✅ `config.rs:39-60`）：genesis 在**运维的配置文件**里还有一份。
-  但那份文件本身**不在 `/data` 里、也没被任何东西备份**（缺口 G3）——抄一遍配置能救，前提是它还在。
+  该文件本身**不在 `/data` 里**，但已通过 `cold_backup.sh` 的 `BACKUP_EXTRA_FILES` 纳入备份清单
+  （按 `extra/<label>` 打包并校验，恢复时用 `RESTORE_EXTRA_TARGETS` 放回；运维口径见
+  `docs/rgbx-bridge/02-2-备份与恢复.md` §1/§3）。G3 已按此关闭。
 
 ### 2.3 B3 · 中继业务 bucket（每节点一份，都在同一个 `neutrino.db` 里）
 
@@ -240,9 +234,23 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 - ⇒ **生产必须保证主链至少有 ≥2 个独立节点**，否则「备份主链数据」本身就成为 P0。
   这属于**拓扑要求**，不是备份工具能解决的（缺口 G6）。
 
-> ✅ **已确认（用户 2026-09-21）**：**生产同样是单主节点** ⇒ `main-data` 与 B1/B2 同属
-> 「不可重建」一档，必须备份。上面的「主链 ≥2 个独立节点」仍是有价值的**拓扑级加固建议**，
-> 但它是备份的补充、不是替代。好消息：CI 与生产的拓扑一致，备份方案**不需要分两套**。
+> ✅ **若生产为单主节点**，`main-data` 与 B1/B2 同属「不可重建」一档，必须备份。上面的「主链 ≥2 个独立
+> 节点」仍是有价值的**拓扑级加固建议**，但它是备份的补充、不是替代；多节点时 `main-data` 可从 P2P 同步。
+
+### 2.6 网关数据（`gateway-data`）
+
+网关是 gateway 架构新增的组件，`--data-dir` 下有四类数据：
+
+| 数据 | 内容 | 丢失后果 | 结论 |
+| --- | --- | --- | --- |
+| `blobs/` + `index/` | 用户投递的 consignment 与 ACK 状态 | 未交付到桥、且用户只上传过一次的那份交付物丢失；桥看不到该笔充值，用户需重传 | **可丢**：协议是 at-least-once，钱包侧可重传；不是权威账本 |
+| `deposit-requests/` | 签名充值请求与已出 invoice | 用户可重新提交同一 `request_id`（签名不变）找回；桥按 request id 幂等 | **可丢，可重放** |
+| `bridge-events/events.jsonl` | 审计事件镜像（默认 90 天） | 统计/对账缺一段；链上数据仍在 | **可丢**，但建议纳入备份以便审计连续 |
+| `--ttl` 控制 | consignment 默认 7 天、充值请求同 TTL | —— | 过期即删 |
+
+**备份范围不含网关**（`cold_backup.sh` 的源清单只覆盖 main/para/sidecar）。这是有意的：网关不是权威，
+丢失后的恢复动作是"让用户重传 / 用户用同一请求 id 重新取 invoice"。若审计要求事件连续，请把
+`<gateway-data-dir>` 作为额外源加入备份（它很小），并在恢复后接受最多 90 天的历史窗口。
 
 ---
 
@@ -268,7 +276,12 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 ⑤ 验证：该节点参与一笔真实签名（或 E2E 场景）
 ```
 
-**今天缺什么**：②③ 全靠人工开 bbolt 文件比对，**没有工具**（缺口 G1）。
+> **G1 已实现（2026-10-24）**：`cmd/rgb-tss-tool` 可以在节点停止时把 `rgbx-tss`
+> 单独导出成 JSON（`export --db ... --out ...`），并导入到目标 `neutrino.db`
+> （`import --file ... --db ... [--force]`）。导出文件含群公钥、rid、share id，
+> 导入后逐字节读回校验；覆盖已有值时先写 `<db>.tss-backup-<unix>`。用法与限制见
+> `cmd/rgb-tss-tool/README.md`。②的「哪一代」比对仍要靠群公钥对链上记录，但不再需要
+> 打开 bbolt 手工找记录。导出的仍只是**单节点 share**，恢复集群依旧需要 ≥threshold 份。
 
 ### 3.2 侧车从零恢复
 
@@ -286,7 +299,8 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 
 ```
 ① 拿回每个合约的 genesis consignment 原始字节
-     - 声明式资产：运维的 RGB_SIDECAR_CONTRACTS 文件里还有（前提：它被备份了 —— 缺口 G3）
+     - 声明式资产：运维的 RGB_SIDECAR_CONTRACTS 文件里还有（已由 `BACKUP_EXTRA_FILES` 纳入备份，
+       见 §4 G3）
      - 自发行资产：**没有出口**（缺口 G0，本文件的核心缺口）
 ② 起一个空 /data 的侧车 + 声明文件 → 合约会被 adopt 进 Stock
 ③ **但 historical state 不会回来**：seals / receives / 已发生的 transfer 全部丢失
@@ -302,14 +316,14 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 （全新链上没有旧 `CrossChainInfo`）。代价：**旧地址下的一切 BTC 与已铸 RGB20 全部作废**。
 ⇒ 这是「备份没做好」的终局，不是恢复方案。
 
-### 3.4 恢复后的自检清单（今天能做的）
+### 3.4 恢复后的自检清单
 
 | 检查 | 怎么做 | 谁做 |
 |---|---|---|
 | share 与链同代 | 启动日志无 panic + `CONFIG.md §4.3.1` 的 fail-closed | 自动 |
-| share 自检覆盖不到的「share 完好性」 | **没有自动检查**（缺口 G2） | ❌ 无 |
+| share 自检覆盖不到的「share 完好性」 | **没有自动检查**（与 G2 无关，见 §6 ❓1） | ❌ 无 |
 | 侧车账 ↔ 链上供应量对账 | 人工：`chain33-cli` 查 `opsupply-` vs 侧车 `GetBalance` | 人工 |
-| 侧车 Stock ↔ ledger 一致 | **没有检查**（缺口 G4） | ❌ 无 |
+| 侧车 Stock ↔ ledger 一致 | **有检查**：启动时逐个核对 ledger 资产在 Stock 中有合约，缺失即拒启（`verify_stock_matches_ledger`）；已声明合约可重新 adopt 修复。跨文件的快照一致性靠停机冷备保证（G4 已按最小方案关闭），在线快照未实现 | 自动 |
 | `btcwallet.db` 生日是否覆盖历史 | **没有检查**（缺口 G7） | ❌ 无 |
 
 ---
@@ -321,17 +335,38 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 | # | 缺口 | 后果 | 粗估 | 依赖 |
 |---|---|---|---|---|
 | **G0** | **`genesis_consignment_hex` 只写不读 + 无 Stock 导出入口**；自发行资产的 genesis 无处可寻 | 侧车 `/data` 全丢 = **合约认知永久丢失**，不可逆 | **1–2 人日**（加一个 `ExportContract` RPC 或 CLI：`Stock::export_contract` 已有库函数）+ 0.5 人日（`issue_usdt` 把 genesis hex 落盘 / 打印） | 侧车 proto 改动 |
-| **G1** | **没有「从 `neutrino.db` 单独导出/导入 `rgbx-tss`」的工具** | 备份只能整文件（GB 级），运维会因此**不做备份**；恢复要人工开 bbolt 比对代次 | **2–3 人日**（新增 CLI：`rgbx tss-export --db <neutrino.db> --out <file>` / `tss-import`；bbolt 单 bucket 读写 + 群公钥/rid 打印） | chain33/plugin CLI 侧 |
-| **G2** | **`stock/*.dat` 写非原子 + 载入失败静默降级成空 Stock** | 崩溃/磁盘满 → `stock.dat` 截断 → 下次启动**静默空 Stock**（不报错），且 `apply_declared_contracts` 因 ledger 已登记而**提前 return、不重新 import**（✅ `engine.rs:683-685`）⇒ 服务照常启动、余额（读 ledger）看着正常，但提现/结算在用到 Stock 时才失败 | **1 人日**（① `stock.store()` 前 tmp+rename+fsync；② `Stock::load` 失败**必须 fail-closed**，不允许静默 in-memory） | 侧车（`engine.rs`/`config.rs`） |
-| **G3** | **`RGB_SIDECAR_CONTRACTS` 声明文件不在 `/data`、无备份约定** | 丢了它 + 丢了 `/data` ⇒ 连「重新 adopt 声明式合约」这条不完整的路都断了 | **0.5 人日**（约定：声明文件放进 `/data`，或纳入备份清单 + 在 `CONFIG.md` 写明） | 无 |
-| **G4** | **`/data` 无一致性快照点**：`ledger.json` 原子写、`stock/*` 非原子写、`btcwallet.db` 是另一个文件 ⇒ 在线 `tar` 可能拿到**撕裂的组合** | 恢复出一份互相矛盾的备份，且**没有工具能发现** | **2–3 人日**（最小方案：加 `Snapshot` RPC —— 在 engine 全局锁内把 `/data` 打成一致 tar / 或 `Quiesce` 后由外部拷贝）；**或** 0.5 人日（文档化「备份前必须停侧车」，代价是停机窗口） | 侧车 |
-| **G5** | **dapp localdb 无重建入口** | localdb 丢 ⇒ 掉队停机，只能等一次带版本升级的发布或临时开逃生阀 | （已在 `CONFIG.md:56-66` 记为后续项，**不在本轮范围**） | — |
-| ~~G6~~ | ~~生产主链拓扑未确认~~ —— **已确认（用户 2026-09-21）：生产同为单主节点** | ⇒ `main-data` 丢 = 链丢 = 全部合约状态丢，**与 B1/B2 同级、必须备份** | 已决策，不再是缺口；且 CI 与生产拓扑一致，备份方案无需分两套 | 已决策 |
-| **G7** | **`btcwallet.db` 生日没有自检** | **静默漏充值** —— 但触发条件是「`btcwallet.db` 丢了/被重建」，**不是**「从旧备份恢复」（原措辞方向错了，见下方【订正 2026-09-22】） | **1 人日**（启动时打印生日 + 与 neutrino 的 earliest 比对，不匹配则 WARN/拒启） | 中继 |
-| ~~G8~~ | ~~**无恢复演练**~~ —— **已落地**：`rgbx/cmd/ci/scripts/backup_test.sh`（备 → 真的销毁卷 → 还原 → 起 → 断言 → 跑业务）。覆盖面与**未覆盖面**见 §4.1 | 已从"没验证过"变成"每次 E2E 都验证"| 已完成 |
+| ~~G1~~ | ~~**没有「从 `neutrino.db` 单独导出/导入 `rgbx-tss`」的工具**~~ —— **已落地（2026-10-24）**：`cmd/rgb-tss-tool export/import` 在节点停止时只导出 `rgbx-tss` bucket（JSON、0600），导入前写回滚副本、无 `--force` 时拒绝覆盖，并校验群公钥/rid；用法见该目录 `README.md` | 备份不再必须整库拷贝；恢复仍要求 ≥3/4 份且同代 | 已完成 | — |
+| ~~G2~~ | ~~**`stock/*.dat` 写非原子 + 载入失败静默降级成空 Stock**~~ —— **已落地（2026-10-24）**：三份文件改为 tmp → `fsync` → `rename` → 目录 `fsync`；载入/完整性失败一律**拒绝启动**，不再有 in-memory 空 Stock（`store.rs`、`engine.rs`） | 现在损坏的 `stock/*.dat` 或残缺的文件集会让启动**带路径、大小与原因失败**；`ledger` 有资产而 Stock 没有时也拒启（除非该合约已声明，可重新 adopt 修复）。写失败在持久化边界上报为错误，ledger 不会先于 Stock 前进 | 已完成（见下方【订正 2026-10-24】） | 已修复 |
+| ~~G3~~ | ~~**`RGB_SIDECAR_CONTRACTS` 声明文件不在 `/data`、无备份约定**~~ —— **已关闭（纳入备份清单）**：`cold_backup.sh` 的 `BACKUP_EXTRA_FILES` 把它按 `extra/<label>` 打包并计入清单校验，`restore_backup.sh` 用 `RESTORE_EXTRA_TARGETS` 放回；运维口径见 `docs/rgbx-bridge/02-2-备份与恢复.md` §1/§3 | 声明文件随包保存，风险降到与其它备份成员相同 | 已完成 | — |
+| ~~G4~~ | ~~**`/data` 无一致性快照点**~~ —— **已按最小方案关闭**：冷备流程是「停 → 打包 → 起」，侧车在打包期间不写；`docs/rgbx-bridge/02-2-备份与恢复.md` §3 已明确「备份前必须停侧车」。**注意**：`Snapshot` RPC / 在线一致性快照**未实现**，在线热备仍不可用 | 一致性由停机窗口保证；在线快照仍缺失 | 已完成（文档方案，0.5 人日） | 侧车 |
+| **G5** | **dapp localdb 无重建入口** | localdb 丢 ⇒ 掉队停机，只能等一次带版本升级的发布或临时开逃生阀 | （已在 `CONFIG.md:56-66` 记为后续项） | — |
+| **G6** | **生产主链拓扑**（单主节点或多节点） | 单主节点时 `main-data` 丢 = 链丢 = 全部合约状态丢，**与 B1/B2 同级、必须备份**；多节点时可从 P2P 同步 | 拓扑要求 | — |
+| ~~G7~~ | ~~**`btcwallet.db` 生日没有自检**~~ —— **已落地**：启动时 `checkWalletBirthday` 比对钱包生日与头链起点，覆盖不到历史时打印 `ALERT wallet birthday cannot cover chain history`；E2E 探针会删除 `btcwallet.db` 并断言告警出现（`backup_test.sh` 的 `scenario_wallet_birthday_guard`）。触发条件是「`btcwallet.db` 丢了/被重建」，**不是**「从旧备份恢复」（原措辞方向错了，见下方【订正 2026-09-22】） | 重建钱包会被立即发现，不再静默漏充值 | 已完成 | — |
+| ~~G8~~ | ~~**无恢复演练**~~ —— **已落地**：`rgbx/cmd/ci/scripts/backup_test.sh`（备 → 真的销毁卷 → 还原 → 起 → 断言 → 跑业务）。覆盖面与不模拟的场景见 §4.1 | 每次 E2E 都执行完整恢复链路 | 已完成 | — |
 
-**合计**：G0–G4 + G7 ≈ **7–10 人日**（不含 G5/G6）；G8 演练已完成。
-→ 与 `LAUNCH_READINESS.md` 的「最小备份/恢复入口」（任务 #30）是同一批工作。
+**合计**：G0 ≈ **1.5–2.5 人日**（G1/G2/G3/G4/G7 已关闭；G5 为后续项）；G8 的恢复演练已落地为 E2E 场景。
+G4 若要做在线快照（`Snapshot` RPC），仍需另计 2–3 人日。
+→ 与 `docs/rgbx-bridge/02-运维手册.md` 的备份章节是同一批工作。
+
+**【订正 2026-10-24】G2 已修复：stock 的写现在是原子的，载入失败是 fail-closed**
+
+本节上半部分与 §0/§1.2 的原文描述的是**修复前**的行为（`File::create` 直接写目标文件、`Stock::load`
+失败回退到 `Stock::in_memory()`）。现行行为以代码为准（`rgb-sidecar/src/store.rs`、`engine.rs`）：
+
+- **写**：三份 `stock/*.dat` 都经 `ledger::write_atomic`（`<name>.dat.tmp` → 写 → `fsync` → `rename`
+  → 目录 `fsync`）。任何时刻目标文件要么是旧完整版本、要么是新完整版本。`rgb-ops` 在事务内要求
+  `store()` 返回 `Ok`，所以写失败被记录并由 `RgbEngine::save()` 在持久化边界的**下一次调用**上报为
+  错误——此时 `ledger.json` **不会**先于 Stock 前进。
+- **读**：只有 `stock/` 下三份文件**全都不存在**才视为首次启动（空 Stock，行为与原来一致）；任何一份
+  缺失（部分还原/首个写没写完）、或存在但解码失败/读失败，启动**直接失败**，错误带文件路径、字节数与
+  原因。不再有"静默空 Stock"。
+- **ledger ↔ Stock 一致性**：启动末尾逐个核对 ledger 里的资产在 Stock 中都有合约，缺一个就拒启；若该
+  合约在 `RGB_SIDECAR_CONTRACTS` 里声明了，则先按 genesis consignment 重新 adopt（这是"只有
+  `ledger.json` 被还原"时的修复路径）。
+- **仍未解决**：三份文件是**逐个**提交的，文件之间不是事务；中断会留下不完整文件集——现在它表现为
+  **拒绝启动**（可诊断），而不是静默错乱。彻底消除需要 journal（属 G4 的一致性快照范畴）。
+- 由此，§6 的 ❓4（`adopt_contract` 在 Stock 空/ledger 有时的行为）与 ❓8（文件不存在与文件损坏是否
+  同一种 `Err`）都已由上述实现回答。
 
 **【订正 2026-09-22】G7 的方向（原文写反了，会误导运维）**
 
@@ -344,9 +379,9 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 
 **判定强度（如实标注）**：以上是**静态读码**（上游 pinned 源码 + 我们零覆盖）推出来的结论，**未实测**。要实测用 G8 演练加两臂：A 臂=停桥前备份 → 停桥后打一笔充值 → 销毁还原 → 起桥，预期日志出现该笔 `detected deposit`（**若不出现，则上面"恢复后能补回"的判断错**）；B 臂=只删 `btcwallet.db` 保留其余再起，预期**静默**漏该笔。regtest 下也可用 `setmocktime` 把链时间推到 T0 来免等 3 天。
 
-### 4.1 G8 演练：验到了什么、**没**验到什么
+### 4.1 G8 演练的覆盖范围
 
-**验到了**（每轮 E2E 最后一个场景，`RGBX_BACKUP_DRILL=0` 可跳过）：
+**自动演练断言**（每轮 E2E 最后一个场景，`RGBX_BACKUP_DRILL=0` 可跳过）：
 
 1. 备份包的**自校验** —— 清单里每个文件的大小 + sha256 在还原时逐个核对；`restore_backup.sh --dry-run`
    **在动手销毁之前**先拿同一组参数跑一遍，参数写错时数据还在。
@@ -358,15 +393,31 @@ db, err := openWalletDB(dbPath, "neutrino.db")
    - 4 个 para 的钱包身份（authAccount 地址在位）。
 4. 还原后**业务仍可用**：跑一笔提现 —— 走完 TSS 签名 → 侧车 BuildWithdrawal → signPsbt → BTC 广播 → 链上销毁。
 
-**没验到（如实标出，别当已覆盖）**：
+**自动演练不模拟的场景（上线前必须单独验证）**：
 
-- **还原后的充值路径未被覆盖**。演练最后那笔"充值"只在还原后的账本**仍有 `minted` seal 时**才跑得起来；
+- **还原后的充值路径不在自动演练内**。演练最后那笔"充值"只在还原后的账本**仍有 `minted` seal 时**才跑得起来；
   而 test-sim 的"用户付款"是**用桥自己的 seal 模拟**的（`simulate_user_pay` 花掉桥的 seal、找零回 TSS 脚本），
   主套件的充值+提现循环会把这些 seal 耗尽（实测备份那一刻：5 consumed + 1 pending-mint，**零 minted**）。
   这是 **fixture 限制，生产里没有对应物**（真实用户带自己的 USDT 付款，不花桥的余额）。
   演练遇到这种情况会**显式打出 SKIPPED 并说明边界**，不静默通过。
-- 未覆盖"单节点恢复"（只还原一个 para 的 `neutrino.db` → 参与一次签名）与"全组从零"（`/data` 全丢 + 重新 adopt）。
-  这两种是 §3.1/§3.3 的流程，演练目前只做**全量冷备 → 全量还原**。
+- **单节点恢复已在自动演练中实现**（`scenario_single_node_restore`，每轮 E2E 在整组场景之后跑）：从整组包里用
+  `restore_backup.sh --only para2` 只还原一个 para（validator），断言
+  ① 该节点的 **TSS peer 名单与还原前完全一致**（B5：libp2p 身份私钥随包回来，不是"新成员"）；
+  ② 钱包身份在位（authAccount 私钥 = para 共识签名钥 + TSS 提交钥，且是在任何 seed/import 之前断言的）；
+  ③ 节点追平主链后参与一笔真实提现（TSS 签名 → 侧车 BuildWithdrawal → BTC 广播 → 链上销毁）。
+  **不模拟**：跨机器/跨属主（同机同用户）、启动日志行（`ensureDKG load from local db` 等）的断言、
+  refresh 协调步骤、以及 ≤ 30 分钟用时统计。
+- **全组从零不在自动演练内**（`/data` 全丢 + 重新 adopt），见 §3.3；上线前必须单独演练。
+- **备份年龄永远是 0**：演练在停服后立刻打包、立刻还原，btcd 不前进，所以"用一份 N 小时前的包恢复"没有被测到。
+  若生产主链是单节点（§2.5），还原旧包会回滚停机窗口内的 `CreateReceive`/consignment，而 BTC 侧付款真实发生
+  ⇒ 这批充值需要用户重传；这个场景必须在上线前用非 0 年龄的包单独验证。
+- **备份源本身是否健康不验**：`btcwallet.db` 只验存在与 sha256，无法证明其生日覆盖历史（若该文件此前被误删重建，
+  备份照常 PASS，但更早的充值永久不可见，见 G7 与 `checkWalletBirthday` 的启动告警）；四份 share 只验"与活文件一致"，
+  不证明每份都可用（share 可用性，见 §6 ❓1）；`sidecar:stock` 只验存在，语义一致性靠停机冷备（G4 最小方案）
+  与提现腿间接覆盖，**没有**在线快照检查。
+- **不模拟**：跨机器/跨属主恢复（tar 保留 uid/gid；演练同机同用户）、备份包异地留存/传输损坏、
+  备份或还原中途断电与网络分区。以上场景上线前必须单独验证。
+- **网关数据不在演练范围内**（见 §2.6）：六个卷不包含 `gateway-data`，销毁/还原都不涉及它。
 
 **金额口径（踩过的坑）**：演练里"还原后跑业务"的金额**必须跟着还原后的实际状态走**，不能用默认值 ——
 默认充值是 `RGB20_DEPOSIT_AMOUNT=1000000`、默认提现是 `RGB20_WITHDRAW_AMOUNT=500000`，
@@ -387,7 +438,7 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 | 侧车 `/data` 全套 | 卷 `rgb-sidecar-data` | 资产状态**不可从链重建**；合约认知丢失（G0） |
 | `rgb20-receive`（含 consignment 原文） | `<paraN>/.../neutrino.db` | 未 mint 的充值**永久卡住**（consignment 无第二份） |
 | `btcwallet.db` | 同上目录（独立文件） | 生日丢失 ⇒ **历史充值永久看不见**（无配置可救） |
-| `main-data`（**若生产仍是单主节点**） | 卷 `main-data` | 链丢 = 全部合约状态丢（G6 待确认） |
+| `main-data`（**若生产为单主节点**） | 卷 `main-data` | 链丢 = 全部合约状态丢（G6） |
 
 ### 🟡 只是麻烦（可自愈 / 可重建 / 服务降级）
 
@@ -396,7 +447,7 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 | `rgb20-deposit-sig` | 自动重签（✅ `CONFIG.md:481-484`） |
 | `rgbx-deposit-scripts` / 侧车 `user_scripts.json` | 用户再要一次地址即重建（纯函数派生，✅ `deposit_address.go:191`） |
 | `min-pending-height` | 从钱包最早点重放（✅ `btcwallet.go:395-413`） |
-| dapp **localdb** | ⚠️ 名义上可从链重放，但**今天没有入口**（G5）⇒ 实际是「等一次版本升级」 |
+| dapp **localdb** | ⚠️ 名义上可从链重放，但**没有重建入口**（G5）⇒ 实际是「等一次版本升级」 |
 | neutrino SPV 头/过滤器 | 重同步（**真实 Bitcoin 网络下可行；regtest 下不可**） |
 | para 链数据 | 从主链重建（⚠️ 推断） |
 | 侧车 `builds/`（**未裁剪**的） | 重放可用；**已裁剪**的载荷永久消失（§2.4） |
@@ -412,18 +463,18 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 
 ---
 
-## 6. 本轮**未确认**、不得当结论引用的项
+## 6. **未确认**、不得当结论引用的项
 
 | # | 未确认的事 | 影响 |
 |---|---|---|
-| ❓1 | **门限语义**：`threshold=3` + 4 节点的**确切数学含义**。`LAUNCH_READINESS.md:60-70` 已指出「rank 决定插值结构，不是必需性」，且 alice 只校验「参与方个数 ≥ threshold」。⇒ 「丢 1 份是否仍可签」「哪几份组合能签」**我没有独立验证**（该结论引自 `LAUNCH_READINESS.md`，其中引用的 `crypto/birkhoffinterpolation/birkhoffinterpolation.go:188` **不在本地 chain33 检出里** —— 本轮未复核到源码） | 若「任意 3 份即可签」，则**3 份备份同处 = 单点**（🔴）；若语义更严，分级会变 |
-| ❓2 | 「权重 0 表示必须参与」的说法来自哪一版设计 | 同上；本轮按**最保守假设**（任意份额丢失都可能致命）设计 |
+| ❓1 | **门限语义**：`threshold=3` + 4 节点的**确切数学含义**。历史清单已指出「rank 决定插值结构，不是必需性」，且 alice 只校验「参与方个数 ≥ threshold」。⇒ 「丢 1 份是否仍可签」「哪几份组合能签」**我没有独立验证**（其中引用的 `crypto/birkhoffinterpolation/birkhoffinterpolation.go:188` **不在本地 chain33 检出里** —— 本文未复核到源码） | 若「任意 3 份即可签」，则**3 份备份同处 = 单点**（🔴）；若语义更严，分级会变 |
+| ❓2 | 「权重 0 表示必须参与」的说法来自哪一版设计 | 同上；本文按**最保守假设**（任意份额丢失都可能致命）设计 |
 | ❓3 | 生产拓扑（几个主链节点？侧车是否单实例？是否共用一个 btcd？） | 直接决定 B4 / B2 的风险等级 |
-| ❓4 | `adopt_contract` 在「Stock 空但 ledger 有 asset」时的最终可操作状态（§3.2 步骤③）—— 我只确认了它会**提前 return 不 import**（`engine.rs:683-685`），没跑过 | 决定 G2 的严重度 |
+| ❓4 | ~~`adopt_contract` 在「Stock 空但 ledger 有 asset」时的最终可操作状态~~ —— **已随 G2 解决（2026-10-24）**：合约缺失时从 genesis consignment 重新 import；未声明则启动拒启（启动自检 `verify_stock_matches_ledger`） | 已不影响分级 |
 | ❓5 | `MemState`/`MemStash` 各字段对「哪些操作会因此失效」的精确映射 | 只影响表述精度，不影响分级 |
 | ❓6 | `user_scripts.json` 的写是否原子 | 只影响它自己的损坏概率 |
 | ❓7 | 侧车 `stock.store()` 是否在**全局 engine 锁**内（若在，快照 RPC 的实现风险更低） | 影响 G4 的实现方式 |
-| ❓8 | `Stock::load` 对「文件不存在」与「文件损坏」是否返回同一种 `Err`（`engine.rs:230` 的 `Err(_)` 一视同仁） | 影响 G2 的修法（是否要区分首次启动与损坏） |
+| ❓8 | ~~`Stock::load` 对「文件不存在」与「文件损坏」是否返回同一种 `Err`~~ —— **已随 G2 解决（2026-10-24）**：三份文件全缺 = 首次启动；任何一份缺失或损坏 = 启动失败（`StockDirState`） | 已不影响分级 |
 
 ---
 
@@ -433,6 +484,5 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 |---|---|
 | `CONFIG.md` §4.3.1–4.3.3 | **详述** share↔链自检、CGGMP 两份材料、refresh 语义。本文**不重复**，只补运维面（备份范围/频率/持有者/恢复步骤） |
 | `CONFIG.md` §4.1.2 | `btcwallet.db` 生日与「只能从备份还原」的**权威说明** |
-| `LAUNCH_READINESS.md` | 本文是「二、上线前必须」第 1 项的产出；第 2 项「最小备份/恢复入口」= 本文第 4 节的缺口 G0–G4 |
-| `TECHNICAL.md` | 侧车/中继的实现细节 |
-| plan `reactive-brewing-sedgewick.md`（2026-09-14 督查结论） | 那次盘点的**部分结论已过时**，本文以代码为准修正了两处：① TSS 是**两条**记录（`cggmp-dkg-result` + `cggmp-refresh-result`），不是一条 `dkg-result`；② 「仓内两份侧车源码已分化」**已不复存在**（全仓只有一个 `neutrino/rgb-sidecar/`） |
+| `docs/rgbx-bridge/02-运维手册.md` | 本文是备份章节的设计依据 |
+| `docs/rgbx-bridge/01-系统设计.md` | 侧车/中继的实现细节与安全模型 |

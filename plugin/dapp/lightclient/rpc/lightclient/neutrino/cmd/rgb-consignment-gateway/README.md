@@ -20,7 +20,7 @@ responsible for validating consignments and broadcasting transactions.
 
 | Method | Behaviour |
 | --- | --- |
-| `server.info` | Returns `protocol_version: "0.2"`, the server version and uptime in seconds. |
+| `server.info` | Returns `protocol_version: "0.2"`, the server version, uptime in seconds and `chain_title` (the configured chain title; the bridge compares it at startup). |
 | `consignment.post` | Stores the uploaded bytes. First upload returns `true`; the identical file returns `false`; a different file for an existing `recipient_id` returns `-101`. |
 | `consignment.get` | Returns the oldest not-yet-ACKed consignment for the recipient as `{consignment, txid, vout?}` (base64); `-400` if none. Several consignments may share one `recipient_id` (address-based invoices do); they are delivered in order, and an ACK consumes the one returned. |
 | `ack.post` | Records an ACK/NACK. First post returns `true`; the same value returns `false`; a different value returns `-100`; no consignment returns `-300`. |
@@ -36,6 +36,7 @@ has to listen for inbound traffic. This API is outside the RGB v0.2 protocol.
 | --- | --- | --- |
 | `POST /deposit/requests` | public | Accepts `{request_id, chain33_addr, asset_symbol, amount, timestamp, pubkey, signature}`, verifies the signature over the canonical message (chain title, request id, address, asset, amount, timestamp) and stores it idempotently by `request_id`. |
 | `GET /deposit/requests/{id}` | public | Returns the request; once the bridge has created it, `status` is `invoiced` and `invoice` / `receive_id` / `recipient_id` are filled in. |
+| `GET /deposit/requests/{id}/status` | public | Convenience view: the stored status (`pending` / `invoiced`) upgraded to `minted` or `rejected` when the ledger holds the newest matching `deposit.minted` / `deposit.rejected` event for that `request_id`. Adds `btc_txid`, `amount` (minted) or `reason` (rejected). Chain balance and withdraw-status remain authoritative. |
 | `GET /bridge/deposit/requests/stream` | bearer | Server-Sent Events stream (one `data:` JSON event per pending request). Replays every request that has no invoice yet on connect, then pushes new ones; `: ping` comments keep the connection alive. |
 | `POST /bridge/deposit/invoices` | bearer | Attaches `{request_id, invoice, receive_id, recipient_id}` to the request. A different invoice for an already-invoiced request is a `409`. |
 
@@ -55,7 +56,7 @@ decisions.
 | Endpoint | Auth | Behaviour |
 | --- | --- | --- |
 | `POST /bridge/events` | bearer | Accepts `{id, type, payload}`. `id` is the bridge's idempotency key: posting the same id again returns the stored sequence and does not create a second row. `payload` must be a JSON object. |
-| `GET /bridge/events?cursor=N&limit=M` (also `/bridge/events/query`) | bearer | Returns `{events, next_cursor, has_more}` with events whose `seq` is greater than `cursor`, oldest first. `limit` defaults to 200 and is capped at 1000. |
+| `GET /bridge/events?cursor=N&limit=M` (also `/bridge/events/query`) | bearer | Returns `{events, next_cursor, has_more}` with events whose `seq` is greater than `cursor`, oldest first. `limit` defaults to 200 and is capped at 1000. A read-only `--events-token` may call this endpoint; it cannot append. |
 
 Accepted event types: `deposit.settled`, `deposit.minted`, `deposit.rejected`,
 `withdraw.locked`, `withdraw.broadcast`, `withdraw.consignment`, `withdraw.settled`,
@@ -90,6 +91,83 @@ Validation rules:
 
 Requests that exceed the size limit return HTTP `413` with a `-32600` error
 body. Rate-limited requests return HTTP `429`.
+
+## Bridge metrics
+
+The gateway aggregates runtime snapshots that bridge nodes push voluntarily. It is a read
+mirror: the bridge never exposes an inbound port, and the gateway never feeds metrics back into
+protocol decisions.
+
+| Endpoint | Auth | Behaviour |
+| --- | --- | --- |
+| `POST /bridge/metrics` | bearer (`--bridge-token`) | Stores the latest snapshot for `node_id` and answers `{"accepted":true,"node_id":"..."}`. The body must be a JSON object of at most 64 KiB; `node_id` is 1..128 bytes. |
+| `GET /bridge/metrics/latest` | bridge token or read-only `--events-token` (GET only) | Returns `{"nodes":[{...snapshot, "received_at":...}], "count":N}`, one entry per node, sorted by `node_id`. `received_at` is the gateway's Unix receive time. |
+| `GET /metrics` | none | Prometheus text exposition (`text/plain; version=0.0.4`) of the aggregated view plus gateway counters. |
+
+Snapshot contract (posted by the bridge every `gatewayMetricsInterval`, default 30s):
+
+```json
+{
+  "node_id": "user.p.rgbx./host/rank-0",
+  "timestamp": 1710000000,
+  "uptime_seconds": 123,
+  "chain": {"title": "user.p.rgbx.", "height": 0, "btc_header_tip": 0},
+  "sidecar": {"reachable": true},
+  "breaker": {"tripped": false, "reason": ""},
+  "counters": {"deposit.settled": 0, "deposit.minted": 0, "deposit.rejected": 0,
+               "withdraw.locked": 0, "withdraw.broadcast": 0, "withdraw.consignment": 0,
+               "withdraw.settled": 0, "withdraw.unlocked": 0, "withdraw.bumped": 0,
+               "sweep.completed": 0, "payout_mismatch": 0},
+  "gauges": {"outbox_pending": 0}
+}
+```
+
+Counters are **process-lifetime totals**: they reset to zero when the bridge restarts. Chain
+heights are best-effort and become `0` when the bridge cannot read them. `outbox_pending` is the
+number of audit events still queued for delivery.
+
+Exposed series:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `rgbx_bridge_up{node}` | gauge | `1` when the latest snapshot is at most 120 seconds old, else `0`. |
+| `rgbx_bridge_snapshot_age_seconds{node}` | gauge | Seconds since the gateway received the snapshot. |
+| `rgbx_bridge_uptime_seconds{node}` | gauge | Bridge process/adapter uptime. |
+| `rgbx_bridge_chain_height{node}`, `rgbx_bridge_btc_header_tip{node}` | gauge | Heights reported by the bridge (`0` when unavailable). |
+| `rgbx_bridge_breaker_tripped{node}` | gauge | `1` when the withdrawal breaker is open. |
+| `rgbx_bridge_sidecar_reachable{node}` | gauge | `1` when the bridge has an established sidecar connection. |
+| `rgbx_bridge_events_total{node,type}` | counter | Events recorded by the bridge since process start. |
+| `rgbx_bridge_outbox_pending{node}` | gauge | Undelivered audit events in the bridge's local outbox. |
+| `rgb_gateway_events_retained`, `rgb_gateway_event_last_seq` | gauge / gauge | Retained audit-ledger size and highest sequence. |
+| `rgb_gateway_uptime_seconds`, `rgb_gateway_data_dir_writable` | gauge | Gateway process state. |
+
+Scraping advice:
+
+- Scrape `GET /metrics` from the operations network only. The endpoint is unauthenticated by
+  design; the gateway by default listens on loopback, and a reverse proxy should restrict or
+  front it.
+- Snapshots live in memory only. A gateway restart clears them; `rgbx_bridge_up` returns to `1`
+  after the next push (at most one interval).
+- The bridge stops pushing when `gatewayMetricsInterval` is `0s` or negative, or when
+  `transportGateway`/`gatewayToken` are not configured. The bridge's own view is then absent,
+  while the gateway's `rgb_gateway_*` series remain available.
+
+## Health check
+
+`GET /healthz` is unauthenticated and reports whether the process can serve its parts:
+
+```json
+{"status":"ok","deposit_api":true,"events":true,"metrics":true,"data_dir_writable":true}
+```
+
+- `deposit_api`: the deposit/bridge API is configured (`--chain-title` and `--bridge-token`).
+- `events`: the event ledger is open.
+- `metrics`: at least one bridge snapshot has arrived since this gateway started. It is `false`
+  until the first push; it does not affect the status code.
+- `data_dir_writable`: a probe file can be created and removed under `--data-dir`.
+
+The response is `200` when `status` is `ok`, and `503` with `status: "degraded"` when the data
+directory is not writable. No paths, tokens or counts are exposed.
 
 ## Incompatibility with protocol 1.0
 
@@ -126,6 +204,7 @@ Every option can be set by flag or environment variable. Flags take precedence.
 | `--bridge-token` | `RGB_GATEWAY_BRIDGE_TOKEN` | empty | Bearer token for `/bridge/*`. Must be at least 16 characters and configured together with `--chain-title`. |
 | `--tls-cert` / `--tls-key` | `RGB_GATEWAY_TLS_CERT` / `RGB_GATEWAY_TLS_KEY` | empty | Serve TLS directly. Empty serves plain HTTP (put it behind a TLS-terminating proxy instead). |
 | `--client-ca` | `RGB_GATEWAY_CLIENT_CA` | empty | CA bundle for client certificates. When set, `/bridge/*` requires mTLS in addition to the token. Requires `--tls-cert`. |
+| `--events-token` | `RGB_GATEWAY_EVENTS_TOKEN` | empty | Optional read-only token for `GET /bridge/events*` (audit/statistics backends). Must differ from `--bridge-token`; POST with it returns `403`. |
 | `--events-retention` | `RGB_GATEWAY_EVENTS_RETENTION` | `2160h` (90 days) | How long bridge ledger events are kept. |
 
 Durations use Go syntax (`168h`, `30m`); sizes are plain bytes.
