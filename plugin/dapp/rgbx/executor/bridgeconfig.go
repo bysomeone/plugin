@@ -950,6 +950,107 @@ func (r *rgbx) depositWindowKV(deposit *rtypes.DepositAsset) (*types.KeyValue, e
 	return r.bumpBridgeWindowCounter(symbol, bridgeWindowMint, deposit.GetAmount())
 }
 
+// mergeEffectiveBridgeConfig merges the global and asset governance records the way
+// enforcement does:
+//   - numeric limits apply only when the asset switch is on and the global record does not
+//     veto them (numericLimitsEnabled);
+//   - pause flags are independent: either record pauses the direction;
+//   - the shared knobs (BTC fee-rate cap, RGB20 lock size) are global; a per-asset value is
+//     used only when the global record leaves them unset;
+//   - numeric limits, large-deposit parameters and the RGB20 fee table come from the asset
+//     record.
+//
+// A nil asset is the "global only" case. The caller handles the empty (global) symbol itself,
+// where the global record is the effective one rather than a master switch.
+func mergeEffectiveBridgeConfig(global, asset *rtypes.BridgeConfigApply) *rtypes.BridgeConfigApply {
+	merged := &rtypes.BridgeConfigApply{}
+	if asset != nil {
+		merged = proto.Clone(asset).(*rtypes.BridgeConfigApply)
+	}
+	merged.Fields = nil
+	merged.LimitsEnabled = numericLimitsEnabled(global, asset)
+	if global != nil {
+		merged.PauseDeposit = merged.GetPauseDeposit() || global.GetPauseDeposit()
+		merged.PauseWithdraw = merged.GetPauseWithdraw() || global.GetPauseWithdraw()
+		if merged.GetWithdrawMaxFeeRateSatPerVbyte() == 0 {
+			merged.WithdrawMaxFeeRateSatPerVbyte = global.GetWithdrawMaxFeeRateSatPerVbyte()
+		}
+		if merged.GetRgb20WithdrawFeeLockVbytes() == 0 {
+			merged.Rgb20WithdrawFeeLockVbytes = global.GetRgb20WithdrawFeeLockVbytes()
+		}
+	}
+	return merged
+}
+
+// effectiveRgb20WithdrawFee resolves the asset's fixed RGB20 withdrawal fee from the merged
+// fee table. 0 means "unconfigured" (the bridge charges nothing and expects a 1:1 invoice).
+func effectiveRgb20WithdrawFee(cfg *rtypes.BridgeConfigApply, symbol string) int64 {
+	for _, fee := range cfg.GetRgb20WithdrawFee() {
+		if fee != nil && strings.EqualFold(fee.GetSymbol(), symbol) {
+			return fee.GetFeeMinUnits()
+		}
+	}
+	return 0
+}
+
+// pendingBridgeConfigActivationHeight returns the activation height of a scheduled loosening
+// that has not taken effect yet, or 0 when none is pending. It mirrors the height comparison
+// loadBridgeConfig uses, so "pending" here means exactly "not applied by loadBridgeConfig".
+func (r *rgbx) pendingBridgeConfigActivationHeight(symbol string) (int64, error) {
+	pending, err := r.loadBridgePendingConfig(symbol)
+	if err != nil || pending == nil {
+		return 0, err
+	}
+	if r.GetStateDB() == nil || r.GetHeight() >= pending.ActivationHeight {
+		return 0, nil
+	}
+	return pending.ActivationHeight, nil
+}
+
+// Query_GetEffectiveBridgeConfig returns the config the executor will actually enforce for a
+// symbol: the global record merged with the asset record, a configured flag, the activation
+// height of a scheduled loosening, and the asset's resolved RGB20 withdrawal fee.
+//
+// Both spellings of an asset symbol are accepted (exact first), matching
+// Query_GetBridgeConfig. An empty symbol returns the global record's effective values. The
+// old Query_GetBridgeConfig contract is unchanged: it still returns the raw stored record.
+func (r *rgbx) Query_GetEffectiveBridgeConfig(req *types.ReqString) (types.Message, error) {
+	symbol := strings.TrimSpace(req.GetData())
+	global, err := r.loadBridgeConfig("")
+	if err != nil {
+		return nil, err
+	}
+	pendingHeight, err := r.pendingBridgeConfigActivationHeight(symbol)
+	if err != nil {
+		return nil, err
+	}
+
+	reply := &rtypes.EffectiveBridgeConfig{PendingActivationHeight: pendingHeight}
+	if symbol == "" {
+		// The global record is the effective config; there is no master switch above it.
+		cfg := &rtypes.BridgeConfigApply{}
+		if global != nil {
+			cfg = proto.Clone(global).(*rtypes.BridgeConfigApply)
+			cfg.Fields = nil
+		}
+		reply.Config = cfg
+		reply.Configured = global != nil || pendingHeight > 0
+		return reply, nil
+	}
+
+	asset, err := r.loadBridgeConfig(symbol)
+	if err != nil {
+		return nil, err
+	}
+	effective := mergeEffectiveBridgeConfig(global, asset)
+	effective.AssetSymbol = r.bridgeLimitSymbol(symbol)
+	reply.AssetSymbol = effective.AssetSymbol
+	reply.Config = effective
+	reply.Configured = global != nil || asset != nil || pendingHeight > 0
+	reply.WithdrawFeeMinUnits = effectiveRgb20WithdrawFee(effective, effective.AssetSymbol)
+	return reply, nil
+}
+
 // Query_GetBridgeConfig returns the effective config. An empty request symbol addresses the
 // global record. Both spellings of an asset symbol are accepted (BTC / XBTC, RGB20_USDT /
 // XRGB20_USDT), with the exact spelling taking precedence; governance is stored under the

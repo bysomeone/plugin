@@ -151,9 +151,47 @@ func TestRgbx_ExecLocal_WithdrawAsset(t *testing.T) {
 	require.Nil(t, readDB(local, key, pendTx))
 	require.Equal(t, int32(rtypes.TyWithdrawAsset), pendTx.ActionType)
 
+	// The withdrawal is also indexed by tx hash, which is the only handle
+	// get-withdraw-status has.
+	index := &rtypes.TxBlockIndex{}
+	require.Nil(t, readDB(local, formatPendingTxHashKey(tx.Hash()), index))
+	require.Equal(t, int64(0), index.GetBlockHeight())
+	require.Equal(t, int64(0), index.GetTxIndex())
+
 	kvSet, err = r.ExecDelLocal(tx, nil, 0)
 	require.Nil(t, err)
 	testSetKV(t, db, kvSet, true)
 	_, err = db.Get(key)
+	require.Equal(t, types.ErrNotFound, err)
+	_, err = db.Get(formatPendingTxHashKey(tx.Hash()))
+	require.Equal(t, types.ErrNotFound, err)
+}
+
+// TestRgbx_ExecLocal_WithdrawHashIndexRemovedByConfirm proves the hash index is not left
+// behind after the bridge confirms the burn: otherwise a later status query would keep
+// reporting the stale pending record.
+func TestRgbx_ExecLocal_WithdrawHashIndexRemovedByConfirm(t *testing.T) {
+	r := newRgbx()
+	withdrawTx, err := r.GetExecutorType().CreateTransaction(rtypes.NameWithdrawAssetAction, &rtypes.WithdrawAsset{})
+	require.Nil(t, err)
+
+	dir, db, local := util.CreateTestDB()
+	defer util.CloseTestDB(dir, db)
+	r.SetLocalDB(local)
+	require.NoError(t, db.Set(formatPendingTxKey(7, 2), types.Encode(&rtypes.PendingTx{
+		TxBlockHeight: 7, TxIndex: 2, TxHash: withdrawTx.Hash(), FromAddress: "from",
+	})))
+	require.NoError(t, db.Set(formatPendingTxHashKey(withdrawTx.Hash()),
+		types.Encode(&rtypes.TxBlockIndex{BlockHeight: 7, TxIndex: 2})))
+
+	confirmTx, err := r.GetExecutorType().CreateTransaction(rtypes.NameConfirmAction, &rtypes.ConfirmTx{
+		TxBlockHeight: 7, TxIndex: 2,
+	})
+	require.Nil(t, err)
+	kvSet, err := r.ExecLocal(confirmTx, &types.ReceiptData{}, 0)
+	require.Nil(t, err)
+	testSetKV(t, db, kvSet, true)
+
+	_, err = db.Get(formatPendingTxHashKey(withdrawTx.Hash()))
 	require.Equal(t, types.ErrNotFound, err)
 }

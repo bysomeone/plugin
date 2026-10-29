@@ -296,6 +296,71 @@ func getWithdrawConsignment(cmd *cobra.Command, _ []string) {
 	sendQueryRPC(cmd, "GetWithdrawConsignmentHash", &types.ReqString{Data: txHash}, reply, false)
 }
 
+// getWithdrawFinalStateCMD exposes the consensus terminal state of a withdrawal burn.
+func getWithdrawFinalStateCMD() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "get-withdraw-final-state",
+		Short:   "get the consensus terminal state of a withdrawal burn (settled/released)",
+		Run:     getWithdrawFinalState,
+		Example: "get-withdraw-final-state --tx-hash 0x...",
+	}
+	cmd.Flags().String("tx-hash", "", "chain33 withdrawal (burn) transaction hash in hex")
+	markRequired(cmd, "tx-hash")
+	return cmd
+}
+
+func getWithdrawFinalState(cmd *cobra.Command, _ []string) {
+	txHash, _ := cmd.Flags().GetString("tx-hash")
+	if txHash == "" {
+		_, _ = fmt.Fprintln(os.Stderr, "tx hash is required")
+		return
+	}
+	reply := &types.ReplyString{}
+	sendQueryRPC(cmd, "GetWithdrawFinalState", &types.ReqString{Data: txHash}, reply, false)
+}
+
+// getWithdrawStatusCMD is the one-call withdrawal outcome: local pending record, consensus
+// terminal state, consignment hash, and the derived status.
+func getWithdrawStatusCMD() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "get-withdraw-status",
+		Short:   "get the pending record, terminal state and derived status of a withdrawal",
+		Run:     getWithdrawStatus,
+		Example: "get-withdraw-status --tx-hash 0x...",
+	}
+	cmd.Flags().String("tx-hash", "", "chain33 withdrawal (burn) transaction hash in hex")
+	markRequired(cmd, "tx-hash")
+	return cmd
+}
+
+func getWithdrawStatus(cmd *cobra.Command, _ []string) {
+	txHash, _ := cmd.Flags().GetString("tx-hash")
+	if txHash == "" {
+		_, _ = fmt.Fprintln(os.Stderr, "tx hash is required")
+		return
+	}
+	reply := &rtypes.WithdrawStatus{}
+	sendQueryRPC(cmd, "GetWithdrawStatus", &types.ReqString{Data: txHash}, reply, false)
+}
+
+// getEffectiveBridgeConfigCMD returns the merged global+asset config the executor enforces.
+func getEffectiveBridgeConfigCMD() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "get-effective-bridge-config",
+		Short:   "get the merged effective bridge configuration (limits, pauses, fees)",
+		Run:     getEffectiveBridgeConfig,
+		Example: "get-effective-bridge-config --asset-symbol XBTC",
+	}
+	cmd.Flags().String("asset-symbol", "", "asset symbol; empty returns the global effective config")
+	return cmd
+}
+
+func getEffectiveBridgeConfig(cmd *cobra.Command, _ []string) {
+	symbol, _ := cmd.Flags().GetString("asset-symbol")
+	reply := &rtypes.EffectiveBridgeConfig{}
+	sendQueryRPC(cmd, "GetEffectiveBridgeConfig", &types.ReqString{Data: symbol}, reply, false)
+}
+
 func listPendingTxByFromCMD() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "listPendingTxByFrom",

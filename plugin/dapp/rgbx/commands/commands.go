@@ -55,6 +55,9 @@ func Cmd() *cobra.Command {
 		getDepositAddressCMD(),
 		listDepositRegistrationsCMD(),
 		getWithdrawConsignmentCMD(),
+		getWithdrawFinalStateCMD(),
+		getWithdrawStatusCMD(),
+		getEffectiveBridgeConfigCMD(),
 	)
 	return cmd
 }
