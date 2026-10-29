@@ -490,27 +490,64 @@ func (g *gateway) handleBridgeInvoice(w http.ResponseWriter, r *http.Request) {
 // requireBridgeAuth enforces the bridge shared secret on /bridge/* paths.
 func (g *gateway) requireBridgeAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if g.cfg.bridgeToken == "" || g.deposits == nil || g.cfg.chainTitle == "" {
-			http.Error(w, "bridge API is not configured", http.StatusServiceUnavailable)
-			return
-		}
-		// When the gateway terminates TLS with a client CA, a verified certificate is required
-		// in addition to the bearer token.
-		if g.cfg.clientCA != "" && (r.TLS == nil || len(r.TLS.VerifiedChains) == 0) {
-			http.Error(w, "client certificate required", http.StatusForbidden)
-			return
-		}
-		auth := r.Header.Get("Authorization")
-		const prefix = "Bearer "
-		if !strings.HasPrefix(auth, prefix) ||
-			subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, prefix)),
-				[]byte(g.cfg.bridgeToken)) != 1 {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="rgb-gateway-bridge"`)
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if !g.bridgeAuthOK(w, r) {
 			return
 		}
 		next(w, r)
 	}
+}
+
+// requireEventReadAuth accepts the bridge token for every method, and the optional read-only
+// events token for GET only. mTLS (when configured) still applies to both.
+func (g *gateway) requireEventReadAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if g.cfg.eventsToken != "" && g.bearerMatches(r, g.cfg.eventsToken) {
+			if g.cfg.clientCA != "" && (r.TLS == nil || len(r.TLS.VerifiedChains) == 0) {
+				http.Error(w, "client certificate required", http.StatusForbidden)
+				return
+			}
+			if r.Method != http.MethodGet {
+				http.Error(w, "the events token is read-only", http.StatusForbidden)
+				return
+			}
+			next(w, r)
+			return
+		}
+		if !g.bridgeAuthOK(w, r) {
+			return
+		}
+		next(w, r)
+	}
+}
+
+// bearerMatches reports whether the request carries exactly this bearer token.
+func (g *gateway) bearerMatches(r *http.Request, token string) bool {
+	auth := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if !strings.HasPrefix(auth, prefix) || token == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, prefix)), []byte(token)) == 1
+}
+
+// bridgeAuthOK writes the failure response and returns false when the caller is not allowed.
+func (g *gateway) bridgeAuthOK(w http.ResponseWriter, r *http.Request) bool {
+	if g.cfg.bridgeToken == "" || g.deposits == nil || g.cfg.chainTitle == "" {
+		http.Error(w, "bridge API is not configured", http.StatusServiceUnavailable)
+		return false
+	}
+	// When the gateway terminates TLS with a client CA, a verified certificate is required
+	// in addition to the bearer token.
+	if g.cfg.clientCA != "" && (r.TLS == nil || len(r.TLS.VerifiedChains) == 0) {
+		http.Error(w, "client certificate required", http.StatusForbidden)
+		return false
+	}
+	if !g.bearerMatches(r, g.cfg.bridgeToken) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="rgb-gateway-bridge"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
 }
 
 func (g *gateway) depositEnabled() bool {

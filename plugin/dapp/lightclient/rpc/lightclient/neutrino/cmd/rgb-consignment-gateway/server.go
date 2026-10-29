@@ -40,6 +40,10 @@ type config struct {
 	// bridgeToken authenticates the bridge on /bridge/* endpoints. Empty disables the bridge
 	// API (deposit requests cannot be served without it).
 	bridgeToken string
+	// eventsToken is an optional read-only token for the audit ledger: it may GET events but
+	// never POST them, so a statistics/audit backend does not need the bridge's write secret.
+	// Empty means only bridgeToken works for reads.
+	eventsToken string
 	// Optional TLS termination. When clientCA is set, /bridge/* additionally requires a
 	// verified client certificate (mTLS).
 	tlsCert  string
@@ -98,8 +102,8 @@ func (g *gateway) handler() http.Handler {
 	mux.HandleFunc("/bridge/deposit/invoices", g.requireBridgeAuth(g.handleBridgeInvoice))
 	// Bridge event ledger: the bridge posts audit facts, an operator's statistics backend reads
 	// them by cursor.
-	mux.HandleFunc("/bridge/events", g.requireBridgeAuth(g.handleBridgeEvents))
-	mux.HandleFunc("/bridge/events/query", g.requireBridgeAuth(g.handleBridgeEventGet))
+	mux.HandleFunc("/bridge/events", g.requireEventReadAuth(g.handleBridgeEvents))
+	mux.HandleFunc("/bridge/events/query", g.requireEventReadAuth(g.handleBridgeEventGet))
 	return mux
 }
 
