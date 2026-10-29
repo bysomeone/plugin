@@ -378,6 +378,12 @@ func (a *Adapter) IsConnected() bool {
 // Start 启动充值轮询 + HTTP（仅官方节点调用）。非阻塞：
 // 后台等待侧车连接成功后自动启动轮询与 HTTP（侧车可能晚于本节点启动）。
 func (a *Adapter) Start(ctx context.Context) error {
+	// Best-effort consistency check against the gateway (chain title and bridge token). It runs
+	// in the background with its own short deadline and never blocks or fails startup.
+	if a.cfg.TransportGateway != "" && a.cfg.GatewayToken != "" {
+		a.wg.Add(1)
+		go a.runGatewaySelfCheck()
+	}
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()

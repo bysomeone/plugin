@@ -160,6 +160,52 @@ func (s *eventStore) append(ev *bridgeEvent, now time.Time) (*bridgeEvent, bool,
 	return ev, true, nil
 }
 
+// depositOutcome is the terminal fact the ledger holds for one deposit request: the mint was
+// accepted (deposit.minted) or the chain refused it (deposit.rejected).
+type depositOutcome struct {
+	Type    string
+	BTCTxID string
+	Amount  int64
+	Reason  string
+}
+
+// depositOutcome scans the ledger for the newest deposit.minted / deposit.rejected event whose
+// payload names requestID. Matching is on the payload's request_id, never on the event id string
+// (event ids are derived from the receive id and carry no request identity). A linear scan is
+// fine: the slice is bounded by the retention window.
+func (s *eventStore) depositOutcome(requestID string) (depositOutcome, bool) {
+	if s == nil || requestID == "" {
+		return depositOutcome{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.events) - 1; i >= 0; i-- {
+		ev := s.events[i]
+		if ev.Type != "deposit.minted" && ev.Type != "deposit.rejected" {
+			continue
+		}
+		var payload struct {
+			RequestID string `json:"request_id"`
+			BTCTxID   string `json:"btc_txid"`
+			Amount    int64  `json:"amount"`
+			Reason    string `json:"reason"`
+		}
+		if err := json.Unmarshal(ev.Payload, &payload); err != nil {
+			continue
+		}
+		if payload.RequestID != requestID {
+			continue
+		}
+		return depositOutcome{
+			Type:    ev.Type,
+			BTCTxID: payload.BTCTxID,
+			Amount:  payload.Amount,
+			Reason:  payload.Reason,
+		}, true
+	}
+	return depositOutcome{}, false
+}
+
 // since returns up to limit events with seq > cursor.
 func (s *eventStore) since(cursor int64, limit int) []*bridgeEvent {
 	s.mu.Lock()

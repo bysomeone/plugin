@@ -94,6 +94,7 @@ func newGateway(cfg config, logger *log.Logger) (*gateway, error) {
 func (g *gateway) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(g.cfg.path, g.handleRPC)
+	mux.HandleFunc("/healthz", g.handleHealthz)
 	// Deposit requests: the user posts a signed request and polls for its invoice; the bridge
 	// consumes requests over SSE and posts invoices back.
 	mux.HandleFunc("/deposit/requests", g.handleDepositRequestPost)
@@ -370,6 +371,9 @@ func (g *gateway) dispatch(req rpcRequest, file []byte) (any, *rpcError) {
 			"protocol_version": protocolVersion,
 			"version":          softwareVersion,
 			"uptime":           int64(time.Since(g.started) / time.Second),
+			// Public: the same title is already part of every deposit request's signed message,
+			// and the bridge compares it against its own configuration at startup.
+			"chain_title": g.cfg.chainTitle,
 		}, nil
 	case "consignment.post":
 		return g.consignmentPost(req.Params, file)
