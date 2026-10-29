@@ -259,6 +259,30 @@ mod test {
         assert!(msg.contains("state.dat"), "must name the missing file: {msg}");
     }
 
+    /// A write is only useful if what comes back is the same state: compare the decoded objects
+    /// with what was stored, for all three files. (The non-empty case — a real contract and its
+    /// seals surviving a restart — is covered end to end by `tests/startup_state.rs`.)
+    #[test]
+    fn a_written_stock_file_reads_back_identical() {
+        fn encoded<T: StrictSerialize>(object: &T) -> Vec<u8> {
+            object.to_strict_serialized::<U32MAX>().unwrap().release()
+        }
+
+        let path = dir("roundtrip");
+        let store = AtomicFsBinStore::open(&path).unwrap();
+        store.store(&MemStash::in_memory()).unwrap();
+        store.store(&MemState::in_memory()).unwrap();
+        store.store(&MemIndex::in_memory()).unwrap();
+        assert!(store.take_write_failure().is_none());
+
+        let stash: MemStash = PersistenceProvider::<MemStash>::load(&store).unwrap();
+        let state: MemState = PersistenceProvider::<MemState>::load(&store).unwrap();
+        let index: MemIndex = PersistenceProvider::<MemIndex>::load(&store).unwrap();
+        assert_eq!(encoded(&stash), encoded(&MemStash::in_memory()));
+        assert_eq!(encoded(&state), encoded(&MemState::in_memory()));
+        assert_eq!(encoded(&index), encoded(&MemIndex::in_memory()));
+    }
+
     #[test]
     fn an_absent_file_is_an_error_not_an_empty_state() {
         let dir = dir("absent");
