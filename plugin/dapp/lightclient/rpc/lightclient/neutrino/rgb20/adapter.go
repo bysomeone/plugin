@@ -30,6 +30,12 @@ type Config struct {
 	// GatewayToken /bridge/* 接口的 bearer token（充值请求流与 invoice 回写）。
 	// 与 TransportGateway 同时配置才会订阅充值请求；空 = 不订阅（旧的自定义入口已删除）。
 	GatewayToken string
+	// GatewayMetricsInterval 主动推送运行指标到网关的间隔。<=0 = 关闭；
+	// 未配置时由 neutrino 主包填入默认值（30s）。
+	GatewayMetricsInterval time.Duration
+	// NodeID 本节点在网关指标视图里的稳定标识（chain title + hostname + rank）。
+	// 空则由适配器回退到 ChainTitle。
+	NodeID string
 	// ChainTitle 本链 Title：充值请求的签名消息里包含它，桥在出票前用它验签
 	// （权威校验仍在铸造时的链上执行）。必须与网关的 chain-title 一致。
 	ChainTitle string
@@ -293,6 +299,10 @@ type Adapter struct {
 	events *eventRecorder
 	// breaker 提现自动熔断（见 withdrawBreaker）。
 	breaker *withdrawBreaker
+	// metrics 进程生命周期内的事件计数器（见 metrics.go）。
+	metrics *bridgeMetricCounters
+	// startedAt 适配器构造时间，用于快照的 uptime_seconds。
+	startedAt time.Time
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -323,6 +333,8 @@ func NewAdapter(cfg Config, store KVStore) (*Adapter, error) {
 		ctx:          ctx,
 		cancel:       cancel,
 		depositNotes: newDepositNoteOnce(),
+		metrics:      newBridgeMetricCounters(),
+		startedAt:    time.Now(),
 		// 上传是旁路：客户端只服务 consignment 交付，超时按配置（默认 10s）。
 		publishClient: &http.Client{Timeout: cfg.ConsignmentPublish.timeout()},
 	}
@@ -383,6 +395,12 @@ func (a *Adapter) Start(ctx context.Context) error {
 	if a.cfg.TransportGateway != "" && a.cfg.GatewayToken != "" {
 		a.wg.Add(1)
 		go a.runGatewaySelfCheck()
+	}
+	// Runtime metrics (#85) start independently of the sidecar connection: "sidecar unreachable"
+	// is one of the states operators need to see, so the pusher must not wait for Connect.
+	if a.cfg.TransportGateway != "" && a.cfg.GatewayToken != "" && a.cfg.GatewayMetricsInterval > 0 {
+		a.wg.Add(1)
+		go a.runMetricsPusher(a.cfg.GatewayMetricsInterval)
 	}
 	a.wg.Add(1)
 	go func() {
@@ -457,6 +475,9 @@ func (a *Adapter) RecordEvent(kind, key string, payload map[string]any) {
 	if a == nil {
 		return
 	}
+	// Counters are updated here, at the single place every audit event passes through, so no
+	// money-path call site has to know about metrics.
+	a.metrics.inc(kind)
 	a.events.record(kind, key, payload)
 }
 

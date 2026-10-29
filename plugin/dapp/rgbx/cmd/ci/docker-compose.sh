@@ -337,6 +337,8 @@ function config_para_file() {
 testListen="127.0.0.1:17000"
 transportGateway="http://gateway:8080/0.2/json-rpc"
 gatewayToken="'"${RGB20_GATEWAY_TOKEN}"'"
+# #85: push runtime metrics to the gateway quickly so the scenario can assert on them.
+gatewayMetricsInterval="2s"
 # 写进 invoice 的公网 transport：E2E 的"用户钱包"是宿主机脚本，所以用宿主发布端口。
 transportEndpoint="'"${RGB20_GATEWAY_PUBLIC_ENDPOINT}"'"'
         abandon_block='

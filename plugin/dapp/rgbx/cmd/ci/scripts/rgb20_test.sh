@@ -1963,6 +1963,55 @@ function scenario_bridge_event_ledger() {
     log_step "PASS: bridge event ledger: $(echo ${types} | sort -u | tr '\n' ' ')"
 }
 
+# 桥运行指标（#85）：桥按 gatewayMetricsInterval 主动推送快照，网关聚合后以 Prometheus 文本格式
+# 暴露。本场景断言"推送链路真的通了"：latest 里至少一个节点、/metrics 里能看到该节点的
+# deposit.minted 计数与 up 状态。推送是异步的（固定间隔），所以做有界等待。
+#
+# 必须排在充值/提现场景之后：计数从进程启动开始累计，此时 deposit.minted 与 withdraw.* 已 >0。
+function scenario_bridge_metrics() {
+    log_step "scenario: bridge runtime metrics reach the gateway and are exposed as Prometheus text (#85)"
+    local token="${RGB20_GATEWAY_TOKEN:-e2e-bridge-token-0123456789abcd}"
+    local base="http://127.0.0.1:${RGB20_GATEWAY_PORT}"
+    local latest="" count="" i
+
+    # 1) GET /bridge/metrics/latest：至少一个节点，且带网关侧的 received_at。
+    for ((i = 0; i < 60; i++)); do
+        latest=$(curl -sf -H "Authorization: Bearer ${token}" "${base}/bridge/metrics/latest" || true)
+        count=$(echo "${latest}" | jq -r '.count // 0' 2>/dev/null || echo 0)
+        if [ "${count:-0}" -ge 1 ]; then
+            break
+        fi
+        sleep 1
+    done
+    if ! [ "${count:-0}" -ge 1 ]; then
+        fail "gateway /bridge/metrics/latest returned no snapshots: $(echo "${latest}" | head -c 400)"
+    fi
+    echo "${latest}" | jq -e '.nodes[0].received_at > 0' >/dev/null ||
+        fail "metrics snapshot has no received_at: $(echo "${latest}" | head -c 400)"
+    echo "${latest}" | jq -e '.nodes[0].counters | type == "object"' >/dev/null ||
+        fail "metrics snapshot has no counters object: $(echo "${latest}" | head -c 400)"
+
+    # 2) GET /metrics（无鉴权）：Prometheus 文本里有该节点的事件计数，且 up=1。
+    local metrics=""
+    for ((i = 0; i < 30; i++)); do
+        metrics=$(curl -sf "${base}/metrics" || true)
+        if echo "${metrics}" | grep -qE 'rgbx_bridge_events_total\{node="[^"]+",type="deposit\.minted"\} [1-9]'; then
+            break
+        fi
+        sleep 1
+    done
+    echo "${metrics}" | grep -qE 'rgbx_bridge_events_total\{node="[^"]+",type="deposit\.minted"\} [1-9]' ||
+        fail "gateway /metrics has no positive deposit.minted counter for any node: $(echo "${metrics}" | head -c 500)"
+    echo "${metrics}" | grep -qE 'rgbx_bridge_up\{node="[^"]+"\} 1' ||
+        fail "gateway /metrics does not report any bridge as up: $(echo "${metrics}" | head -c 500)"
+    echo "${metrics}" | grep -qE '^# TYPE rgbx_bridge_events_total counter$' ||
+        fail "gateway /metrics is missing the Prometheus TYPE line for rgbx_bridge_events_total"
+    echo "${metrics}" | grep -qE '^rgb_gateway_data_dir_writable (0|1)$' ||
+        fail "gateway /metrics is missing rgb_gateway_data_dir_writable"
+
+    log_step "PASS: bridge metrics: latest count=${count}, deposit.minted > 0 and rgbx_bridge_up=1 in /metrics"
+}
+
 function run_rgb20_all() {
     run_rgb20_env
     # #78 紧跟 env：桥（官方节点）刚就绪、btcd 的 segwit 已激活，充值地址绑定 + 充值铸币
@@ -1979,6 +2028,8 @@ function run_rgb20_all() {
     # 事件账本紧跟前面的入金/出金场景：此时 deposit.*、withdraw.locked/broadcast 都已发生，
     # 投递是异步的，场景内部有界等待。
     scenario_bridge_event_ledger
+    # #85：事件账本之后，指标快照（2s 间隔）里已包含同一批充值/提现计数。
+    scenario_bridge_metrics
     run_rgb20_sidecar_smoke
     # #70 unlock: rebuilds the sidecar ledger (then restores it) to construct a permanently
     # rejected withdrawal. It must run before the fee-mismatch case: that case intentionally

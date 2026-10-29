@@ -206,6 +206,17 @@ func (s *eventStore) depositOutcome(requestID string) (depositOutcome, bool) {
 	return depositOutcome{}, false
 }
 
+// stats returns the number of retained events and the highest sequence assigned so far.
+// Sequence numbers are never reused, so lastSeq is monotonic even after pruning.
+func (s *eventStore) stats() (count, lastSeq int64) {
+	if s == nil {
+		return 0, 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return int64(len(s.events)), s.next - 1
+}
+
 // since returns up to limit events with seq > cursor.
 func (s *eventStore) since(cursor int64, limit int) []*bridgeEvent {
 	s.mu.Lock()

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -174,6 +175,51 @@ func (n *neutrinoClient) Init(ctx context.Context, q queue.Queue, cfg *lightclie
 
 }
 
+// defaultGatewayMetricsInterval 指标推送的默认间隔（配置项为空时）。
+const defaultGatewayMetricsInterval = 30 * time.Second
+
+// gatewayMetricsInterval parses the gatewayMetricsInterval configuration value. An empty value
+// means the default; an explicit "0s" or a negative duration disables pushing. An unparseable
+// value is loud but non-fatal: metrics are an observability aid, not a money-path feature, so a
+// typo falls back to the default instead of refusing to start the bridge.
+func gatewayMetricsInterval(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultGatewayMetricsInterval
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		log.Warn("rgb20 invalid gatewayMetricsInterval; using default",
+			"value", raw, "default", defaultGatewayMetricsInterval, "err", err)
+		return defaultGatewayMetricsInterval
+	}
+	return d
+}
+
+// rgb20NodeID returns the stable identifier the gateway keys this node's metrics snapshot by.
+// There is no dedicated node-name option, so it is built from configuration that is already
+// per-node: chain title, hostname and the Birkhoff rank. Hostnames keep nodes apart even when
+// several share a rank (the normal 4-node setup uses {0,1,1,1}); commitAddr is the fallback
+// when the OS does not report a hostname.
+func (n *neutrinoClient) rgb20NodeID() string {
+	title := strings.TrimSpace(n.chainTitle)
+	if title == "" {
+		title = "rgbx"
+	}
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = n.commitAddr
+	}
+	if strings.TrimSpace(host) == "" {
+		host = "unknown"
+	}
+	id := fmt.Sprintf("%s/%s/rank-%d", title, host, n.cfg.Tss.Rank)
+	if len(id) > 128 {
+		id = id[:128]
+	}
+	return id
+}
+
 // initRgb20Adapter 按配置构造 RGB20 侧车适配器（所有节点都需要：签名节点用只读校验）。
 func (n *neutrinoClient) initRgb20Adapter() error {
 	if n.cfg.Rgb20.SidecarAddr == "" {
@@ -190,7 +236,12 @@ func (n *neutrinoClient) initRgb20Adapter() error {
 		TransportEndpoint: n.cfg.Rgb20.TransportEndpoint,
 		TransportGateway:  n.cfg.Rgb20.TransportGateway,
 		GatewayToken:      n.cfg.Rgb20.GatewayToken,
-		ChainTitle:        n.chainTitle,
+		// 指标推送间隔：配置为空用默认 30s；显式 0/负值关闭（见 rgb20/metrics.go）。
+		GatewayMetricsInterval: gatewayMetricsInterval(n.cfg.Rgb20.GatewayMetricsInterval),
+		// 节点标识：chain title + hostname + Birkhoff rank（见 rgb20NodeID）。
+		// hostname 保证同 rank 的多个节点在网关侧仍是不同的 series。
+		NodeID:     n.rgb20NodeID(),
+		ChainTitle: n.chainTitle,
 		// 无上下文的测试签名（E2E 的 sign-psbt 端点）：按配置透传，默认关闭。
 		TestSignPsbt: n.cfg.Rgb20.TestSignPsbt,
 		// 头链保留深度 B：头链只提交到 best - B，充值提交前的本地深度门控据此把链上判据换算成本地判据。

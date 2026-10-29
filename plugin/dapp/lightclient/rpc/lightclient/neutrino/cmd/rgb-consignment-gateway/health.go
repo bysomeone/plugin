@@ -28,6 +28,7 @@ func (g *gateway) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		"status":            status,
 		"deposit_api":       g.depositEnabled(),
 		"events":            g.events != nil,
+		"metrics":           g.metrics.receivedAny(),
 		"data_dir_writable": writable,
 	})
 }

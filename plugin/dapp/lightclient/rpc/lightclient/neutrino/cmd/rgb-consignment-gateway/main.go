@@ -230,6 +230,7 @@ func run(cfg config, logger *log.Logger) error {
 	} else {
 		logger.Printf("deposit API disabled (chain-title/bridge-token not configured)")
 	}
+	logger.Printf("bridge metrics endpoint enabled (POST /bridge/metrics, GET /bridge/metrics/latest, GET /metrics)")
 
 	select {
 	case err := <-errCh:
