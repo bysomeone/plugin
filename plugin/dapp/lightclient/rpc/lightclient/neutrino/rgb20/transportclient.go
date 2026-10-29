@@ -124,6 +124,9 @@ type ServerInfo struct {
 	ProtocolVersion string `json:"protocol_version"`
 	Version         string `json:"version"`
 	Uptime          int64  `json:"uptime"`
+	// ChainTitle is the chain title the gateway signs into deposit requests. The bridge
+	// compares it against its own ChainTitle at startup (they must be identical).
+	ChainTitle string `json:"chain_title"`
 }
 
 // ConsignmentResult is the `consignment.get` result. Consignment is decoded from the protocol's

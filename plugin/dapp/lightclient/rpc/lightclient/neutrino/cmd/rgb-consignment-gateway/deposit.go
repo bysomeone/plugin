@@ -32,6 +32,10 @@ import (
 const (
 	depositRequestStatusPending  = "pending"
 	depositRequestStatusInvoiced = "invoiced"
+	// depositRequestStatusMinted / depositRequestStatusRejected are derived, not stored: they
+	// come from the bridge event ledger once the request has been invoiced.
+	depositRequestStatusMinted   = "minted"
+	depositRequestStatusRejected = "rejected"
 
 	depositRequestMaxBody = 256 << 10
 	// depositStreamBuffer is how many requests may queue for one stream subscriber before
@@ -371,23 +375,87 @@ func (g *gateway) handleDepositRequestPost(w http.ResponseWriter, r *http.Reques
 }
 
 // handleDepositRequestGet returns one request and, once available, its invoice (public).
+// It also serves GET /deposit/requests/{id}/status.
 func (g *gateway) handleDepositRequestGet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	id := strings.TrimPrefix(r.URL.Path, "/deposit/requests/")
-	if id == "" || strings.ContainsRune(id, '/') {
+	rest := strings.TrimPrefix(r.URL.Path, "/deposit/requests/")
+	parts := strings.Split(rest, "/")
+	switch {
+	case len(parts) == 1 && parts[0] != "":
+		g.handleDepositRequestByID(w, r, parts[0])
+	case len(parts) == 2 && parts[0] != "" && parts[1] == "status":
+		g.handleDepositRequestStatus(w, r, parts[0])
+	default:
 		http.NotFound(w, r)
-		return
 	}
+}
+
+func (g *gateway) handleDepositRequestByID(w http.ResponseWriter, r *http.Request, id string) {
 	rec, ok := g.deposits.get(id)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
 	writeJSON(w, http.StatusOK, rec.wire())
+}
+
+// depositStatusWire is the derived status view. It starts from the stored request and, once the
+// request was invoiced, folds in the newest minted/rejected event from the ledger.
+type depositStatusWire struct {
+	RequestID   string `json:"request_id"`
+	Status      string `json:"status"`
+	Chain33Addr string `json:"chain33_addr,omitempty"`
+	AssetSymbol string `json:"asset_symbol,omitempty"`
+	Amount      int64  `json:"amount,omitempty"`
+	Timestamp   int64  `json:"timestamp,omitempty"`
+	Invoice     string `json:"invoice,omitempty"`
+	ReceiveID   string `json:"receive_id,omitempty"`
+	RecipientID string `json:"recipient_id,omitempty"`
+	BTCTxID     string `json:"btc_txid,omitempty"`
+	Reason      string `json:"reason,omitempty"`
+}
+
+// handleDepositRequestStatus reports pending/invoiced from the request store and, for an
+// invoiced request, upgrades to minted/rejected when the ledger holds the corresponding fact.
+// This is a convenience view only; chain balance and withdraw-status stay authoritative.
+func (g *gateway) handleDepositRequestStatus(w http.ResponseWriter, r *http.Request, id string) {
+	rec, ok := g.deposits.get(id)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	out := depositStatusWire{
+		RequestID:   rec.RequestID,
+		Status:      rec.Status,
+		Chain33Addr: rec.Chain33Addr,
+		AssetSymbol: rec.AssetSymbol,
+		Amount:      rec.Amount,
+		Timestamp:   rec.Timestamp,
+		Invoice:     rec.Invoice,
+		ReceiveID:   rec.ReceiveID,
+		RecipientID: rec.RecipientID,
+	}
+	if rec.Status == depositRequestStatusInvoiced && g.events != nil {
+		if outcome, found := g.events.depositOutcome(rec.RequestID); found {
+			switch outcome.Type {
+			case "deposit.minted":
+				out.Status = depositRequestStatusMinted
+				out.BTCTxID = outcome.BTCTxID
+				if outcome.Amount > 0 {
+					out.Amount = outcome.Amount
+				}
+			case "deposit.rejected":
+				out.Status = depositRequestStatusRejected
+				out.BTCTxID = outcome.BTCTxID
+				out.Reason = outcome.Reason
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleBridgeStream pushes deposit requests to the bridge over SSE.
