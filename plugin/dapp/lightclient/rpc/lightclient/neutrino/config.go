@@ -128,6 +128,10 @@ type rgb20Config struct {
 	// GatewayToken /bridge/* 接口的 bearer token（充值请求 SSE 流 + invoice 回写）。
 	// 与 transportGateway 同时配置才会订阅充值请求。
 	GatewayToken string `json:"gatewayToken"`
+	// GatewayMetricsInterval 桥主动推送运行指标到网关的间隔，Go duration 字符串
+	// （如 "30s"）。空 = 默认 30s；"0s" 或负值 = 关闭。仅当 transportGateway 与
+	// gatewayToken 同时配置时生效。
+	GatewayMetricsInterval string `json:"gatewayMetricsInterval"`
 	// Contracts RGB20 资产合约列表。
 	Contracts []rgb20Contract `json:"contracts"`
 	// ChangeAddress 提现找零地址（TSS P2WPKH 地址）；留空则由 TSS 地址自动填充。

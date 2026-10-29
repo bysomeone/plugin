@@ -59,6 +59,7 @@ type gateway struct {
 	store    *store
 	deposits *depositStore
 	events   *eventStore
+	metrics  *metricsStore
 	limiter  *rateLimiter
 	logger   *log.Logger
 	started  time.Time
@@ -85,6 +86,7 @@ func newGateway(cfg config, logger *log.Logger) (*gateway, error) {
 		store:    st,
 		deposits: deposits,
 		events:   events,
+		metrics:  newMetricsStore(),
 		limiter:  newRateLimiter(cfg.rateLimit, time.Minute),
 		logger:   logger,
 		started:  time.Now(),
@@ -105,6 +107,13 @@ func (g *gateway) handler() http.Handler {
 	// them by cursor.
 	mux.HandleFunc("/bridge/events", g.requireEventReadAuth(g.handleBridgeEvents))
 	mux.HandleFunc("/bridge/events/query", g.requireEventReadAuth(g.handleBridgeEventGet))
+	// Runtime metrics: bridges push snapshots, operators read the aggregated view. GET /metrics
+	// is unauthenticated Prometheus text (bind the gateway to loopback or a private network).
+	// requireEventReadAuth accepts the bridge token for both methods and the read-only events
+	// token for GET only, so a statistics backend can read metrics without write access.
+	mux.HandleFunc("/bridge/metrics", g.requireEventReadAuth(g.handleBridgeMetricsPost))
+	mux.HandleFunc("/bridge/metrics/latest", g.requireEventReadAuth(g.handleBridgeMetricsLatest))
+	mux.HandleFunc("/metrics", g.handleMetrics)
 	return mux
 }
 

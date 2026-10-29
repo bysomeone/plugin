@@ -123,10 +123,11 @@ func TestHealthz(t *testing.T) {
 	assert.Equal(t, "ok", got["status"])
 	assert.Equal(t, true, got["deposit_api"])
 	assert.Equal(t, true, got["events"])
+	assert.Equal(t, false, got["metrics"], "no bridge snapshot has arrived yet")
 	assert.Equal(t, true, got["data_dir_writable"])
 
 	// Nothing sensitive is exposed.
-	assert.Len(t, got, 4, "healthz must only report the four documented fields: %v", got)
+	assert.Len(t, got, 5, "healthz must only report the five documented fields: %v", got)
 }
 
 func TestHealthzDegradedWhenDataDirIsNotWritable(t *testing.T) {

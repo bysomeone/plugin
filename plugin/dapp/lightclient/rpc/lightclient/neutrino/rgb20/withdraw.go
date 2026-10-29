@@ -369,12 +369,14 @@ func (a *Adapter) Withdraw(ctx context.Context, req *WithdrawRequest) (*Withdraw
 		// 既不签名也不广播（拒绝点在校验之后、SignPsbt 之前）。用户资产的去向见
 		// WithdrawPayoutMismatchError 的注释（已锁定，等解锁路径）。
 		var mismatch *WithdrawPayoutMismatchError
-		if errors.As(err, &mismatch) &&
-			a.breaker.recordMismatch(hex.EncodeToString(req.Chain33TxHash)) {
-			log.Error("ALERT withdrawal circuit breaker tripped: several distinct withdrawals "+
-				"were refused for a payout mismatch; this node stops signing new withdrawals "+
-				"until it is restarted and the cause is fixed",
-				"threshold", a.cfg.Safety.MaxPayoutMismatchBurns)
+		if errors.As(err, &mismatch) {
+			a.metrics.inc(metricPayoutMismatch)
+			if a.breaker.recordMismatch(hex.EncodeToString(req.Chain33TxHash)) {
+				log.Error("ALERT withdrawal circuit breaker tripped: several distinct withdrawals "+
+					"were refused for a payout mismatch; this node stops signing new withdrawals "+
+					"until it is restarted and the cause is fixed",
+					"threshold", a.cfg.Safety.MaxPayoutMismatchBurns)
+			}
 		}
 		return nil, fmt.Errorf("validate withdrawal: %w", err)
 	}
