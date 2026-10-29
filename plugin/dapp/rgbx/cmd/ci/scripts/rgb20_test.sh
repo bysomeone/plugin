@@ -689,6 +689,9 @@ function rgb20_withdraw_once() {
     amt=$(awk "BEGIN{printf \"%.8f\", ${amount}/100000000}")
     withdraw_hash=$(${MAIN_CLI} send rgbx withdraw -a "${amt}" -f 20 -d "${user_invoice}" -s "${RGB20_SYMBOL}" -k "${GENESIS_KEY}")
     assert_length "${withdraw_hash}" 66 "rgb20 withdraw tx hash (${label})"
+    # 供调用方在 PASS 行里引用（本函数只打日志、不返回 txid）。
+    # shellcheck disable=SC2034  # read by backup_test.sh (single-node restore PASS line)
+    RGB20_LAST_WITHDRAW_HASH="${withdraw_hash}"
 
     # 3. 等桥确认销毁（本轮这笔 pending 清除 = rgbx Confirm 已提交）
     wait_no_withdraw_pending_for_user "${USER_MAIN_ADDR}" "${withdraw_hash}"

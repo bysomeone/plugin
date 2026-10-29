@@ -46,9 +46,10 @@ function testcase_entry() {
     scenario_duplicate_confirm_rejected "${NATIVE_MINT_TX_HASH}"
 
     # ---- 备份/恢复演练（#30 / BACKUP_RECOVERY.md G8）：备 → 真的销毁 → 还原 → 充值 + 提现 ----
-    # 放在**整个入口的最后**：它会销毁并还原 main/para1-4/侧车的全部数据（含主链、TSS share、
-    # libp2p 身份私钥、侧车账本），失败时环境停在"已销毁"态 —— 那会盖掉后面所有用例的结果，
-    # 所以它必须是最后一个。跳过方式：RGBX_BACKUP_DRILL=0。
+    # 另含单节点恢复（整组包 + `--only`，只还原 para2）。整体放在**整个入口的最后**：
+    # 第一个场景会销毁并还原 main/para1-4/侧车的全部数据（含主链、TSS share、libp2p 身份私钥、
+    # 侧车账本），失败时环境停在"已销毁"态 —— 那会盖掉后面所有用例的结果，所以它必须是最后一个。
+    # 跳过方式：RGBX_BACKUP_DRILL=0（两个场景一起跳过）。
     run_backup_drill_all
 }
 
