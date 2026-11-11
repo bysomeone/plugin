@@ -108,8 +108,22 @@ type refreshRecord struct {
 }
 
 // errTssKeyMaterialNotReady 本节点的 CGGMP 密钥材料还没就绪（DKG 或 refresh 未完成）。
-// 签名前必须两道都在：DKG 给 share 与群公钥，refresh 给 Paillier/Pedersen（CGGMP 的阶段约束）。
+// 签名前必须两道都在：DKG 给群公钥与 Birkhoff 参数，refresh 给本节点的 share 与 Paillier/Pedersen
+// 材料（CGGMP 的阶段约束；签名用的 share 是 refresh 产物，不是 DKG 根 share）。
 var errTssKeyMaterialNotReady = fmt.Errorf("tss key material not ready: dkg/refresh result missing on this node")
+
+// errTssKeyMaterialLost 本节点既没有可用的 refresh 记录，DKG 记录里也没有根 share —— 材料不可恢复。
+//
+// 为什么意味着"不可恢复"而不是"再跑一轮 refresh"：cggmp.ProcessRefresh 要用 DKG 的根 share
+// 参与多方协议（aRes.Share 来自 dkgResult.Share）。首次 refresh 成功后本节点会刻意抹掉根 share
+// （见 stripDKGShare），所以"删掉 refresh 记录重跑"这条路已经不存在了。唯一可用的处置是从
+// 当前这一代（群公钥/rid 相符）的离线备份恢复 neutrino.db 的 rgbx-tss bucket。
+// 任何继续重试 ProcessRefresh 的循环都必然失败，因此这里必须 fail-closed。
+var errTssKeyMaterialLost = fmt.Errorf("tss key material lost: the DKG record carries no root share and there " +
+	"is no usable refresh record on this node. A refresh round cannot be re-run without the DKG root share " +
+	"(it is stripped after the first successful refresh), so this node cannot recover by itself. Restore " +
+	"neutrino.db (bucket " + tssBucketName + ") from the offline backup of the SAME key generation (same group " +
+	"public key / rid); do NOT run a new DKG, which would change the group key that the chain has already pinned")
 
 // errRedkgRefusedOnChainWithoutLocalShare **链上已有该 symbol 的 CrossChainInfo，而本节点没有
 // DKG 结果** —— 拒绝自动重跑 DKG（#28）。
@@ -121,8 +135,9 @@ var errTssKeyMaterialNotReady = fmt.Errorf("tss key material not ready: dkg/refr
 // 且表现是"静默失灵"而不是报错。
 //
 // 正确处置（错误信息里带上，运维要能照着做）：把与本组同一代的 neutrino.db 还原回来；
-// 若整组密钥材料都必须重建，那就连链一起重建（全新链 ⇒ 没有旧记录）；
-// 而**只换 key 材料、不换群公钥**的诉求由 CGGMP refresh 承担（见 ensureRefreshResult）。
+// 若整组密钥材料都必须重建，那就连链一起重建（全新链 ⇒ 没有旧记录）。
+// 注意：**只换 key 材料、不换群公钥**的 refresh 只有在 DKG 根 share 还在时才可能；
+// 首次 refresh 成功后根 share 已被抹掉，此后恢复只能依赖同代备份（见 errTssKeyMaterialLost）。
 type errRedkgRefusedOnChainWithoutLocalShare struct {
 	symbol     string
 	tssAddress string
@@ -136,9 +151,10 @@ func (e *errRedkgRefusedOnChainWithoutLocalShare) Error() string {
 		"duplicate), so every deposit address derived from the on-chain key would keep receiving BTC that no "+
 		"signature can ever spend and every RGB20 mint proof would fail to verify — the funds would be locked "+
 		"forever. Fix by restoring this node's neutrino.db from the backup of the SAME group (bucket %q); to "+
-		"rebuild the whole group, wipe the chain state as well (a fresh chain has no CrossChainInfo). To rotate "+
-		"key material WITHOUT changing the group public key use the CGGMP refresh path instead (see CONFIG.md, "+
-		"tss.rank/refresh sections)",
+		"rebuild the whole group, wipe the chain state as well (a fresh chain has no CrossChainInfo). Rotating "+
+		"key material without changing the group public key requires a refresh round, which needs the DKG root "+
+		"share: it is stripped after the first successful refresh, so after that the only way back is the "+
+		"same-generation backup (see CONFIG.md, tss.rank/refresh sections)",
 		e.symbol, e.tssAddress, e.chainPub, tssBucketName)
 }
 
@@ -278,7 +294,12 @@ func (t *tssService) init() {
 	if err := t.loadDKGFromDB(); err == nil {
 		log.Info("ensureDKG load from local db")
 		t.ensureDKGOnChain()
-		t.ensureRefreshResult()
+		if err := t.ensureRefreshResult(); err != nil {
+			// 不可恢复的材料缺失（根 share 已抹掉且 refresh 记录不可用）：拒绝启动，
+			// 不能"看起来起来了"却签不了名，也不能进入注定失败的 refresh 重试循环。
+			log.Error("init tssService unrecoverable tss key material, refuse to start", "err", err)
+			panic(err)
+		}
 		t.dkgCompleted.Store(true)
 		// Phase 5 修复：loadDKGFromDB 分支也必须设置 selfPeerId，否则 handleSignNotify 的
 		// isSigner 检查永远失败（selfPeerId 空），该节点不参与组签名（sign-psbt 超时）。
@@ -352,7 +373,10 @@ func (t *tssService) init() {
 	// refresh 放在提交之后：提交只依赖 DKG 的群公钥，而 refresh 要在每个节点上现生成 2048-bit
 	// Paillier 安全素数（本机 4 节点实测 ≈23s）。先提交能让链上 CrossChainInfo 尽早落地，
 	// 不被 refresh 拖慢（E2E 的 wait_auto_dkg_commit 等的就是它）。
-	t.ensureRefreshResult()
+	if err := t.ensureRefreshResult(); err != nil {
+		log.Error("init tssService unrecoverable tss key material, refuse to start", "err", err)
+		panic(err)
+	}
 
 	t.dkgCompleted.Store(true)
 	t.waitSelfPeerId()
@@ -454,23 +478,23 @@ func (t *tssService) readTssRecord(key string) ([]byte, error) {
 	return data, err
 }
 
-// writeTssRecord 把一条记录写进 neutrino.db 的 tss bucket（带重试，直到成功）。
-func (t *tssService) writeTssRecord(key string, data []byte) {
-	for {
-		err := walletdb.Update(t.client.neutrinoCfg.Database, func(tx walletdb.ReadWriteTx) error {
-			bucket, err := tx.CreateTopLevelBucket([]byte(tssBucketName))
-			if err != nil {
-				return err
-			}
-			return bucket.Put([]byte(key), data)
-		})
-		if err == nil {
-			log.Debug("writeTssRecord success", "key", key, "len", len(data))
-			return
+// writeTssRecord 把一条记录写进 neutrino.db 的 tss bucket，返回本次写入的错误。
+// 重试策略由调用方决定：启动路径上的 DKG 落盘必须重试到成功；抹 share 的收尾写入失败则
+// 只记 error、下次启动重试（不能让进程卡在一条收尾写入上）。
+func (t *tssService) writeTssRecord(key string, data []byte) error {
+	err := walletdb.Update(t.client.neutrinoCfg.Database, func(tx walletdb.ReadWriteTx) error {
+		bucket, err := tx.CreateTopLevelBucket([]byte(tssBucketName))
+		if err != nil {
+			return err
 		}
-		log.Error("writeTssRecord retry", "key", key, "err", err)
-		time.Sleep(time.Second * 3)
+		return bucket.Put([]byte(key), data)
+	})
+	if err != nil {
+		log.Error("writeTssRecord", "key", key, "err", err)
+		return err
 	}
+	log.Debug("writeTssRecord success", "key", key, "len", len(data))
+	return nil
 }
 
 // loadDKGFromDB 载入 CGGMP DKG 结果（bucket rgbx-tss / key cggmp-dkg-result，JSON）。
@@ -478,6 +502,9 @@ func (t *tssService) writeTssRecord(key string, data []byte) {
 // 用 JSON 而不是原来的 proto（types.Encode）：CGGMP 的 DKGResult 里带 map-of-points（Bks /
 // PartialPubKeys），proto 表达啰嗦，而它只做本节点本地持久化、不走共识（见 cggmp README 的
 // "Kept separate" 一节：两个 DKG 结果类型刻意不合并，各自序列化）。
+//
+// 记录里的 Share 可能为空：首次 refresh 成功后它会被刻意抹掉（见 stripDKGShare），
+// 只剩签名与链上核对需要的公开参数。
 func (t *tssService) loadDKGFromDB() error {
 	dkgData, err := t.readTssRecord(dkgResultKey)
 	if err != nil {
@@ -502,14 +529,20 @@ func (t *tssService) loadDKGFromDB() error {
 	return t.generateTssAddress()
 }
 
-// saveDKGToDB saves DKG result to database with retry until success
+// saveDKGToDB saves DKG result to database with retry until success.
+// 启动路径必须保证 DKG 记录（首次运行时含 share）确实落盘，因此这里保持"重试到成功"。
 func (t *tssService) saveDKGToDB() {
 	dkgData, err := json.Marshal(t.dkgResult)
 	if err != nil {
 		log.Error("saveDKGToDB marshal", "err", err)
 		return
 	}
-	t.writeTssRecord(dkgResultKey, dkgData)
+	for {
+		if err := t.writeTssRecord(dkgResultKey, dkgData); err == nil {
+			return
+		}
+		time.Sleep(time.Second * 3)
+	}
 }
 
 // loadRefreshFromDB 载入本节点已落盘的 CGGMP refresh 产物，并核对它是不是**当前这把钥**的
@@ -539,14 +572,17 @@ func (t *tssService) loadRefreshFromDB() error {
 
 // saveRefreshToDB 落盘 refresh 产物（连同它对应的 DKG rid）。⚠️ 含 Paillier 私钥素数 + YSecret，
 // 敏感度等同 share，备份范围必须覆盖（见 refreshResultKey 的说明）。
-func (t *tssService) saveRefreshToDB() {
+//
+// 返回 error 是必须的：调用方只有在**确认这份材料已落盘**之后才允许抹掉 DKG 根 share
+// （见 ensureRefreshResult / stripDKGShare）。
+func (t *tssService) saveRefreshToDB() error {
 	rec := &refreshRecord{DkgRid: hex.EncodeToString(t.dkgResult.Rid), Result: t.refreshResult}
 	data, err := json.Marshal(rec)
 	if err != nil {
 		log.Error("saveRefreshToDB marshal", "err", err)
-		return
+		return err
 	}
-	t.writeTssRecord(refreshResultKey, data)
+	return t.writeTssRecord(refreshResultKey, data)
 }
 
 // refreshSessionName refresh 轮的会话名：由 DKG 的 rid 派生，同一个 key 的所有节点一致。
@@ -554,21 +590,91 @@ func refreshSessionName(rid []byte) string {
 	return refreshSessionPrefix + hex.EncodeToString(rid)
 }
 
+// processRefresh 是 cggmp.ProcessRefresh 的可替换入口：单测用它驱动
+// ensureRefreshResult 的成功/落盘失败路径，生产环境从不改写。
+var processRefresh = cggmp.ProcessRefresh
+
+// dkgSharePresent 本节点的 DKG 记录里是否还带着根 share。首次 refresh 成功后它会被抹掉，
+// 因此"没有 share"在稳态下是正常形态，不能据此判定材料缺失 —— 还要看 refresh 记录。
+func (t *tssService) dkgSharePresent() bool {
+	return t.dkgResult != nil && len(t.dkgResult.Share) > 0
+}
+
+// stripDKGShare 在 refresh 材料已确认落盘之后，抹掉 DKG 根 share（内存 + 持久化记录），
+// 只保留公开参数（PubX/PubY/Bks/Rid/PartialPubKeys）。
+//
+// 为什么根 share 可以丢：签名用的是 refresh 产物里的 share（cggmp.ProcessSign 传给 alice 的是
+// refreshRes.Share），DKG 只提供群公钥与 Birkhoff 参数；refresh 落盘后本节点不再需要根 share，
+// 留着它只会多出一份"能重构私钥的完整分片"的危害。
+//
+// 幂等：内存里已经空了就直接返回（重启后记录里也没有 share）。
+// 持久化失败只记 error、不阻塞：下次启动 loadRefreshFromDB 成功后会再次走到这里重试；
+// 在此之前内存里的 share 已经清掉，不影响本次进程签名（refresh 记录已在）。
+func (t *tssService) stripDKGShare() {
+	if !t.dkgSharePresent() {
+		return
+	}
+	t.dkgResult.Share = nil
+	data, err := json.Marshal(t.dkgResult)
+	if err != nil {
+		log.Error("stripDKGShare marshal", "err", err)
+		return
+	}
+	if err := t.writeTssRecord(dkgResultKey, data); err != nil {
+		log.Error("stripDKGShare persist stripped dkg record failed, will retry on next startup",
+			"err", err, "dkgRid", hexOrEmpty(t.dkgResult.Rid))
+		return
+	}
+	log.Info("stripDKGShare removed the dkg root share after refresh material was persisted",
+		"dkgRid", hexOrEmpty(t.dkgResult.Rid))
+}
+
+// sleepRetry 等待 d 后返回 true；客户端 context 结束（进程关闭）时立即返回 false，
+// 让 refresh 的重试循环能退出而不是把 init goroutine 永远挂住。
+func (t *tssService) sleepRetry(d time.Duration) bool {
+	if t.client == nil || t.client.ctx == nil {
+		time.Sleep(d)
+		return true
+	}
+	select {
+	case <-t.client.ctx.Done():
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
 // ensureRefreshResult 保证内存里有"当前这把钥的" CGGMP refresh 结果：先从 DB 载入，没有再跑一轮。
 //
 // refresh 是 CGGMP 的**必经阶段**（不是可选）：DKG 之后每把钥必须跑一次 refresh 才能签名，
-// 产物（本节点 Paillier 私钥素数 + 各 peer 的 Pedersen/ppk/y 参数）落盘后由**每次签名复用** ——
-// 不要每签一次就跑一次 refresh。
+// 产物（本节点 share + Paillier 私钥素数 + 各 peer 的 Pedersen/ppk/y 参数）落盘后由**每次签名复用**
+// —— 不要每签一次就跑一次 refresh。
 //
 // 补跑 refresh（本节点缺记录）为什么要发一轮新协议：refresh 是多方协议，单节点无法凭空造出材料。
 // 会话名由 rid 派生 ⇒ 所有缺记录的节点会落在**同一轮**；已经持有记录的节点不参与。因此补跑的
 // 前提是**缺记录的节点一起重启**（正常路径不会出现部分节点缺记录：DKG 与 refresh 的落盘是
 // 同一条启动路径上先后两步，中断只可能发生在两者之间）。重跑失败按分钟重试，不置 dkgCompleted
 // —— 没有 refresh 材料就签不了名，"看起来起来了"比不起来更危险。
-func (t *tssService) ensureRefreshResult() {
+//
+// 首次 refresh 成功并落盘后，DKG 根 share 会被抹掉（见 stripDKGShare）。因此当本节点
+// 既没有 refresh 记录、DKG 里也没有根 share 时，重跑 refresh 注定失败 ⇒ 返回
+// errTssKeyMaterialLost，由 init fail-closed（调用方 panic）。
+func (t *tssService) ensureRefreshResult() error {
 	if err := t.loadRefreshFromDB(); err == nil {
 		log.Info("ensureRefresh load refresh result from local db", "dkgRid", hexOrEmpty(t.dkgResult.Rid))
-		return
+		t.stripDKGShare()
+		return nil
+	} else if !t.dkgSharePresent() {
+		tssAddress := ""
+		if t.tssAddress != nil {
+			tssAddress = t.tssAddress.String()
+		}
+		log.Error("ensureRefresh no usable refresh record and the DKG record carries no root share; "+
+			"this node cannot recover by rerunning refresh. Restore neutrino.db (bucket "+tssBucketName+") "+
+			"from the offline backup of the same key generation (same group public key / rid).",
+			"err", err, "dkgRid", hexOrEmpty(dkgRidOf(t.dkgResult)), "tssAddress", tssAddress)
+		return fmt.Errorf("%w (dkgRid=%s, tssAddress=%s)", errTssKeyMaterialLost,
+			hexOrEmpty(dkgRidOf(t.dkgResult)), tssAddress)
 	} else {
 		log.Warn("ensureRefresh no usable local refresh result, running a refresh round "+
 			"(every signing node that lacks one must join; restart them together so they share the round)",
@@ -576,17 +682,39 @@ func (t *tssService) ensureRefreshResult() {
 	}
 
 	for {
-		res, err := cggmp.ProcessRefresh(t.cfg.Peers, t.cfg.Threshold, t.dkgResult,
+		res, err := processRefresh(t.cfg.Peers, t.cfg.Threshold, t.dkgResult,
 			refreshSessionName(t.dkgResult.Rid), cggmp.WithTimeout(tssRefreshTimeout))
 		if err == nil {
 			t.refreshResult = res
-			t.saveRefreshToDB()
+			if err := t.saveRefreshToDB(); err != nil {
+				// 落盘失败 ⇒ 绝不 strip：根 share 是重跑 refresh 的前提，留着它下次启动还能重试。
+				t.refreshResult = nil
+				log.Error("ensureRefresh persist refresh result failed, keeping the dkg root share and retrying",
+					"err", err, "dkgRid", hexOrEmpty(t.dkgResult.Rid))
+				if !t.sleepRetry(time.Minute) {
+					return nil
+				}
+				continue
+			}
+			// 顺序刻意如此：refresh 材料**确认落盘之后**才抹根 share。反过来的话，
+			// 若 refresh 落盘失败，本节点就永久失去重跑 refresh 的能力（只能靠离线备份恢复）。
+			t.stripDKGShare()
 			log.Info("ensureRefresh refresh round done", "dkgRid", hexOrEmpty(t.dkgResult.Rid))
-			return
+			return nil
 		}
 		log.Error("ensureRefresh ProcessRefresh retry", "err", err, "dkgRid", hexOrEmpty(t.dkgResult.Rid))
-		time.Sleep(time.Minute)
+		if !t.sleepRetry(time.Minute) {
+			return nil
+		}
 	}
+}
+
+// dkgRidOf 取 DKG 结果的 rid（nil 安全），只用于日志/错误信息。
+func dkgRidOf(dkg *cggmp.DKGResult) []byte {
+	if dkg == nil {
+		return nil
+	}
+	return dkg.Rid
 }
 
 // generateBitcoinAddress generates Bitcoin address from TSS public key

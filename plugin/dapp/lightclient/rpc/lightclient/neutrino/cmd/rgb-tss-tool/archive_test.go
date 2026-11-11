@@ -266,7 +266,11 @@ func TestExportDoesNotPrintSecretMaterial(t *testing.T) {
 	dkgJSON, err := json.Marshal(dkg)
 	require.NoError(t, err)
 	src := filepath.Join(dir, "source.db")
-	createTestDB(t, src, map[string][]byte{neutrino.TSSDKGResultKey: dkgJSON})
+	createTestDB(t, src, map[string][]byte{
+		neutrino.TSSDKGResultKey: dkgJSON,
+		// Export requires the refresh record: without it the archive could not sign.
+		neutrino.TSSRefreshResultKey: testRefresh(t, dkg.Rid),
+	})
 	out := filepath.Join(dir, "archive.json")
 
 	var stdout, stderr bytes.Buffer

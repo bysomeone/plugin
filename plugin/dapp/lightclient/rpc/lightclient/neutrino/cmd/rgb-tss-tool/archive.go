@@ -155,20 +155,40 @@ func exportTSS(opts exportOptions) (*exportSummary, error) {
 	}
 	rid := hex.EncodeToString(dkg.Rid)
 
-	// The refresh record is not required for the archive to be useful (it can be
-	// rerun), but when it is present and decodable it must belong to this DKG.
-	if raw, ok := data.values[neutrino.TSSRefreshResultKey]; ok {
-		var envelope struct {
-			DkgRid string `json:"dkgRid"`
+	refreshRaw, refreshPresent := data.values[neutrino.TSSRefreshResultKey]
+	refreshPresent = refreshPresent && len(refreshRaw) > 0
+	hasShare := len(dkg.Share) > 0
+
+	// After the first successful refresh the node strips the DKG root share and keeps
+	// only the public parameters plus the refresh record. An archive is only useful
+	// (and safe to hand around) when it can actually sign, i.e. when it carries that
+	// refresh record; refuse the two incomplete combinations instead of producing a
+	// backup that cannot restore a signer.
+	if !refreshPresent {
+		if hasShare {
+			return nil, fmt.Errorf("refusing to export %s: the DKG record still carries the root share but "+
+				"there is no %q entry. This node has not completed its first refresh: the archive could "+
+				"not sign, and it would leak the DKG root share for no benefit. Complete a refresh (start "+
+				"the node so it runs one) and export again",
+				dbPath, neutrino.TSSRefreshResultKey)
 		}
-		switch err := json.Unmarshal(raw, &envelope); {
-		case err != nil:
-			warnf(opts.Warn, "refresh entry %q does not decode (%v); exporting its raw bytes anyway",
-				neutrino.TSSRefreshResultKey, err)
-		case envelope.DkgRid != "" && rid != "" && envelope.DkgRid != rid:
-			warnf(opts.Warn, "refresh entry belongs to DKG rid %s, but the DKG result has rid %s; "+
-				"exporting both anyway", envelope.DkgRid, rid)
-		}
+		return nil, fmt.Errorf("refusing to export %s: the key material is incomplete — the DKG record has "+
+			"no root share and there is no %q entry. Such an archive cannot sign, and this node needs an "+
+			"offline backup of the same key generation to recover",
+			dbPath, neutrino.TSSRefreshResultKey)
+	}
+
+	// The refresh record is required above, but it still must belong to this DKG.
+	var envelope struct {
+		DkgRid string `json:"dkgRid"`
+	}
+	switch err := json.Unmarshal(refreshRaw, &envelope); {
+	case err != nil:
+		warnf(opts.Warn, "refresh entry %q does not decode (%v); exporting its raw bytes anyway",
+			neutrino.TSSRefreshResultKey, err)
+	case envelope.DkgRid != "" && rid != "" && envelope.DkgRid != rid:
+		warnf(opts.Warn, "refresh entry belongs to DKG rid %s, but the DKG result has rid %s; "+
+			"exporting both anyway", envelope.DkgRid, rid)
 	}
 
 	a := &archive{
@@ -587,6 +607,10 @@ func writeArchiveAtomic(path string, a *archive) error {
 	return nil
 }
 
+// decodeDKG decodes the DKG entry. A record whose root share was stripped after the
+// first refresh is valid: it keeps the public parameters and is paired with the
+// refresh record, which carries the signing share. The share is validated only when
+// present (old records still carry it).
 func decodeDKG(data *bucketData) (*cggmp.DKGResult, error) {
 	raw, ok := data.values[neutrino.TSSDKGResultKey]
 	if !ok {
@@ -596,12 +620,11 @@ func decodeDKG(data *bucketData) (*cggmp.DKGResult, error) {
 	if err := json.Unmarshal(raw, &dkg); err != nil {
 		return nil, fmt.Errorf("decode %q: %w", neutrino.TSSDKGResultKey, err)
 	}
-	if len(dkg.Share) == 0 {
-		return nil, fmt.Errorf("decode %q: the record carries no share", neutrino.TSSDKGResultKey)
-	}
-	var scalar btcec.ModNScalar
-	if overflow := scalar.SetByteSlice(dkg.Share); overflow || scalar.IsZero() {
-		return nil, fmt.Errorf("decode %q: the share is not a valid secp256k1 scalar", neutrino.TSSDKGResultKey)
+	if len(dkg.Share) > 0 {
+		var scalar btcec.ModNScalar
+		if overflow := scalar.SetByteSlice(dkg.Share); overflow || scalar.IsZero() {
+			return nil, fmt.Errorf("decode %q: the share is not a valid secp256k1 scalar", neutrino.TSSDKGResultKey)
+		}
 	}
 	return &dkg, nil
 }

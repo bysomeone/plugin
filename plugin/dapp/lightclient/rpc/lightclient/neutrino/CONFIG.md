@@ -445,7 +445,7 @@ P2WSH 充值地址上线后，用户的充值**不再进主池**（钱停在各�
 
 | key | 内容 | 敏感度 |
 |---|---|---|
-| `cggmp-dkg-result` | 群公钥、本节点 share、各节点 Birkhoff 参数、DKG rid、各节点 partial pubkey | **等同私钥 share** |
+| `cggmp-dkg-result` | 群公钥、各节点 Birkhoff 参数、DKG rid、各节点 partial pubkey；**首次 refresh 成功落盘后本节点 share 被抹掉**（只留公开参数） | 抹 share 前**等同私钥 share**；抹掉后是公开参数 |
 | `cggmp-refresh-result` | refresh 后的 share、**本节点 Paillier 私钥素数**（`paillierP/Q`）、`ySecret`、各节点 Pedersen/ppk/y 参数 | **等同私钥 share**（Paillier 素数 + share 即可参与组签名） |
 
 - **备份范围必须同时包含两者**：只备份 `cggmp-dkg-result` 是不完整的。两条记录都是**明文 JSON**
@@ -455,6 +455,12 @@ P2WSH 充值地址上线后，用户的充值**不再进主池**（钱停在各�
   启动时若发现本地没有与当前 DKG（按 `rid` 比对）配套的 refresh 记录，会自动补跑一轮
   （会话名由 `rid` 派生，因此**缺记录的节点必须一起重启**才会落在同一轮；正常路径不会出现
   部分节点缺记录——两条记录是同一条启动路径上先后两步写入的）。
+- **首次 refresh 成功后根 share 被刻意抹掉**：顺序严格是"refresh 记录确认落盘 → 才抹
+  `cggmp-dkg-result` 里的 share"（`stripDKGShare`）；落盘失败则不抹，保持原样重试。
+  抹掉之后签名只用 refresh 记录里的 share，DKG 记录只提供群公钥 / Birkhoff / partial pubkey。
+  ⇒ **删除 `cggmp-refresh-result` 再重启补跑不再是恢复手段**（重跑 `ProcessRefresh` 需要根 share）；
+  若记录损坏或丢失，只能从**同一代**的离线备份还原。既无根 share 又无可用 refresh 记录时，
+  节点启动会直接 fail-closed（`errTssKeyMaterialLost`），不会进入注定失败的 refresh 重试。
 - **超时按阶段给**：DKG/PPK/签名沿用包装器默认 30s，**refresh 给 5 分钟**——它要在每个节点上
   现生成 2048-bit Paillier 安全素数（本机 4 节点实测 ≈23s），30s 在真实网络下必炸。
 - **rank 自检**：启动时按 4.3 的规则校验 `rank + 1 < threshold`，不合规即拒绝启动
@@ -464,8 +470,8 @@ P2WSH 充值地址上线后，用户的充值**不再进主池**（钱停在各�
   因为 re-DKG 会换出新的群公钥，而链上那把钥每个 symbol 只有一份、写死不可改 ⇒ 已发放的 P2WSH
   充值地址收到的 BTC 永远花不出去、RGB20 的 `threshold_sig` 永远验不过，**资金永久锁死**。
   正确处置：① 从**同一代**备份还原 `neutrino.db`；② 整组重建（那就要连链一起重建：全新链上没有
-  旧记录）；③ **只换密钥材料、不换群公钥**的诉求走 refresh（删掉所有签名节点的
-  `cggmp-refresh-result` 后一起重启，即补跑一节所述）。
+  旧记录）。注意：首次 refresh 成功后根 share 已被抹掉，**"删 refresh 记录再全员重启重跑"这条
+  路已不存在**（重跑需要根 share）；恢复只能依赖当前代的离线备份。
 - 同类闸门：链上记录存在但群公钥**是另一把**时，`ensureDKGOnChain` 不再"报 stall 无限等"，而是
   直接拒绝启动（不可自愈，且不能靠重跑 DKG 修）。
 

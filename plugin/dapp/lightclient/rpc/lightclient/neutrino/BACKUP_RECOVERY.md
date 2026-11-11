@@ -128,13 +128,13 @@ db, err := openWalletDB(dbPath, "neutrino.db")
 
 | 项 | 内容 |
 |---|---|
-| **存放位置** | `<paraN-data>/paradatadir/lightclient/neutrino.db` → bucket **`rgbx-tss`**，两条 key：<br>• **`cggmp-dkg-result`**（群公钥、本节点 share、各节点 Birkhoff 参数、DKG rid、partial pubkey）<br>• **`cggmp-refresh-result`**（refresh 后 share、**Paillier 私钥素数 `paillierP/Q`**、`ySecret`、Pedersen/ppk 参数）<br>✅ `tss.go:59,60,69,481,506,517,542` |
+| **存放位置** | `<paraN-data>/paradatadir/lightclient/neutrino.db` → bucket **`rgbx-tss`**，两条 key：<br>• **`cggmp-dkg-result`**（群公钥、各节点 Birkhoff 参数、DKG rid、partial pubkey；首次 refresh 成功后本节点根 share 被抹掉，只留公开参数）<br>• **`cggmp-refresh-result`**（refresh 后 share、**Paillier 私钥素数 `paillierP/Q`**、`ySecret`、Pedersen/ppk 参数）<br>✅ `tss.go:59,60,69,481,506,517,542` |
 | **格式 / 加密** | **明文 JSON**，无额外加密（✅ `CONFIG.md:412-413`、`tss.go:65-68` 注释）。**敏感度 = 私钥** |
 | **是否独立** | 每节点一份，互不相同，缺一不可拼（✅ 4 个 para 各自 `initNeutrinoConfig` 开自己的 db） |
 | **丢失后果** | **不可逆**。丢 1–3 份：剩余 ≥ `threshold=3` 仍能签（可用性下降）；**丢到只剩 2 份 ⇒ 旧 TSS 地址下的 BTC 与 RGB20 的 `threshold_sig` 永久无法产出**。re-DKG 换群公钥，而链上 `CrossChainInfo` 每 symbol 一份、写死不可改（`ErrDuplicateDKGCommit`，✅ `rgbx/executor/checktx.go:327-330`、`:78`）⇒ **资金永久锁死** |
-| **能否靠重跑修复** | ❌ **不能**。唯一「换材料不换公钥」的机制是 CGGMP `ProcessRefresh`（= 删掉 `cggmp-refresh-result` 后全员重启补跑），但它**只能换 refresh 那一半**，`cggmp-dkg-result` 本身（含 share 与群公钥）丢了就没了 |
+| **能否靠重跑修复** | ❌ **不能**。首次 refresh 成功后根 share 已被抹掉（`stripDKGShare`），重跑 `ProcessRefresh` 缺少协议输入 ⇒ **"删掉 `cggmp-refresh-result` 再全员重启补跑"已不是恢复手段**。任何一份记录丢失/损坏，唯一处置是从**同一代**离线备份还原 |
 | **必须备份** | **P0，最高优先级** |
-| **建议方式 / 频率** | DKG+refresh 落盘后**立刻一次**（这是一次性关键资产，之后不再变，除非跑 refresh）；变更（走 refresh）后重做一次 |
+| **建议方式 / 频率** | DKG+refresh 落盘后**立刻一次**（这是一次性关键资产；首次 refresh 后根 share 被抹掉，记录不再变化）；变更（走 refresh）后重做一次 |
 | **由谁持有** | **每个 para 的运维方各自持有自己的那份**，且**不得三份同处**（`threshold=3`，3 份 = 直接可花）。⚠️ 建议至少一份离线冷备 |
 
 > ✅ **链上不含 share**：`CrossChainInfo` 只写 `tssAddress` / `pubkey`（✅ `rgbx/executor/crosschain.go:52-62`），
@@ -270,9 +270,11 @@ db, err := openWalletDB(dbPath, "neutrino.db")
      - <paraN-data>/paradatadir/lightclient/neutrino.db     ← 含 rgbx-tss
      - <paraN-data>/paradatadir/lightclient/btcwallet.db    ← 生日 + tx store
 ④ 起容器，看启动日志：
-     - "ensureDKG load from local db"        = share 载入成功
+     - "ensureDKG load from local db"        = DKG 记录载入成功（根 share 可能已被抹掉，属稳态）
      - share 自检未 panic                    = 与链同代
-     - 若 refresh 记录缺失：会自动补跑一轮 refresh（✅ tss.go:569-583；需**缺记录的节点一起重启**）
+     - 记录里已无根 share 是稳态（首次 refresh 后已抹掉），不是故障；只要 refresh 记录可用即可签名
+     - 若 refresh 记录缺失或损坏：**不能靠重跑 refresh 恢复**（根 share 已抹掉），只能从同代离线备份还原；
+       两者都缺时节点会 fail-closed（`errTssKeyMaterialLost`）
 ⑤ 验证：该节点参与一笔真实签名（或 E2E 场景）
 ```
 
