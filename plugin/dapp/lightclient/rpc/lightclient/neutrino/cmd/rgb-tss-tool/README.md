@@ -37,9 +37,11 @@ JSON, mode `0600`, written through a temp file and renamed into place:
 serialization (`cggmp.DKGResult` / the refresh envelope); the tool does not
 introduce a second key-material format. `group_pubkey`, `rid` and `share_id` are
 derived from the DKG entry for identification and are re-verified on import.
-`share_id` is the participant id whose `g^{share}` matches this node's share; it
-is empty if the DKG record cannot identify it. `chain_title` is informational
-metadata supplied with `--chain-title`; it is not cryptographically bound.
+`share_id` is the participant id whose `g^{share}` matches this node's DKG share;
+it is empty when the DKG record no longer carries that root share (the steady
+state after the first refresh) or cannot identify it. `chain_title` is
+informational metadata supplied with `--chain-title`; it is not
+cryptographically bound.
 
 ## Usage
 
@@ -63,6 +65,20 @@ never prints share or Paillier material.
 A corrupt refresh entry produces a warning and is exported verbatim; a DKG entry
 that cannot be decoded is a hard error, because then the archive cannot be
 identified or verified.
+
+Export refuses material that cannot sign:
+
+- **DKG entry still carries the root share, but there is no refresh entry** — the
+  node has not completed its first refresh. The archive could not sign, and it
+  would leak the DKG root share, so export fails. Start the node so it runs a
+  refresh round, then export again.
+- **No root share in the DKG entry and no refresh entry** — the key material is
+  incomplete and cannot be restored into a signer. Export fails.
+
+With a refresh entry present, export proceeds whether or not the DKG entry still
+carries the root share, so archives written before the share was stripped remain
+valid, and archives written afterwards (public parameters + refresh material)
+are the normal form.
 
 ### Import
 
@@ -98,8 +114,13 @@ rgb-tss-tool import --file <db>.tss-backup-<unix> --db <db> --force
   the group does not recognize it (see `BACKUP_RECOVERY.md` §2.1, item B5).
 - The archive is **plaintext key material**. Store it with the same care as the
   database: `0600`, encrypted at rest, off the node.
-- The refresh record can be rerun if lost; the DKG result (the share) cannot. The
-  tool always refuses to export without a decodable DKG entry.
+- **After the first refresh, only the refresh record can sign.** The node strips
+  the DKG root share once the refresh material is on disk, keeping the public
+  parameters needed for signing and chain checks. That means a refresh round can
+  no longer be re-run from scratch, and deleting the refresh record is **not** a
+  recovery path: restore the archive (or the `neutrino.db` bucket) of the same key
+  generation instead. The tool refuses to export without a refresh record for
+  exactly this reason.
 - This tool does not check that the share matches the chain's `CrossChainInfo`;
   that check remains at node startup (`CONFIG.md` §4.3.1).
 
